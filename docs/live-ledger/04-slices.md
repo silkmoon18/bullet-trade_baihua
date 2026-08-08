@@ -93,11 +93,12 @@ Tests (initial):
   - git diff --check v0.9.2..HEAD -> 初次FAIL，发现Markdown EOF空行；修复后PASS
   - python scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> 初次发现可达历史含旧敏感值，触发压平
 Findings: 旧helper API不兼容未明确、EOF格式、runtime忽略不足、公共remote可误推、状态文档过期
-Fix commit: pending sanitized squash commit
+Fix commit: 7085155（sanitized squash commit）
 Retest:
-  - git diff --check v0.9.2..HEAD -> pending squash
-  - python scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> pending squash
-Final code candidate SHA: pending sanitized squash commit
+  - git diff --check v0.9.2..7085155 -> PASS
+  - git show --check --oneline --stat 7085155 -> PASS
+  - python scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
+Final code candidate SHA: 7085155
 Final reviewer: pending
 Final review result: pending
 Residual risks/external blockers: 用户私有origin URL未提供，当前仓库local-only；外部token/Webhook尚待用户轮换
