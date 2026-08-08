@@ -119,7 +119,7 @@ Decision: DONE
 ### 验证
 
 - 本地导入策略不会因旧helper API立即报错。
-- BACKTEST不连接远端；SHADOW持续禁止下单/撤单并清除旧客户端；LIVE只校验配置且无连接/接管副作用。
+- BACKTEST不连接远端；SHADOW/LIVE在profile导入前即禁止下单/撤单并清除旧客户端；LIVE只校验配置，不连接服务器、不接管portfolio，仅安装本地fail-closed函数。
 - 策略源码无host、token、Webhook和账户明文。
 
 ### 首次审查与修复记录
@@ -140,7 +140,7 @@ Fix commit: 17f8eb2
 Fixes:
   - 进程模式、namespace、公开helper、RemoteBrokerClient和ShortLivedClient多层fail-closed
   - SHADOW清除旧client并在幂等安装时重建保护；远程context要求干净进程重启
-  - LIVE改为无副作用profile校验，good_etf在helper调用前直接拒绝LIVE
+  - LIVE改为无远程连接和portfolio接管的profile校验，仅保留本地fail-closed保护；good_etf在helper调用前直接拒绝LIVE
   - 目标市值按当前持仓判断增持/减持；仅增持使用买入上浮限价
   - retries/timeout增加上下限并同步文档和边界测试
 Retest:

@@ -63,7 +63,7 @@ bullet-trade/
 
 `v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
 
-S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW严格校验profile但不建远程连接，清除旧远程客户端，并在namespace、公开helper和缓存broker三层阻断交易变更；LIVE只校验profile并保持连接和交易关闭。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW/LIVE在导入profile之前先建立进程和namespace门禁、清除旧远程客户端，并通过namespace、公开helper、缓存broker和短连接client阻断交易或远程访问。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。任一远程模式初始化失败后必须使用干净进程重启。`good_etf.py`在调用helper前就会拒绝LIVE启动。
 
 ### BulletTrade服务器侧
 

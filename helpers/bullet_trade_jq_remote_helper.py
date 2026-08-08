@@ -1632,7 +1632,7 @@ _PROFILE_OPTIONAL_FIELDS = {
     "debug",
 }
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
-_SHADOW_MUTATION_NAMES = {
+_RUNTIME_MUTATION_NAMES = {
     "order",
     "order_value",
     "order_percent",
@@ -1801,9 +1801,9 @@ def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
     }
 
 
-def _is_shadow_mutation_name(name: str) -> bool:
+def _is_runtime_mutation_name(name: str) -> bool:
     return (
-        name in _SHADOW_MUTATION_NAMES
+        name in _RUNTIME_MUTATION_NAMES
         or name.startswith("order_")
         or name == "cancel"
         or name.startswith("cancel_")
@@ -1811,24 +1811,64 @@ def _is_shadow_mutation_name(name: str) -> bool:
     )
 
 
-def _shadow_mutation_guard(name: str) -> Callable[..., Any]:
+def _runtime_mutation_guard(name: str, active_mode: str) -> Callable[..., Any]:
     def blocked(*args, **kwargs):
-        raise RuntimeError("SHADOW模式禁止交易变更: {}".format(name))
+        raise RuntimeError("{}模式禁止交易变更: {}".format(active_mode, name))
 
-    blocked.__name__ = "shadow_blocked_{}".format(name)
+    blocked.__name__ = "runtime_blocked_{}_{}".format(active_mode.lower(), name)
     return blocked
 
 
-def _install_shadow_guards(namespace: Dict[str, Any]) -> Tuple[str, ...]:
-    names = set(_SHADOW_MUTATION_NAMES)
+def _install_runtime_guards(
+    namespace: Dict[str, Any],
+    active_mode: str,
+) -> Tuple[str, ...]:
+    names = set(_RUNTIME_MUTATION_NAMES)
     names.update(
         name
         for name, value in namespace.items()
-        if isinstance(name, str) and callable(value) and _is_shadow_mutation_name(name)
+        if isinstance(name, str) and callable(value) and _is_runtime_mutation_name(name)
     )
     for name in names:
-        namespace[name] = _shadow_mutation_guard(name)
+        namespace[name] = _runtime_mutation_guard(name, active_mode)
     return tuple(sorted(names))
+
+
+def _runtime_active_mode(mode: str) -> str:
+    return "LIVE_BLOCKED" if mode == "LIVE" else mode
+
+
+def _clear_runtime_clients() -> None:
+    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT
+
+    _CLIENT = None
+    _DATA_CLIENT = None
+    _BROKER_CLIENT = None
+
+
+def _arm_remote_runtime_gate(
+    namespace: Dict[str, Any],
+    mode: str,
+) -> Tuple[str, ...]:
+    """在导入任何运行配置前建立进程和策略namespace双重门禁。"""
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE
+
+    active_mode = _runtime_active_mode(mode)
+    _STRATEGY_RUNTIME_ACTIVE_MODE = active_mode
+    _clear_runtime_clients()
+    return _install_runtime_guards(namespace, active_mode)
+
+
+def _mark_runtime_failed(namespace: Dict[str, Any]) -> None:
+    """保持失败关闭；后续显式重试安装前，不允许复用任何交易入口。"""
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE
+
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+    _clear_runtime_clients()
+    namespace.pop(_STRATEGY_RUNTIME_STATE_KEY, None)
+    _install_runtime_guards(namespace, "FAILED")
 
 
 def _context_uses_remote_snapshot(context: Any) -> bool:
@@ -1839,25 +1879,27 @@ def _context_uses_remote_snapshot(context: Any) -> bool:
     )
 
 
-def _enforce_shadow_postconditions(
+def _enforce_remote_postconditions(
     namespace: Dict[str, Any],
     context: Any,
+    active_mode: str,
 ) -> Tuple[str, ...]:
-    """修复SHADOW保护，并清除一切可复用的远程客户端。"""
-
-    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT
+    """修复远程模式保护，并清除一切可复用的远程客户端。"""
 
     inherited_remote_context = _context_uses_remote_snapshot(context)
     _restore_jq_compat(namespace)
-    _CLIENT = None
-    _DATA_CLIENT = None
-    _BROKER_CLIENT = None
+    _clear_runtime_clients()
+    blocked_names = _install_runtime_guards(namespace, active_mode)
     if inherited_remote_context:
-        raise RuntimeError("SHADOW不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略")
-    return _install_shadow_guards(namespace)
+        raise RuntimeError(
+            "{}不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略".format(
+                active_mode
+            )
+        )
+    return blocked_names
 
 
-def install_strategy_runtime(
+def _install_strategy_runtime_impl(
     namespace: Dict[str, Any],
     *,
     context: Any,
@@ -1928,14 +1970,20 @@ def install_strategy_runtime(
         state = dict(existing["state"])
         if normalised_mode == "SHADOW":
             _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-            try:
-                state["blocked_mutations"] = _enforce_shadow_postconditions(namespace, context)
-            except Exception:
-                _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-                raise
+            state["blocked_mutations"] = _enforce_remote_postconditions(
+                namespace,
+                context,
+                normalised_mode,
+            )
             existing["state"] = state
         elif normalised_mode == "LIVE":
             _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
+            state["blocked_mutations"] = _enforce_remote_postconditions(
+                namespace,
+                context,
+                "LIVE_BLOCKED",
+            )
+            existing["state"] = state
         else:
             _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
         return dict(state)
@@ -1969,11 +2017,11 @@ def install_strategy_runtime(
         # S01 的 SHADOW 是严格的本地只读门禁：不 configure、不建socket，
         # 也不调用会替换portfolio的 install_jq_compat。远端原子快照在S15接入。
         _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-        try:
-            blocked_names = _enforce_shadow_postconditions(namespace, context)
-        except Exception:
-            _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-            raise
+        blocked_names = _enforce_remote_postconditions(
+            namespace,
+            context,
+            normalised_mode,
+        )
         state = {
             "api_version": STRATEGY_RUNTIME_API_VERSION,
             "profile_schema_version": PROFILE_SCHEMA_VERSION,
@@ -1989,8 +2037,13 @@ def install_strategy_runtime(
             "blocked_mutations": blocked_names,
         }
     else:
-        # S01不得让LIVE产生任何连接、portfolio替换或交易函数接管副作用。
+        # S01不得让LIVE产生任何连接或portfolio替换；仅安装本地失败关闭门禁。
         _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
+        blocked_names = _enforce_remote_postconditions(
+            namespace,
+            context,
+            "LIVE_BLOCKED",
+        )
         state = {
             "api_version": STRATEGY_RUNTIME_API_VERSION,
             "profile_schema_version": PROFILE_SCHEMA_VERSION,
@@ -2004,11 +2057,66 @@ def install_strategy_runtime(
             "production_ready": False,
             "reason": "live_blocked_until_strategy_ledger",
             "mirror_jq_orders": False,
+            "blocked_mutations": blocked_names,
         }
 
     _STRATEGY_RUNTIME_PROCESS_SIGNATURE = install_signature
     namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
     return dict(state)
+
+
+def install_strategy_runtime(
+    namespace: Dict[str, Any],
+    *,
+    context: Any,
+    profile: str,
+    mode: str,
+    strategy_id: str,
+    expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
+    profile_module: str = "jq_runtime_config",
+) -> Dict[str, Any]:
+    """安装版本化的聚宽策略运行入口，并保证远程模式全程失败关闭。"""
+
+    if not isinstance(namespace, dict):
+        raise RuntimeError("namespace 必须是策略globals()字典")
+    if _STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED":
+        _mark_runtime_failed(namespace)
+        raise RuntimeError("策略运行安装已经失败；必须使用干净运行进程重启")
+    normalised_mode = _normalise_runtime_mode(mode)
+    if normalised_mode not in {"SHADOW", "LIVE"}:
+        if normalised_mode == "BACKTEST" and _STRATEGY_RUNTIME_ACTIVE_MODE in {
+            "SHADOW",
+            "LIVE_BLOCKED",
+            "FAILED",
+        }:
+            _mark_runtime_failed(namespace)
+            raise RuntimeError("远程运行模式已启动或失败；切换BACKTEST必须使用干净运行进程")
+        return _install_strategy_runtime_impl(
+            namespace,
+            context=context,
+            profile=profile,
+            mode=normalised_mode,
+            strategy_id=strategy_id,
+            expected_api_version=expected_api_version,
+            profile_module=profile_module,
+        )
+
+    try:
+        # profile是可执行Python模块；在其导入发生任何副作用前先阻断进程、
+        # 缓存客户端和策略namespace中的所有交易变更入口。
+        _arm_remote_runtime_gate(namespace, normalised_mode)
+        return _install_strategy_runtime_impl(
+            namespace,
+            context=context,
+            profile=profile,
+            mode=normalised_mode,
+            strategy_id=strategy_id,
+            expected_api_version=expected_api_version,
+            profile_module=profile_module,
+        )
+    except BaseException:
+        _mark_runtime_failed(namespace)
+        raise
 
 
 def _restore_jq_compat(namespace: Dict[str, Any]) -> None:

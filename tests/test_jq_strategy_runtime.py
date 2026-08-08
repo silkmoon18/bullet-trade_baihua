@@ -1,3 +1,4 @@
+import builtins
 import sys
 import types
 
@@ -234,14 +235,57 @@ def test_shadow_idempotent_reinstall_repairs_namespace_and_client_guards(monkeyp
         namespace["order"]("000001.XSHE", 100)
 
 
-def test_shadow_rejects_context_inherited_from_remote_compat(monkeypatch):
+@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+def test_remote_modes_reject_context_inherited_from_remote_compat(monkeypatch, mode):
     module_name = _profile_module(monkeypatch)
     context = _Context("sim_trade")
     context.portfolio = object.__new__(helper._RemoteJQPortfolio)
+    client = _MutationProbeClient()
+    raw_broker = helper.RemoteBrokerClient(client)
+    cached_client = helper._ShortLivedClient("127.0.0.1", 58620, "unit-test-token")
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", raw_broker)
+    socket_calls = []
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    def native_mutation(*args, **kwargs):
+        raise AssertionError("远程context拒绝后不得恢复原生交易入口")
+
+    def cached_compat_order(*args, **kwargs):
+        return raw_broker.order("000001.XSHE", 100)
+
+    namespace = {
+        helper._JQ_COMPAT_STATE_KEY: {
+            "installed": True,
+            "originals": {
+                "order": native_mutation,
+                "order_target": native_mutation,
+                "cancel_order": native_mutation,
+            },
+        },
+        "order": cached_compat_order,
+        "order_target": lambda *args, **kwargs: "remote-order-target",
+        "cancel_order": lambda *args, **kwargs: "remote-cancel",
+    }
 
     with pytest.raises(RuntimeError, match="不能复用.*远程兼容层"):
-        _install({}, context, module_name)
+        _install(namespace, context, module_name, mode=mode)
     assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert helper._BROKER_CLIENT is None
+    for name in ("order", "order_target", "cancel_order"):
+        with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+            namespace[name]()
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        raw_broker.order("000001.XSHE", 100)
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        cached_compat_order()
+    with pytest.raises(RuntimeError, match="FAILED模式禁止远程访问"):
+        cached_client.request("broker.account", {})
+    assert client.requests == []
+    assert socket_calls == []
 
 
 def test_shadow_blocks_mutations_on_previously_cached_raw_broker(monkeypatch):
@@ -291,7 +335,7 @@ def test_runtime_modes_block_previously_cached_short_lived_client(
         cached_client.request("broker.account", {})
 
 
-def test_live_validates_profile_without_remote_or_namespace_side_effects(monkeypatch):
+def test_live_validates_profile_without_remote_takeover_and_installs_local_guards(monkeypatch):
     module_name = _profile_module(monkeypatch)
     real_configure = helper.configure
     monkeypatch.setattr(
@@ -323,7 +367,10 @@ def test_live_validates_profile_without_remote_or_namespace_side_effects(monkeyp
     assert state["mirror_jq_orders"] is False
     assert "token" not in state
     assert "host" not in state
-    assert namespace["order"] is native_order
+    assert "order" in state["blocked_mutations"]
+    assert namespace["order"] is not native_order
+    with pytest.raises(RuntimeError, match="LIVE_BLOCKED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
     assert context.portfolio is native_portfolio
     assert helper._CLIENT is None
     assert helper._DATA_CLIENT is None
@@ -369,10 +416,11 @@ def test_remote_modes_are_idempotent(monkeypatch, mode):
         "install_jq_compat",
         lambda *args, **kwargs: pytest.fail("S01远程模式不得安装旧兼容层"),
     )
-    namespace = {}
+    namespace = {"order": lambda *args, **kwargs: "unsafe"}
     context = _Context("sim_trade")
 
     first = _install(namespace, context, module_name, mode=mode)
+    namespace["order"] = lambda *args, **kwargs: "rebound-unsafe"
     monkeypatch.setattr(
         helper,
         "_load_runtime_profile",
@@ -383,6 +431,158 @@ def test_remote_modes_are_idempotent(monkeypatch, mode):
     assert first == second
     expected_active = "SHADOW" if mode == "SHADOW" else "LIVE_BLOCKED"
     assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == expected_active
+    with pytest.raises(RuntimeError, match="{}模式禁止交易变更".format(expected_active)):
+        namespace["order"]("000001.XSHE", 100)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_active"),
+    [("SHADOW", "SHADOW"), ("LIVE", "LIVE_BLOCKED")],
+)
+def test_remote_gate_is_armed_before_profile_import_side_effects(
+    monkeypatch,
+    mode,
+    expected_active,
+):
+    module_name = "side_effect_jq_runtime_config_{}".format(mode.lower())
+    module = types.ModuleType(module_name)
+    module.PROFILE_SCHEMA_VERSION = 1
+    module.PROFILES = {"good_etf-prod": _valid_profile()}
+    cached_client = helper._ShortLivedClient("127.0.0.1", 58620, "unit-test-token")
+    probe_client = _MutationProbeClient()
+    raw_broker = helper.RemoteBrokerClient(probe_client)
+    monkeypatch.setattr(helper, "_CLIENT", cached_client)
+    monkeypatch.setattr(helper, "_DATA_CLIENT", object())
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", raw_broker)
+    namespace = {"order": lambda *args, **kwargs: "native-mutation"}
+    socket_calls = []
+
+    def forbidden_socket(*args, **kwargs):
+        socket_calls.append((args, kwargs))
+        raise AssertionError("profile导入副作用不得触达socket")
+
+    monkeypatch.setattr(helper.socket, "create_connection", forbidden_socket)
+    original_import = builtins.__import__
+    observations = {}
+
+    def import_with_side_effect(name, *args, **kwargs):
+        if name != module_name:
+            return original_import(name, *args, **kwargs)
+        observations["active"] = helper._STRATEGY_RUNTIME_ACTIVE_MODE
+        observations["clients"] = (
+            helper._CLIENT,
+            helper._DATA_CLIENT,
+            helper._BROKER_CLIENT,
+        )
+        with pytest.raises(RuntimeError, match="{}模式禁止交易变更".format(expected_active)):
+            helper.configure(host="127.0.0.1", token="unit-test-token")
+        with pytest.raises(RuntimeError, match="{}模式禁止远程访问".format(expected_active)):
+            cached_client.request("broker.account", {})
+        with pytest.raises(RuntimeError, match="{}模式禁止交易变更".format(expected_active)):
+            raw_broker.order("000001.XSHE", 100)
+        with pytest.raises(RuntimeError, match="{}模式禁止交易变更".format(expected_active)):
+            namespace["order"]("000001.XSHE", 100)
+        return module
+
+    monkeypatch.setattr(builtins, "__import__", import_with_side_effect)
+
+    state = _install(namespace, _Context("sim_trade"), module_name, mode=mode)
+
+    assert state["mode"] == mode
+    assert observations == {"active": expected_active, "clients": (None, None, None)}
+    assert probe_client.requests == []
+    assert socket_calls == []
+
+
+@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+def test_remote_profile_failure_keeps_failed_gate_and_invalidates_cached_clients(
+    monkeypatch,
+    mode,
+):
+    cached_client = helper._ShortLivedClient("127.0.0.1", 58620, "unit-test-token")
+    probe_client = _MutationProbeClient()
+    raw_broker = helper.RemoteBrokerClient(probe_client)
+    monkeypatch.setattr(helper, "_CLIENT", cached_client)
+    monkeypatch.setattr(helper, "_DATA_CLIENT", object())
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", raw_broker)
+    namespace = {
+        "order": lambda *args, **kwargs: "native-order",
+        "order_target": lambda *args, **kwargs: "native-order-target",
+        "cancel_order": lambda *args, **kwargs: "native-cancel",
+    }
+    socket_calls = []
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="无法加载运行配置模块"):
+        _install(
+            namespace,
+            _Context("sim_trade"),
+            "definitely_missing_profile_with_old_clients_{}".format(mode.lower()),
+            mode=mode,
+        )
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert helper._CLIENT is None
+    assert helper._DATA_CLIENT is None
+    assert helper._BROKER_CLIENT is None
+    for name in ("order", "order_target", "cancel_order"):
+        with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+            namespace[name]()
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        raw_broker.order("000001.XSHE", 100)
+    with pytest.raises(RuntimeError, match="FAILED模式禁止远程访问"):
+        cached_client.request("broker.account", {})
+    assert probe_client.requests == []
+    assert socket_calls == []
+
+
+def test_backtest_after_failed_remote_attempt_requires_clean_process(monkeypatch):
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+
+    with pytest.raises(RuntimeError, match="无法加载运行配置模块"):
+        _install(
+            namespace,
+            _Context("sim_trade"),
+            "definitely_missing_profile_before_backtest",
+            mode="SHADOW",
+        )
+    with pytest.raises(RuntimeError, match="必须使用干净运行进程重启"):
+        _install(
+            namespace,
+            _Context("full_backtest"),
+            "unused_profile",
+            mode="BACKTEST",
+        )
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_failed_remote_install_cannot_retry_in_same_process(monkeypatch):
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+    context = _Context("sim_trade")
+
+    with pytest.raises(RuntimeError, match="无法加载运行配置模块"):
+        _install(namespace, context, "missing_profile_before_retry", mode="SHADOW")
+    module_name = _profile_module(monkeypatch)
+    monkeypatch.setattr(
+        helper,
+        "_load_runtime_profile",
+        lambda *args, **kwargs: pytest.fail("FAILED进程不得再次加载profile"),
+    )
+
+    with pytest.raises(RuntimeError, match="必须使用干净运行进程重启"):
+        _install(namespace, context, module_name, mode="SHADOW")
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert helper._STRATEGY_RUNTIME_STATE_KEY not in namespace
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
 
 
 def test_reinstall_with_different_contract_fails_closed(monkeypatch):
