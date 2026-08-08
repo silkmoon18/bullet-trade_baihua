@@ -21,7 +21,7 @@
 
 当前三种模式的边界是：
 
-- `BACKTEST`：不需要helper或profile，直接使用聚宽原生回测接口；
+- `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时先经版本化入口检查旧远程client/portfolio污染，只有traceback证明目标helper本体尚未执行且确实不存在时才使用纯聚宽本地兜底；helper内部导入失败、进程仍加载其他helper别名，或无helper但context仍是旧远程portfolio都会中止；
 - `SHADOW`：需要版本匹配的helper和私有profile，只记录计划，所有交易变更均被阻断；
 - `LIVE`：S01尚未切换到StrategyLedger，策略会明确拒绝启动。
 

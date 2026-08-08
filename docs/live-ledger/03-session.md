@@ -36,7 +36,8 @@
 - `.idea/`、runtime、导出产物和本地profile已有明确忽略规则。
 - S00最终候选为`7085155`；基线校验脚本和Git格式检查均PASS，最终独立复审已APPROVE。
 - S01初始实现`655b3c9`经多轮修复形成精确候选`354ecf3`；契约和安全审查批准，但对抗审查仍发现旧compat originals/别名、helper reload、并发契约、RPC切换、污染BACKTEST、BaseException凭据脱敏及namespace状态伪造问题，因此该SHA明确REWORK，不能发布。
-- S01 v3修复已提交为`f253827`：增加原子owner/在途lease/generation、严格进程权威状态、旧compat隔离、跨reload portfolio标记、全模式干净进程边界和poison namespace防御；又通过对抗反例修复了关键字namespace、递归/并发不同namespace、同namespace预门禁、import alias/partial/wrapped/closure别名及热重载虚假成功。137项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过；仍须把本记录提交后的精确HEAD交给三方复审，不能标记S01完成。
+- S01 v3精确候选`34944b3`经三方复审仍为REWORK：策略BACKTEST分支可绕过helper污染检查；helper在BACKTEST读取context前尚未建立进程门禁；`raise ... from None`仍通过`__context__`保留profile导入异常；profile导入成功后的属性异常也未脱敏。
+- S01 v4首轮工作树预审继续为REWORK，又发现异常进程状态失败开放、无helper兜底接受旧远程portfolio、helper内部ImportError被误判为缺失、未知profile字段名回显、超大整数逃逸稳定错误、并发双BACKTEST给失败namespace遗留guard等问题。第二轮修复后的预审仍发现孤儿`TRANSITIONING`可恢复成功、超大API版本错误不稳定，以及无helper兜底在已加载其他helper别名时仍有context getter远程窗口。第三轮修复将孤儿态直接转FAILED，要求精确`ModuleNotFoundError`的traceback证明helper本体尚未执行，并在context前拒绝任何已加载helper别名和旧remote portfolio；预审仅余策略期望API和helper实际API两个超大内部版本的稳定错误MINOR。第四轮工作树已对API比较两侧统一使用有界安全显示。162项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查已通过，第四轮契约、安全、对抗预审均APPROVE；当前可提交候选，但精确SHA三方复审通过前仍不能关闭S01。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
@@ -47,14 +48,14 @@
 当前目标：
 
 - 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
-- BACKTEST不读取profile、不连接网络；SHADOW/LIVE在原子登记owner时即先禁止mutation、清除旧客户端，且不连接服务器或接管portfolio；LIVE的namespace变化仅是本地fail-closed保护。
+- 三个合法模式都在原子登记owner时先建立进程远程门禁；BACKTEST不读取profile、不连接网络、不替换聚宽原生函数，有helper时检查历史远程污染、无helper时允许纯回测兜底；SHADOW/LIVE还会先禁止namespace mutation并清除旧客户端，且不连接服务器或接管portfolio；LIVE的namespace变化仅是本地fail-closed保护。
 - runtime只接受普通字符串mode和真实模块`globals()`字典；并发、递归、热重载、污染状态或在途RPC不能发布虚假成功契约。
 - 移除迁移策略对旧定制helper API的调用。
 - 缺helper、旧helper版本、缺profile和无效配置fail-fast且不泄露token。
 
 ## 下一步
 
-冻结S01 v3代码和行为文档，运行完整验证并提交；随后对新的精确SHA重新执行安全、契约和对抗三方复审。三方全部APPROVE后才能关闭S01并进入S02类型桩与IDE支持。
+完成S01 v4预提交独立审查，修复全部finding后提交代码和行为文档；随后对新的精确SHA重新执行安全、契约和对抗三方复审。三方全部APPROVE后才能关闭S01并进入S02类型桩与IDE支持。
 
 ## 恢复检查表
 

@@ -22,7 +22,7 @@
 - `host`：BulletTrade 服务地址；
 - `token`：服务端认证 token。
 
-可选字段为 `port`、`account_key`、`sub_account_id`、`tls_cert`、`retries`、`retry_interval`、`rpc_timeout`、`place_order_timeout_margin`、`default_wait_timeout` 和 `debug`。未知字段会被拒绝，错误信息不会回显 token。
+可选字段为 `port`、`account_key`、`sub_account_id`、`tls_cert`、`retries`、`retry_interval`、`rpc_timeout`、`place_order_timeout_margin`、`default_wait_timeout` 和 `debug`。`PROFILES`和单个profile必须是普通`dict`，字段名和字符串值必须是普通`str`，数值与布尔字段也只接受对应的精确内建类型。未知字段会被拒绝且不会回显字段名；配置导入或属性读取的意外异常使用固定消息且不保留异常链，避免日志/异常采集器通过错误文本或`__context__`取回 token。超范围或异常大的精确整数也只产生稳定的契约错误。
 
 为避免配置笔误造成无限等待，schema v1限制`retries`为0至10、`retry_interval`为0.1至30秒、`rpc_timeout`为5至300秒、下单等待及其安全余量为0至300秒。
 
@@ -30,9 +30,11 @@
 
 | MODE | 允许的聚宽运行类型 | helper/profile | 交易行为 |
 |---|---|---|---|
-| `BACKTEST` | `simple_backtest`、`full_backtest` | 不需要，也不导入私有 profile或连接网络 | 使用聚宽原生回测订单 |
+| `BACKTEST` | `simple_backtest`、`full_backtest` | helper可缺省；存在时只做版本和历史污染检查，仍不导入私有profile或连接网络 | 使用聚宽原生回测订单，不替换下单函数 |
 | `SHADOW` | `sim_trade` | 导入profile前先建立本地门禁；必须通过schema校验，S01不建远程连接 | 只生成计划和日志；所有下单、撤单入口均被阻断 |
 | `LIVE` | `sim_trade` | 导入profile前先建立本地门禁；必须通过schema校验，S01不建远程连接 | helper保持交易关闭并安装本地阻断函数；`good_etf.py`在调用helper前即因尚无StrategyLedger而拒绝启动 |
+
+只有导入目标`bullet_trade_jq_remote_helper`本身得到精确`ModuleNotFoundError`，且异常traceback表明helper本体尚未开始执行时，策略才把helper视为缺失；helper文件已上传但其内部依赖、初始化或同名缺失异常必须直接中止，不能静默降级为BACKTEST。无helper兜底会在读取context前拒绝任何仍加载在`sys.modules`中的helper别名，也会拒绝带稳定marker或旧helper类特征的远程portfolio，要求干净进程重启。
 
 `install_strategy_runtime`的第一个参数必须直接传模块的普通`globals()`字典，`mode`必须是普通字符串；不接受可覆写字典行为的子类或会在`__str__`中执行代码的对象。SHADOW和helper级LIVE都不会安装旧`install_jq_compat`、替换`context.portfolio`或连接服务器；替换namespace中的交易函数是有意的本地fail-closed保护。
 
@@ -40,7 +42,7 @@
 
 任何旧`install_jq_compat`状态、旧远程portfolio、已发布client、helper热重载、运行状态篡改或安装失败都会要求干净进程重启；这也适用于BACKTEST，系统不会猜测旧兼容层是否已完整恢复。namespace中的runtime record只是可篡改副本，进程内signature和canonical state才是权威，不能从namespace缓存恢复进程状态。
 
-安装与旧配置入口使用单进程原子切换边界。SHADOW/LIVE登记owner时即先安装`TRANSITIONING`门禁；并发、递归或不同契约安装不会排队覆盖已返回结果。在途RPC会让新runtime安装失败并进入`FAILED`，因此不会成功发布SHADOW/LIVE；已经获得lease的当前网络attempt可能收尾，但generation变化后不得开始下一次重试，新请求也会被拒绝。
+安装与旧配置入口使用单进程原子切换边界。BACKTEST/SHADOW/LIVE登记owner时都先建立进程级`TRANSITIONING`门禁，再读取`context`；SHADOW/LIVE还会立即保护namespace交易入口。并发、递归或不同契约安装不会排队覆盖已返回结果。在途RPC会让新runtime安装失败并进入`FAILED`，因此不会成功发布新契约；已经获得lease的当前网络attempt可能收尾，但generation变化后不得开始下一次重试，新请求也会被拒绝。
 
 任一合法runtime安装、配置导入或上下文校验失败后，进程进入`FAILED`并清空运行状态；不得在同一进程重试或切回BACKTEST，应让聚宽使用干净进程重启策略。
 

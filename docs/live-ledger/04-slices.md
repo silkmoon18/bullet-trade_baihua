@@ -211,10 +211,95 @@ Retest:
   - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
   - git diff --check -> PASS（仅工作树CRLF转换提示）
 Pre-commit reviewer: /root/audit_s01_v3_contract -> APPROVE；helper/test冻结哈希与上述137项验证一致，无BLOCKER/MAJOR/MINOR
-Final candidate SHA: PENDING
-Final reviewer: PENDING（三方精确SHA复审）
-Final review result: PENDING
+Final candidate SHA: 34944b32692744db0c5d8482508a0fed8d8df5c7
+Final reviewers: /root/review_s01_v3_exact_contract；/root/review_s01_v3_exact_security；/root/review_s01_exact_adversarial_v2
+Final review result: REWORK（1 APPROVE，2 REWORK；任一REWORK即不得放行）
+Final findings:
+  - MAJOR: good_etf的BACKTEST本地分支绕过helper，旧client/remote portfolio污染仍可返回orders_enabled=True
+  - MAJOR: helper在BACKTEST读取context属性前未建立进程门禁，属性副作用可通过缓存client发出远程mutation并返回虚假成功
+  - MAJOR: profile import脱敏错误仍通过__context__保留含凭据的原异常对象
+  - MINOR: import成功后的PROFILE_SCHEMA_VERSION/PROFILES属性异常不在脱敏边界内
 Residual risks/external blockers: 任意其他模块、容器、callable对象或局部变量中预存的原生函数引用无法由Python撤销；profile仍是可信代码而非沙箱；真实聚宽smoke在S18
+Decision: REWORK
+```
+
+### v4边界修复与第四次精确候选记录
+
+```text
+Slice: S01
+Reviewed commit: 34944b32692744db0c5d8482508a0fed8d8df5c7
+Review result: REWORK
+Fix commit: PENDING
+Fixes in current candidate:
+  - 三个合法模式在原子owner登记时先建立进程级TRANSITIONING门禁，再读取任何context属性
+  - good_etf在helper存在时连BACKTEST也统一调用版本化入口；仅helper缺失的纯聚宽BACKTEST走本地兜底
+  - BACKTEST经helper检查旧client、remote portfolio及legacy compat污染，但不替换聚宽原生下单函数、不导入profile、不连接网络
+  - profile导入和导入后属性读取统一安全快照；脱敏错误离开except后抛出，__context__/__cause__不保留秘密异常
+  - PROFILES、单个profile及字段值只接受精确内建类型，拒绝通过魔术方法执行的poison子类
+  - 通用configure/runtime跨reload脱敏错误同样在except外抛出并断开异常链
+Retest:
+  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 147 passed
+  - python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py strategies/joinquant/good_etf.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py --select=E9,F63,F7,F82 -> PASS
+  - Python 3.8 ast.parse(feature_version=(3, 8)) for changed Python files -> PY38_AST_OK
+  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS（仅工作树CRLF转换提示）
+First pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
+First pre-commit result: REWORK（三方均REWORK）
+First pre-commit findings:
+  - MAJOR: 被篡改为未知值的进程active state未被固定blocked set覆盖，BACKTEST context属性仍可让缓存client触达socket
+  - MAJOR: helper缺失兜底不检查旧remote portfolio，仍可返回orders_enabled=True
+  - MAJOR: helper内部ImportError/依赖缺失被顶层宽泛ImportError误判为helper未安装并静默降级
+  - MAJOR: 未知profile字段名原样进入错误文本，字段名自身含凭据时泄露
+  - MAJOR: 并发两个不同namespace的BACKTEST会给失败方永久安装TRANSITIONING guard，与最终BACKTEST状态冲突
+  - MINOR: 超大精确整数可在schema错误格式化或math.isfinite中逃逸为ValueError/OverflowError
+Second fixes in current worktree:
+  - 任意未知/非普通字符串active state在owner登记时直接转FAILED，固定错误不读取对象文本；remote/mutation gate改为非None一律阻断
+  - 只有目标helper自身的精确ModuleNotFoundError才允许BACKTEST兜底；内部导入错误原样中止，兜底也拒绝稳定marker/旧类特征remote portfolio
+  - 未知字段使用固定错误且不回显键；schema版本仅回显有界整数，数值先做类型、有限性和范围检查再转换
+  - 新增transition mode；只有两个纯BACKTEST竞争时失败方保留原生函数，涉及任一远程模式仍保护失败namespace
+Second retest:
+  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 155 passed
+  - fatal flake8 for helper/strategy/runtime tests -> PASS
+  - Python 3.8 AST -> PY38_AST_OK
+  - baseline validator -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS（仅工作树CRLF转换提示）
+Second pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
+Second pre-commit result: REWORK（1 APPROVE，2 REWORK）
+Second pre-commit findings:
+  - MAJOR: owner缺失的孤儿TRANSITIONING被下一次BACKTEST恢复为orders_enabled=True，而非FAILED
+  - MAJOR: 无helper兜底读取context前不检查其他模块名下仍加载的helper，getter可用缓存client触达socket
+  - MINOR: helper本体执行后主动抛同名ModuleNotFoundError仍可能被误判为目标模块缺失
+  - MINOR: helper expected_api_version和策略读取的helper API version为超大整数时，错误格式化逃逸为ValueError
+Third fixes in current worktree:
+  - owner为空时只有BACKTEST/SHADOW/LIVE_BLOCKED/FAILED是稳定状态；孤儿TRANSITIONING和其他值在context前统一转FAILED
+  - helper缺失兜底同时要求精确ModuleNotFoundError、目标name和仅调用点单帧traceback；helper本体开始执行后的同名异常继续抛出
+  - 兜底在任何context getter前扫描sys.modules并拒绝顶层或包别名helper；随后仍检查稳定marker、继承marker和旧类/module特征
+  - helper与策略API版本错误只回显有界精确整数，其他值固定显示<invalid>
+Third retest:
+  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 160 passed
+  - fatal flake8 for helper/strategy/runtime tests -> PASS
+  - Python 3.8 AST -> PY38_AST_OK
+  - baseline validator -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS（仅工作树CRLF转换提示）
+Third pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
+Third pre-commit result: REWORK（2 APPROVE，1 REWORK）
+Third pre-commit findings:
+  - MINOR: good_etf内部期望API版本被篡改为超大整数时，expected错误格式化逃逸为ValueError
+  - MINOR: helper自身API版本被篡改为超大整数时，actual错误格式化逃逸为ValueError
+Fourth fixes in current worktree:
+  - 策略与helper的API版本比较对expected和actual两侧都只回显有界精确整数，其他值固定显示<invalid>
+Fourth retest:
+  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 162 passed
+  - fatal flake8 for helper/strategy/runtime tests -> PASS
+  - Python 3.8 AST -> PY38_AST_OK
+  - baseline validator -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS（仅工作树CRLF转换提示）
+Fourth pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
+Fourth pre-commit result: APPROVE（三方均无BLOCKER/MAJOR/MINOR；安全专项20 passed，对抗专项11 passed，契约版本专项4 passed）
+Final candidate SHA: PENDING
+Final reviewers: PENDING（三方精确SHA复审）
+Final review result: PENDING
+Residual risks/external blockers: helper缺失兜底会拒绝sys.modules中的helper别名和remote portfolio标记，但Python无法发现已从模块表删除后藏在任意局部变量/容器中的旧client；该路径只接受全新可信聚宽context，部署规约禁止卸载helper后同进程降级。profile仍是可信代码而非沙箱；真实聚宽smoke在S18
 Decision: IN_PROGRESS
 ```
 

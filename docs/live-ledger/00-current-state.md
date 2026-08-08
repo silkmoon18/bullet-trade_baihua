@@ -63,7 +63,7 @@ bullet-trade/
 
 `v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
 
-S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW/LIVE在原子登记安装owner时即先建立`TRANSITIONING` namespace门禁，随后才读取context和可信profile，并清除旧远程客户端。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、helper热重载或公开状态篡改都失败关闭。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：三个合法模式都在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；未知、被篡改或owner缺失的孤儿`TRANSITIONING`进程状态会在context前固定失败，且未知状态对象不会进入错误格式化。SHADOW/LIVE还会同时保护namespace并在读取可信profile前清除旧远程客户端。BACKTEST不读取profile或连接网络，也不替换聚宽原生下单函数；helper已上传时，`good_etf.py`必须经版本化入口检查旧client/remote portfolio等污染，只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底。helper内部导入失败、进程中仍加载任何helper别名或兜底context仍带旧远程portfolio都会在读取context前中止。并发BACKTEST的失败方保留原生下单函数；涉及任一远程模式的并发失败namespace仍安装本地门禁。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、helper热重载或公开状态篡改都失败关闭。profile导入和导入后属性读取的意外异常使用固定消息并断开异常链，profile容器和值只接受精确内建类型；未知字段名不回显，异常大的schema、数值或API版本也只产生稳定契约错误。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
 
 该边界要求直接传普通模块`globals()`字典和普通字符串mode。它会保护标准交易名、直接别名及可安全识别的函数名、partial、wrapped和直接闭包引用，但无法撤销已经藏在其他模块、容器、任意callable对象或局部变量中的原生函数引用；因此策略初始化必须单线程、先安装runtime再启动任何回调，profile仍属于可信代码而非沙箱。namespace runtime record不是权威恢复源，进程内signature/canonical state与当前helper实例必须同时匹配。
 

@@ -23,7 +23,7 @@
 - 支持同步/异步：wait_timeout>0 时轮询订单状态，否则立即返回。
 - 提供 account/positions/order_status/orders/cancel/order_value/order_target 等常见聚宽风格 API。
 - install_jq_compat 在回测中不接管；在聚宽模拟盘中接管账户状态和同名下单函数，默认同步等待 16 秒。
-- install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；当前LIVE只校验配置并保持交易关闭。
+- install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；三种模式均先建立进程门禁再读取context，BACKTEST不联网，当前LIVE只校验配置并保持交易关闭。
 """
 
 import ast
@@ -74,6 +74,9 @@ _STRATEGY_RUNTIME_TRANSITION_OWNER = globals().get(
 _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = globals().get(
     "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE"
 )
+_STRATEGY_RUNTIME_TRANSITION_MODE = globals().get(
+    "_STRATEGY_RUNTIME_TRANSITION_MODE"
+)
 
 _CLIENT: Optional["_ShortLivedClient"] = None
 _DATA_CLIENT: Optional["RemoteDataClient"] = None
@@ -102,6 +105,9 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
     def locked(*args, **kwargs):
         global _STRATEGY_RUNTIME_TRANSITION_OWNER
         global _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+        global _STRATEGY_RUNTIME_TRANSITION_MODE
+        global _STRATEGY_RUNTIME_ACTIVE_MODE
+        global _STRATEGY_RUNTIME_CONTRACT_GENERATION
 
         current_thread = threading.get_ident()
         namespace = None
@@ -115,10 +121,12 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
             if type(requested_mode) is str
             else None
         )
+        invalid_runtime_state = False
 
         def call_with_generation_check():
             instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
             module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
+            generation_drift = False
             try:
                 result = function(*args, **kwargs)
             except BaseException:
@@ -126,11 +134,16 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
                     _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
                     or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
                 ):
-                    _fail_runtime_generation_drift(namespace)
-                    raise RuntimeError(
-                        "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
-                    ) from None
-                raise
+                    generation_drift = True
+                else:
+                    raise
+            if generation_drift:
+                _fail_runtime_generation_drift(namespace)
+                # 必须离开except作用域后再抛出，确保异常对象本身不保留
+                # 可能含凭据的__context__引用。
+                raise RuntimeError(
+                    "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
+                )
             if (
                 _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
                 or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
@@ -153,16 +166,47 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
         with _STRATEGY_RUNTIME_OWNER_LOCK:
             owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
             transition_namespace = _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+            transition_mode = _STRATEGY_RUNTIME_TRANSITION_MODE
             if owner is None:
-                if namespace is not None and requested_remote_mode in {"SHADOW", "LIVE"}:
-                    _install_runtime_guards(namespace, "TRANSITIONING")
+                if (
+                    namespace is not None
+                    and requested_remote_mode in _RUNTIME_MODES
+                ):
+                    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+                    if active_mode is None:
+                        _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+                        _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
+                    elif (
+                        type(active_mode) is not str
+                        or active_mode
+                        not in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}
+                    ):
+                        _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+                        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+                        invalid_runtime_state = True
+                if namespace is not None and (
+                    invalid_runtime_state
+                    or requested_remote_mode in {"SHADOW", "LIVE"}
+                ):
+                    _install_runtime_guards(
+                        namespace,
+                        "FAILED" if invalid_runtime_state else "TRANSITIONING",
+                    )
                 _STRATEGY_RUNTIME_TRANSITION_OWNER = current_thread
                 _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = namespace
+                _STRATEGY_RUNTIME_TRANSITION_MODE = requested_remote_mode
                 owns_transition = True
             else:
                 owns_transition = False
         if not owns_transition:
-            if namespace is not None and namespace is not transition_namespace:
+            if (
+                namespace is not None
+                and namespace is not transition_namespace
+                and (
+                    requested_remote_mode in {"SHADOW", "LIVE"}
+                    or transition_mode in {"SHADOW", "LIVE"}
+                )
+            ):
                 _install_runtime_guards(namespace, "TRANSITIONING")
             if owner == current_thread:
                 raise RuntimeError("策略运行模式安装不允许递归调用")
@@ -170,12 +214,18 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
 
         try:
             with _STRATEGY_RUNTIME_LOCK:
+                if invalid_runtime_state:
+                    _mark_runtime_failed(namespace)
+                    raise RuntimeError(
+                        "策略运行进程状态无效；必须使用干净运行进程重启"
+                    )
                 return call_with_generation_check()
         finally:
             with _STRATEGY_RUNTIME_OWNER_LOCK:
                 if _STRATEGY_RUNTIME_TRANSITION_OWNER == current_thread:
                     _STRATEGY_RUNTIME_TRANSITION_OWNER = None
                     _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+                    _STRATEGY_RUNTIME_TRANSITION_MODE = None
 
     return locked
 
@@ -1815,20 +1865,34 @@ _RUNTIME_BLOCKED_ACTIVE_MODES = {
 
 
 def _assert_runtime_mutation_allowed(operation: str) -> None:
-    if _STRATEGY_RUNTIME_ACTIVE_MODE in _RUNTIME_BLOCKED_ACTIVE_MODES:
+    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+    if active_mode is not None:
+        mode_label = (
+            active_mode
+            if type(active_mode) is str
+            and active_mode in _RUNTIME_BLOCKED_ACTIVE_MODES
+            else "INVALID"
+        )
         raise RuntimeError(
             "{}模式禁止交易变更: {}".format(
-                _STRATEGY_RUNTIME_ACTIVE_MODE,
+                mode_label,
                 operation,
             )
         )
 
 
 def _assert_runtime_remote_allowed(operation: str) -> None:
-    if _STRATEGY_RUNTIME_ACTIVE_MODE in _RUNTIME_BLOCKED_ACTIVE_MODES:
+    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+    if active_mode is not None:
+        mode_label = (
+            active_mode
+            if type(active_mode) is str
+            and active_mode in _RUNTIME_BLOCKED_ACTIVE_MODES
+            else "INVALID"
+        )
         raise RuntimeError(
             "{}模式禁止远程访问: {}".format(
-                _STRATEGY_RUNTIME_ACTIVE_MODE,
+                mode_label,
                 operation,
             )
         )
@@ -1883,23 +1947,23 @@ def _normalise_run_type(context: Any) -> str:
 
 
 def _validate_runtime_identifier(value: Any, field: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise RuntimeError("{} 必须是非空字符串".format(field))
-    normalised = value.strip()
+    normalised = str.strip(value)
     if not normalised or normalised != value or len(normalised) > 128:
         raise RuntimeError("{} 必须是非空、无首尾空白且不超过128字符的字符串".format(field))
-    if not all(char.isalnum() or char in "._-" for char in normalised):
+    if not all(str.isalnum(char) or char in "._-" for char in normalised):
         raise RuntimeError("{} 只能包含字母、数字、点、下划线和连字符".format(field))
     return normalised
 
 
 def _validate_profile_module_name(value: Any) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise RuntimeError("profile_module 必须是Python模块名")
-    module_name = value.strip()
+    module_name = str.strip(value)
     if not module_name or module_name != value:
         raise RuntimeError("profile_module 必须是Python模块名")
-    if not all(part.isidentifier() for part in module_name.split(".")):
+    if not all(str.isidentifier(part) for part in str.split(module_name, ".")):
         raise RuntimeError("profile_module 必须是合法的Python模块名")
     return module_name
 
@@ -1907,58 +1971,83 @@ def _validate_profile_module_name(value: Any) -> str:
 def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
     """延迟加载并严格校验聚宽私有运行profile。"""
 
+    profile_module = _validate_profile_module_name(profile_module)
+    profile = _validate_runtime_identifier(profile, "profile")
+    load_failed = False
     try:
         module = __import__(profile_module, fromlist=["*"])
+        schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
+        profiles = getattr(module, "PROFILES", None)
     except BaseException:
-        # 配置模块自己的异常可能包含密钥，边界错误不拼接原异常。
+        # 配置模块导入或属性读取异常都可能包含密钥。先离开except作用域，
+        # 再抛出固定边界错误，确保新异常的__context__不保留原异常对象。
+        load_failed = True
+    if load_failed:
         raise RuntimeError(
-            "无法加载运行配置模块 {}；请确认文件已上传且可以导入".format(profile_module)
-        ) from None
-
-    schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
-    if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
-        raise RuntimeError(
-            "运行配置schema版本不匹配: expected={} actual={}".format(
-                PROFILE_SCHEMA_VERSION,
-                schema_version if type(schema_version) is int else "<invalid>",
+            "无法加载运行配置模块 {}；请确认文件已上传且配置可读取".format(
+                profile_module
             )
         )
 
-    profiles = getattr(module, "PROFILES", None)
-    if not isinstance(profiles, dict):
+    if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
+        safe_actual_version = (
+            schema_version
+            if type(schema_version) is int and -1_000_000 <= schema_version <= 1_000_000
+            else "<invalid>"
+        )
+        raise RuntimeError(
+            "运行配置schema版本不匹配: expected={} actual={}".format(
+                PROFILE_SCHEMA_VERSION,
+                safe_actual_version,
+            )
+        )
+
+    # 只接受精确内建dict，并先通过dict基类方法快照。后续校验仅对精确
+    # str/int/float/bool执行，避免恶意子类的魔术方法在错误边界泄露凭据。
+    if type(profiles) is not dict:
         raise RuntimeError("运行配置模块必须定义字典 PROFILES")
-    if profile not in profiles:
+    profile_items = tuple(dict.items(profiles))
+    if any(type(name) is not str for name, _ in profile_items):
+        raise RuntimeError("运行配置 PROFILES 的profile名称必须是普通字符串")
+    matching_profiles = [value for name, value in profile_items if name == profile]
+    if not matching_profiles:
         raise RuntimeError("运行配置中不存在profile: {}".format(profile))
-    raw = profiles[profile]
-    if not isinstance(raw, dict):
+    raw = matching_profiles[0]
+    if type(raw) is not dict:
         raise RuntimeError("profile {} 必须是字典".format(profile))
 
-    unknown = sorted(
-        str(key)
-        for key in raw
-        if not isinstance(key, str) or key not in _PROFILE_ALLOWED_FIELDS
-    )
-    if unknown:
-        raise RuntimeError("profile {} 包含未知字段: {}".format(profile, ", ".join(unknown)))
-    missing = sorted(_PROFILE_REQUIRED_FIELDS - set(raw))
+    raw_items = tuple(dict.items(raw))
+    if any(type(key) is not str for key, _ in raw_items):
+        raise RuntimeError("profile {} 包含非普通字符串字段".format(profile))
+    raw_values = {key: value for key, value in raw_items}
+    if any(key not in _PROFILE_ALLOWED_FIELDS for key in raw_values):
+        raise RuntimeError("profile {} 包含未知字段；字段名不予回显".format(profile))
+    missing = sorted(_PROFILE_REQUIRED_FIELDS - set(raw_values))
     if missing:
         raise RuntimeError("profile {} 缺少必填字段: {}".format(profile, ", ".join(missing)))
 
-    configured_strategy_id = _validate_runtime_identifier(raw.get("strategy_id"), "profile.strategy_id")
-    host = raw.get("host")
-    if not isinstance(host, str) or not host or host != host.strip() or any(ch.isspace() for ch in host):
+    configured_strategy_id = _validate_runtime_identifier(
+        raw_values.get("strategy_id"), "profile.strategy_id"
+    )
+    host = raw_values.get("host")
+    if (
+        type(host) is not str
+        or not host
+        or host != str.strip(host)
+        or any(str.isspace(ch) for ch in host)
+    ):
         raise RuntimeError("profile.host 必须是非空且不含空白的字符串")
     if len(host) > 255:
         raise RuntimeError("profile.host 长度不能超过255字符")
-    token = raw.get("token")
-    if not isinstance(token, str) or not token or token != token.strip():
+    token = raw_values.get("token")
+    if type(token) is not str or not token or token != str.strip(token):
         raise RuntimeError("profile.token 必须是非空且无首尾空白的字符串")
 
-    port = raw.get("port", 58620)
+    port = raw_values.get("port", 58620)
     if type(port) is not int or not 1 <= port <= 65535:
         raise RuntimeError("profile.port 必须是1到65535之间的整数")
 
-    retries = raw.get("retries", 2)
+    retries = raw_values.get("retries", 2)
     if type(retries) is not int or not 0 <= retries <= 10:
         raise RuntimeError("profile.retries 必须是0到10之间的整数")
 
@@ -1970,24 +2059,26 @@ def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
     }
     numeric_values: Dict[str, float] = {}
     for field, (default, minimum, maximum) in numeric_rules.items():
-        value = raw.get(field, default)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        value = raw_values.get(field, default)
+        if type(value) not in (int, float):
             raise RuntimeError("profile.{} 必须是有限数值".format(field))
-        if not minimum <= float(value) <= maximum:
+        if type(value) is float and not math.isfinite(value):
+            raise RuntimeError("profile.{} 必须是有限数值".format(field))
+        if value < minimum or value > maximum:
             raise RuntimeError(
                 "profile.{} 必须在{}到{}之间".format(field, minimum, maximum)
             )
         numeric_values[field] = float(value)
 
-    debug = raw.get("debug", True)
+    debug = raw_values.get("debug", True)
     if type(debug) is not bool:
         raise RuntimeError("profile.debug 必须是布尔值")
 
     optional_strings: Dict[str, Optional[str]] = {}
     for field in ("account_key", "sub_account_id", "tls_cert"):
-        value = raw.get(field)
+        value = raw_values.get(field)
         if value is not None and (
-            not isinstance(value, str) or not value or value != value.strip()
+            type(value) is not str or not value or value != str.strip(value)
         ):
             raise RuntimeError("profile.{} 必须是非空且无首尾空白的字符串或None".format(field))
         optional_strings[field] = value
@@ -2428,10 +2519,22 @@ def _install_strategy_runtime_impl(
     run_type = _normalise_run_type(context)
     normalised_strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     if type(expected_api_version) is not int or expected_api_version != STRATEGY_RUNTIME_API_VERSION:
+        safe_expected_api_version = (
+            expected_api_version
+            if type(expected_api_version) is int
+            and -1_000_000 <= expected_api_version <= 1_000_000
+            else "<invalid>"
+        )
+        safe_actual_api_version = (
+            STRATEGY_RUNTIME_API_VERSION
+            if type(STRATEGY_RUNTIME_API_VERSION) is int
+            and -1_000_000 <= STRATEGY_RUNTIME_API_VERSION <= 1_000_000
+            else "<invalid>"
+        )
         raise RuntimeError(
             "策略运行时API版本不匹配: expected={} actual={}".format(
-                expected_api_version,
-                STRATEGY_RUNTIME_API_VERSION,
+                safe_expected_api_version,
+                safe_actual_api_version,
             )
         )
 

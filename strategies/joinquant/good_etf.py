@@ -13,14 +13,22 @@
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
+import sys
 
 from jqdata import *
 
 try:
     import bullet_trade_jq_remote_helper as bt
-except ImportError as exc:
+except ModuleNotFoundError as exc:
+    if (
+        type(exc) is not ModuleNotFoundError
+        or exc.name != 'bullet_trade_jq_remote_helper'
+        or exc.__traceback__ is None
+        or exc.__traceback__.tb_next is not None
+    ):
+        raise
     bt = None
-    _bt_import_error_message = str(exc)
+    _bt_import_error_message = 'module not found'
 else:
     _bt_import_error_message = None
 
@@ -51,11 +59,80 @@ def _run_type(context):
     return str(getattr(run_params, 'type', '') or '').strip().lower()
 
 
+def _is_remote_portfolio(value):
+    if value is None:
+        return False
+    value_type = type(value)
+    type_mro = type.__getattribute__(value_type, '__mro__')
+    has_remote_marker = False
+    for base in type_mro:
+        marker = type.__getattribute__(base, '__dict__').get(
+            '_bt_remote_portfolio_marker')
+        if (
+            type(marker) is str
+            and marker == 'bullet-trade-remote-jq-portfolio-v1'
+        ):
+            has_remote_marker = True
+            break
+    type_name = type.__getattribute__(value_type, '__name__')
+    module_name = type.__getattribute__(value_type, '__module__')
+    module_basename = (
+        str.rsplit(module_name, '.', 1)[-1]
+        if type(module_name) is str
+        else ''
+    )
+    return (
+        has_remote_marker
+    ) or (
+        type(type_name) is str
+        and type_name in ('_RemoteJQPortfolio', '_RemoteJQSubPortfolio')
+        and module_basename == 'bullet_trade_jq_remote_helper'
+    )
+
+
+def _context_uses_remote_snapshot(context):
+    portfolio = getattr(context, 'portfolio', None)
+    if _is_remote_portfolio(portfolio):
+        return True
+    subportfolios = getattr(context, 'subportfolios', None)
+    if type(subportfolios) not in (list, tuple):
+        return False
+    return any(_is_remote_portfolio(item) for item in subportfolios)
+
+
+def _has_loaded_remote_helper_alias():
+    helper_basename = 'bullet_trade_jq_remote_helper'
+    return any(
+        type(module_name) is str
+        and (
+            module_name == helper_basename
+            or str.endswith(module_name, '.' + helper_basename)
+        )
+        for module_name in tuple(sys.modules)
+    )
+
+
 def _install_runtime(context):
     """安装运行模式；此异常不得被策略业务层吞掉。"""
     mode = str(MODE or '').strip().upper()
-    run_type = _run_type(context)
-    if mode == 'BACKTEST':
+    if mode not in ('BACKTEST', 'SHADOW', 'LIVE'):
+        raise RuntimeError('good_etf MODE必须是BACKTEST、SHADOW或LIVE')
+
+    # helper未上传时只允许聚宽原生回测兜底；此路径不导入profile、不访问网络。
+    # helper存在时，所有模式都必须进入版本化入口，由helper在读取context前先
+    # 建立进程级门禁并检查是否残留旧远程client/portfolio。
+    if bt is None:
+        if mode != 'BACKTEST':
+            raise RuntimeError(
+                '当前模式需要bullet_trade_jq_remote_helper.py，请先上传到聚宽研究根目录；导入错误={}'.format(
+                    _bt_import_error_message or '<unknown>'))
+        if _has_loaded_remote_helper_alias():
+            raise RuntimeError(
+                'good_etf BACKTEST检测到已加载的远程helper；必须使用版本化入口或干净运行进程')
+        if _context_uses_remote_snapshot(context):
+            raise RuntimeError(
+                'good_etf BACKTEST检测到旧远程portfolio；必须使用干净运行进程重启')
+        run_type = _run_type(context)
         if run_type not in ('simple_backtest', 'full_backtest'):
             raise RuntimeError(
                 'good_etf运行模式不匹配: MODE=BACKTEST 仅允许聚宽回测，当前run_type={}'.format(
@@ -72,17 +149,23 @@ def _install_runtime(context):
         g.bt_runtime = state
         return state
 
-    if mode not in ('SHADOW', 'LIVE'):
-        raise RuntimeError('good_etf MODE必须是BACKTEST、SHADOW或LIVE')
-    if bt is None:
-        raise RuntimeError(
-            '当前模式需要bullet_trade_jq_remote_helper.py，请先上传到聚宽研究根目录；导入错误={}'.format(
-                _bt_import_error_message or '<unknown>'))
     actual_api_version = getattr(bt, 'STRATEGY_RUNTIME_API_VERSION', None)
     if type(actual_api_version) is not int or actual_api_version != _EXPECTED_RUNTIME_API_VERSION:
+        safe_expected_api_version = (
+            _EXPECTED_RUNTIME_API_VERSION
+            if type(_EXPECTED_RUNTIME_API_VERSION) is int
+            and -1_000_000 <= _EXPECTED_RUNTIME_API_VERSION <= 1_000_000
+            else '<invalid>'
+        )
+        safe_actual_api_version = (
+            actual_api_version
+            if type(actual_api_version) is int
+            and -1_000_000 <= actual_api_version <= 1_000_000
+            else '<invalid>'
+        )
         raise RuntimeError(
             '聚宽helper运行时API版本不匹配: expected={} actual={}'.format(
-                _EXPECTED_RUNTIME_API_VERSION, actual_api_version))
+                safe_expected_api_version, safe_actual_api_version))
     if mode == 'LIVE':
         raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
     state = bt.install_strategy_runtime(

@@ -1,4 +1,5 @@
 import ast
+import builtins
 import importlib.util
 import math
 import runpy
@@ -60,6 +61,11 @@ def _load_strategy(monkeypatch, helper_module=None):
     monkeypatch.setitem(sys.modules, "jqdata", jqdata)
     if helper_module is None:
         monkeypatch.delitem(sys.modules, "bullet_trade_jq_remote_helper", raising=False)
+        monkeypatch.delitem(
+            sys.modules,
+            "helpers.bullet_trade_jq_remote_helper",
+            raising=False,
+        )
     else:
         monkeypatch.setitem(sys.modules, "bullet_trade_jq_remote_helper", helper_module)
 
@@ -136,6 +142,183 @@ def test_backtest_installs_without_helper_profile_or_network(monkeypatch, run_ty
     assert state["orders_enabled"] is True
     assert state["production_ready"] is False
     assert strategy.g.bt_runtime == state
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["import_error", "missing_dependency", "self_named_missing"],
+)
+def test_helper_internal_import_failure_never_downgrades_to_backtest(
+    monkeypatch,
+    failure_kind,
+):
+    original_import = builtins.__import__
+
+    def broken_helper_import(name, *args, **kwargs):
+        if name != "bullet_trade_jq_remote_helper":
+            return original_import(name, *args, **kwargs)
+        if failure_kind == "missing_dependency":
+            raise ModuleNotFoundError(
+                "No module named 'helper_internal_dependency'",
+                name="helper_internal_dependency",
+            )
+        if failure_kind == "self_named_missing":
+            raise ModuleNotFoundError(
+                "helper body failed after execution started",
+                name="bullet_trade_jq_remote_helper",
+            )
+        raise ImportError("helper body import failed")
+
+    monkeypatch.setattr(builtins, "__import__", broken_helper_import)
+
+    with pytest.raises(ImportError):
+        _load_strategy(monkeypatch)
+
+
+def test_backtest_without_helper_rejects_old_remote_portfolio(monkeypatch):
+    class OldRemotePortfolio:
+        _bt_remote_portfolio_marker = "bullet-trade-remote-jq-portfolio-v1"
+
+    strategy = _load_strategy(monkeypatch)
+    context = _Context("full_backtest", portfolio=OldRemotePortfolio())
+
+    with pytest.raises(RuntimeError, match="旧远程portfolio"):
+        strategy._install_runtime(context)
+
+
+def test_backtest_without_top_level_helper_rejects_loaded_helper_alias(monkeypatch):
+    from helpers import bullet_trade_jq_remote_helper as runtime_helper
+
+    strategy = _load_strategy(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "helpers.bullet_trade_jq_remote_helper",
+        runtime_helper,
+    )
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
+    cached_client = runtime_helper._ShortLivedClient(
+        "127.0.0.1", 58620, "unit-test-token", retries=0
+    )
+    socket_calls = []
+    portfolio_reads = []
+    monkeypatch.setattr(
+        runtime_helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    class ContextWithSideEffect:
+        run_params = _RunParams("full_backtest")
+
+        @property
+        def portfolio(self):
+            portfolio_reads.append("portfolio")
+            try:
+                cached_client.request("broker.place_order", {"amount": 100})
+            except RuntimeError:
+                pass
+            return None
+
+    with pytest.raises(RuntimeError, match="已加载的远程helper"):
+        strategy._install_runtime(ContextWithSideEffect())
+
+    assert portfolio_reads == []
+    assert socket_calls == []
+
+
+def test_backtest_uses_versioned_helper_before_strategy_reads_context(monkeypatch):
+    calls = []
+    helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    helper.STRATEGY_RUNTIME_API_VERSION = 1
+
+    def install(namespace, **kwargs):
+        calls.append((namespace, kwargs))
+        return {
+            "mode": "BACKTEST",
+            "run_type": "full_backtest",
+            "strategy_id": "good_etf",
+            "enabled": False,
+            "orders_enabled": True,
+            "production_ready": False,
+        }
+
+    helper.install_strategy_runtime = install
+    strategy = _load_strategy(monkeypatch, helper)
+
+    class UnreadableRunParams:
+        @property
+        def type(self):
+            pytest.fail("策略层不得在helper建立门禁前读取context")
+
+    context = types.SimpleNamespace(run_params=UnreadableRunParams())
+    state = strategy._install_runtime(context)
+
+    assert state["mode"] == "BACKTEST"
+    assert len(calls) == 1
+    _, kwargs = calls[0]
+    assert kwargs["context"] is context
+    assert kwargs["mode"] == "BACKTEST"
+
+
+def test_backtest_rejects_old_helper_api(monkeypatch):
+    old_helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    old_helper.STRATEGY_RUNTIME_API_VERSION = 0
+    strategy = _load_strategy(monkeypatch, old_helper)
+
+    with pytest.raises(RuntimeError, match="API版本不匹配"):
+        strategy._install_runtime(_Context("full_backtest"))
+
+
+def test_backtest_rejects_huge_helper_api_with_stable_error(monkeypatch):
+    malformed_helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    malformed_helper.STRATEGY_RUNTIME_API_VERSION = 10 ** 5000
+    malformed_helper.install_strategy_runtime = lambda *args, **kwargs: pytest.fail(
+        "API版本错误不得进入runtime"
+    )
+    strategy = _load_strategy(monkeypatch, malformed_helper)
+
+    with pytest.raises(RuntimeError, match="actual=<invalid>"):
+        strategy._install_runtime(_Context("full_backtest"))
+
+
+def test_backtest_rejects_huge_expected_api_with_stable_error(monkeypatch):
+    helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper.install_strategy_runtime = lambda *args, **kwargs: pytest.fail(
+        "API版本错误不得进入runtime"
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy._EXPECTED_RUNTIME_API_VERSION = 10 ** 5000
+
+    with pytest.raises(RuntimeError, match="expected=<invalid>"):
+        strategy._install_runtime(_Context("full_backtest"))
+
+
+def test_backtest_with_helper_rejects_remote_process_contamination(monkeypatch):
+    from helpers import bullet_trade_jq_remote_helper as runtime_helper
+
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_PROCESS_SIGNATURE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_CANONICAL_STATE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_TRANSITION_OWNER", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_TRANSITION_MODE", None)
+    monkeypatch.setattr(runtime_helper, "_CLIENT", object())
+    monkeypatch.setattr(runtime_helper, "_DATA_CLIENT", None)
+    monkeypatch.setattr(runtime_helper, "_BROKER_CLIENT", None)
+
+    strategy = _load_strategy(monkeypatch, runtime_helper)
+    remote_portfolio = object.__new__(runtime_helper._RemoteJQPortfolio)
+    context = _Context("full_backtest", portfolio=remote_portfolio)
+
+    with pytest.raises(RuntimeError, match="BACKTEST检测到旧远程运行状态"):
+        strategy._install_runtime(context)
+
+    assert runtime_helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert runtime_helper._CLIENT is None
+    assert runtime_helper._DATA_CLIENT is None
+    assert runtime_helper._BROKER_CLIENT is None
 
 
 def test_backtest_mode_rejects_joinquant_sim_trade(monkeypatch):

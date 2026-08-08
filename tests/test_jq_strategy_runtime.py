@@ -20,6 +20,7 @@ def _reset_runtime_process_gate(monkeypatch):
     monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
     monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_TRANSITION_OWNER", None)
     monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE", None)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_TRANSITION_MODE", None)
     monkeypatch.setattr(helper, "_CLIENT", None)
     monkeypatch.setattr(helper, "_DATA_CLIENT", None)
     monkeypatch.setattr(helper, "_BROKER_CLIENT", None)
@@ -110,6 +111,117 @@ def test_backtest_returns_before_profile_import_or_remote_install(monkeypatch, r
     }
 
 
+def test_backtest_arms_process_gate_before_reading_context(monkeypatch):
+    cached_client = helper._ShortLivedClient(
+        "127.0.0.1", 58620, "unit-test-token", retries=0
+    )
+    socket_calls = []
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    class SideEffectRunParams:
+        @property
+        def type(self):
+            return cached_client.request("broker.place_order", {"amount": 100})
+
+    class SideEffectContext:
+        run_params = SideEffectRunParams()
+
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+    with pytest.raises(RuntimeError, match="TRANSITIONING模式禁止远程访问"):
+        _install(
+            namespace,
+            SideEffectContext(),
+            "module_that_must_not_be_imported",
+            mode="BACKTEST",
+        )
+
+    assert socket_calls == []
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_unknown_process_state_fails_closed_before_context(monkeypatch):
+    class PoisonActiveMode:
+        def __str__(self):
+            raise AssertionError("无效运行状态不得被格式化")
+
+        def __repr__(self):
+            raise AssertionError("无效运行状态不得被格式化")
+
+    cached_client = helper._ShortLivedClient(
+        "127.0.0.1", 58620, "unit-test-token", retries=0
+    )
+    socket_calls = []
+    context_reads = []
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", PoisonActiveMode())
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="INVALID模式禁止远程访问"):
+        cached_client.request("broker.place_order", {"amount": 100})
+
+    class SideEffectRunParams:
+        @property
+        def type(self):
+            context_reads.append("type")
+            return cached_client.request("broker.place_order", {"amount": 100})
+
+    class SideEffectContext:
+        run_params = SideEffectRunParams()
+
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+    with pytest.raises(RuntimeError, match="进程状态无效"):
+        _install(
+            namespace,
+            SideEffectContext(),
+            "module_that_must_not_be_imported",
+            mode="BACKTEST",
+        )
+
+    assert context_reads == []
+    assert socket_calls == []
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_orphaned_transition_state_fails_closed_before_context(monkeypatch):
+    context_reads = []
+
+    class UnreadableRunParams:
+        @property
+        def type(self):
+            context_reads.append("type")
+            return "full_backtest"
+
+    class UnreadableContext:
+        run_params = UnreadableRunParams()
+
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", "TRANSITIONING")
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+
+    with pytest.raises(RuntimeError, match="进程状态无效"):
+        _install(
+            namespace,
+            UnreadableContext(),
+            "unused_profile",
+            mode="BACKTEST",
+        )
+
+    assert context_reads == []
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
 @pytest.mark.parametrize(
     ("mode", "run_type"),
     [
@@ -169,6 +281,30 @@ def test_runtime_rejects_api_version_mismatch_before_profile_import(monkeypatch)
             _Context("sim_trade"),
             "unused_profile",
             expected_api_version=2,
+        )
+
+
+def test_runtime_rejects_huge_api_version_with_stable_error():
+    with pytest.raises(RuntimeError, match="expected=<invalid>"):
+        _install(
+            {},
+            _Context("full_backtest"),
+            "unused_profile",
+            mode="BACKTEST",
+            expected_api_version=10 ** 5000,
+        )
+
+
+def test_runtime_rejects_huge_actual_api_version_with_stable_error(monkeypatch):
+    monkeypatch.setattr(helper, "STRATEGY_RUNTIME_API_VERSION", 10 ** 5000)
+
+    with pytest.raises(RuntimeError, match="actual=<invalid>"):
+        _install(
+            {},
+            _Context("full_backtest"),
+            "unused_profile",
+            mode="BACKTEST",
+            expected_api_version=1,
         )
 
 
@@ -955,6 +1091,61 @@ def test_concurrent_runtime_install_cannot_enter_second_contract(monkeypatch):
         second_namespace["order"]("000001.XSHE", 100)
 
 
+def test_concurrent_backtest_rejection_preserves_native_order(monkeypatch):
+    normalise_entered = threading.Event()
+    release_normalise = threading.Event()
+    original_normalise = helper._normalise_run_type
+
+    def blocking_normalise(context):
+        normalise_entered.set()
+        assert release_normalise.wait(5)
+        return original_normalise(context)
+
+    monkeypatch.setattr(helper, "_normalise_run_type", blocking_normalise)
+    first_order = lambda *args, **kwargs: "first-native"
+    second_order = lambda *args, **kwargs: "second-native"
+    first_namespace = {"order": first_order}
+    second_namespace = {"order": second_order}
+    results = []
+    errors = []
+
+    def first_install():
+        try:
+            results.append(
+                _install(
+                    first_namespace,
+                    _Context("full_backtest"),
+                    "unused_profile",
+                    mode="BACKTEST",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=first_install)
+    first_thread.start()
+    assert normalise_entered.wait(5)
+
+    with pytest.raises(RuntimeError, match="正在切换"):
+        _install(
+            second_namespace,
+            _Context("full_backtest"),
+            "unused_profile",
+            mode="BACKTEST",
+        )
+    assert second_namespace["order"] is second_order
+
+    release_normalise.set()
+    first_thread.join(5)
+    assert not first_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0]["mode"] == "BACKTEST"
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "BACKTEST"
+    assert first_namespace["order"] is first_order
+    assert second_namespace["order"] is second_order
+
+
 def test_same_namespace_is_guarded_before_concurrent_install_rejection(monkeypatch):
     normalise_entered = threading.Event()
     release_normalise = threading.Event()
@@ -1382,6 +1573,8 @@ def test_standalone_configure_cannot_publish_clients_across_helper_reload():
         except RuntimeError as exc:
             assert "调用期间发生重载" in str(exc)
             assert secret not in str(exc)
+            assert exc.__context__ is None
+            assert exc.__cause__ is None
         else:
             raise AssertionError("跨reload的旧configure调用不得返回成功")
 
@@ -1440,7 +1633,45 @@ def test_unknown_profile_field_is_rejected(monkeypatch):
         monkeypatch,
         profiles={"good_etf-prod": _valid_profile(password="must-not-be-accepted")},
     )
-    with pytest.raises(RuntimeError, match="未知字段: password"):
+    with pytest.raises(RuntimeError, match="未知字段；字段名不予回显") as exc_info:
+        _install({}, _Context("sim_trade"), module_name)
+    assert "password" not in str(exc_info.value)
+
+
+def test_unknown_profile_field_never_echoes_secret_name(monkeypatch):
+    secret = "credential-must-not-appear-in-field-name"
+    profile = _valid_profile()
+    profile[secret] = "unexpected"
+    module_name = _profile_module(
+        monkeypatch,
+        profiles={"good_etf-prod": profile},
+    )
+
+    with pytest.raises(RuntimeError, match="未知字段") as exc_info:
+        _install({}, _Context("sim_trade"), module_name)
+
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+
+
+def test_huge_profile_schema_version_has_stable_runtime_error(monkeypatch):
+    module_name = _profile_module(monkeypatch, version=10 ** 5000)
+
+    with pytest.raises(RuntimeError, match="schema版本不匹配") as exc_info:
+        _install({}, _Context("sim_trade"), module_name)
+
+    assert "<invalid>" in str(exc_info.value)
+
+
+def test_huge_profile_numeric_value_has_stable_runtime_error(monkeypatch):
+    module_name = _profile_module(
+        monkeypatch,
+        profiles={
+            "good_etf-prod": _valid_profile(retry_interval=10 ** 5000),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"profile\.retry_interval"):
         _install({}, _Context("sim_trade"), module_name)
 
 
@@ -1506,4 +1737,39 @@ def test_profile_import_base_exception_never_leaks_token(monkeypatch, exception_
         _install({}, _Context("sim_trade"), "unsafe_profile_module", mode="LIVE")
 
     assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
     assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("attribute", ["PROFILE_SCHEMA_VERSION", "PROFILES"])
+@pytest.mark.parametrize("exception_type", [RuntimeError, SystemExit, KeyboardInterrupt])
+def test_profile_attribute_base_exception_never_leaks_token(
+    monkeypatch,
+    attribute,
+    exception_type,
+):
+    secret = "post-import-profile-secret"
+    module_name = "unsafe_profile_attributes_{}_{}".format(
+        attribute.lower(), exception_type.__name__.lower()
+    )
+
+    class UnsafeProfileModule(types.ModuleType):
+        def __getattribute__(self, name):
+            if name == attribute:
+                raise exception_type("profile attribute failed with token={}".format(secret))
+            return types.ModuleType.__getattribute__(self, name)
+
+    module = UnsafeProfileModule(module_name)
+    module.PROFILE_SCHEMA_VERSION = 1
+    module.PROFILES = {"good_etf-prod": _valid_profile()}
+    monkeypatch.setitem(sys.modules, module_name, module)
+
+    with pytest.raises(RuntimeError, match="无法加载运行配置模块") as exc_info:
+        _install({}, _Context("sim_trade"), module_name, mode="LIVE")
+
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
