@@ -148,7 +148,35 @@ Retest:
   - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
   - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
   - git diff --check -> PASS
-Final code candidate SHA: 17f8eb2；待审查记录提交后生成最终SHA
+Final code candidate SHA: 335a707
+Final review result: REWORK；详见下一轮记录
+Decision: REWORK
+```
+
+### 最终候选复审与第二次修复记录
+
+```text
+Slice: S01
+Reviewed commit: 335a7077e5e53eebe7eeefe4167fdce9370b3045
+Reviewers: /root/review_s01_final_security；/root/review_s01_final_strategy
+Review result: REWORK
+Findings:
+  - BLOCKER: SHADOW/LIVE在导入Python profile之后才设置进程门禁；导入副作用可调用configure并触达socket
+  - BLOCKER: profile缺失或校验失败时active仍为空、旧client仍可复用，后续configure继续可用
+  - MAJOR: 继承远程兼容context的SHADOW失败路径先恢复原生下单函数再抛错，namespace可继续mutation
+Fix commit: 5bca3702e40dd8751d6df53092fa747115179865
+Fixes:
+  - SHADOW/LIVE在任何run_type、契约或profile校验前先设置进程门禁、清client并保护namespace
+  - profile导入、校验及远程context拒绝的任意异常统一进入FAILED，重新安装保护并删除过期runtime state
+  - LIVE也显式安装本地fail-closed函数；SHADOW/LIVE幂等安装均修复被重绑的namespace
+  - 远程运行安装一旦失败，同一进程不得重试或切回BACKTEST，必须使用干净进程重启
+  - 明确Python profile是可信可执行代码而非沙箱，门禁只覆盖BulletTrade及策略namespace入口
+Retest:
+  - $env:PYTHONDONTWRITEBYTECODE='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 111 passed
+  - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
+  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS
+Exact review candidate: 本审查记录提交后的HEAD
 Final review result: PENDING
 Decision: IN_REVIEW
 ```
