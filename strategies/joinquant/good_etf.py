@@ -9,7 +9,7 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# 状态：迁移基线，尚未完成 StrategyLedger 实盘改造，禁止直接用于真实资金。
+# 状态：S01运行契约候选；尚未完成StrategyLedger实盘改造，禁止直接用于真实资金。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
@@ -83,6 +83,8 @@ def _install_runtime(context):
         raise RuntimeError(
             '聚宽helper运行时API版本不匹配: expected={} actual={}'.format(
                 _EXPECTED_RUNTIME_API_VERSION, actual_api_version))
+    if mode == 'LIVE':
+        raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
     state = bt.install_strategy_runtime(
         globals(),
         context=context,
@@ -93,8 +95,6 @@ def _install_runtime(context):
     )
     if not isinstance(state, dict):
         raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
-    if mode == 'LIVE' and not state.get('production_ready', False):
-        raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
     g.bt_runtime = state
     return state
 
@@ -130,12 +130,13 @@ def _submit_target_amount(security, target_amount):
     return order_target(security, target_amount)
 
 
-def _submit_target_value(security, target_value, last_price=None):
+def _submit_target_value(security, target_value, last_price=None, current_value=0.0):
     if _runtime_mode() == 'SHADOW':
         log.info('SHADOW目标市值 | {} -> {:.2f}'.format(security, target_value))
         return None
     style = None
-    if last_price is not None and last_price > 0 and BUY_PRICE_FLOAT_PCT > 0:
+    is_increase = target_value > current_value
+    if is_increase and last_price is not None and last_price > 0 and BUY_PRICE_FLOAT_PCT > 0:
         style = LimitOrderStyle(last_price * (1 + BUY_PRICE_FLOAT_PCT))
     return order_target_value(security, target_value, style=style)
 
@@ -350,9 +351,21 @@ def market_open(context):
             for code, weight in zip(order_fund_codes, weights):
                 normalized_weight = weight / total_weight
                 target_value = investable_value * normalized_weight
-                log.info(f'调仓买入 | {code} 权重={weight / total_weight:.1%} 目标市值={target_value:.2f}')
+                position = context.portfolio.positions[code] if code in context.portfolio.positions else None
+                current_value = getattr(position, 'value', None) if position is not None else 0.0
+                if current_value is None:
+                    current_value = getattr(position, 'total_amount', 0) * selected_funds.loc[code, 'last_price']
+                target_delta = target_value - current_value
+                if abs(target_delta) < 0.01:
+                    action = '不变'
+                elif target_delta > 0:
+                    action = '增持'
+                else:
+                    action = '减持'
+                log.info(f'调仓{action} | {code} 权重={normalized_weight:.1%} '
+                         f'当前市值={current_value:.2f} 目标市值={target_value:.2f}')
                 order_result = _submit_target_value(
-                    code, target_value, selected_funds.loc[code, 'last_price'])
+                    code, target_value, selected_funds.loc[code, 'last_price'], current_value)
                 log.info('目标市值已提交 | {} order_id={}'.format(
                     code, getattr(order_result, 'order_id', None)))
             log.info('===== 开盘选股下单完成 =====')

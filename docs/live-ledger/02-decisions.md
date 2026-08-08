@@ -82,6 +82,6 @@ shadow、QMT模拟和小额实盘依赖真实交易日及用户外部授权，�
 
 ## D019：过渡运行边界
 
-聚宽策略默认`MODE='BACKTEST'`。BACKTEST不得读取私有profile或触达远端；SHADOW仅在`sim_trade`中运行，严格校验版本化profile但不建远程连接，并阻断runtime管理的下单/撤单入口；S01的LIVE只是旧兼容层验证路径，返回`production_ready=False`，`good_etf.py`必须据此拒绝启动。
+聚宽策略默认`MODE='BACKTEST'`。BACKTEST不得读取私有profile或触达远端；SHADOW仅在`sim_trade`中运行，严格校验版本化profile但不建远程连接，并持续阻断namespace、公开helper和缓存broker的下单/撤单入口；S01的LIVE只校验profile，返回`orders_enabled=False`和`production_ready=False`且不安装旧兼容层，`good_etf.py`还必须在调用helper前拒绝启动。
 
 后果：S01可以安全验证同源策略和配置契约，但不能被解释为已经具备实盘能力。只有S15替换为StrategyLedger runtime且S18至S20门禁通过后，才允许真实资金。

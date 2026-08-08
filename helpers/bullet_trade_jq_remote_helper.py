@@ -23,7 +23,7 @@
 - 支持同步/异步：wait_timeout>0 时轮询订单状态，否则立即返回。
 - 提供 account/positions/order_status/orders/cancel/order_value/order_target 等常见聚宽风格 API。
 - install_jq_compat 在回测中不接管；在聚宽模拟盘中接管账户状态和同名下单函数，默认同步等待 16 秒。
-- install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；当前LIVE仍是非生产兼容路径。
+- install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；当前LIVE只校验配置并保持交易关闭。
 """
 
 import ast
@@ -44,6 +44,8 @@ import pandas as pd
 _CLIENT: Optional["_ShortLivedClient"] = None
 _DATA_CLIENT: Optional["RemoteDataClient"] = None
 _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
+_STRATEGY_RUNTIME_ACTIVE_MODE: Optional[str] = None
+_STRATEGY_RUNTIME_PROCESS_SIGNATURE: Optional[Tuple[Any, ...]] = None
 
 # 全局调试开关
 _DEBUG: bool = True
@@ -211,6 +213,8 @@ def configure(
         debug: 是否启用调试日志，默认 True
     """
     global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT, _DEBUG
+
+    _assert_runtime_mutation_allowed("configure")
     
     _DEBUG = debug
     _log("INFO", "初始化远程连接: host={}, port={}, retries={}, debug={}", host, port, retries, debug)
@@ -439,6 +443,7 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整、停牌检查、价格笼子等。
         """
+        _assert_runtime_mutation_allowed("broker.order")
         if amount == 0:
             return ""
         price, market = _resolve_price_market(price=price, style=style, market=market)
@@ -488,6 +493,7 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整，实际成交市值可能与请求略有偏差。
         """
+        _assert_runtime_mutation_allowed("broker.order_value")
         _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         if value == 0:
             return ""
@@ -530,6 +536,7 @@ class RemoteBrokerClient:
     ) -> str:
         """按当前远程账户总资产的一定比例下单。"""
 
+        _assert_runtime_mutation_allowed("broker.order_percent")
         account = self.get_account()
         return self.order_value(
             security,
@@ -576,6 +583,7 @@ class RemoteBrokerClient:
         
         注意：建议 target 为 100 的整数倍，服务端会自动取整。
         """
+        _assert_runtime_mutation_allowed("broker.order_target")
         _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         price, market = _resolve_price_market(price=price, style=style, market=market)
         current = self._current_amount(security)
@@ -626,6 +634,7 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整，实际市值可能与目标略有偏差。
         """
+        _assert_runtime_mutation_allowed("broker.order_target_value")
         _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         if target_value is None:
             if value is None:
@@ -672,6 +681,7 @@ class RemoteBrokerClient:
     ) -> str:
         """调仓到当前远程账户总资产的一定比例。"""
 
+        _assert_runtime_mutation_allowed("broker.order_target_percent")
         account = self.get_account()
         return self.order_target_value(
             security,
@@ -790,6 +800,7 @@ class RemoteBrokerClient:
         return self._client.request("broker.order_status", payload)
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        _assert_runtime_mutation_allowed("broker.cancel_order")
         payload = self._base_payload()
         payload["order_id"] = order_id
         return self._client.request("broker.cancel_order", payload)
@@ -882,6 +893,7 @@ class RemoteBrokerClient:
         - 限价单涨跌停校验
         - 卖出可卖数量检查
         """
+        _assert_runtime_mutation_allowed("broker.place_order")
         try:
             _log("INFO", "[下单] 准备下单: security={}, amount={}, price={}, side={}, wait_timeout={}", 
                  security, amount, price, side, wait_timeout)
@@ -1152,6 +1164,7 @@ class _ShortLivedClient:
         Raises:
             RuntimeError: 所有重试都失败后抛出最后一个异常
         """
+        _assert_runtime_remote_allowed(action)
         effective_timeout = max(5.0, float(timeout or self.rpc_timeout))
         last_error: Optional[Exception] = None
         attempts = self.retries + 1
@@ -1630,6 +1643,26 @@ _SHADOW_MUTATION_NAMES = {
 }
 
 
+def _assert_runtime_mutation_allowed(operation: str) -> None:
+    if _STRATEGY_RUNTIME_ACTIVE_MODE in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}:
+        raise RuntimeError(
+            "{}模式禁止交易变更: {}".format(
+                _STRATEGY_RUNTIME_ACTIVE_MODE,
+                operation,
+            )
+        )
+
+
+def _assert_runtime_remote_allowed(operation: str) -> None:
+    if _STRATEGY_RUNTIME_ACTIVE_MODE in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}:
+        raise RuntimeError(
+            "{}模式禁止远程访问: {}".format(
+                _STRATEGY_RUNTIME_ACTIVE_MODE,
+                operation,
+            )
+        )
+
+
 def _normalise_runtime_mode(mode: Any) -> str:
     value = str(mode or "").strip().upper()
     if value not in _RUNTIME_MODES:
@@ -1718,23 +1751,24 @@ def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
         raise RuntimeError("profile.port 必须是1到65535之间的整数")
 
     retries = raw.get("retries", 2)
-    if type(retries) is not int or retries < 0:
-        raise RuntimeError("profile.retries 必须是非负整数")
+    if type(retries) is not int or not 0 <= retries <= 10:
+        raise RuntimeError("profile.retries 必须是0到10之间的整数")
 
     numeric_rules = {
-        "retry_interval": (0.5, True),
-        "rpc_timeout": (DEFAULT_RPC_TIMEOUT_SECONDS, False),
-        "place_order_timeout_margin": (DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS, True),
-        "default_wait_timeout": (DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS, True),
+        "retry_interval": (0.5, 0.1, 30.0),
+        "rpc_timeout": (DEFAULT_RPC_TIMEOUT_SECONDS, 5.0, 300.0),
+        "place_order_timeout_margin": (DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS, 0.0, 300.0),
+        "default_wait_timeout": (DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS, 0.0, 300.0),
     }
     numeric_values: Dict[str, float] = {}
-    for field, (default, allow_zero) in numeric_rules.items():
+    for field, (default, minimum, maximum) in numeric_rules.items():
         value = raw.get(field, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise RuntimeError("profile.{} 必须是有限数值".format(field))
-        if value < 0 or (not allow_zero and value == 0):
-            qualifier = "非负" if allow_zero else "正"
-            raise RuntimeError("profile.{} 必须是{}数值".format(field, qualifier))
+        if not minimum <= float(value) <= maximum:
+            raise RuntimeError(
+                "profile.{} 必须在{}到{}之间".format(field, minimum, maximum)
+            )
         numeric_values[field] = float(value)
 
     debug = raw.get("debug", True)
@@ -1785,18 +1819,6 @@ def _shadow_mutation_guard(name: str) -> Callable[..., Any]:
     return blocked
 
 
-class _ShadowReadOnlyBrokerProxy:
-    """阻断helper直调下单，避免绕过聚宽namespace的SHADOW保护。"""
-
-    def __init__(self, broker: Any):
-        self._broker = broker
-
-    def __getattr__(self, name: str) -> Any:
-        if _is_shadow_mutation_name(name):
-            return _shadow_mutation_guard(name)
-        return getattr(self._broker, name)
-
-
 def _install_shadow_guards(namespace: Dict[str, Any]) -> Tuple[str, ...]:
     names = set(_SHADOW_MUTATION_NAMES)
     names.update(
@@ -1807,6 +1829,32 @@ def _install_shadow_guards(namespace: Dict[str, Any]) -> Tuple[str, ...]:
     for name in names:
         namespace[name] = _shadow_mutation_guard(name)
     return tuple(sorted(names))
+
+
+def _context_uses_remote_snapshot(context: Any) -> bool:
+    portfolio = getattr(context, "portfolio", None)
+    subportfolios = getattr(context, "subportfolios", None) or []
+    return isinstance(portfolio, _RemoteJQPortfolio) or any(
+        isinstance(item, _RemoteJQPortfolio) for item in subportfolios
+    )
+
+
+def _enforce_shadow_postconditions(
+    namespace: Dict[str, Any],
+    context: Any,
+) -> Tuple[str, ...]:
+    """修复SHADOW保护，并清除一切可复用的远程客户端。"""
+
+    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT
+
+    inherited_remote_context = _context_uses_remote_snapshot(context)
+    _restore_jq_compat(namespace)
+    _CLIENT = None
+    _DATA_CLIENT = None
+    _BROKER_CLIENT = None
+    if inherited_remote_context:
+        raise RuntimeError("SHADOW不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略")
+    return _install_shadow_guards(namespace)
 
 
 def install_strategy_runtime(
@@ -1821,9 +1869,11 @@ def install_strategy_runtime(
 ) -> Dict[str, Any]:
     """安装版本化的聚宽策略运行入口。
 
-    BACKTEST完全保持聚宽原生行为；SHADOW只初始化远程只读客户端并阻断
-    下单/撤单；LIVE暂时复用v0.9.2兼容层，仍不是StrategyLedger生产实现。
+    BACKTEST完全保持聚宽原生行为；SHADOW不建立远程连接并阻断下单/撤单；
+    LIVE在StrategyLedger完成前只校验profile并保持交易关闭。
     """
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_PROCESS_SIGNATURE
 
     if not isinstance(namespace, dict):
         raise RuntimeError("namespace 必须是策略globals()字典")
@@ -1860,6 +1910,12 @@ def install_strategy_runtime(
         expected_api_version,
         id(context),
     )
+    if (
+        _STRATEGY_RUNTIME_PROCESS_SIGNATURE is not None
+        and _STRATEGY_RUNTIME_PROCESS_SIGNATURE != install_signature
+    ):
+        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+        raise RuntimeError("helper进程已使用不同配置的策略运行契约，拒绝覆盖")
     existing = namespace.get(_STRATEGY_RUNTIME_STATE_KEY)
     if existing is not None:
         if (
@@ -1867,8 +1923,22 @@ def install_strategy_runtime(
             or existing.get("signature") != install_signature
             or not isinstance(existing.get("state"), dict)
         ):
+            _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
             raise RuntimeError("策略运行时已经使用不同配置安装，拒绝重复覆盖")
-        return dict(existing["state"])
+        state = dict(existing["state"])
+        if normalised_mode == "SHADOW":
+            _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
+            try:
+                state["blocked_mutations"] = _enforce_shadow_postconditions(namespace, context)
+            except Exception:
+                _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+                raise
+            existing["state"] = state
+        elif normalised_mode == "LIVE":
+            _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
+        else:
+            _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
+        return dict(state)
 
     # 关键安全边界：回测在导入profile、configure和任何远端安装之前返回。
     if normalised_mode == "BACKTEST":
@@ -1884,6 +1954,8 @@ def install_strategy_runtime(
             "production_ready": False,
             "reason": "backtest",
         }
+        _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
+        _STRATEGY_RUNTIME_PROCESS_SIGNATURE = install_signature
         namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
         return dict(state)
 
@@ -1893,31 +1965,15 @@ def install_strategy_runtime(
     if config["strategy_id"] != normalised_strategy_id:
         raise RuntimeError("profile.strategy_id 与策略声明的 strategy_id 不一致")
 
-    connection = {
-        key: config[key]
-        for key in (
-            "host",
-            "token",
-            "port",
-            "account_key",
-            "sub_account_id",
-            "tls_cert",
-            "retries",
-            "retry_interval",
-            "rpc_timeout",
-            "place_order_timeout_margin",
-            "default_wait_timeout",
-            "debug",
-        )
-    }
-
     if normalised_mode == "SHADOW":
         # S01 的 SHADOW 是严格的本地只读门禁：不 configure、不建socket，
         # 也不调用会替换portfolio的 install_jq_compat。远端原子快照在S15接入。
-        global _BROKER_CLIENT
-        if _BROKER_CLIENT is not None and not isinstance(_BROKER_CLIENT, _ShadowReadOnlyBrokerProxy):
-            _BROKER_CLIENT = _ShadowReadOnlyBrokerProxy(_BROKER_CLIENT)
-        blocked_names = _install_shadow_guards(namespace)
+        _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
+        try:
+            blocked_names = _enforce_shadow_postconditions(namespace, context)
+        except Exception:
+            _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+            raise
         state = {
             "api_version": STRATEGY_RUNTIME_API_VERSION,
             "profile_schema_version": PROFILE_SCHEMA_VERSION,
@@ -1933,19 +1989,8 @@ def install_strategy_runtime(
             "blocked_mutations": blocked_names,
         }
     else:
-        try:
-            compat = install_jq_compat(
-                namespace,
-                context=context,
-                mirror_jq_orders=False,
-                **connection,
-            )
-        except Exception:
-            raise RuntimeError(
-                "LIVE兼容层初始化失败；请检查profile和远程服务状态"
-            ) from None
-        if not isinstance(compat, dict) or not compat.get("enabled"):
-            raise RuntimeError("LIVE兼容层未启用，拒绝继续运行")
+        # S01不得让LIVE产生任何连接、portfolio替换或交易函数接管副作用。
+        _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
         state = {
             "api_version": STRATEGY_RUNTIME_API_VERSION,
             "profile_schema_version": PROFILE_SCHEMA_VERSION,
@@ -1954,13 +1999,14 @@ def install_strategy_runtime(
             "mode": normalised_mode,
             "run_type": run_type,
             "strategy_id": normalised_strategy_id,
-            "enabled": True,
-            "orders_enabled": True,
+            "enabled": False,
+            "orders_enabled": False,
             "production_ready": False,
-            "reason": "live_compatibility_only",
+            "reason": "live_blocked_until_strategy_ledger",
             "mirror_jq_orders": False,
         }
 
+    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = install_signature
     namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
     return dict(state)
 
@@ -2398,6 +2444,7 @@ def order(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order")
     return get_broker_client().order(
         security,
         amount,
@@ -2427,6 +2474,7 @@ def order_value(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order_value")
     return get_broker_client().order_value(
         security,
         value,
@@ -2458,6 +2506,7 @@ def order_percent(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order_percent")
     return get_broker_client().order_percent(
         security,
         percent,
@@ -2489,6 +2538,7 @@ def order_target(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order_target")
     return get_broker_client().order_target(
         security,
         target,
@@ -2521,6 +2571,7 @@ def order_target_value(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order_target_value")
     return get_broker_client().order_target_value(
         security,
         target_value,
@@ -2553,6 +2604,7 @@ def order_target_percent(
     order_remark: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    _assert_runtime_mutation_allowed("order_target_percent")
     return get_broker_client().order_target_percent(
         security,
         percent,
@@ -2570,6 +2622,7 @@ def order_target_percent(
 
 
 def cancel_order(order_id: str) -> Dict[str, Any]:
+    _assert_runtime_mutation_allowed("cancel_order")
     return get_broker_client().cancel_order(order_id)
 
 

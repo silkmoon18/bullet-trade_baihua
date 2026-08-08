@@ -6,6 +6,15 @@ import pytest
 from helpers import bullet_trade_jq_remote_helper as helper
 
 
+@pytest.fixture(autouse=True)
+def _reset_runtime_process_gate(monkeypatch):
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_PROCESS_SIGNATURE", None)
+    monkeypatch.setattr(helper, "_CLIENT", None)
+    monkeypatch.setattr(helper, "_DATA_CLIENT", None)
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", None)
+
+
 class _RunParams:
     def __init__(self, run_type):
         self.type = run_type
@@ -16,16 +25,13 @@ class _Context:
         self.run_params = _RunParams(run_type)
 
 
-class _Broker:
+class _MutationProbeClient:
     def __init__(self):
-        self.order_calls = 0
+        self.requests = []
 
-    def get_account(self):
-        return {"available_cash": 1}
-
-    def order(self, *args, **kwargs):
-        self.order_calls += 1
-        return "unsafe-order"
+    def request(self, action, payload, timeout=None):
+        self.requests.append((action, payload, timeout))
+        raise AssertionError("只读门禁后不得触达远程client")
 
 
 def _valid_profile(**overrides):
@@ -133,7 +139,7 @@ def test_runtime_rejects_api_version_mismatch_before_profile_import(monkeypatch)
         )
 
 
-def test_shadow_strictly_validates_profile_but_never_configures_or_installs_compat(monkeypatch):
+def test_shadow_validates_profile_clears_existing_clients_and_never_installs_compat(monkeypatch):
     module_name = _profile_module(monkeypatch)
     monkeypatch.setattr(
         helper,
@@ -145,9 +151,13 @@ def test_shadow_strictly_validates_profile_but_never_configures_or_installs_comp
         "install_jq_compat",
         lambda *args, **kwargs: pytest.fail("SHADOW不得调用install_jq_compat"),
     )
-    broker = _Broker()
-    monkeypatch.setattr(helper, "_BROKER_CLIENT", broker)
-    query = lambda: "query-ok"
+    monkeypatch.setattr(helper, "_CLIENT", object())
+    monkeypatch.setattr(helper, "_DATA_CLIENT", object())
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", object())
+
+    def query():
+        return "query-ok"
+
     namespace = {
         "order": lambda *args: "unsafe",
         "order_batch": lambda *args: "unsafe",
@@ -176,44 +186,153 @@ def test_shadow_strictly_validates_profile_but_never_configures_or_installs_comp
         with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
             namespace[name]()
 
-    # helper模块的便捷下单也必须被只读broker代理阻断。
+    # helper模块的便捷下单必须由进程级门禁阻断，且旧客户端引用被清除。
     with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
         helper.order("000001.XSHE", 100)
-    assert broker.order_calls == 0
-    assert helper.get_broker_client().get_account() == {"available_cash": 1}
+    assert helper._CLIENT is None
+    assert helper._DATA_CLIENT is None
+    assert helper._BROKER_CLIENT is None
+    with pytest.raises(RuntimeError, match="尚未调用 configure"):
+        helper.get_broker_client()
 
 
-def test_live_uses_jq_compat_with_forced_no_mirror_and_profile_defaults(monkeypatch):
+def test_shadow_clean_install_blocks_late_configure_and_direct_mutations(monkeypatch):
     module_name = _profile_module(monkeypatch)
-    calls = []
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", None)
+    namespace = {}
 
-    def fake_install(namespace, **kwargs):
-        calls.append(kwargs)
-        return {"enabled": True, "run_type": "sim_trade"}
+    _install(namespace, _Context("sim_trade"), module_name)
 
-    monkeypatch.setattr(helper, "install_jq_compat", fake_install)
-    state = _install({}, _Context("sim_trade"), module_name, mode="LIVE")
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更: configure"):
+        helper.configure(host="127.0.0.1", token="unit-test-token")
+    for mutation, args in (
+        (helper.order, ("000001.XSHE", 100)),
+        (helper.order_value, ("000001.XSHE", 1000)),
+        (helper.order_percent, ("000001.XSHE", 0.1)),
+        (helper.order_target, ("000001.XSHE", 100)),
+        (helper.order_target_value, ("000001.XSHE", 1000)),
+        (helper.order_target_percent, ("000001.XSHE", 0.1)),
+        (helper.cancel_order, ("order-1",)),
+    ):
+        with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+            mutation(*args)
 
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["host"] == "127.0.0.1"
-    assert call["token"] == "top-secret-token"
-    assert call["port"] == 58620
-    assert call["retries"] == 2
-    assert call["retry_interval"] == 0.5
-    assert call["rpc_timeout"] == helper.DEFAULT_RPC_TIMEOUT_SECONDS
-    assert call["place_order_timeout_margin"] == helper.DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS
-    assert call["default_wait_timeout"] == helper.DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS
-    assert call["mirror_jq_orders"] is False
+
+def test_shadow_idempotent_reinstall_repairs_namespace_and_client_guards(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    namespace = {"order": lambda *args: "unsafe"}
+    context = _Context("sim_trade")
+    first = _install(namespace, context, module_name)
+
+    namespace["order"] = lambda *args: "rebound-unsafe"
+    helper._BROKER_CLIENT = object()
+    second = _install(namespace, context, module_name)
+
+    assert first == second
+    assert helper._BROKER_CLIENT is None
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_shadow_rejects_context_inherited_from_remote_compat(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    context = _Context("sim_trade")
+    context.portfolio = object.__new__(helper._RemoteJQPortfolio)
+
+    with pytest.raises(RuntimeError, match="不能复用.*远程兼容层"):
+        _install({}, context, module_name)
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+
+
+def test_shadow_blocks_mutations_on_previously_cached_raw_broker(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    client = _MutationProbeClient()
+    raw_broker = helper.RemoteBrokerClient(client)
+    monkeypatch.setattr(helper, "_BROKER_CLIENT", raw_broker)
+
+    _install({}, _Context("sim_trade"), module_name)
+
+    for mutation, args in (
+        (raw_broker.order, ("000001.XSHE", 100)),
+        (raw_broker.order_value, ("000001.XSHE", 1000)),
+        (raw_broker.order_percent, ("000001.XSHE", 0.1)),
+        (raw_broker.order_target, ("000001.XSHE", 100)),
+        (raw_broker.order_target_value, ("000001.XSHE", 1000)),
+        (raw_broker.order_target_percent, ("000001.XSHE", 0.1)),
+        (raw_broker.cancel_order, ("order-1",)),
+    ):
+        with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+            mutation(*args)
+    assert client.requests == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "run_type", "profile_module"),
+    [
+        ("BACKTEST", "full_backtest", "unused_profile"),
+        ("SHADOW", "sim_trade", "profile"),
+        ("LIVE", "sim_trade", "profile"),
+    ],
+)
+def test_runtime_modes_block_previously_cached_short_lived_client(
+    monkeypatch, mode, run_type, profile_module
+):
+    cached_client = helper._ShortLivedClient("127.0.0.1", 58620, "unit-test-token")
+    if profile_module == "profile":
+        profile_module = _profile_module(monkeypatch)
+    _install({}, _Context(run_type), profile_module, mode=mode)
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: pytest.fail("runtime门禁后不得创建socket"),
+    )
+
+    with pytest.raises(RuntimeError, match="禁止远程访问"):
+        cached_client.request("broker.account", {})
+
+
+def test_live_validates_profile_without_remote_or_namespace_side_effects(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    real_configure = helper.configure
+    monkeypatch.setattr(
+        helper,
+        "configure",
+        lambda **kwargs: pytest.fail("S01 LIVE不得configure或建socket"),
+    )
+    monkeypatch.setattr(
+        helper,
+        "install_jq_compat",
+        lambda *args, **kwargs: pytest.fail("S01 LIVE不得安装兼容层"),
+    )
+
+    def native_order(*args):
+        return "native"
+
+    namespace = {"order": native_order}
+    native_portfolio = object()
+    context = _Context("sim_trade")
+    context.portfolio = native_portfolio
+
+    state = _install(namespace, context, module_name, mode="LIVE")
+
     assert state["mode"] == "LIVE"
-    assert state["orders_enabled"] is True
+    assert state["enabled"] is False
+    assert state["orders_enabled"] is False
     assert state["production_ready"] is False
-    assert state["reason"] == "live_compatibility_only"
+    assert state["reason"] == "live_blocked_until_strategy_ledger"
+    assert state["mirror_jq_orders"] is False
     assert "token" not in state
     assert "host" not in state
+    assert namespace["order"] is native_order
+    assert context.portfolio is native_portfolio
+    assert helper._CLIENT is None
+    assert helper._DATA_CLIENT is None
+    assert helper._BROKER_CLIENT is None
+    with pytest.raises(RuntimeError, match="LIVE_BLOCKED模式禁止交易变更"):
+        real_configure(host="127.0.0.1", token="unit-test-token")
 
 
-def test_live_passes_explicit_optional_profile_values(monkeypatch):
+def test_profile_loader_normalises_explicit_optional_values(monkeypatch):
     profile = _valid_profile(
         port=60000,
         account_key="main",
@@ -227,36 +346,28 @@ def test_live_passes_explicit_optional_profile_values(monkeypatch):
         debug=False,
     )
     module_name = _profile_module(monkeypatch, profiles={"good_etf-prod": profile})
-    calls = []
-    monkeypatch.setattr(
-        helper,
-        "install_jq_compat",
-        lambda namespace, **kwargs: calls.append(kwargs) or {"enabled": True},
-    )
 
-    _install({}, _Context("sim_trade"), module_name, mode="LIVE")
+    loaded = helper._load_runtime_profile(module_name, "good_etf-prod")
 
-    call = calls[0]
-    assert call["port"] == 60000
-    assert call["account_key"] == "main"
-    assert call["sub_account_id"] == "good_etf@main"
-    assert call["tls_cert"] == "server.pem"
-    assert call["retries"] == 4
-    assert call["retry_interval"] == 1.0
-    assert call["rpc_timeout"] == 21.0
-    assert call["place_order_timeout_margin"] == 7.0
-    assert call["default_wait_timeout"] == 9.0
-    assert call["debug"] is False
+    assert loaded["port"] == 60000
+    assert loaded["account_key"] == "main"
+    assert loaded["sub_account_id"] == "good_etf@main"
+    assert loaded["tls_cert"] == "server.pem"
+    assert loaded["retries"] == 4
+    assert loaded["retry_interval"] == 1.0
+    assert loaded["rpc_timeout"] == 21.0
+    assert loaded["place_order_timeout_margin"] == 7.0
+    assert loaded["default_wait_timeout"] == 9.0
+    assert loaded["debug"] is False
 
 
 @pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
 def test_remote_modes_are_idempotent(monkeypatch, mode):
     module_name = _profile_module(monkeypatch)
-    calls = []
     monkeypatch.setattr(
         helper,
         "install_jq_compat",
-        lambda namespace, **kwargs: calls.append(kwargs) or {"enabled": True},
+        lambda *args, **kwargs: pytest.fail("S01远程模式不得安装旧兼容层"),
     )
     namespace = {}
     context = _Context("sim_trade")
@@ -270,7 +381,8 @@ def test_remote_modes_are_idempotent(monkeypatch, mode):
     second = _install(namespace, context, module_name, mode=mode)
 
     assert first == second
-    assert len(calls) == (1 if mode == "LIVE" else 0)
+    expected_active = "SHADOW" if mode == "SHADOW" else "LIVE_BLOCKED"
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == expected_active
 
 
 def test_reinstall_with_different_contract_fails_closed(monkeypatch):
@@ -345,8 +457,14 @@ def test_profile_port_is_strict(monkeypatch, port):
         {"token": ""},
         {"token": " token-with-space"},
         {"debug": 1},
+        {"retries": 11},
         {"rpc_timeout": float("nan")},
+        {"rpc_timeout": 4.99},
+        {"rpc_timeout": 301},
         {"retry_interval": -1},
+        {"retry_interval": 31},
+        {"place_order_timeout_margin": 301},
+        {"default_wait_timeout": 301},
         {"account_key": ""},
     ],
 )
@@ -368,19 +486,18 @@ def test_profile_strategy_id_must_match_strategy(monkeypatch):
         _install({}, _Context("sim_trade"), module_name)
 
 
-def test_live_initialisation_error_never_leaks_token(monkeypatch):
+def test_profile_import_error_never_leaks_token(monkeypatch):
     secret = "unique-super-secret-token"
-    module_name = _profile_module(
-        monkeypatch,
-        profiles={"good_etf-prod": _valid_profile(token=secret)},
-    )
+    original_import = __import__
 
-    def unsafe_failure(namespace, **kwargs):
-        raise RuntimeError("connection failed with token={}".format(kwargs["token"]))
+    def unsafe_import(name, *args, **kwargs):
+        if name == "unsafe_profile_module":
+            raise RuntimeError("profile failed with token={}".format(secret))
+        return original_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(helper, "install_jq_compat", unsafe_failure)
-    with pytest.raises(RuntimeError, match="LIVE兼容层初始化失败") as exc_info:
-        _install({}, _Context("sim_trade"), module_name, mode="LIVE")
+    monkeypatch.setattr("builtins.__import__", unsafe_import)
+    with pytest.raises(RuntimeError, match="无法加载运行配置模块") as exc_info:
+        _install({}, _Context("sim_trade"), "unsafe_profile_module", mode="LIVE")
 
     assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None

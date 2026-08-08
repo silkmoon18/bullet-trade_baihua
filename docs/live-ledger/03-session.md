@@ -45,7 +45,7 @@
 当前目标：
 
 - 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
-- BACKTEST不读取profile、不连接网络；SHADOW禁止mutation；LIVE明确为非生产兼容路径。
+- BACKTEST不读取profile、不连接网络；SHADOW持续禁止mutation并清除旧客户端；LIVE仅校验配置且无连接/接管副作用。
 - 移除迁移策略对旧定制helper API的调用。
 - 缺helper、旧helper版本、缺profile和无效配置fail-fast且不泄露token。
 

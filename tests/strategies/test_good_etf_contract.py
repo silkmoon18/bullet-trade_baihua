@@ -220,12 +220,9 @@ def test_strategy_rejects_malformed_runtime_state(monkeypatch):
 def test_good_etf_refuses_transitional_live_runtime(monkeypatch):
     helper = types.ModuleType("bullet_trade_jq_remote_helper")
     helper.STRATEGY_RUNTIME_API_VERSION = 1
-    helper.install_strategy_runtime = lambda namespace, **kwargs: {
-        "mode": "LIVE",
-        "run_type": "sim_trade",
-        "strategy_id": "good_etf",
-        "production_ready": False,
-    }
+    helper.install_strategy_runtime = lambda namespace, **kwargs: pytest.fail(
+        "S01 LIVE必须在安装helper runtime前失败关闭"
+    )
     strategy = _load_strategy(monkeypatch, helper)
     strategy.MODE = "LIVE"
 
@@ -268,6 +265,40 @@ def test_target_values_use_total_nav_not_available_cash(monkeypatch):
     assert math.isclose(orders[1][1], expected_investable * 1 / 3, rel_tol=1e-9)
     assert math.isclose(sum(order[1] for order in orders), expected_investable, rel_tol=1e-9)
     assert sum(order[1] for order in orders) > portfolio.available_cash
+
+
+def test_target_value_reduction_does_not_use_buy_side_limit_price(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    orders = []
+    current = {
+        "510001.XSHG": types.SimpleNamespace(last_price=9.0, high_limit=11.0, paused=False),
+        "510002.XSHG": types.SimpleNamespace(last_price=9.5, high_limit=11.0, paused=False),
+    }
+    strategy.g.bt_runtime = {"mode": "BACKTEST"}
+    strategy.g.fund_list = pd.DataFrame(
+        {"unit_net_value": [10.0, 10.0]},
+        index=["510001.XSHG", "510002.XSHG"],
+    )
+    strategy.get_current_data = lambda: current
+    strategy.get_open_orders = lambda: {}
+    strategy.LimitOrderStyle = lambda price: ("limit", price)
+    strategy.order_target_value = (
+        lambda security, value, style=None: orders.append((security, value, style))
+    )
+    oversized = types.SimpleNamespace(value=9_000.0, total_amount=1_000)
+    portfolio = types.SimpleNamespace(
+        positions={"510001.XSHG": oversized},
+        available_cash=1_000.0,
+        total_value=10_000.0,
+        positions_value=9_000.0,
+    )
+
+    strategy.market_open(_Context("simple_backtest", portfolio))
+
+    orders_by_security = {security: (value, style) for security, value, style in orders}
+    assert orders_by_security["510001.XSHG"][0] < oversized.value
+    assert orders_by_security["510001.XSHG"][1] is None
+    assert orders_by_security["510002.XSHG"][1][0] == "limit"
 
 
 def test_profile_example_is_versioned_and_deliberately_has_no_credentials():
