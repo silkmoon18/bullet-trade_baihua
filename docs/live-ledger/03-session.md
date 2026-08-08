@@ -36,7 +36,7 @@
 - `.idea/`、runtime、导出产物和本地profile已有明确忽略规则。
 - S00最终候选为`7085155`；基线校验脚本和Git格式检查均PASS，最终独立复审已APPROVE。
 - S01初始实现`655b3c9`经多轮修复形成精确候选`354ecf3`；契约和安全审查批准，但对抗审查仍发现旧compat originals/别名、helper reload、并发契约、RPC切换、污染BACKTEST、BaseException凭据脱敏及namespace状态伪造问题，因此该SHA明确REWORK，不能发布。
-- 当前S01 v3工作候选已增加原子owner/在途lease/generation、严格进程权威状态、旧compat隔离、跨reload portfolio标记、全模式干净进程边界和poison namespace防御；又通过对抗反例修复了关键字namespace、递归/并发不同namespace、同namespace预门禁、import alias/partial/wrapped/closure别名及热重载虚假成功。137项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过；代码尚未形成新的精确复审SHA，不能标记S01完成。
+- S01 v3修复已提交为`f253827`：增加原子owner/在途lease/generation、严格进程权威状态、旧compat隔离、跨reload portfolio标记、全模式干净进程边界和poison namespace防御；又通过对抗反例修复了关键字namespace、递归/并发不同namespace、同namespace预门禁、import alias/partial/wrapped/closure别名及热重载虚假成功。137项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过；仍须把本记录提交后的精确HEAD交给三方复审，不能标记S01完成。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 

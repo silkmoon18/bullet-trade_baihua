@@ -195,7 +195,7 @@ Findings:
   - MAJOR: 污染进程切回BACKTEST仍可能保留旧wrapper/context/client却返回orders_enabled=True
   - MAJOR: profile导入的SystemExit/KeyboardInterrupt可携带敏感文本逃逸
   - MAJOR: 篡改namespace公开state可伪造LIVE/orders_enabled/production_ready
-Fix commit: PENDING（当前工作树尚未提交）
+Fix commit: f2538270d845da65d0835ae6a2a34b5c406ce390
 Fixes in current candidate:
   - runtime lock、原子transition owner、在途RPC lease和contract generation共同线性化安装/请求；在途请求使安装FAILED且禁止后续重试
   - helper instance token、module generation、进程signature/canonical state和严格namespace envelope拒绝reload恢复及公开state篡改
@@ -210,6 +210,7 @@ Retest:
   - Python 3.8 ast.parse(feature_version=(3, 8)) for helper/runtime tests -> PY38_AST_OK
   - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
   - git diff --check -> PASS（仅工作树CRLF转换提示）
+Pre-commit reviewer: /root/audit_s01_v3_contract -> APPROVE；helper/test冻结哈希与上述137项验证一致，无BLOCKER/MAJOR/MINOR
 Final candidate SHA: PENDING
 Final reviewer: PENDING（三方精确SHA复审）
 Final review result: PENDING
