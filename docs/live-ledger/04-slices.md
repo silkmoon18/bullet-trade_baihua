@@ -112,15 +112,46 @@ Decision: DONE
 - 策略只保留`PROFILE`、`MODE`、稳定`STRATEGY_ID`和业务参数。
 - BACKTEST/SHADOW/LIVE模式定义及非法组合fail-fast。
 - 无密钥profile schema、example和本地私有profile忽略规则。
-- 迁移策略不再调用旧helper扩展参数/函数；使用`v0.9.2 install_jq_compat`或最小runtime facade。
+- 迁移策略不再调用旧helper扩展参数/函数；统一使用最小版本化runtime facade，S01不启用旧`install_jq_compat`实盘接管。
 - 缺helper、helper版本不匹配、缺profile、空token的明确错误。
 - 策略文件不导入`bullet_trade.*`服务器内部包。
 
 ### 验证
 
 - 本地导入策略不会因旧helper API立即报错。
-- BACKTEST不连接远端；SHADOW禁止下单；LIVE缺配置fail-fast。
+- BACKTEST不连接远端；SHADOW持续禁止下单/撤单并清除旧客户端；LIVE只校验配置且无连接/接管副作用。
 - 策略源码无host、token、Webhook和账户明文。
+
+### 首次审查与修复记录
+
+```text
+Slice: S01
+Implementation commit: 655b3c9
+Reviewers: /root/review_s01_runtime_security；/root/review_s01_strategy_contract
+Reviewed commit/diff: f6a73b0..655b3c9
+Initial result: REWORK
+Findings:
+  - BLOCKER: SHADOW可被晚到configure、namespace重绑和缓存broker绕过，幂等安装不修复postcondition
+  - MAJOR: SHADOW继承旧broker后只做代理，读取账户仍会触达socket
+  - MAJOR: S01 LIVE先安装真实兼容层、替换portfolio/订单函数，再由策略报错
+  - MAJOR: 入选但超配的持仓减仓错误复用买入上浮限价，且日志误报为买入
+  - MINOR: SHADOW docstring与实际无连接语义矛盾；profile等待参数缺少合理上限
+Fix commit: 17f8eb2
+Fixes:
+  - 进程模式、namespace、公开helper、RemoteBrokerClient和ShortLivedClient多层fail-closed
+  - SHADOW清除旧client并在幂等安装时重建保护；远程context要求干净进程重启
+  - LIVE改为无副作用profile校验，good_etf在helper调用前直接拒绝LIVE
+  - 目标市值按当前持仓判断增持/减持；仅增持使用买入上浮限价
+  - retries/timeout增加上下限并同步文档和边界测试
+Retest:
+  - $env:PYTHONDONTWRITEBYTECODE='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 104 passed
+  - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
+  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS
+Final code candidate SHA: 17f8eb2；待审查记录提交后生成最终SHA
+Final review result: PENDING
+Decision: IN_REVIEW
+```
 
 ## S02：JoinQuant Typings and IDE
 
