@@ -37,7 +37,7 @@
 - S00最终候选为`7085155`；基线校验脚本和Git格式检查均PASS，最终独立复审已APPROVE。
 - S01初始实现`655b3c9`经多轮修复形成精确候选`354ecf3`；契约和安全审查批准，但对抗审查仍发现旧compat originals/别名、helper reload、并发契约、RPC切换、污染BACKTEST、BaseException凭据脱敏及namespace状态伪造问题，因此该SHA明确REWORK，不能发布。
 - S01 v3精确候选`34944b3`经三方复审仍为REWORK：策略BACKTEST分支可绕过helper污染检查；helper在BACKTEST读取context前尚未建立进程门禁；`raise ... from None`仍通过`__context__`保留profile导入异常；profile导入成功后的属性异常也未脱敏。
-- S01 v4首轮工作树预审继续为REWORK，又发现异常进程状态失败开放、无helper兜底接受旧远程portfolio、helper内部ImportError被误判为缺失、未知profile字段名回显、超大整数逃逸稳定错误、并发双BACKTEST给失败namespace遗留guard等问题。第二轮修复后的预审仍发现孤儿`TRANSITIONING`可恢复成功、超大API版本错误不稳定，以及无helper兜底在已加载其他helper别名时仍有context getter远程窗口。第三轮修复将孤儿态直接转FAILED，要求精确`ModuleNotFoundError`的traceback证明helper本体尚未执行，并在context前拒绝任何已加载helper别名和旧remote portfolio；预审仅余策略期望API和helper实际API两个超大内部版本的稳定错误MINOR。第四轮工作树已对API比较两侧统一使用有界安全显示。162项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查已通过，第四轮契约、安全、对抗预审均APPROVE；当前可提交候选，但精确SHA三方复审通过前仍不能关闭S01。
+- S01 v4首轮工作树预审继续为REWORK，又发现异常进程状态失败开放、无helper兜底接受旧远程portfolio、helper内部ImportError被误判为缺失、未知profile字段名回显、超大整数逃逸稳定错误、并发双BACKTEST给失败namespace遗留guard等问题。第二轮修复后的预审仍发现孤儿`TRANSITIONING`可恢复成功、超大API版本错误不稳定，以及无helper兜底在已加载其他helper别名时仍有context getter远程窗口。第三轮修复将孤儿态直接转FAILED，要求精确`ModuleNotFoundError`的traceback证明helper本体尚未执行，并在context前拒绝任何已加载helper别名和旧remote portfolio；预审仅余策略期望API和helper实际API两个超大内部版本的稳定错误MINOR。第四轮对API比较两侧统一使用有界安全显示，162项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过，契约、安全、对抗预审全部APPROVE。实现已提交为`aa04303`；提交本记录后的精确HEAD仍须三方复审，不能提前关闭S01。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 

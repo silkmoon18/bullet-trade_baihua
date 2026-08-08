@@ -229,7 +229,7 @@ Decision: REWORK
 Slice: S01
 Reviewed commit: 34944b32692744db0c5d8482508a0fed8d8df5c7
 Review result: REWORK
-Fix commit: PENDING
+Fix commit: aa043034760e42617be795b318cb70d2b22af70a
 Fixes in current candidate:
   - 三个合法模式在原子owner登记时先建立进程级TRANSITIONING门禁，再读取任何context属性
   - good_etf在helper存在时连BACKTEST也统一调用版本化入口；仅helper缺失的纯聚宽BACKTEST走本地兜底
