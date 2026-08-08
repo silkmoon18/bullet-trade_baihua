@@ -63,7 +63,9 @@ bullet-trade/
 
 `v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
 
-S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW/LIVE在导入profile之前先建立进程和namespace门禁、清除旧远程客户端，并通过namespace、公开helper、缓存broker和短连接client阻断交易或远程访问。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。任一远程模式初始化失败后必须使用干净进程重启。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW/LIVE在原子登记安装owner时即先建立`TRANSITIONING` namespace门禁，随后才读取context和可信profile，并清除旧远程客户端。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、helper热重载或公开状态篡改都失败关闭。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+
+该边界要求直接传普通模块`globals()`字典和普通字符串mode。它会保护标准交易名、直接别名及可安全识别的函数名、partial、wrapped和直接闭包引用，但无法撤销已经藏在其他模块、容器、任意callable对象或局部变量中的原生函数引用；因此策略初始化必须单线程、先安装runtime再启动任何回调，profile仍属于可信代码而非沙箱。namespace runtime record不是权威恢复源，进程内signature/canonical state与当前helper实例必须同时匹配。
 
 ### BulletTrade服务器侧
 

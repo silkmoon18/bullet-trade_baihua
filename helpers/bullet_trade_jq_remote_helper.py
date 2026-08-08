@@ -27,6 +27,7 @@
 """
 
 import ast
+import functools
 import hashlib
 import json
 import math
@@ -35,26 +36,176 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 import traceback
+import types
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+# importlib.reload()会复用原module字典。锁必须跨reload保留，旧client的方法才会
+# 与新runtime状态使用同一并发边界；generation/token则必须每次加载更新，用于
+# 拒绝旧namespace缓存。任何同进程reload都进入FAILED，要求干净进程重启。
+_PREVIOUS_RUNTIME_GENERATION = int(globals().get("_STRATEGY_RUNTIME_MODULE_GENERATION", 0))
+_STRATEGY_RUNTIME_MODULE_GENERATION = _PREVIOUS_RUNTIME_GENERATION + 1
+_existing_runtime_lock = globals().get("_STRATEGY_RUNTIME_LOCK")
+_STRATEGY_RUNTIME_LOCK = (
+    _existing_runtime_lock
+    if _existing_runtime_lock is not None
+    else threading.RLock()
+)
+_existing_runtime_owner_lock = globals().get("_STRATEGY_RUNTIME_OWNER_LOCK")
+_STRATEGY_RUNTIME_OWNER_LOCK = (
+    _existing_runtime_owner_lock
+    if _existing_runtime_owner_lock is not None
+    else threading.Lock()
+)
+_STRATEGY_RUNTIME_INSTANCE_TOKEN = object()
+_STRATEGY_RUNTIME_INFLIGHT_REQUESTS = int(
+    globals().get("_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
+)
+_STRATEGY_RUNTIME_CONTRACT_GENERATION = int(
+    globals().get("_STRATEGY_RUNTIME_CONTRACT_GENERATION", 0)
+) + (1 if _PREVIOUS_RUNTIME_GENERATION else 0)
+_STRATEGY_RUNTIME_TRANSITION_OWNER = globals().get(
+    "_STRATEGY_RUNTIME_TRANSITION_OWNER"
+)
+_STRATEGY_RUNTIME_TRANSITION_NAMESPACE = globals().get(
+    "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE"
+)
+
 _CLIENT: Optional["_ShortLivedClient"] = None
 _DATA_CLIENT: Optional["RemoteDataClient"] = None
 _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
-_STRATEGY_RUNTIME_ACTIVE_MODE: Optional[str] = None
+_STRATEGY_RUNTIME_ACTIVE_MODE: Optional[str] = (
+    "FAILED" if _PREVIOUS_RUNTIME_GENERATION else None
+)
 _STRATEGY_RUNTIME_PROCESS_SIGNATURE: Optional[Tuple[Any, ...]] = None
+_STRATEGY_RUNTIME_CANONICAL_STATE: Optional[Dict[str, Any]] = None
 
 # 全局调试开关
 _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
 STRATEGY_RUNTIME_API_VERSION: int = 1
 PROFILE_SCHEMA_VERSION: int = 1
+STRATEGY_RUNTIME_STATE_SCHEMA_VERSION: int = 1
 DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
 DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
+
+
+def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., Any]:
+    """串行化配置、旧兼容安装和runtime状态切换。"""
+
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        global _STRATEGY_RUNTIME_TRANSITION_OWNER
+        global _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+
+        current_thread = threading.get_ident()
+        namespace = None
+        if args and type(args[0]) is dict:
+            namespace = args[0]
+        elif type(kwargs.get("namespace")) is dict:
+            namespace = kwargs["namespace"]
+        requested_mode = kwargs.get("mode")
+        requested_remote_mode = (
+            str.upper(str.strip(requested_mode))
+            if type(requested_mode) is str
+            else None
+        )
+
+        def call_with_generation_check():
+            instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
+            module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
+            try:
+                result = function(*args, **kwargs)
+            except BaseException:
+                if (
+                    _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
+                    or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+                ):
+                    _fail_runtime_generation_drift(namespace)
+                    raise RuntimeError(
+                        "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
+                    ) from None
+                raise
+            if (
+                _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
+                or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+            ):
+                _fail_runtime_generation_drift(namespace)
+                raise RuntimeError(
+                    "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
+                )
+            return result
+
+        if function.__name__ != "install_strategy_runtime":
+            owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
+            if owner is not None and owner != current_thread:
+                raise RuntimeError("策略运行模式正在切换；拒绝并发配置、请求或重复安装")
+            with _STRATEGY_RUNTIME_LOCK:
+                return call_with_generation_check()
+
+        # owner reservation使用独立短锁：两个同时到达的安装调用不能都观察到
+        # owner=None后在主锁上排队，否则后一个调用会污染前一个已返回的成功状态。
+        with _STRATEGY_RUNTIME_OWNER_LOCK:
+            owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
+            transition_namespace = _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+            if owner is None:
+                if namespace is not None and requested_remote_mode in {"SHADOW", "LIVE"}:
+                    _install_runtime_guards(namespace, "TRANSITIONING")
+                _STRATEGY_RUNTIME_TRANSITION_OWNER = current_thread
+                _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = namespace
+                owns_transition = True
+            else:
+                owns_transition = False
+        if not owns_transition:
+            if namespace is not None and namespace is not transition_namespace:
+                _install_runtime_guards(namespace, "TRANSITIONING")
+            if owner == current_thread:
+                raise RuntimeError("策略运行模式安装不允许递归调用")
+            raise RuntimeError("策略运行模式正在切换；拒绝并发配置、请求或重复安装")
+
+        try:
+            with _STRATEGY_RUNTIME_LOCK:
+                return call_with_generation_check()
+        finally:
+            with _STRATEGY_RUNTIME_OWNER_LOCK:
+                if _STRATEGY_RUNTIME_TRANSITION_OWNER == current_thread:
+                    _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+                    _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+
+    return locked
+
+
+def _track_runtime_request(function: Callable[..., Any]) -> Callable[..., Any]:
+    """登记锁外RPC；runtime切换发现已有请求时必须失败关闭。"""
+
+    @functools.wraps(function)
+    def tracked(self, action, *args, **kwargs):
+        global _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+
+        current_thread = threading.get_ident()
+        owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
+        if owner is not None and owner != current_thread:
+            raise RuntimeError("策略运行模式正在切换；禁止远程访问: {}".format(action))
+        with _STRATEGY_RUNTIME_LOCK:
+            _assert_runtime_remote_allowed(action)
+            lease_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+            _STRATEGY_RUNTIME_INFLIGHT_REQUESTS += 1
+        try:
+            kwargs["_runtime_lease_generation"] = lease_generation
+            return function(self, action, *args, **kwargs)
+        finally:
+            with _STRATEGY_RUNTIME_LOCK:
+                _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = max(
+                    0,
+                    _STRATEGY_RUNTIME_INFLIGHT_REQUESTS - 1,
+                )
+
+    return tracked
 
 
 class MarketOrderStyle:
@@ -182,6 +333,7 @@ def _warn(msg: str, *args, **kwargs):
     print(f"[{timestamp}] [WARN] {formatted_msg}", file=sys.stderr)
 
 
+@_serialise_runtime_boundary
 def configure(
     host: str,
     token: str,
@@ -215,6 +367,7 @@ def configure(
     global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT, _DEBUG
 
     _assert_runtime_mutation_allowed("configure")
+    _assert_no_inflight_runtime_requests("configure")
     
     _DEBUG = debug
     _log("INFO", "初始化远程连接: host={}, port={}, retries={}, debug={}", host, port, retries, debug)
@@ -1144,11 +1297,14 @@ class _ShortLivedClient:
         self.retry_interval = max(0.1, float(retry_interval))
         self.rpc_timeout = max(5.0, float(rpc_timeout))
 
+    @_track_runtime_request
     def request(
         self,
         action: str,
         payload: Dict[str, Any],
         timeout: Optional[float] = None,
+        *,
+        _runtime_lease_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         发送 RPC 请求（每次调用都会建立新的 TCP 连接）。
@@ -1173,6 +1329,12 @@ class _ShortLivedClient:
         _log("INFO", "[RPC] 开始请求: action={}, host={}, port={}, attempts={}", action, self.host, self.port, attempts)
         
         for attempt in range(1, attempts + 1):
+            # runtime切换会让已有lease停止后续重试；当前已开始的attempt可收尾，
+            # 但不得在TRANSITIONING/FAILED后再创建新socket。
+            _assert_runtime_request_lease_current(
+                action,
+                _runtime_lease_generation,
+            )
             sock: Optional[socket.socket] = None
             connect_start_time = time.time()
             
@@ -1566,6 +1728,8 @@ class _RemoteSnapshotCache:
 
 
 class _RemoteJQPortfolio:
+    _bt_remote_portfolio_marker = "bullet-trade-remote-jq-portfolio-v1"
+
     def __init__(self, cache: _RemoteSnapshotCache):
         self._cache = cache
         self.subportfolios = []
@@ -1641,10 +1805,17 @@ _RUNTIME_MUTATION_NAMES = {
     "order_target_percent",
     "cancel_order",
 }
+_RUNTIME_BLOCKED_ACTIVE_MODES = {
+    "TRANSITIONING",
+    "BACKTEST",
+    "SHADOW",
+    "LIVE_BLOCKED",
+    "FAILED",
+}
 
 
 def _assert_runtime_mutation_allowed(operation: str) -> None:
-    if _STRATEGY_RUNTIME_ACTIVE_MODE in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}:
+    if _STRATEGY_RUNTIME_ACTIVE_MODE in _RUNTIME_BLOCKED_ACTIVE_MODES:
         raise RuntimeError(
             "{}模式禁止交易变更: {}".format(
                 _STRATEGY_RUNTIME_ACTIVE_MODE,
@@ -1654,7 +1825,7 @@ def _assert_runtime_mutation_allowed(operation: str) -> None:
 
 
 def _assert_runtime_remote_allowed(operation: str) -> None:
-    if _STRATEGY_RUNTIME_ACTIVE_MODE in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}:
+    if _STRATEGY_RUNTIME_ACTIVE_MODE in _RUNTIME_BLOCKED_ACTIVE_MODES:
         raise RuntimeError(
             "{}模式禁止远程访问: {}".format(
                 _STRATEGY_RUNTIME_ACTIVE_MODE,
@@ -1663,8 +1834,45 @@ def _assert_runtime_remote_allowed(operation: str) -> None:
         )
 
 
+def _assert_no_inflight_runtime_requests(operation: str) -> None:
+    if _STRATEGY_RUNTIME_INFLIGHT_REQUESTS:
+        raise RuntimeError(
+            "{}时仍有{}个远程请求在途；必须使用干净运行进程重启".format(
+                operation,
+                _STRATEGY_RUNTIME_INFLIGHT_REQUESTS,
+            )
+        )
+
+
+def _assert_runtime_request_lease_current(
+    operation: str,
+    lease_generation: Optional[int],
+) -> None:
+    with _STRATEGY_RUNTIME_LOCK:
+        if lease_generation != _STRATEGY_RUNTIME_CONTRACT_GENERATION:
+            raise RuntimeError("策略运行契约已切换；禁止旧请求继续远程访问: {}".format(operation))
+        _assert_runtime_remote_allowed(operation)
+
+
+def _assert_runtime_install_generation_current(
+    instance_token: object,
+    module_generation: int,
+    expected_active_mode: str,
+) -> None:
+    """拒绝在安装期间发生的helper reload或状态代际漂移。"""
+
+    if (
+        _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
+        or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+        or _STRATEGY_RUNTIME_ACTIVE_MODE != expected_active_mode
+    ):
+        raise RuntimeError("策略运行helper在安装期间发生重载或状态漂移；必须使用干净运行进程重启")
+
+
 def _normalise_runtime_mode(mode: Any) -> str:
-    value = str(mode or "").strip().upper()
+    if type(mode) is not str:
+        raise RuntimeError("运行模式必须是普通字符串 BACKTEST、SHADOW 或 LIVE")
+    value = str.upper(str.strip(mode))
     if value not in _RUNTIME_MODES:
         raise RuntimeError("运行模式必须是 BACKTEST、SHADOW 或 LIVE")
     return value
@@ -1701,7 +1909,7 @@ def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
 
     try:
         module = __import__(profile_module, fromlist=["*"])
-    except Exception:
+    except BaseException:
         # 配置模块自己的异常可能包含密钥，边界错误不拼接原异常。
         raise RuntimeError(
             "无法加载运行配置模块 {}；请确认文件已上传且可以导入".format(profile_module)
@@ -1802,11 +2010,13 @@ def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
 
 
 def _is_runtime_mutation_name(name: str) -> bool:
+    if type(name) is not str:
+        return False
     return (
         name in _RUNTIME_MUTATION_NAMES
-        or name.startswith("order_")
+        or str.startswith(name, "order_")
         or name == "cancel"
-        or name.startswith("cancel_")
+        or str.startswith(name, "cancel_")
         or name in {"place_order", "submit_order"}
     )
 
@@ -1816,21 +2026,126 @@ def _runtime_mutation_guard(name: str, active_mode: str) -> Callable[..., Any]:
         raise RuntimeError("{}模式禁止交易变更: {}".format(active_mode, name))
 
     blocked.__name__ = "runtime_blocked_{}_{}".format(active_mode.lower(), name)
+    setattr(blocked, "_bt_runtime_mutation_guard", True)
     return blocked
+
+
+def _callable_references_runtime_mutation(
+    value: Callable[..., Any],
+    candidates: List[Callable[..., Any]],
+) -> bool:
+    """识别直接别名及常见partial/wrapped/closure形式的交易函数引用。"""
+
+    pending: List[Callable[..., Any]] = [value]
+    seen: Set[int] = set()
+    while pending and len(seen) < 64:
+        current = pending.pop()
+        if any(current is candidate for candidate in candidates):
+            return True
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        try:
+            callable_name = None
+            if type(current) is types.FunctionType:
+                callable_name = current.__name__
+            elif type(current) is types.MethodType:
+                callable_name = current.__func__.__name__
+            elif type(current) in {
+                types.BuiltinFunctionType,
+                types.BuiltinMethodType,
+            }:
+                callable_name = current.__name__
+            if type(callable_name) is str and _is_runtime_mutation_name(callable_name):
+                return True
+
+            if isinstance(current, functools.partial):
+                partial_type = functools.partial
+                partial_func = partial_type.func.__get__(current, type(current))
+                partial_args = partial_type.args.__get__(current, type(current))
+                partial_keywords = partial_type.keywords.__get__(current, type(current))
+                pending.append(partial_func)
+                pending.extend(item for item in partial_args if callable(item))
+                if partial_keywords:
+                    pending.extend(
+                        item
+                        for item in dict.values(partial_keywords)
+                        if callable(item)
+                    )
+            elif type(current) is types.MethodType:
+                pending.append(current.__func__)
+            elif type(current) is types.FunctionType:
+                wrapped = dict.get(current.__dict__, "__wrapped__")
+                if callable(wrapped):
+                    pending.append(wrapped)
+                closure = current.__closure__ or ()
+                for cell in closure:
+                    try:
+                        cell_value = cell.cell_contents
+                    except ValueError:
+                        continue
+                    if callable(cell_value):
+                        pending.append(cell_value)
+                pending.extend(
+                    item for item in (current.__defaults__ or ()) if callable(item)
+                )
+                kwdefaults = current.__kwdefaults__ or {}
+                pending.extend(
+                    item for item in dict.values(kwdefaults) if callable(item)
+                )
+        except BaseException:
+            # namespace中的未知callable元数据不可阻断基础交易guard；无法安全
+            # 识别的任意callable-object间接引用不属于namespace门禁保证范围。
+            continue
+    return False
 
 
 def _install_runtime_guards(
     namespace: Dict[str, Any],
     active_mode: str,
+    extra_mutation_callables: Tuple[Callable[..., Any], ...] = (),
 ) -> Tuple[str, ...]:
+    # 同一个原生/兼容交易函数可能被保存为trade_alias等非标准名称。
+    # 先按标准mutation键收集对象identity，再把namespace内的直接别名一并替换。
+    snapshot = dict.copy(namespace)
+    mutation_callables = list(extra_mutation_callables)
+    mutation_callables.extend(
+        value
+        for name, value in snapshot.items()
+        if (
+            type(name) is str
+            and callable(value)
+            and _is_runtime_mutation_name(name)
+        )
+    )
     names = set(_RUNTIME_MUTATION_NAMES)
     names.update(
         name
-        for name, value in namespace.items()
-        if isinstance(name, str) and callable(value) and _is_runtime_mutation_name(name)
+        for name, value in snapshot.items()
+        if type(name) is str and callable(value) and _is_runtime_mutation_name(name)
+    )
+    names.update(
+        name
+        for name, value in snapshot.items()
+        if (
+            type(name) is str
+            and type(value) is types.FunctionType
+            and dict.get(value.__dict__, "_bt_runtime_mutation_guard") is True
+        )
+    )
+    names.update(
+        name
+        for name, value in snapshot.items()
+        if (
+            type(name) is str
+            and callable(value)
+            and _callable_references_runtime_mutation(value, mutation_callables)
+        )
     )
     for name in names:
-        namespace[name] = _runtime_mutation_guard(name, active_mode)
+        dict.__setitem__(namespace, name, _runtime_mutation_guard(name, active_mode))
     return tuple(sorted(names))
 
 
@@ -1846,36 +2161,113 @@ def _clear_runtime_clients() -> None:
     _BROKER_CLIENT = None
 
 
+def _fail_runtime_generation_drift(namespace: Optional[Dict[str, Any]]) -> None:
+    """旧调用栈跨helper reload返回时，撤销其刚发布的任何运行状态。"""
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CANONICAL_STATE
+    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
+
+    if isinstance(namespace, dict):
+        _mark_runtime_failed(namespace)
+        return
+    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+    _STRATEGY_RUNTIME_CANONICAL_STATE = None
+    _clear_runtime_clients()
+
+
+def _quarantine_legacy_jq_compat(
+    namespace: Dict[str, Any],
+) -> Tuple[bool, Tuple[Callable[..., Any], ...]]:
+    """移除旧兼容状态，并返回其中需要按identity封锁的mutation函数。"""
+
+    if not dict.__contains__(namespace, _JQ_COMPAT_STATE_KEY):
+        return False, ()
+
+    state = dict.get(namespace, _JQ_COMPAT_STATE_KEY)
+    mutation_callables: List[Callable[..., Any]] = []
+    if isinstance(state, dict):
+        originals = dict.get(state, "originals")
+        if isinstance(originals, dict):
+            mutation_callables.extend(
+                value
+                for name, value in dict.items(originals)
+                if (
+                    type(name) is str
+                    and _is_runtime_mutation_name(name)
+                    and callable(value)
+                )
+            )
+            dict.clear(originals)
+        dict.clear(state)
+        dict.__setitem__(state, "quarantined", True)
+    dict.pop(namespace, _JQ_COMPAT_STATE_KEY, None)
+    return True, tuple(mutation_callables)
+
+
 def _arm_remote_runtime_gate(
     namespace: Dict[str, Any],
     mode: str,
 ) -> Tuple[str, ...]:
     """在导入任何运行配置前建立进程和策略namespace双重门禁。"""
 
-    global _STRATEGY_RUNTIME_ACTIVE_MODE
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CONTRACT_GENERATION
 
     active_mode = _runtime_active_mode(mode)
-    _STRATEGY_RUNTIME_ACTIVE_MODE = active_mode
+    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
     _clear_runtime_clients()
-    return _install_runtime_guards(namespace, active_mode)
+    legacy_compat, legacy_callables = _quarantine_legacy_jq_compat(namespace)
+    blocked_names = _install_runtime_guards(
+        namespace,
+        active_mode,
+        legacy_callables,
+    )
+    _assert_no_inflight_runtime_requests("安装{}运行模式".format(mode))
+    if legacy_compat:
+        raise RuntimeError("检测到旧聚宽兼容层状态；必须使用干净运行进程重启")
+    _STRATEGY_RUNTIME_ACTIVE_MODE = active_mode
+    return blocked_names
 
 
 def _mark_runtime_failed(namespace: Dict[str, Any]) -> None:
     """保持失败关闭；后续显式重试安装前，不允许复用任何交易入口。"""
 
-    global _STRATEGY_RUNTIME_ACTIVE_MODE
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CANONICAL_STATE
+    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
 
+    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
     _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+    _STRATEGY_RUNTIME_CANONICAL_STATE = None
     _clear_runtime_clients()
-    namespace.pop(_STRATEGY_RUNTIME_STATE_KEY, None)
-    _install_runtime_guards(namespace, "FAILED")
+    dict.pop(namespace, _STRATEGY_RUNTIME_STATE_KEY, None)
+    legacy_callables: Tuple[Callable[..., Any], ...] = ()
+    try:
+        _, legacy_callables = _quarantine_legacy_jq_compat(namespace)
+    finally:
+        _install_runtime_guards(namespace, "FAILED", legacy_callables)
 
 
 def _context_uses_remote_snapshot(context: Any) -> bool:
+    def is_remote_portfolio(value: Any) -> bool:
+        value_type = type(value)
+        module_basename = str(getattr(value_type, "__module__", "")).split(".")[-1]
+        return (
+            isinstance(value, _RemoteJQPortfolio)
+            or getattr(value_type, "_bt_remote_portfolio_marker", None)
+            == "bullet-trade-remote-jq-portfolio-v1"
+            or (
+                getattr(value_type, "__name__", "")
+                in {"_RemoteJQPortfolio", "_RemoteJQSubPortfolio"}
+                and module_basename == "bullet_trade_jq_remote_helper"
+            )
+        )
+
     portfolio = getattr(context, "portfolio", None)
     subportfolios = getattr(context, "subportfolios", None) or []
-    return isinstance(portfolio, _RemoteJQPortfolio) or any(
-        isinstance(item, _RemoteJQPortfolio) for item in subportfolios
+    return (
+        is_remote_portfolio(portfolio)
+        or any(is_remote_portfolio(item) for item in subportfolios)
     )
 
 
@@ -1887,9 +2279,15 @@ def _enforce_remote_postconditions(
     """修复远程模式保护，并清除一切可复用的远程客户端。"""
 
     inherited_remote_context = _context_uses_remote_snapshot(context)
-    _restore_jq_compat(namespace)
+    legacy_compat, legacy_callables = _quarantine_legacy_jq_compat(namespace)
     _clear_runtime_clients()
-    blocked_names = _install_runtime_guards(namespace, active_mode)
+    blocked_names = _install_runtime_guards(
+        namespace,
+        active_mode,
+        legacy_callables,
+    )
+    if legacy_compat:
+        raise RuntimeError("检测到旧聚宽兼容层状态；必须使用干净运行进程重启")
     if inherited_remote_context:
         raise RuntimeError(
             "{}不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略".format(
@@ -1897,6 +2295,119 @@ def _enforce_remote_postconditions(
             )
         )
     return blocked_names
+
+
+def _prepare_backtest_postconditions(
+    namespace: Dict[str, Any],
+    context: Any,
+) -> None:
+    """BACKTEST只接受从未被旧远程兼容层或client污染的干净进程。"""
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CONTRACT_GENERATION
+
+    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
+    _assert_no_inflight_runtime_requests("安装BACKTEST运行模式")
+    if (
+        dict.__contains__(namespace, _JQ_COMPAT_STATE_KEY)
+        or _context_uses_remote_snapshot(context)
+        or _CLIENT is not None
+        or _DATA_CLIENT is not None
+        or _BROKER_CLIENT is not None
+    ):
+        _mark_runtime_failed(namespace)
+        raise RuntimeError("BACKTEST检测到旧远程运行状态；必须使用干净运行进程重启")
+    _clear_runtime_clients()
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "BACKTEST"
+
+
+_STRATEGY_RUNTIME_RECORD_KEYS = {
+    "schema_version",
+    "runtime_instance_token",
+    "signature",
+    "state",
+}
+
+
+def _build_strategy_runtime_state(
+    *,
+    mode: str,
+    run_type: str,
+    strategy_id: str,
+    profile: str,
+    profile_module: Optional[str] = None,
+    blocked_mutations: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
+    state = {
+        "api_version": STRATEGY_RUNTIME_API_VERSION,
+        "profile_schema_version": PROFILE_SCHEMA_VERSION,
+        "profile": profile,
+        "mode": mode,
+        "run_type": run_type,
+        "strategy_id": strategy_id,
+        "enabled": False,
+        "orders_enabled": mode == "BACKTEST",
+        "production_ready": False,
+        "reason": "backtest",
+    }
+    if mode == "SHADOW":
+        state.update(
+            {
+                "profile_module": profile_module,
+                "enabled": True,
+                "orders_enabled": False,
+                "reason": "shadow_read_only",
+                "blocked_mutations": blocked_mutations,
+            }
+        )
+    elif mode == "LIVE":
+        state.update(
+            {
+                "profile_module": profile_module,
+                "orders_enabled": False,
+                "reason": "live_blocked_until_strategy_ledger",
+                "mirror_jq_orders": False,
+                "blocked_mutations": blocked_mutations,
+            }
+        )
+    return state
+
+
+def _commit_strategy_runtime_state(
+    namespace: Dict[str, Any],
+    signature: Tuple[Any, ...],
+    state: Dict[str, Any],
+) -> None:
+    global _STRATEGY_RUNTIME_PROCESS_SIGNATURE, _STRATEGY_RUNTIME_CANONICAL_STATE
+
+    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = signature
+    _STRATEGY_RUNTIME_CANONICAL_STATE = dict(state)
+    dict.__setitem__(namespace, _STRATEGY_RUNTIME_STATE_KEY, {
+        "schema_version": STRATEGY_RUNTIME_STATE_SCHEMA_VERSION,
+        "runtime_instance_token": _STRATEGY_RUNTIME_INSTANCE_TOKEN,
+        "signature": signature,
+        "state": dict(state),
+    })
+
+
+def _validate_existing_strategy_runtime_state(
+    existing: Any,
+    signature: Tuple[Any, ...],
+    expected_active_mode: str,
+) -> Dict[str, Any]:
+    if (
+        type(existing) is not dict
+        or set(dict.keys(existing)) != _STRATEGY_RUNTIME_RECORD_KEYS
+        or dict.get(existing, "schema_version") != STRATEGY_RUNTIME_STATE_SCHEMA_VERSION
+        or dict.get(existing, "runtime_instance_token") is not _STRATEGY_RUNTIME_INSTANCE_TOKEN
+        or dict.get(existing, "signature") != signature
+        or _STRATEGY_RUNTIME_PROCESS_SIGNATURE != signature
+        or _STRATEGY_RUNTIME_CANONICAL_STATE is None
+        or dict.get(existing, "state") != _STRATEGY_RUNTIME_CANONICAL_STATE
+        or _STRATEGY_RUNTIME_ACTIVE_MODE != expected_active_mode
+    ):
+        raise RuntimeError("策略运行时缓存、进程契约或helper实例不一致；必须使用干净运行进程重启")
+    return dict(_STRATEGY_RUNTIME_CANONICAL_STATE)
 
 
 def _install_strategy_runtime_impl(
@@ -1909,15 +2420,9 @@ def _install_strategy_runtime_impl(
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
     profile_module: str = "jq_runtime_config",
 ) -> Dict[str, Any]:
-    """安装版本化的聚宽策略运行入口。
+    """安装版本化的聚宽策略运行入口。"""
 
-    BACKTEST完全保持聚宽原生行为；SHADOW不建立远程连接并阻断下单/撤单；
-    LIVE在StrategyLedger完成前只校验profile并保持交易关闭。
-    """
-
-    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_PROCESS_SIGNATURE
-
-    if not isinstance(namespace, dict):
+    if type(namespace) is not dict:
         raise RuntimeError("namespace 必须是策略globals()字典")
     normalised_mode = _normalise_runtime_mode(mode)
     run_type = _normalise_run_type(context)
@@ -1935,136 +2440,95 @@ def _install_strategy_runtime_impl(
             raise RuntimeError(
                 "BACKTEST模式仅允许聚宽回测，当前run_type={}".format(run_type or "<empty>")
             )
-    elif run_type != "sim_trade":
-        raise RuntimeError(
-            "{}模式仅允许聚宽模拟盘运行，当前run_type={}".format(
-                normalised_mode,
-                run_type or "<empty>",
+        normalised_profile = str(profile)
+        normalised_profile_module = str(profile_module)
+        _prepare_backtest_postconditions(namespace, context)
+    else:
+        if run_type != "sim_trade":
+            raise RuntimeError(
+                "{}模式仅允许聚宽模拟盘运行，当前run_type={}".format(
+                    normalised_mode,
+                    run_type or "<empty>",
+                )
             )
-        )
+        normalised_profile = _validate_runtime_identifier(profile, "profile")
+        normalised_profile_module = _validate_profile_module_name(profile_module)
+        if _context_uses_remote_snapshot(context):
+            raise RuntimeError(
+                "{}不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略".format(
+                    _runtime_active_mode(normalised_mode)
+                )
+            )
 
     install_signature = (
         normalised_mode,
         run_type,
         normalised_strategy_id,
-        str(profile),
-        str(profile_module),
+        normalised_profile,
+        normalised_profile_module,
         expected_api_version,
         id(context),
     )
-    if (
-        _STRATEGY_RUNTIME_PROCESS_SIGNATURE is not None
-        and _STRATEGY_RUNTIME_PROCESS_SIGNATURE != install_signature
-    ):
-        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-        raise RuntimeError("helper进程已使用不同配置的策略运行契约，拒绝覆盖")
-    existing = namespace.get(_STRATEGY_RUNTIME_STATE_KEY)
-    if existing is not None:
-        if (
-            not isinstance(existing, dict)
-            or existing.get("signature") != install_signature
-            or not isinstance(existing.get("state"), dict)
-        ):
-            _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-            raise RuntimeError("策略运行时已经使用不同配置安装，拒绝重复覆盖")
-        state = dict(existing["state"])
-        if normalised_mode == "SHADOW":
-            _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-            state["blocked_mutations"] = _enforce_remote_postconditions(
-                namespace,
-                context,
-                normalised_mode,
-            )
-            existing["state"] = state
-        elif normalised_mode == "LIVE":
-            _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
-            state["blocked_mutations"] = _enforce_remote_postconditions(
-                namespace,
-                context,
-                "LIVE_BLOCKED",
-            )
-            existing["state"] = state
-        else:
-            _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-        return dict(state)
+    existing = dict.get(namespace, _STRATEGY_RUNTIME_STATE_KEY)
 
-    # 关键安全边界：回测在导入profile、configure和任何远端安装之前返回。
-    if normalised_mode == "BACKTEST":
-        state = {
-            "api_version": STRATEGY_RUNTIME_API_VERSION,
-            "profile_schema_version": PROFILE_SCHEMA_VERSION,
-            "profile": str(profile),
-            "mode": normalised_mode,
-            "run_type": run_type,
-            "strategy_id": normalised_strategy_id,
-            "enabled": False,
-            "orders_enabled": True,
-            "production_ready": False,
-            "reason": "backtest",
-        }
-        _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-        _STRATEGY_RUNTIME_PROCESS_SIGNATURE = install_signature
-        namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
-        return dict(state)
-
-    normalised_profile = _validate_runtime_identifier(profile, "profile")
-    normalised_profile_module = _validate_profile_module_name(profile_module)
-    config = _load_runtime_profile(normalised_profile_module, normalised_profile)
-    if config["strategy_id"] != normalised_strategy_id:
-        raise RuntimeError("profile.strategy_id 与策略声明的 strategy_id 不一致")
-
-    if normalised_mode == "SHADOW":
-        # S01 的 SHADOW 是严格的本地只读门禁：不 configure、不建socket，
-        # 也不调用会替换portfolio的 install_jq_compat。远端原子快照在S15接入。
-        _STRATEGY_RUNTIME_ACTIVE_MODE = normalised_mode
-        blocked_names = _enforce_remote_postconditions(
-            namespace,
-            context,
-            normalised_mode,
-        )
-        state = {
-            "api_version": STRATEGY_RUNTIME_API_VERSION,
-            "profile_schema_version": PROFILE_SCHEMA_VERSION,
-            "profile": normalised_profile,
-            "profile_module": normalised_profile_module,
-            "mode": normalised_mode,
-            "run_type": run_type,
-            "strategy_id": normalised_strategy_id,
-            "enabled": True,
-            "orders_enabled": False,
-            "production_ready": False,
-            "reason": "shadow_read_only",
-            "blocked_mutations": blocked_names,
-        }
+    if _STRATEGY_RUNTIME_PROCESS_SIGNATURE is None:
+        if existing is not None or _STRATEGY_RUNTIME_CANONICAL_STATE is not None:
+            raise RuntimeError("发现无进程权威状态的策略运行缓存；必须使用干净运行进程重启")
     else:
-        # S01不得让LIVE产生任何连接或portfolio替换；仅安装本地失败关闭门禁。
-        _STRATEGY_RUNTIME_ACTIVE_MODE = "LIVE_BLOCKED"
+        if existing is None:
+            raise RuntimeError("策略运行时进程契约存在但namespace缓存缺失；必须使用干净运行进程重启")
+        state = _validate_existing_strategy_runtime_state(
+            existing,
+            install_signature,
+            _runtime_active_mode(normalised_mode),
+        )
+        if normalised_mode != "BACKTEST":
+            blocked_names = _enforce_remote_postconditions(
+                namespace,
+                context,
+                _runtime_active_mode(normalised_mode),
+            )
+            state = _build_strategy_runtime_state(
+                mode=normalised_mode,
+                run_type=run_type,
+                strategy_id=normalised_strategy_id,
+                profile=normalised_profile,
+                profile_module=normalised_profile_module,
+                blocked_mutations=blocked_names,
+            )
+        _commit_strategy_runtime_state(namespace, install_signature, state)
+        return dict(state)
+
+    if normalised_mode == "BACKTEST":
+        state = _build_strategy_runtime_state(
+            mode=normalised_mode,
+            run_type=run_type,
+            strategy_id=normalised_strategy_id,
+            profile=normalised_profile,
+        )
+    else:
+        config = _load_runtime_profile(normalised_profile_module, normalised_profile)
+        if config["strategy_id"] != normalised_strategy_id:
+            raise RuntimeError("profile.strategy_id 与策略声明的 strategy_id 不一致")
         blocked_names = _enforce_remote_postconditions(
             namespace,
             context,
-            "LIVE_BLOCKED",
+            _runtime_active_mode(normalised_mode),
         )
-        state = {
-            "api_version": STRATEGY_RUNTIME_API_VERSION,
-            "profile_schema_version": PROFILE_SCHEMA_VERSION,
-            "profile": normalised_profile,
-            "profile_module": normalised_profile_module,
-            "mode": normalised_mode,
-            "run_type": run_type,
-            "strategy_id": normalised_strategy_id,
-            "enabled": False,
-            "orders_enabled": False,
-            "production_ready": False,
-            "reason": "live_blocked_until_strategy_ledger",
-            "mirror_jq_orders": False,
-            "blocked_mutations": blocked_names,
-        }
+        state = _build_strategy_runtime_state(
+            mode=normalised_mode,
+            run_type=run_type,
+            strategy_id=normalised_strategy_id,
+            profile=normalised_profile,
+            profile_module=normalised_profile_module,
+            blocked_mutations=blocked_names,
+        )
 
-    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = install_signature
-    namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
+    _commit_strategy_runtime_state(namespace, install_signature, state)
     return dict(state)
 
 
+@_serialise_runtime_boundary
 def install_strategy_runtime(
     namespace: Dict[str, Any],
     *,
@@ -2077,21 +2541,32 @@ def install_strategy_runtime(
 ) -> Dict[str, Any]:
     """安装版本化的聚宽策略运行入口，并保证远程模式全程失败关闭。"""
 
-    if not isinstance(namespace, dict):
+    if type(namespace) is not dict:
         raise RuntimeError("namespace 必须是策略globals()字典")
     if _STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED":
         _mark_runtime_failed(namespace)
         raise RuntimeError("策略运行安装已经失败；必须使用干净运行进程重启")
-    normalised_mode = _normalise_runtime_mode(mode)
-    if normalised_mode not in {"SHADOW", "LIVE"}:
+    install_instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
+    install_module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
+
+    try:
+        normalised_mode = _normalise_runtime_mode(mode)
+        if (
+            _STRATEGY_RUNTIME_INSTANCE_TOKEN is not install_instance_token
+            or _STRATEGY_RUNTIME_MODULE_GENERATION != install_module_generation
+        ):
+            raise RuntimeError("策略运行helper在安装期间发生重载或状态漂移；必须使用干净运行进程重启")
+        expected_active_mode = _runtime_active_mode(normalised_mode)
         if normalised_mode == "BACKTEST" and _STRATEGY_RUNTIME_ACTIVE_MODE in {
             "SHADOW",
             "LIVE_BLOCKED",
-            "FAILED",
         }:
-            _mark_runtime_failed(namespace)
-            raise RuntimeError("远程运行模式已启动或失败；切换BACKTEST必须使用干净运行进程")
-        return _install_strategy_runtime_impl(
+            raise RuntimeError("远程运行模式已启动；切换BACKTEST必须使用干净运行进程")
+        if normalised_mode in {"SHADOW", "LIVE"}:
+            # profile是可执行Python模块；在其导入发生任何副作用前先阻断进程、
+            # 缓存客户端和策略namespace中的所有交易变更入口。
+            _arm_remote_runtime_gate(namespace, normalised_mode)
+        state = _install_strategy_runtime_impl(
             namespace,
             context=context,
             profile=profile,
@@ -2100,20 +2575,12 @@ def install_strategy_runtime(
             expected_api_version=expected_api_version,
             profile_module=profile_module,
         )
-
-    try:
-        # profile是可执行Python模块；在其导入发生任何副作用前先阻断进程、
-        # 缓存客户端和策略namespace中的所有交易变更入口。
-        _arm_remote_runtime_gate(namespace, normalised_mode)
-        return _install_strategy_runtime_impl(
-            namespace,
-            context=context,
-            profile=profile,
-            mode=normalised_mode,
-            strategy_id=strategy_id,
-            expected_api_version=expected_api_version,
-            profile_module=profile_module,
+        _assert_runtime_install_generation_current(
+            install_instance_token,
+            install_module_generation,
+            expected_active_mode,
         )
+        return state
     except BaseException:
         _mark_runtime_failed(namespace)
         raise
@@ -2192,6 +2659,7 @@ def _mirror_jq_order(
         _warn("聚宽镜像下单失败，仅影响聚宽页面展示，不影响远程真实订单: {}", exc)
 
 
+@_serialise_runtime_boundary
 def install_jq_compat(
     namespace: Dict[str, Any],
     *,
@@ -2215,6 +2683,11 @@ def install_jq_compat(
     回测环境不接管；仅在 `context.run_params.type == "sim_trade"` 时接管
     `context.portfolio`、`context.subportfolios` 和聚宽同名交易函数。
     """
+
+    if type(namespace) is not dict:
+        raise RuntimeError("namespace 必须是策略globals()字典")
+    _assert_runtime_mutation_allowed("install_jq_compat")
+    _assert_no_inflight_runtime_requests("install_jq_compat")
 
     run_type = _run_type_from_context(context)
     state = namespace.get(_JQ_COMPAT_STATE_KEY)

@@ -2,7 +2,7 @@
 
 ## Session元数据
 
-- 日期：2026-08-08
+- 日期：2026-08-09
 - 时区：Asia/Shanghai
 - 工作分支：`feat/joinquant-live-ledger`
 - 上游基线：`v0.9.2 / be0451b`
@@ -35,7 +35,8 @@
 - 原 `bt_quant` 工作树干净，旧仓库保留。
 - `.idea/`、runtime、导出产物和本地profile已有明确忽略规则。
 - S00最终候选为`7085155`；基线校验脚本和Git格式检查均PASS，最终独立复审已APPROVE。
-- S01初始实现`655b3c9`经独立审查后在`17f8eb2`修复；候选`335a707`的最终复审又发现profile导入前门禁过晚和远程context拒绝后namespace恢复漏洞，已在`5bca370`修复。111项相关回归、静态检查和基线校验通过，正在等待新的精确SHA复审。
+- S01初始实现`655b3c9`经多轮修复形成精确候选`354ecf3`；契约和安全审查批准，但对抗审查仍发现旧compat originals/别名、helper reload、并发契约、RPC切换、污染BACKTEST、BaseException凭据脱敏及namespace状态伪造问题，因此该SHA明确REWORK，不能发布。
+- 当前S01 v3工作候选已增加原子owner/在途lease/generation、严格进程权威状态、旧compat隔离、跨reload portfolio标记、全模式干净进程边界和poison namespace防御；又通过对抗反例修复了关键字namespace、递归/并发不同namespace、同namespace预门禁、import alias/partial/wrapped/closure别名及热重载虚假成功。137项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过；代码尚未形成新的精确复审SHA，不能标记S01完成。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
@@ -46,13 +47,14 @@
 当前目标：
 
 - 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
-- BACKTEST不读取profile、不连接网络；SHADOW/LIVE在profile导入前即禁止mutation、清除旧客户端，且不连接服务器或接管portfolio；LIVE的namespace变化仅是本地fail-closed保护。
+- BACKTEST不读取profile、不连接网络；SHADOW/LIVE在原子登记owner时即先禁止mutation、清除旧客户端，且不连接服务器或接管portfolio；LIVE的namespace变化仅是本地fail-closed保护。
+- runtime只接受普通字符串mode和真实模块`globals()`字典；并发、递归、热重载、污染状态或在途RPC不能发布虚假成功契约。
 - 移除迁移策略对旧定制helper API的调用。
 - 缺helper、旧helper版本、缺profile和无效配置fail-fast且不泄露token。
 
 ## 下一步
 
-完成S01实现、测试、独立审查和最终复审后进入S02类型桩与IDE支持。
+冻结S01 v3代码和行为文档，运行完整验证并提交；随后对新的精确SHA重新执行安全、契约和对抗三方复审。三方全部APPROVE后才能关闭S01并进入S02类型桩与IDE支持。
 
 ## 恢复检查表
 

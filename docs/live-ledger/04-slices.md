@@ -176,9 +176,45 @@ Retest:
   - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
   - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
   - git diff --check -> PASS
-Exact review candidate: 本审查记录提交后的HEAD
+Exact review candidate: 354ecf3230b28d6569a71fe548c7234847b591bf
+Final review result: REWORK；契约与安全审查APPROVE，对抗审查发现新的BLOCKER/MAJOR，详见下一轮记录
+Decision: REWORK
+```
+
+### 精确候选第三次对抗审查与v3修复记录
+
+```text
+Slice: S01
+Reviewed commit: 354ecf3230b28d6569a71fe548c7234847b591bf
+Reviewers: /root/review_s01_exact_contract_v2；/root/review_s01_exact_security_v2；/root/review_s01_exact_adversarial_v2
+Review result: REWORK（2 APPROVE，1 REWORK；任一REWORK即不得放行）
+Findings:
+  - BLOCKER: legacy compat originals、直接别名和跨reload旧portfolio可绕过SHADOW门禁
+  - MAJOR: namespace缓存被当作权威、helper reload和并发不同契约可发布不一致状态
+  - MAJOR: ShortLivedClient入口检查与建socket之间存在切换TOCTOU
+  - MAJOR: 污染进程切回BACKTEST仍可能保留旧wrapper/context/client却返回orders_enabled=True
+  - MAJOR: profile导入的SystemExit/KeyboardInterrupt可携带敏感文本逃逸
+  - MAJOR: 篡改namespace公开state可伪造LIVE/orders_enabled/production_ready
+Fix commit: PENDING（当前工作树尚未提交）
+Fixes in current candidate:
+  - runtime lock、原子transition owner、在途RPC lease和contract generation共同线性化安装/请求；在途请求使安装FAILED且禁止后续重试
+  - helper instance token、module generation、进程signature/canonical state和严格namespace envelope拒绝reload恢复及公开state篡改
+  - 任何legacy compat痕迹、旧remote portfolio、已发布client或污染BACKTEST均隔离并要求干净进程
+  - legacy originals被清空；标准交易名、直接/import alias、partial、wrapped和直接closure引用被本地guard
+  - profile import BaseException统一脱敏；configure/runtime调用跨reload不能重新发布client或虚假成功状态
+  - runtime只接受普通字符串mode和真实模块globals字典；SHADOW/LIVE在owner登记时即安装TRANSITIONING门禁
+  - poison callable/dict/str/partial子类不能阻断基础FAILED guard；并发/递归不同namespace也会先保护再拒绝
+Retest:
+  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 137 passed
+  - python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py tests/test_jq_strategy_runtime.py --select=E9,F63,F7,F82 -> PASS
+  - Python 3.8 ast.parse(feature_version=(3, 8)) for helper/runtime tests -> PY38_AST_OK
+  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
+  - git diff --check -> PASS（仅工作树CRLF转换提示）
+Final candidate SHA: PENDING
+Final reviewer: PENDING（三方精确SHA复审）
 Final review result: PENDING
-Decision: IN_REVIEW
+Residual risks/external blockers: 任意其他模块、容器、callable对象或局部变量中预存的原生函数引用无法由Python撤销；profile仍是可信代码而非沙箱；真实聚宽smoke在S18
+Decision: IN_PROGRESS
 ```
 
 ## S02：JoinQuant Typings and IDE

@@ -1,5 +1,10 @@
 import builtins
+import functools
+import os
+import subprocess
 import sys
+import textwrap
+import threading
 import types
 
 import pytest
@@ -11,6 +16,10 @@ from helpers import bullet_trade_jq_remote_helper as helper
 def _reset_runtime_process_gate(monkeypatch):
     monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
     monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_PROCESS_SIGNATURE", None)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_CANONICAL_STATE", None)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_TRANSITION_OWNER", None)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE", None)
     monkeypatch.setattr(helper, "_CLIENT", None)
     monkeypatch.setattr(helper, "_DATA_CLIENT", None)
     monkeypatch.setattr(helper, "_BROKER_CLIENT", None)
@@ -121,8 +130,31 @@ def test_runtime_rejects_unknown_mode_before_profile_import(monkeypatch):
         "_load_runtime_profile",
         lambda *args, **kwargs: pytest.fail("非法模式不得导入profile"),
     )
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
     with pytest.raises(RuntimeError, match="BACKTEST、SHADOW 或 LIVE"):
-        _install({}, _Context("sim_trade"), "unused_profile", mode="paper")
+        _install(namespace, _Context("sim_trade"), "unused_profile", mode="paper")
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_runtime_requires_exact_globals_dict_namespace():
+    class OverriddenNamespace(dict):
+        def __getitem__(self, key):
+            if key == "order":
+                return lambda *args, **kwargs: "forged-native-order"
+            return super().__getitem__(key)
+
+    namespace = OverriddenNamespace({"order": lambda *args, **kwargs: "native"})
+    with pytest.raises(RuntimeError, match=r"globals\(\)字典"):
+        helper.install_strategy_runtime(
+            namespace,
+            context=_Context("sim_trade"),
+            profile="good_etf-prod",
+            mode="SHADOW",
+            strategy_id="good_etf",
+            profile_module="profile_must_not_load",
+        )
 
 
 def test_runtime_rejects_api_version_mismatch_before_profile_import(monkeypatch):
@@ -236,10 +268,9 @@ def test_shadow_idempotent_reinstall_repairs_namespace_and_client_guards(monkeyp
 
 
 @pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
-def test_remote_modes_reject_context_inherited_from_remote_compat(monkeypatch, mode):
+def test_remote_modes_quarantine_legacy_compat_originals_and_aliases(monkeypatch, mode):
     module_name = _profile_module(monkeypatch)
     context = _Context("sim_trade")
-    context.portfolio = object.__new__(helper._RemoteJQPortfolio)
     client = _MutationProbeClient()
     raw_broker = helper.RemoteBrokerClient(client)
     cached_client = helper._ShortLivedClient("127.0.0.1", 58620, "unit-test-token")
@@ -257,25 +288,29 @@ def test_remote_modes_reject_context_inherited_from_remote_compat(monkeypatch, m
     def cached_compat_order(*args, **kwargs):
         return raw_broker.order("000001.XSHE", 100)
 
+    originals = {
+        "order": native_mutation,
+        "order_target": native_mutation,
+        "cancel_order": native_mutation,
+    }
+    legacy_state = {"installed": True, "originals": originals}
     namespace = {
-        helper._JQ_COMPAT_STATE_KEY: {
-            "installed": True,
-            "originals": {
-                "order": native_mutation,
-                "order_target": native_mutation,
-                "cancel_order": native_mutation,
-            },
-        },
+        helper._JQ_COMPAT_STATE_KEY: legacy_state,
         "order": cached_compat_order,
         "order_target": lambda *args, **kwargs: "remote-order-target",
         "cancel_order": lambda *args, **kwargs: "remote-cancel",
+        "trade_alias": native_mutation,
+        "compat_alias": cached_compat_order,
     }
 
-    with pytest.raises(RuntimeError, match="不能复用.*远程兼容层"):
+    with pytest.raises(RuntimeError, match="旧聚宽兼容层"):
         _install(namespace, context, module_name, mode=mode)
     assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
     assert helper._BROKER_CLIENT is None
-    for name in ("order", "order_target", "cancel_order"):
+    assert helper._JQ_COMPAT_STATE_KEY not in namespace
+    assert originals == {}
+    assert legacy_state == {"quarantined": True}
+    for name in ("order", "order_target", "cancel_order", "trade_alias", "compat_alias"):
         with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
             namespace[name]()
     with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
@@ -286,6 +321,173 @@ def test_remote_modes_reject_context_inherited_from_remote_compat(monkeypatch, m
         cached_client.request("broker.account", {})
     assert client.requests == []
     assert socket_calls == []
+
+
+@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+def test_remote_modes_reject_inherited_remote_context_without_compat_state(monkeypatch, mode):
+    module_name = _profile_module(monkeypatch)
+    context = _Context("sim_trade")
+    context.portfolio = object.__new__(helper._RemoteJQPortfolio)
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+
+    with pytest.raises(RuntimeError, match="不能复用.*远程兼容层"):
+        _install(namespace, context, module_name, mode=mode)
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_shadow_guards_direct_namespace_alias_of_native_order(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+
+    def native_order(*args, **kwargs):
+        raise AssertionError("SHADOW不得调用原生order或其直接别名")
+
+    @functools.wraps(native_order)
+    def wrapped_alias(*args, **kwargs):
+        return native_order(*args, **kwargs)
+
+    def closure_alias(*args, **kwargs):
+        return native_order(*args, **kwargs)
+
+    namespace = {
+        "order": native_order,
+        "trade_alias": native_order,
+        "partial_alias": functools.partial(native_order),
+        "wrapped_alias": wrapped_alias,
+        "closure_alias": closure_alias,
+    }
+    state = _install(namespace, _Context("sim_trade"), module_name)
+
+    assert {
+        "trade_alias",
+        "partial_alias",
+        "wrapped_alias",
+        "closure_alias",
+    }.issubset(state["blocked_mutations"])
+    for name in (
+        "order",
+        "trade_alias",
+        "partial_alias",
+        "wrapped_alias",
+        "closure_alias",
+    ):
+        with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+            namespace[name]("000001.XSHE", 100)
+
+
+def test_shadow_guards_imported_order_alias_without_canonical_binding(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+
+    def imported_jq_order(*args, **kwargs):
+        raise AssertionError("仅保留import alias时也不得执行原生order")
+
+    imported_jq_order.__name__ = "order"
+    namespace = {
+        "trade": imported_jq_order,
+        "partial_trade": functools.partial(imported_jq_order),
+    }
+    state = _install(namespace, _Context("sim_trade"), module_name)
+
+    assert {"trade", "partial_trade"}.issubset(state["blocked_mutations"])
+    for name in ("trade", "partial_trade"):
+        with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+            namespace[name]("000001.XSHE", 100)
+
+
+def test_unrelated_callable_getattr_cannot_break_fail_closed_guards(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+
+    class PoisonCallable:
+        def __call__(self, *args, **kwargs):
+            return "unrelated"
+
+        def __getattr__(self, name):
+            if name == "_bt_runtime_mutation_guard":
+                raise RuntimeError("POISON_GUARD_MARKER_LOOKUP")
+            raise AttributeError(name)
+
+    class PoisonPartial(functools.partial):
+        def __getattribute__(self, name):
+            if name in {"func", "args", "keywords"}:
+                raise RuntimeError("POISON_PARTIAL_METADATA")
+            return super().__getattribute__(name)
+
+    def native_order(*args, **kwargs):
+        raise AssertionError("无关callable不得阻止原生order被guard")
+
+    poison = PoisonCallable()
+    poison_partial = PoisonPartial(native_order)
+    namespace = {
+        "order": native_order,
+        "unrelated_callable": poison,
+        "unrelated_partial": poison_partial,
+    }
+    state = _install(namespace, _Context("sim_trade"), module_name)
+
+    assert state["mode"] == "SHADOW"
+    assert namespace["unrelated_callable"] is poison
+    assert "unrelated_partial" in state["blocked_mutations"]
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        namespace["unrelated_partial"]("000001.XSHE", 100)
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_poisoned_legacy_dict_and_str_key_cannot_break_failed_cleanup(monkeypatch):
+    class PoisonDict(dict):
+        def get(self, *args, **kwargs):
+            raise RuntimeError("POISON_DICT_GET")
+
+        def items(self, *args, **kwargs):
+            raise RuntimeError("POISON_DICT_ITEMS")
+
+        def clear(self, *args, **kwargs):
+            raise RuntimeError("POISON_DICT_CLEAR")
+
+        def pop(self, *args, **kwargs):
+            raise RuntimeError("POISON_DICT_POP")
+
+        def __setitem__(self, key, value):
+            raise RuntimeError("POISON_DICT_SETITEM")
+
+    class PoisonKey(str):
+        def startswith(self, *args, **kwargs):
+            raise RuntimeError("POISON_STR_STARTSWITH")
+
+    class PoisonCallable:
+        def __call__(self, *args, **kwargs):
+            return "unrelated"
+
+        def __getattr__(self, name):
+            raise RuntimeError("POISON_CALLABLE_GETATTR")
+
+    def native_order(*args, **kwargs):
+        raise AssertionError("FAILED清理后不得执行原生order")
+
+    originals = PoisonDict({"order": native_order})
+    legacy_state = PoisonDict({"installed": True, "originals": originals})
+    namespace = {
+        helper._JQ_COMPAT_STATE_KEY: legacy_state,
+        "order": native_order,
+        PoisonKey("unrelated_key"): PoisonCallable(),
+    }
+
+    with pytest.raises(RuntimeError, match="旧聚宽兼容层"):
+        _install(
+            namespace,
+            _Context("sim_trade"),
+            "profile_must_not_load_after_legacy_detection",
+            mode="SHADOW",
+        )
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert not dict.__contains__(namespace, helper._JQ_COMPAT_STATE_KEY)
+    assert dict(originals) == {}
+    assert dict(legacy_state) == {"quarantined": True}
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        dict.__getitem__(namespace, "order")("000001.XSHE", 100)
 
 
 def test_shadow_blocks_mutations_on_previously_cached_raw_broker(monkeypatch):
@@ -585,13 +787,107 @@ def test_failed_remote_install_cannot_retry_in_same_process(monkeypatch):
         namespace["order"]("000001.XSHE", 100)
 
 
+@pytest.mark.parametrize("installed", [False, True])
+def test_backtest_rejects_any_legacy_compat_trace(monkeypatch, installed):
+    def native_order(*args, **kwargs):
+        raise AssertionError("污染进程不得返回orders_enabled=True")
+
+    originals = {"order": native_order}
+    legacy_state = {"installed": installed, "originals": originals}
+    namespace = {
+        helper._JQ_COMPAT_STATE_KEY: legacy_state,
+        "order": lambda *args, **kwargs: "old-wrapper",
+        "trade_alias": native_order,
+    }
+
+    with pytest.raises(RuntimeError, match="BACKTEST检测到旧远程运行状态"):
+        _install(
+            namespace,
+            _Context("full_backtest"),
+            "unused_profile",
+            mode="BACKTEST",
+        )
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert helper._JQ_COMPAT_STATE_KEY not in namespace
+    assert originals == {}
+    assert legacy_state == {"quarantined": True}
+    for name in ("order", "trade_alias"):
+        with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+            namespace[name]()
+
+
+def test_idempotent_install_rejects_tampered_public_state(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    namespace = {}
+    context = _Context("sim_trade")
+    _install(namespace, context, module_name)
+    cached_state = namespace[helper._STRATEGY_RUNTIME_STATE_KEY]["state"]
+    cached_state.update(
+        {
+            "mode": "LIVE",
+            "orders_enabled": True,
+            "production_ready": True,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="缓存.*不一致"):
+        _install(namespace, context, module_name)
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    assert helper._STRATEGY_RUNTIME_STATE_KEY not in namespace
+
+
+def test_namespace_state_never_restores_missing_process_authority(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    namespace = {}
+    context = _Context("sim_trade")
+    _install(namespace, context, module_name)
+    monkeypatch.setattr(helper, "_STRATEGY_RUNTIME_PROCESS_SIGNATURE", None)
+
+    with pytest.raises(RuntimeError, match="无进程权威状态"):
+        _install(namespace, context, module_name)
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+
+
+def test_process_authority_rejects_missing_namespace_state(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    namespace = {}
+    context = _Context("sim_trade")
+    _install(namespace, context, module_name)
+    namespace.pop(helper._STRATEGY_RUNTIME_STATE_KEY)
+
+    with pytest.raises(RuntimeError, match="namespace缓存缺失"):
+        _install(namespace, context, module_name)
+
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+
+
+def test_runtime_blocks_late_install_jq_compat_before_state_write(monkeypatch):
+    module_name = _profile_module(monkeypatch)
+    namespace = {}
+    context = _Context("sim_trade")
+    _install(namespace, context, module_name)
+
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        helper.install_jq_compat(
+            namespace,
+            context=context,
+            host="127.0.0.1",
+            token="unit-test-token",
+        )
+
+    assert helper._JQ_COMPAT_STATE_KEY not in namespace
+
+
 def test_reinstall_with_different_contract_fails_closed(monkeypatch):
     module_name = _profile_module(monkeypatch)
     namespace = {}
     context = _Context("sim_trade")
     _install(namespace, context, module_name)
 
-    with pytest.raises(RuntimeError, match="不同配置"):
+    with pytest.raises(RuntimeError, match="不一致|不同配置"):
         helper.install_strategy_runtime(
             namespace,
             context=context,
@@ -600,6 +896,515 @@ def test_reinstall_with_different_contract_fails_closed(monkeypatch):
             strategy_id="good_etf",
             profile_module=module_name,
         )
+
+
+def test_concurrent_runtime_install_cannot_enter_second_contract(monkeypatch):
+    profile_entered = threading.Event()
+    release_profile = threading.Event()
+    loader_calls = []
+
+    def blocking_loader(*args, **kwargs):
+        loader_calls.append((args, kwargs))
+        profile_entered.set()
+        assert release_profile.wait(5), "测试未释放profile loader"
+        return _valid_profile()
+
+    monkeypatch.setattr(helper, "_load_runtime_profile", blocking_loader)
+    first_namespace = {"order": lambda *args, **kwargs: "first-native"}
+    second_namespace = {"order": lambda *args, **kwargs: "second-native"}
+    results = []
+    errors = []
+
+    def run_install(namespace, context):
+        try:
+            results.append(
+                _install(
+                    namespace,
+                    context,
+                    "unused_because_loader_is_patched",
+                    mode="SHADOW",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(
+        target=run_install,
+        args=(first_namespace, _Context("sim_trade")),
+    )
+    second_thread = threading.Thread(
+        target=run_install,
+        args=(second_namespace, _Context("sim_trade")),
+    )
+    first_thread.start()
+    assert profile_entered.wait(5), "首个安装未进入profile loader"
+    second_thread.start()
+    second_thread.join(5)
+    assert not second_thread.is_alive(), "并发安装不得等待profile线程形成死锁"
+    release_profile.set()
+    first_thread.join(5)
+    assert not first_thread.is_alive()
+
+    assert len(results) == 1
+    assert results[0]["mode"] == "SHADOW"
+    assert len(errors) == 1
+    assert "正在切换" in str(errors[0])
+    assert len(loader_calls) == 1
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "SHADOW"
+    with pytest.raises(RuntimeError, match="TRANSITIONING模式禁止交易变更"):
+        second_namespace["order"]("000001.XSHE", 100)
+
+
+def test_same_namespace_is_guarded_before_concurrent_install_rejection(monkeypatch):
+    normalise_entered = threading.Event()
+    release_normalise = threading.Event()
+    original_normalise = helper._normalise_runtime_mode
+    normalise_calls = []
+
+    def blocking_normalise(mode):
+        normalise_calls.append(mode)
+        if len(normalise_calls) == 1:
+            normalise_entered.set()
+            assert release_normalise.wait(5)
+        return original_normalise(mode)
+
+    monkeypatch.setattr(helper, "_normalise_runtime_mode", blocking_normalise)
+    monkeypatch.setattr(helper, "_load_runtime_profile", lambda *args, **kwargs: _valid_profile())
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+    results = []
+    errors = []
+
+    def first_install():
+        try:
+            results.append(
+                _install(
+                    namespace,
+                    _Context("sim_trade"),
+                    "unused_because_loader_is_patched",
+                    mode="SHADOW",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=first_install)
+    first_thread.start()
+    assert normalise_entered.wait(5)
+
+    with pytest.raises(RuntimeError, match="正在切换"):
+        _install(
+            namespace,
+            _Context("sim_trade"),
+            "unused_because_loader_is_patched",
+            mode="SHADOW",
+        )
+    with pytest.raises(RuntimeError, match="TRANSITIONING模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+    release_normalise.set()
+    first_thread.join(5)
+    assert not first_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0]["mode"] == "SHADOW"
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "SHADOW"
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_recursive_install_guards_different_nested_namespace(monkeypatch):
+    nested_namespace = {"order": lambda *args, **kwargs: "nested-native-order"}
+    recursive_errors = []
+
+    def recursive_profile_loader(*args, **kwargs):
+        try:
+            _install(
+                nested_namespace,
+                _Context("sim_trade"),
+                "recursive_profile_must_not_load",
+                mode="SHADOW",
+            )
+        except RuntimeError as exc:
+            recursive_errors.append(exc)
+        return _valid_profile()
+
+    monkeypatch.setattr(helper, "_load_runtime_profile", recursive_profile_loader)
+    outer_namespace = {"order": lambda *args, **kwargs: "outer-native-order"}
+    state = _install(
+        outer_namespace,
+        _Context("sim_trade"),
+        "unused_because_loader_is_patched",
+        mode="SHADOW",
+    )
+
+    assert state["mode"] == "SHADOW"
+    assert len(recursive_errors) == 1
+    assert "不允许递归调用" in str(recursive_errors[0])
+    with pytest.raises(RuntimeError, match="TRANSITIONING模式禁止交易变更"):
+        nested_namespace["order"]("000001.XSHE", 100)
+    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+        outer_namespace["order"]("000001.XSHE", 100)
+
+
+def test_simultaneous_installers_cannot_queue_before_transition_owner_is_set(monkeypatch):
+    start = threading.Barrier(3)
+    profile_entered = threading.Event()
+    release_profile = threading.Event()
+    rejection_finished = threading.Event()
+    loader_calls = []
+
+    def profile_loader(*args, **kwargs):
+        loader_calls.append((args, kwargs))
+        profile_entered.set()
+        assert release_profile.wait(5)
+        return _valid_profile()
+
+    monkeypatch.setattr(helper, "_load_runtime_profile", profile_loader)
+    namespaces = [
+        {"order": lambda *args, **kwargs: "first-native"},
+        {"order": lambda *args, **kwargs: "second-native"},
+    ]
+    results = []
+    errors = []
+
+    def run_install(index):
+        start.wait(5)
+        try:
+            results.append(
+                (
+                    index,
+                    helper.install_strategy_runtime(
+                        namespace=namespaces[index],
+                        context=_Context("sim_trade"),
+                        profile="good_etf-prod",
+                        mode="SHADOW",
+                        strategy_id="good_etf",
+                        profile_module="unused_because_loader_is_patched",
+                    ),
+                )
+            )
+        except BaseException as exc:
+            errors.append((index, exc))
+            rejection_finished.set()
+
+    threads = [threading.Thread(target=run_install, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait(5)
+    assert profile_entered.wait(5)
+    assert rejection_finished.wait(5), "第二个安装必须立即拒绝，不能在主锁上排队"
+    release_profile.set()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+
+    assert len(results) == 1
+    assert results[0][1]["mode"] == "SHADOW"
+    assert len(errors) == 1
+    assert "正在切换" in str(errors[0][1])
+    assert len(loader_calls) == 1
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "SHADOW"
+    rejected_index = errors[0][0]
+    with pytest.raises(RuntimeError, match="TRANSITIONING模式禁止交易变更"):
+        namespaces[rejected_index]["order"]("000001.XSHE", 100)
+
+
+def test_inflight_request_prevents_shadow_from_becoming_active(monkeypatch):
+    socket_entered = threading.Event()
+    release_socket = threading.Event()
+    socket_modes = []
+    request_errors = []
+    install_errors = []
+    client = helper._ShortLivedClient(
+        "127.0.0.1",
+        58620,
+        "unit-test-token",
+        retries=2,
+        retry_interval=0.1,
+    )
+
+    def blocking_socket(*args, **kwargs):
+        socket_modes.append(helper._STRATEGY_RUNTIME_ACTIVE_MODE)
+        socket_entered.set()
+        assert release_socket.wait(5), "测试未释放socket"
+        raise OSError("expected test transport stop")
+
+    monkeypatch.setattr(helper.socket, "create_connection", blocking_socket)
+
+    def run_request():
+        try:
+            client.request("broker.account", {})
+        except BaseException as exc:
+            request_errors.append(exc)
+
+    namespace = {"order": lambda *args, **kwargs: "native-order"}
+
+    def run_install():
+        try:
+            _install(
+                namespace,
+                _Context("sim_trade"),
+                "profile_must_not_load_while_request_is_inflight",
+                mode="SHADOW",
+            )
+        except BaseException as exc:
+            install_errors.append(exc)
+
+    request_thread = threading.Thread(target=run_request)
+    install_thread = threading.Thread(target=run_install)
+    request_thread.start()
+    assert socket_entered.wait(5), "旧请求未进入socket"
+    install_thread.start()
+    install_thread.join(5)
+    assert not install_thread.is_alive(), "runtime应对在途请求立即失败关闭"
+    assert len(install_errors) == 1
+    assert "远程请求在途" in str(install_errors[0])
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    release_socket.set()
+    request_thread.join(5)
+    assert not request_thread.is_alive()
+
+    assert len(request_errors) == 1
+    assert helper._STRATEGY_RUNTIME_INFLIGHT_REQUESTS == 0
+    assert socket_modes == [None]
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+@pytest.mark.parametrize("exception_type", [SystemExit, KeyboardInterrupt])
+def test_request_base_exception_always_releases_inflight_lease(monkeypatch, exception_type):
+    client = helper._ShortLivedClient(
+        "127.0.0.1",
+        58620,
+        "unit-test-token",
+        retries=0,
+    )
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(exception_type("transport-stop")),
+    )
+
+    with pytest.raises(exception_type, match="transport-stop"):
+        client.request("broker.account", {})
+
+    assert helper._STRATEGY_RUNTIME_INFLIGHT_REQUESTS == 0
+
+
+def test_helper_reload_fails_closed_and_recognises_old_remote_portfolio():
+    script = textwrap.dedent(
+        """
+        import importlib
+        import sys
+        import types
+
+        from helpers import bullet_trade_jq_remote_helper as helper
+
+        class RunParams:
+            type = "sim_trade"
+
+        class Context:
+            run_params = RunParams()
+
+        profile_module = types.ModuleType("reload_runtime_profile")
+        profile_module.PROFILE_SCHEMA_VERSION = 1
+        profile_module.PROFILES = {
+            "good_etf-prod": {
+                "strategy_id": "good_etf",
+                "host": "127.0.0.1",
+                "token": "unit-test-token",
+            }
+        }
+        sys.modules[profile_module.__name__] = profile_module
+        namespace = {"order": lambda *args, **kwargs: "native"}
+        context = Context()
+        helper.install_strategy_runtime(
+            namespace,
+            context=context,
+            profile="good_etf-prod",
+            mode="SHADOW",
+            strategy_id="good_etf",
+            profile_module=profile_module.__name__,
+        )
+        old_token = namespace[helper._STRATEGY_RUNTIME_STATE_KEY]["runtime_instance_token"]
+        old_portfolio = object.__new__(helper._RemoteJQPortfolio)
+        helper = importlib.reload(helper)
+        assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+        assert helper._STRATEGY_RUNTIME_INSTANCE_TOKEN is not old_token
+        probe_context = Context()
+        probe_context.portfolio = old_portfolio
+        assert helper._context_uses_remote_snapshot(probe_context)
+        try:
+            helper.install_strategy_runtime(
+                namespace,
+                context=context,
+                profile="good_etf-prod",
+                mode="SHADOW",
+                strategy_id="good_etf",
+                profile_module=profile_module.__name__,
+            )
+        except RuntimeError as exc:
+            assert "干净运行进程重启" in str(exc)
+        else:
+            raise AssertionError("reload后的旧namespace不得恢复runtime")
+        assert helper._STRATEGY_RUNTIME_STATE_KEY not in namespace
+        try:
+            namespace["order"]("000001.XSHE", 100)
+        except RuntimeError as exc:
+            assert "FAILED模式禁止交易变更" in str(exc)
+        else:
+            raise AssertionError("reload失败后namespace必须保持guard")
+        print("RELOAD_FAIL_CLOSED_OK")
+        """
+    )
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RELOAD_FAIL_CLOSED_OK" in result.stdout
+
+
+def test_profile_reload_during_runtime_install_cannot_return_false_success():
+    script = textwrap.dedent(
+        """
+        import importlib
+
+        from helpers import bullet_trade_jq_remote_helper as helper
+
+        class RunParams:
+            type = "sim_trade"
+
+        class Context:
+            run_params = RunParams()
+
+        namespace = {"order": lambda *args, **kwargs: "native"}
+
+        def reloading_profile_loader(*args, **kwargs):
+            importlib.reload(helper)
+            return {"strategy_id": "good_etf"}
+
+        helper._load_runtime_profile = reloading_profile_loader
+        try:
+            helper.install_strategy_runtime(
+                namespace,
+                context=Context(),
+                profile="good_etf-prod",
+                mode="SHADOW",
+                strategy_id="good_etf",
+                profile_module="reload_during_profile_import",
+            )
+        except RuntimeError as exc:
+            assert "发生重载" in str(exc)
+        else:
+            raise AssertionError("profile导入期间reload不得返回SHADOW成功状态")
+
+        assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+        assert helper._STRATEGY_RUNTIME_STATE_KEY not in namespace
+        try:
+            namespace["order"]("000001.XSHE", 100)
+        except RuntimeError as exc:
+            assert "FAILED模式禁止交易变更" in str(exc)
+        else:
+            raise AssertionError("reload失败后namespace必须保持guard")
+        print("PROFILE_RELOAD_FAIL_CLOSED_OK")
+        """
+    )
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PROFILE_RELOAD_FAIL_CLOSED_OK" in result.stdout
+
+
+def test_non_string_mode_is_rejected_without_executing_custom_str():
+    calls = []
+
+    class SideEffectMode:
+        def __str__(self):
+            calls.append("custom-str-called")
+            return "SHADOW"
+
+    namespace = {"order": lambda *args, **kwargs: "native"}
+    with pytest.raises(RuntimeError, match="普通字符串"):
+        helper.install_strategy_runtime(
+            namespace,
+            context=_Context("sim_trade"),
+            profile="good_etf-prod",
+            mode=SideEffectMode(),
+            strategy_id="good_etf",
+            profile_module="profile_must_not_load",
+        )
+
+    assert calls == []
+    assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED模式禁止交易变更"):
+        namespace["order"]("000001.XSHE", 100)
+
+
+def test_standalone_configure_cannot_publish_clients_across_helper_reload():
+    script = textwrap.dedent(
+        """
+        import importlib
+
+        from helpers import bullet_trade_jq_remote_helper as helper
+
+        original_client_class = helper._ShortLivedClient
+
+        def reloading_client_factory(*args, **kwargs):
+            importlib.reload(helper)
+            return original_client_class(*args, **kwargs)
+
+        helper._ShortLivedClient = reloading_client_factory
+        secret = "configure-reload-secret"
+        try:
+            helper.configure(
+                host="127.0.0.1",
+                token=secret,
+                retries=0,
+                debug=False,
+            )
+        except RuntimeError as exc:
+            assert "调用期间发生重载" in str(exc)
+            assert secret not in str(exc)
+        else:
+            raise AssertionError("跨reload的旧configure调用不得返回成功")
+
+        assert helper._STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+        assert helper._CLIENT is None
+        assert helper._DATA_CLIENT is None
+        assert helper._BROKER_CLIENT is None
+        print("CONFIGURE_RELOAD_FAIL_CLOSED_OK")
+        """
+    )
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CONFIGURE_RELOAD_FAIL_CLOSED_OK" in result.stdout
 
 
 def test_missing_profile_module_has_clear_error_without_import_details():
@@ -686,13 +1491,14 @@ def test_profile_strategy_id_must_match_strategy(monkeypatch):
         _install({}, _Context("sim_trade"), module_name)
 
 
-def test_profile_import_error_never_leaks_token(monkeypatch):
+@pytest.mark.parametrize("exception_type", [RuntimeError, SystemExit, KeyboardInterrupt])
+def test_profile_import_base_exception_never_leaks_token(monkeypatch, exception_type):
     secret = "unique-super-secret-token"
     original_import = __import__
 
     def unsafe_import(name, *args, **kwargs):
         if name == "unsafe_profile_module":
-            raise RuntimeError("profile failed with token={}".format(secret))
+            raise exception_type("profile failed with token={}".format(secret))
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr("builtins.__import__", unsafe_import)

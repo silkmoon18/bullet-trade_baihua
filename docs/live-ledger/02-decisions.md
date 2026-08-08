@@ -82,6 +82,6 @@ shadow、QMT模拟和小额实盘依赖真实交易日及用户外部授权，�
 
 ## D019：过渡运行边界
 
-聚宽策略默认`MODE='BACKTEST'`。BACKTEST不得读取私有profile或触达远端；SHADOW/LIVE仅在`sim_trade`中运行，并在执行可信Python profile之前先设置进程门禁、清除旧client和保护namespace。SHADOW严格校验profile但不建远程连接；S01的LIVE只校验profile，返回`orders_enabled=False`和`production_ready=False`，不安装旧兼容层或替换portfolio，但会有意安装本地交易阻断函数。任何远程模式安装失败后保持`FAILED`并要求干净进程重启；`good_etf.py`还必须在调用helper前拒绝LIVE启动。
+聚宽策略默认`MODE='BACKTEST'`。BACKTEST不得读取私有profile或触达远端；SHADOW/LIVE仅在`sim_trade`中运行，并在原子登记安装owner时先把普通模块`globals()`中的交易入口置为`TRANSITIONING`，再执行context和可信Python profile校验。SHADOW严格校验profile但不建远程连接；S01的LIVE只校验profile，返回`orders_enabled=False`和`production_ready=False`，不安装旧兼容层或替换portfolio，但会有意安装本地交易阻断函数。任何合法runtime安装失败、旧兼容层污染、旧远程portfolio、在途RPC、helper热重载或状态完整性故障都保持`FAILED`并要求干净进程重启；污染进程不得切回BACKTEST。`good_etf.py`还必须在调用helper前拒绝LIVE启动。
 
-后果：S01可以安全验证同源策略和配置契约，但不能被解释为已经具备实盘能力。profile属于维护者可信代码，运行门禁不承诺沙箱化任意Python副作用。只有S15替换为StrategyLedger runtime且S18至S20门禁通过后，才允许真实资金。
+后果：runtime只接受普通字符串mode和真实模块`globals()`字典。namespace record不能恢复进程权威状态；并发/递归安装不会排队覆盖已返回契约。门禁覆盖标准交易名、直接别名及可安全识别的函数名/partial/wrapped/直接闭包，但无法撤销藏在其他模块、容器、任意callable对象或局部变量中的原生引用。策略必须先完成单线程初始化再启动回调；profile属于维护者可信代码，运行门禁不承诺沙箱化任意Python副作用。S01只可安全验证同源策略和配置契约，不能被解释为已经具备实盘能力。只有S15替换为StrategyLedger runtime且S18至S20门禁通过后，才允许真实资金。
