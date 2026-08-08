@@ -22,6 +22,7 @@
 | D016 | 首版只支持专用物理账户、单策略、禁止人工交易；共享账户延期 | Accepted |
 | D017 | 每个slice修复审查问题后必须对最终SHA再次独立复审 | Accepted |
 | D018 | 自动化交付与真实交易日soak分开；外部门禁允许BLOCKED等待证据 | Accepted |
+| D019 | S01采用profile schema v1和严格模式矩阵；StrategyLedger完成前LIVE必须失败关闭 | Accepted |
 
 ## D001：不合并敏感历史
 
@@ -78,3 +79,9 @@
 实现提交接受第一次独立审查；修复findings后生成新的最终SHA，再由独立审查者复审该SHA或精确diff。只有最终复审通过才可DONE。
 
 shadow、QMT模拟和小额实盘依赖真实交易日及用户外部授权，与自动化E2E实现拆开。没有足够证据时状态保持BLOCKED，不以文档完成代替真实验收。
+
+## D019：过渡运行边界
+
+聚宽策略默认`MODE='BACKTEST'`。BACKTEST不得读取私有profile或触达远端；SHADOW仅在`sim_trade`中运行，严格校验版本化profile但不建远程连接，并阻断runtime管理的下单/撤单入口；S01的LIVE只是旧兼容层验证路径，返回`production_ready=False`，`good_etf.py`必须据此拒绝启动。
+
+后果：S01可以安全验证同源策略和配置契约，但不能被解释为已经具备实盘能力。只有S15替换为StrategyLedger runtime且S18至S20门禁通过后，才允许真实资金。

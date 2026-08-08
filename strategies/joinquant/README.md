@@ -1,6 +1,6 @@
 # 聚宽策略工作区
 
-本目录保存可复制到聚宽策略编辑器的策略源码。当前仅包含从 `bt_quant@e6462dd` 脱敏导入的迁移基线 `good_etf.py`。
+本目录保存可复制到聚宽策略编辑器的策略源码。当前仅包含从 `bt_quant@e6462dd` 脱敏导入并迁移到版本化运行契约的 `good_etf.py`。
 
 ## 迁移映射
 
@@ -17,24 +17,25 @@
 
 ## 当前使用限制
 
-`good_etf.py`仍是迁移基线：
+`good_etf.py`已经不再保存host、token、Webhook或账户配置，也不再调用旧定制helper的同步追单/通知接口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
 
-- `SEND_SIGNALS=False`
-- 连接token为空
-- 尚未切换到StrategyLedger
-- 已知目标金额和同步追单问题尚待后续slice修复
-- 仍调用旧定制helper的4个 `jq_order*` 配置参数、`strategy_name`、`notify`、`cancel_all_open_orders`、`order_target_sync` 和 `order_target_value_sync`；这些接口与上游v0.9.2 helper不兼容
+当前三种模式的边界是：
 
-因此当前文件只能编译和审查，不能搭配上游helper直接运行。S01先完成helper/profile契约迁移；S15完成StrategyLedger runtime。在S20小额实盘门禁通过前不得启用真实信号。
+- `BACKTEST`：不需要helper或profile，直接使用聚宽原生回测接口；
+- `SHADOW`：需要版本匹配的helper和私有profile，只记录计划，所有交易变更均被阻断；
+- `LIVE`：S01尚未切换到StrategyLedger，策略会明确拒绝启动。
+
+因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。S15接入StrategyLedger runtime；S18至S20依次完成真实聚宽、QMT模拟和用户批准的小额实盘门禁。
 
 ## 直接复制语义
 
-S01完成后的标准工作流将是：
+标准工作流是：
 
-1. 将统一helper和无密钥profile文件一次上传到聚宽研究根目录。
-2. 本目录策略源码保持 `from jqdata import *` 和顶层helper导入。
-3. 本地和聚宽使用同一个策略文件，不维护本地专用分支。
-4. 复制策略源码到聚宽策略编辑器即可运行。
-5. 新环境可使用导出工具生成上传清单；单文件bundle是可选方案。
+1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在本地私有文件中维护连接配置。
+2. 将统一helper和私有`jq_runtime_config.py`上传到聚宽研究根目录。
+3. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入。
+4. 本地和聚宽使用同一个策略文件，不维护本地专用分支。
+5. 复制策略源码到聚宽策略编辑器；只修改顶部的`PROFILE`、`MODE`和`STRATEGY_ID`部署声明。
+6. S03完成后使用导出工具生成可校验的上传清单；单文件bundle是可选方案。
 
 “代码一致”指同一份策略源码和已验证API契约，不代表本地兼容引擎与聚宽私有撮合实现绝对相同。

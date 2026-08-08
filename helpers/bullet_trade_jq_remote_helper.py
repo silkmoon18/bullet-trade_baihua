@@ -3,13 +3,18 @@
 
 使用方法：
 1. 将本文件复制到聚宽研究环境根目录；
-2. 在策略里：
+2. 新策略优先使用版本化运行入口（连接信息来自私有 jq_runtime_config.py）：
+   import bullet_trade_jq_remote_helper as bt
+   bt.install_strategy_runtime(
+       globals(), context=context, profile='good_etf-prod', mode='SHADOW',
+       strategy_id='good_etf', expected_api_version=1)
+3. 兼容旧策略时也可以直接配置底层客户端：
    import bullet_trade_jq_remote_helper as bt
    bt.configure(host='你的IP', token='你的token', port=58620, account_key='main', sub_account_id='demo@main')
    acct = bt.get_account()
    oid = bt.order('000001.XSHE', amount=100, price=None, side='BUY', wait_timeout=10)
    bt.cancel_order(oid)
-3. 如果希望聚宽模拟盘里尽量不改原策略下单代码，可在 process_initialize 里调用：
+4. 如果希望聚宽模拟盘里尽量不改原策略下单代码，可在 process_initialize 里调用：
    bt.install_jq_compat(globals(), context=context, host='你的IP', token='你的token')
 
 特点：
@@ -18,11 +23,13 @@
 - 支持同步/异步：wait_timeout>0 时轮询订单状态，否则立即返回。
 - 提供 account/positions/order_status/orders/cancel/order_value/order_target 等常见聚宽风格 API。
 - install_jq_compat 在回测中不接管；在聚宽模拟盘中接管账户状态和同名下单函数，默认同步等待 16 秒。
+- install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；当前LIVE仍是非生产兼容路径。
 """
 
 import ast
 import hashlib
 import json
+import math
 import os
 import socket
 import ssl
@@ -41,6 +48,8 @@ _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
 # 全局调试开关
 _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
+STRATEGY_RUNTIME_API_VERSION: int = 1
+PROFILE_SCHEMA_VERSION: int = 1
 DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
 DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
@@ -1465,6 +1474,7 @@ def _df_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
 
 # --------- 聚宽策略零改兼容层 ----------
 _JQ_COMPAT_STATE_KEY = "__bt_jq_compat_state__"
+_STRATEGY_RUNTIME_STATE_KEY = "__bt_strategy_runtime_state__"
 _JQ_COMPAT_FUNCTIONS = [
     "order",
     "order_value",
@@ -1591,6 +1601,368 @@ def _run_type_from_context(context: Any) -> Optional[str]:
     if isinstance(run_params, dict):
         return run_params.get("type")
     return getattr(run_params, "type", None)
+
+
+_RUNTIME_MODES = {"BACKTEST", "SHADOW", "LIVE"}
+_BACKTEST_RUN_TYPES = {"simple_backtest", "full_backtest"}
+_PROFILE_REQUIRED_FIELDS = {"strategy_id", "host", "token"}
+_PROFILE_OPTIONAL_FIELDS = {
+    "port",
+    "account_key",
+    "sub_account_id",
+    "tls_cert",
+    "retries",
+    "retry_interval",
+    "rpc_timeout",
+    "place_order_timeout_margin",
+    "default_wait_timeout",
+    "debug",
+}
+_PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
+_SHADOW_MUTATION_NAMES = {
+    "order",
+    "order_value",
+    "order_percent",
+    "order_target",
+    "order_target_value",
+    "order_target_percent",
+    "cancel_order",
+}
+
+
+def _normalise_runtime_mode(mode: Any) -> str:
+    value = str(mode or "").strip().upper()
+    if value not in _RUNTIME_MODES:
+        raise RuntimeError("运行模式必须是 BACKTEST、SHADOW 或 LIVE")
+    return value
+
+
+def _normalise_run_type(context: Any) -> str:
+    return str(_run_type_from_context(context) or "").strip().lower()
+
+
+def _validate_runtime_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("{} 必须是非空字符串".format(field))
+    normalised = value.strip()
+    if not normalised or normalised != value or len(normalised) > 128:
+        raise RuntimeError("{} 必须是非空、无首尾空白且不超过128字符的字符串".format(field))
+    if not all(char.isalnum() or char in "._-" for char in normalised):
+        raise RuntimeError("{} 只能包含字母、数字、点、下划线和连字符".format(field))
+    return normalised
+
+
+def _validate_profile_module_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("profile_module 必须是Python模块名")
+    module_name = value.strip()
+    if not module_name or module_name != value:
+        raise RuntimeError("profile_module 必须是Python模块名")
+    if not all(part.isidentifier() for part in module_name.split(".")):
+        raise RuntimeError("profile_module 必须是合法的Python模块名")
+    return module_name
+
+
+def _load_runtime_profile(profile_module: str, profile: str) -> Dict[str, Any]:
+    """延迟加载并严格校验聚宽私有运行profile。"""
+
+    try:
+        module = __import__(profile_module, fromlist=["*"])
+    except Exception:
+        # 配置模块自己的异常可能包含密钥，边界错误不拼接原异常。
+        raise RuntimeError(
+            "无法加载运行配置模块 {}；请确认文件已上传且可以导入".format(profile_module)
+        ) from None
+
+    schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
+    if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "运行配置schema版本不匹配: expected={} actual={}".format(
+                PROFILE_SCHEMA_VERSION,
+                schema_version if type(schema_version) is int else "<invalid>",
+            )
+        )
+
+    profiles = getattr(module, "PROFILES", None)
+    if not isinstance(profiles, dict):
+        raise RuntimeError("运行配置模块必须定义字典 PROFILES")
+    if profile not in profiles:
+        raise RuntimeError("运行配置中不存在profile: {}".format(profile))
+    raw = profiles[profile]
+    if not isinstance(raw, dict):
+        raise RuntimeError("profile {} 必须是字典".format(profile))
+
+    unknown = sorted(
+        str(key)
+        for key in raw
+        if not isinstance(key, str) or key not in _PROFILE_ALLOWED_FIELDS
+    )
+    if unknown:
+        raise RuntimeError("profile {} 包含未知字段: {}".format(profile, ", ".join(unknown)))
+    missing = sorted(_PROFILE_REQUIRED_FIELDS - set(raw))
+    if missing:
+        raise RuntimeError("profile {} 缺少必填字段: {}".format(profile, ", ".join(missing)))
+
+    configured_strategy_id = _validate_runtime_identifier(raw.get("strategy_id"), "profile.strategy_id")
+    host = raw.get("host")
+    if not isinstance(host, str) or not host or host != host.strip() or any(ch.isspace() for ch in host):
+        raise RuntimeError("profile.host 必须是非空且不含空白的字符串")
+    if len(host) > 255:
+        raise RuntimeError("profile.host 长度不能超过255字符")
+    token = raw.get("token")
+    if not isinstance(token, str) or not token or token != token.strip():
+        raise RuntimeError("profile.token 必须是非空且无首尾空白的字符串")
+
+    port = raw.get("port", 58620)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError("profile.port 必须是1到65535之间的整数")
+
+    retries = raw.get("retries", 2)
+    if type(retries) is not int or retries < 0:
+        raise RuntimeError("profile.retries 必须是非负整数")
+
+    numeric_rules = {
+        "retry_interval": (0.5, True),
+        "rpc_timeout": (DEFAULT_RPC_TIMEOUT_SECONDS, False),
+        "place_order_timeout_margin": (DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS, True),
+        "default_wait_timeout": (DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS, True),
+    }
+    numeric_values: Dict[str, float] = {}
+    for field, (default, allow_zero) in numeric_rules.items():
+        value = raw.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise RuntimeError("profile.{} 必须是有限数值".format(field))
+        if value < 0 or (not allow_zero and value == 0):
+            qualifier = "非负" if allow_zero else "正"
+            raise RuntimeError("profile.{} 必须是{}数值".format(field, qualifier))
+        numeric_values[field] = float(value)
+
+    debug = raw.get("debug", True)
+    if type(debug) is not bool:
+        raise RuntimeError("profile.debug 必须是布尔值")
+
+    optional_strings: Dict[str, Optional[str]] = {}
+    for field in ("account_key", "sub_account_id", "tls_cert"):
+        value = raw.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not value or value != value.strip()
+        ):
+            raise RuntimeError("profile.{} 必须是非空且无首尾空白的字符串或None".format(field))
+        optional_strings[field] = value
+
+    return {
+        "strategy_id": configured_strategy_id,
+        "host": host,
+        "token": token,
+        "port": port,
+        "account_key": optional_strings["account_key"],
+        "sub_account_id": optional_strings["sub_account_id"],
+        "tls_cert": optional_strings["tls_cert"],
+        "retries": retries,
+        "retry_interval": numeric_values["retry_interval"],
+        "rpc_timeout": numeric_values["rpc_timeout"],
+        "place_order_timeout_margin": numeric_values["place_order_timeout_margin"],
+        "default_wait_timeout": numeric_values["default_wait_timeout"],
+        "debug": debug,
+    }
+
+
+def _is_shadow_mutation_name(name: str) -> bool:
+    return (
+        name in _SHADOW_MUTATION_NAMES
+        or name.startswith("order_")
+        or name == "cancel"
+        or name.startswith("cancel_")
+        or name in {"place_order", "submit_order"}
+    )
+
+
+def _shadow_mutation_guard(name: str) -> Callable[..., Any]:
+    def blocked(*args, **kwargs):
+        raise RuntimeError("SHADOW模式禁止交易变更: {}".format(name))
+
+    blocked.__name__ = "shadow_blocked_{}".format(name)
+    return blocked
+
+
+class _ShadowReadOnlyBrokerProxy:
+    """阻断helper直调下单，避免绕过聚宽namespace的SHADOW保护。"""
+
+    def __init__(self, broker: Any):
+        self._broker = broker
+
+    def __getattr__(self, name: str) -> Any:
+        if _is_shadow_mutation_name(name):
+            return _shadow_mutation_guard(name)
+        return getattr(self._broker, name)
+
+
+def _install_shadow_guards(namespace: Dict[str, Any]) -> Tuple[str, ...]:
+    names = set(_SHADOW_MUTATION_NAMES)
+    names.update(
+        name
+        for name, value in namespace.items()
+        if isinstance(name, str) and callable(value) and _is_shadow_mutation_name(name)
+    )
+    for name in names:
+        namespace[name] = _shadow_mutation_guard(name)
+    return tuple(sorted(names))
+
+
+def install_strategy_runtime(
+    namespace: Dict[str, Any],
+    *,
+    context: Any,
+    profile: str,
+    mode: str,
+    strategy_id: str,
+    expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
+    profile_module: str = "jq_runtime_config",
+) -> Dict[str, Any]:
+    """安装版本化的聚宽策略运行入口。
+
+    BACKTEST完全保持聚宽原生行为；SHADOW只初始化远程只读客户端并阻断
+    下单/撤单；LIVE暂时复用v0.9.2兼容层，仍不是StrategyLedger生产实现。
+    """
+
+    if not isinstance(namespace, dict):
+        raise RuntimeError("namespace 必须是策略globals()字典")
+    normalised_mode = _normalise_runtime_mode(mode)
+    run_type = _normalise_run_type(context)
+    normalised_strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
+    if type(expected_api_version) is not int or expected_api_version != STRATEGY_RUNTIME_API_VERSION:
+        raise RuntimeError(
+            "策略运行时API版本不匹配: expected={} actual={}".format(
+                expected_api_version,
+                STRATEGY_RUNTIME_API_VERSION,
+            )
+        )
+
+    if normalised_mode == "BACKTEST":
+        if run_type not in _BACKTEST_RUN_TYPES:
+            raise RuntimeError(
+                "BACKTEST模式仅允许聚宽回测，当前run_type={}".format(run_type or "<empty>")
+            )
+    elif run_type != "sim_trade":
+        raise RuntimeError(
+            "{}模式仅允许聚宽模拟盘运行，当前run_type={}".format(
+                normalised_mode,
+                run_type or "<empty>",
+            )
+        )
+
+    install_signature = (
+        normalised_mode,
+        run_type,
+        normalised_strategy_id,
+        str(profile),
+        str(profile_module),
+        expected_api_version,
+        id(context),
+    )
+    existing = namespace.get(_STRATEGY_RUNTIME_STATE_KEY)
+    if existing is not None:
+        if (
+            not isinstance(existing, dict)
+            or existing.get("signature") != install_signature
+            or not isinstance(existing.get("state"), dict)
+        ):
+            raise RuntimeError("策略运行时已经使用不同配置安装，拒绝重复覆盖")
+        return dict(existing["state"])
+
+    # 关键安全边界：回测在导入profile、configure和任何远端安装之前返回。
+    if normalised_mode == "BACKTEST":
+        state = {
+            "api_version": STRATEGY_RUNTIME_API_VERSION,
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
+            "profile": str(profile),
+            "mode": normalised_mode,
+            "run_type": run_type,
+            "strategy_id": normalised_strategy_id,
+            "enabled": False,
+            "orders_enabled": True,
+            "production_ready": False,
+            "reason": "backtest",
+        }
+        namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
+        return dict(state)
+
+    normalised_profile = _validate_runtime_identifier(profile, "profile")
+    normalised_profile_module = _validate_profile_module_name(profile_module)
+    config = _load_runtime_profile(normalised_profile_module, normalised_profile)
+    if config["strategy_id"] != normalised_strategy_id:
+        raise RuntimeError("profile.strategy_id 与策略声明的 strategy_id 不一致")
+
+    connection = {
+        key: config[key]
+        for key in (
+            "host",
+            "token",
+            "port",
+            "account_key",
+            "sub_account_id",
+            "tls_cert",
+            "retries",
+            "retry_interval",
+            "rpc_timeout",
+            "place_order_timeout_margin",
+            "default_wait_timeout",
+            "debug",
+        )
+    }
+
+    if normalised_mode == "SHADOW":
+        # S01 的 SHADOW 是严格的本地只读门禁：不 configure、不建socket，
+        # 也不调用会替换portfolio的 install_jq_compat。远端原子快照在S15接入。
+        global _BROKER_CLIENT
+        if _BROKER_CLIENT is not None and not isinstance(_BROKER_CLIENT, _ShadowReadOnlyBrokerProxy):
+            _BROKER_CLIENT = _ShadowReadOnlyBrokerProxy(_BROKER_CLIENT)
+        blocked_names = _install_shadow_guards(namespace)
+        state = {
+            "api_version": STRATEGY_RUNTIME_API_VERSION,
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
+            "profile": normalised_profile,
+            "profile_module": normalised_profile_module,
+            "mode": normalised_mode,
+            "run_type": run_type,
+            "strategy_id": normalised_strategy_id,
+            "enabled": True,
+            "orders_enabled": False,
+            "production_ready": False,
+            "reason": "shadow_read_only",
+            "blocked_mutations": blocked_names,
+        }
+    else:
+        try:
+            compat = install_jq_compat(
+                namespace,
+                context=context,
+                mirror_jq_orders=False,
+                **connection,
+            )
+        except Exception:
+            raise RuntimeError(
+                "LIVE兼容层初始化失败；请检查profile和远程服务状态"
+            ) from None
+        if not isinstance(compat, dict) or not compat.get("enabled"):
+            raise RuntimeError("LIVE兼容层未启用，拒绝继续运行")
+        state = {
+            "api_version": STRATEGY_RUNTIME_API_VERSION,
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
+            "profile": normalised_profile,
+            "profile_module": normalised_profile_module,
+            "mode": normalised_mode,
+            "run_type": run_type,
+            "strategy_id": normalised_strategy_id,
+            "enabled": True,
+            "orders_enabled": True,
+            "production_ready": False,
+            "reason": "live_compatibility_only",
+            "mirror_jq_orders": False,
+        }
+
+    namespace[_STRATEGY_RUNTIME_STATE_KEY] = {"signature": install_signature, "state": state}
+    return dict(state)
 
 
 def _restore_jq_compat(namespace: Dict[str, Any]) -> None:
@@ -2239,7 +2611,10 @@ def get_positions() -> List[RemotePosition]:
 
 
 __all__ = [
+    "STRATEGY_RUNTIME_API_VERSION",
+    "PROFILE_SCHEMA_VERSION",
     "configure",
+    "install_strategy_runtime",
     "install_jq_compat",
     "get_data_client",
     "get_broker_client",

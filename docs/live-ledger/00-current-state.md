@@ -39,11 +39,12 @@ bullet-trade/
 │  ├─ reporting/            回测报告
 │  └─ utils/                通用工具
 ├─ helpers/
-│  ├─ bullet_trade_jq_remote_helper.py
+│  ├─ bullet_trade_jq_remote_helper.py  单文件helper及版本化运行入口
 │  └─ jq_remote_strategy_example.py
 ├─ strategies/
 │  └─ joinquant/
-│     └─ good_etf.py        从bt_quant脱敏导入的迁移基线
+│     └─ good_etf.py        脱敏、同源的聚宽策略
+├─ jq_runtime/              私有profile schema、示例和上传说明
 ├─ jqdata.py                本地 `from jqdata import *` 兼容入口
 ├─ tests/                   单元、集成、E2E和策略测试
 ├─ docs/                    项目文档
@@ -61,6 +62,8 @@ bullet-trade/
 - 聚宽负责选股、取数、触发下单和日志展示。
 
 `v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
+
+S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：BACKTEST不读取profile或连接网络；SHADOW严格校验profile但不建远程连接，并阻断策略namespace中的交易变更；LIVE只保留非生产兼容验证路径。`good_etf.py`在StrategyLedger完成前会拒绝LIVE启动。
 
 ### BulletTrade服务器侧
 
@@ -144,40 +147,44 @@ from jqdata import *
 - 折价排序、前N只和折价绝对值权重。
 - 停牌/涨停过滤、多时点风控和日终对账思想。
 
-已知问题：
+S01候选已经处理：
 
-1. 当前增强版用 `available_cash * weight` 作为 `order_target_value` 的最终目标，是直接逻辑错误。最终目标应基于策略虚拟NAV，而不是剩余现金。
-2. 当前同步追单循环可能长时间阻塞聚宽回调。
-3. 目标差额按整个物理账户计算，无法隔离人工/其他策略持仓。
-4. 订单超时查重仍依赖模糊匹配，不能提供持久幂等。
-5. `cancel_all_open_orders()` 在缺少策略标签时可能回退撤全部，实盘不可接受。
-6. 09:30调仓和09:30风控可能对同一标的产生冲突。
-7. 昨日单位净值与今日开盘价不是严格同时间折价。
-8. 1万元、3只ETF受到100份整手和最低佣金显著影响。
-9. 数据故障与“有效但无候选”尚未严格区分。
-10. 文件仍是迁移基线，已关闭真实信号并清空连接凭据，禁止直接用于真实资金。
+- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、`MODE`、`STRATEGY_ID`。
+- 移除旧定制helper的同步追单、账户查询、全账户撤单和通知调用。
+- 过渡期组合目标改为`context.portfolio.total_value × DEPLOY_RATIO × normalized_weight`，不再用可用现金直接计算最终目标。
+- 尾盘仅记录聚宽组合快照，不再把旧helper返回的整个物理账户误报为策略级对账。
+
+仍然存在的问题：
+
+1. 过渡目标仍使用聚宽组合总资产；实盘必须改用StrategyLedger的策略虚拟NAV、working exposure和费用缓冲。
+2. 生产级异步执行、卖后买和部分成交恢复尚未实现；不能把S01兼容路径用于真实资金。
+3. 策略级资金/持仓归属、持久幂等和券商硬对账尚未实现。
+4. 09:30调仓和09:30风控可能对同一标的产生冲突。
+5. 昨日单位净值与今日开盘价不是严格同时间折价。
+6. 1万元、3只ETF受到100份整手和最低佣金显著影响。
+7. 数据故障与“有效但无候选”尚未严格区分。
 
 ### 6.1 与 v0.9.2 helper 的已知API差异
 
-迁移策略来自 `bt_quant@e6462dd` 的定制helper调用，当前不能直接搭配上游 `v0.9.2` helper运行。S01必须先消除以下差异，未完成前策略初始化会失败：
+迁移策略来自 `bt_quant@e6462dd` 的定制helper调用。下表保留迁移差异及S01候选的处理结果：
 
 | 迁移策略调用 | v0.9.2状态 | 处理决策 |
 |---|---|---|
-| `configure(jq_order=..., jq_order_value=..., jq_order_target=..., jq_order_target_value=...)` | 4个参数均不受支持 | 改用 `install_jq_compat(...)` 接管聚宽同名函数，后续主调仓改为runtime组合意图 |
-| `configure(send_signals=...)` | 不支持该参数 | 由明确的BACKTEST/SHADOW/LIVE模式控制 |
-| `configure(feishu_webhook_url=...)` | 不支持该参数 | 通知移到服务器，不在策略内持有Webhook |
-| `configure(strategy_name=...)` | 不支持该参数 | S01使用稳定`STRATEGY_ID`作本地契约；S14由strategy-scoped API正式承载 |
-| `bt.notify(...)` | 上游helper无此函数 | 改为服务器状态事件/通知接口 |
-| `bt.cancel_all_open_orders()` | 上游helper无此扩展 | 后续仅允许按strategy intent取消，禁止账户级回退 |
-| `bt.order_target_sync(...)` | 上游helper无此扩展 | 由组合执行状态机异步完成 |
-| `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 改为一次提交TargetPortfolioIntent |
+| `configure(jq_order=..., jq_order_value=..., jq_order_target=..., jq_order_target_value=...)` | 4个参数均不受支持 | 已移除；统一调用版本化runtime入口 |
+| `configure(send_signals=...)` | 不支持该参数 | 已移除；由BACKTEST/SHADOW/LIVE模式控制 |
+| `configure(feishu_webhook_url=...)` | 不支持该参数 | 已移除；通知后续移到服务器事件 |
+| `configure(strategy_name=...)` | 不支持该参数 | 已改为稳定`STRATEGY_ID`；S14由strategy-scoped API承载 |
+| `bt.notify(...)` | 上游helper无此函数 | 已移除；S01只写聚宽日志 |
+| `bt.cancel_all_open_orders()` | 上游helper无此扩展 | 已移除；回测仅撤聚宽可见挂单，生产后续按strategy intent撤单 |
+| `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
+| `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-S01的入口不是“策略已经可运行”，而是“保留一份脱敏、可追踪、明确不可运行的迁移基线”。S01完成后才允许把导出smoke作为可运行证据。
+S01候选只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。S03导出smoke、S15 StrategyLedger runtime和S18至S20真实门禁均不可省略。
 
 ## 7. 安全现状
 
 - 原策略曾硬编码远程token、服务器地址和飞书Webhook；这些值应视为已经暴露，必须在外部系统轮换。
-- 新仓库导入版本已移除这些值，并默认 `SEND_SIGNALS=False`。
+- 新仓库策略已移除这些值；默认`MODE='BACKTEST'`，且S01的LIVE明确失败关闭。
 - 官方公共仓库已配置为只读 `upstream` 并禁用push；在用户提供私有fork URL后再添加可写 `origin`。
 - 生产配置不得提交到Git，日志不得打印token、Webhook或完整账户信息。
 

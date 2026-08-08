@@ -15,20 +15,21 @@
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
 
 from jqdata import *
-import bullet_trade_jq_remote_helper as bt
 
-# ===== 配置区域 =====
-DEBUG = False
-SEND_SIGNALS = False
-FEISHU_WEBHOOK_URL = ''
+try:
+    import bullet_trade_jq_remote_helper as bt
+except ImportError as exc:
+    bt = None
+    _bt_import_error_message = str(exc)
+else:
+    _bt_import_error_message = None
 
-BT_REMOTE_HOST = "127.0.0.1"
-BT_REMOTE_PORT = 58620
-BT_REMOTE_TOKEN = ""
-ACCOUNT_KEY = None  # 可选
-SUB_ACCOUNT = None  # 可选
-STRATEGY_NAME = 'good_etf'  # 策略标识：随订单上报，用于按策略隔离撤单/对账
-BT_TLS_CERT = None  # 可选：TLS 证书文件路径（上传到聚宽研究环境后填文件名，如 'server.crt'）
+# ===== 部署契约 =====
+# 安全默认值为BACKTEST。SHADOW/LIVE需要上传独立的helper和私有jq_runtime_config.py。
+PROFILE = 'good_etf-prod'
+MODE = 'BACKTEST'
+STRATEGY_ID = 'good_etf'
+_EXPECTED_RUNTIME_API_VERSION = 1
 
 # ===== 策略参数 =====
 MAX_HOLD_NUM = 3           # 最大持仓只数：选折价最深的前 N 只
@@ -36,40 +37,107 @@ MIN_MONEY = 5e6            # 流动性下限：前一日成交额 > 500 万
 MAX_MONEY = 2e7            # 流动性上限：前一日成交额 < 2000 万
 STOP_LOSS_RATIO = 0.95     # 止损线：现价跌破成本价 95%
 TAKE_PROFIT_RATIO = 1.10   # 止盈线：现价涨超成本价 110%
+DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、费用和价格波动
 # 港股类 ETF 过滤关键词（名称包含任一关键词即剔除）
 HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '港股通', '恒生互联网']
 
 # ===== 执行参数 =====
 BUY_PRICE_FLOAT_PCT = 0.002   # 限价买入浮动比例：限价 = 最新价 × (1 + 0.2%)，上浮提高成交率
-CHASE_MAX_ROUNDS = 3          # 未成交部分最大追单轮数（每轮撤单后重挂）
-CHASE_ROUND_TIMEOUT = 8       # 每轮等待成交秒数
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 
 
-def _ensure_configured():
-    if not BT_REMOTE_TOKEN:
+def _run_type(context):
+    run_params = getattr(context, 'run_params', None)
+    return str(getattr(run_params, 'type', '') or '').strip().lower()
+
+
+def _install_runtime(context):
+    """安装运行模式；此异常不得被策略业务层吞掉。"""
+    mode = str(MODE or '').strip().upper()
+    run_type = _run_type(context)
+    if mode == 'BACKTEST':
+        if run_type not in ('simple_backtest', 'full_backtest'):
+            raise RuntimeError(
+                'good_etf运行模式不匹配: MODE=BACKTEST 仅允许聚宽回测，当前run_type={}'.format(
+                    run_type or '<empty>'))
+        state = {
+            'mode': mode,
+            'run_type': run_type,
+            'strategy_id': STRATEGY_ID,
+            'enabled': False,
+            'orders_enabled': True,
+            'production_ready': False,
+            'reason': 'backtest',
+        }
+        g.bt_runtime = state
+        return state
+
+    if mode not in ('SHADOW', 'LIVE'):
+        raise RuntimeError('good_etf MODE必须是BACKTEST、SHADOW或LIVE')
+    if bt is None:
         raise RuntimeError(
-            "请先在 BT_REMOTE_HOST/BT_REMOTE_PORT/BT_REMOTE_TOKEN/ACCOUNT_KEY/SUB_ACCOUNT 填写远程服务器配置")
-    bt.configure(
-        host=BT_REMOTE_HOST,
-        port=BT_REMOTE_PORT,
-        token=BT_REMOTE_TOKEN,
-        account_key=ACCOUNT_KEY,
-        sub_account_id=SUB_ACCOUNT,
-        jq_order=order,
-        jq_order_value=order_value,
-        jq_order_target=order_target,
-        jq_order_target_value=order_target_value,
-        debug=DEBUG,
-        send_signals=SEND_SIGNALS,
-        feishu_webhook_url=FEISHU_WEBHOOK_URL,
-        strategy_name=STRATEGY_NAME,
-        tls_cert=BT_TLS_CERT
+            '当前模式需要bullet_trade_jq_remote_helper.py，请先上传到聚宽研究根目录；导入错误={}'.format(
+                _bt_import_error_message or '<unknown>'))
+    actual_api_version = getattr(bt, 'STRATEGY_RUNTIME_API_VERSION', None)
+    if type(actual_api_version) is not int or actual_api_version != _EXPECTED_RUNTIME_API_VERSION:
+        raise RuntimeError(
+            '聚宽helper运行时API版本不匹配: expected={} actual={}'.format(
+                _EXPECTED_RUNTIME_API_VERSION, actual_api_version))
+    state = bt.install_strategy_runtime(
+        globals(),
+        context=context,
+        profile=PROFILE,
+        mode=mode,
+        strategy_id=STRATEGY_ID,
+        expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
     )
-    # 让券商端可用数据补价
-    bt.get_broker_client().bind_data_client(bt.get_data_client())
-    log.info(f'远程配置完成 | host={BT_REMOTE_HOST} port={BT_REMOTE_PORT} | '
-             f'SEND_SIGNALS={SEND_SIGNALS} DEBUG={DEBUG}')
+    if not isinstance(state, dict):
+        raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
+    if mode == 'LIVE' and not state.get('production_ready', False):
+        raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
+    g.bt_runtime = state
+    return state
+
+
+def _runtime_mode():
+    state = getattr(g, 'bt_runtime', None)
+    if isinstance(state, dict):
+        return state.get('mode', str(MODE).upper())
+    return str(MODE).upper()
+
+
+def _notify(message):
+    # S01不在聚宽策略中保存Webhook；后续由服务器状态事件统一通知。
+    log.info('[策略通知] {}'.format(message))
+
+
+def _cancel_open_orders_for_runtime():
+    if _runtime_mode() == 'SHADOW':
+        log.info('SHADOW计划 | 跳过撤单')
+        return 0
+    open_orders = get_open_orders() or {}
+    cancelled = 0
+    for order_obj in list(open_orders.values()):
+        cancel_order(order_obj)
+        cancelled += 1
+    return cancelled
+
+
+def _submit_target_amount(security, target_amount):
+    if _runtime_mode() == 'SHADOW':
+        log.info('SHADOW目标数量 | {} -> {}'.format(security, target_amount))
+        return None
+    return order_target(security, target_amount)
+
+
+def _submit_target_value(security, target_value, last_price=None):
+    if _runtime_mode() == 'SHADOW':
+        log.info('SHADOW目标市值 | {} -> {:.2f}'.format(security, target_value))
+        return None
+    style = None
+    if last_price is not None and last_price > 0 and BUY_PRICE_FLOAT_PCT > 0:
+        style = LimitOrderStyle(last_price * (1 + BUY_PRICE_FLOAT_PCT))
+    return order_target_value(security, target_value, style=style)
 
 
 def initialize(context):
@@ -92,8 +160,8 @@ def initialize(context):
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
 
-    # 首次启动即完成远程配置（process_initialize 在重启时会再次调用，configure 是幂等的）
-    _ensure_configured()
+    # 运行模式安装失败必须阻断初始化，不能被业务层的宽泛异常捕获。
+    _install_runtime(context)
 
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
@@ -110,17 +178,17 @@ def initialize(context):
     run_daily(handle_risk_management, time='13:30', reference_security='000300.XSHG')
     # 14:50 尾盘风控检查
     run_daily(handle_risk_management, time='14:50', reference_security='000300.XSHG')
-    # 14:55 尾盘对账（模拟持仓 vs 券商持仓，仅报告）
+    # 14:55 尾盘快照（S01仅记录聚宽组合；真实对账由后续StrategyLedger切片实现）
     run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
-    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 09:30/10:30/13:30/14:50 | 14:55 尾盘对账')
+    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 09:30/10:30/13:30/14:50 | 14:55 尾盘快照')
 
 
 def process_initialize(context):
     """
-    聚宽重启/代码刷新时调用，此处完成所有初始化与任务注册。
+    聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
-    _ensure_configured()
+    _install_runtime(context)
 
 
 def before_market_open(context):
@@ -246,14 +314,14 @@ def market_open(context):
             log.info(f'候选明细 | {code} 折价率={row["premium"]:.2f}% '
                      f'最新价={row["last_price"]:.3f} 净值={row["unit_net_value"]:.4f}')
         if order_fund_codes:
-            bt.notify(f'选中折价ETF {len(order_fund_codes)} 只: {order_fund_codes}')
+            _notify(f'选中折价ETF {len(order_fund_codes)} 只: {order_fund_codes}')
 
-        # 撤销昨日遗留未成交挂单，避免干扰今日追单
-        cancelled = bt.cancel_all_open_orders()
+        # 撤销昨日遗留未成交挂单，避免干扰今日目标委托。
+        cancelled = _cancel_open_orders_for_runtime()
         if cancelled:
             log.info(f'已撤销 {cancelled} 笔遗留挂单')
 
-        # 第一步：卖出不在选定列表中的持仓（调仓，市价追单直到清仓）
+        # 第一步：对不在选定列表中的持仓提交清仓目标。
         # 注意：迭代持仓列表副本，避免下单过程中持仓变化影响遍历
         hold_codes = list(context.portfolio.positions.keys())
         log.info(f'当前持仓 {len(hold_codes)} 只: {hold_codes}')
@@ -261,43 +329,36 @@ def market_open(context):
             if hold_code not in order_fund_codes:
                 pos = context.portfolio.positions[hold_code]
                 log.info(f'调仓卖出 | {hold_code} 数量={pos.total_amount} 成本={pos.avg_cost:.4f}')
-                result = bt.order_target_sync(hold_code, 0, max_rounds=CHASE_MAX_ROUNDS,
-                                              round_timeout=CHASE_ROUND_TIMEOUT)
-                if result:
-                    msg = (f'卖出结果 | {hold_code} 成交={result["filled_amount"]} '
-                           f'剩余={result["remaining"]} 轮数={result["rounds"]} 完成={result["done"]}')
-                    log.info(msg)
-                    bt.notify(msg)
+                order_result = _submit_target_amount(hold_code, 0)
+                log.info('清仓目标已提交 | {} order_id={}'.format(
+                    hold_code, getattr(order_result, 'order_id', None)))
 
-        # 第二步：按折价率绝对值权重分配资金下单
+        # 第二步：按折价率绝对值权重分配“组合目标市值”。
+        # 目标金额必须基于组合总资产，而不是可用现金；否则已有持仓会被重复缩小，
+        # 且卖单尚未成交时可用现金也不能代表本轮可部署资金。
         if not selected_funds.empty:
             # 计算权重（折价率绝对值占比）
             weights = selected_funds['premium'].abs().tolist()
             total_weight = sum(weights) if sum(weights) != 0 else 1e-9  # 防除零
 
-            # 可用资金（全部用于买入；卖出已同步完成，此处口径准确）
-            available_cash = context.portfolio.available_cash
-            log.info(f'可用资金: {available_cash:.2f}')
+            total_value = context.portfolio.total_value
+            investable_value = total_value * DEPLOY_RATIO
+            log.info(f'组合总资产={total_value:.2f} 目标部署={investable_value:.2f} '
+                     f'现金缓冲={total_value - investable_value:.2f}')
 
-            # 按权重下单（限价追单：每轮按最新价×(1+浮动比例) 重新定价）
+            # 按权重提交目标市值；实际成交与资金入账由后续StrategyLedger切片接管。
             for code, weight in zip(order_fund_codes, weights):
-                target_value = available_cash * (weight / total_weight)
+                normalized_weight = weight / total_weight
+                target_value = investable_value * normalized_weight
                 log.info(f'调仓买入 | {code} 权重={weight / total_weight:.1%} 目标市值={target_value:.2f}')
-                result = bt.order_target_value_sync(
-                    code, target_value,
-                    price_float_pct=BUY_PRICE_FLOAT_PCT,
-                    max_rounds=CHASE_MAX_ROUNDS,
-                    round_timeout=CHASE_ROUND_TIMEOUT)
-                if result:
-                    msg = (f'买入结果 | {code} 目标={result["target_amount"]} '
-                           f'成交={result["filled_amount"]} 剩余={result["remaining"]} '
-                           f'轮数={result["rounds"]} 完成={result["done"]}')
-                    log.info(msg)
-                    bt.notify(msg)
+                order_result = _submit_target_value(
+                    code, target_value, selected_funds.loc[code, 'last_price'])
+                log.info('目标市值已提交 | {} order_id={}'.format(
+                    code, getattr(order_result, 'order_id', None)))
             log.info('===== 开盘选股下单完成 =====')
         else:
             log.warn('无折价ETF可选，已执行全部卖出，今日不再买入')
-            bt.notify('无折价ETF可选，已执行全部卖出，今日不再买入')
+            _notify('无折价ETF可选，已提交全部卖出目标，今日不再买入')
 
     except Exception as e:
         log.error(f"开盘下单异常：{e}")
@@ -325,56 +386,40 @@ def handle_risk_management(context):
                 msg = (f"止损触发 | 标的：{hold_code} | 成本价：{cost_basis:.4f} | "
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
-                bt.notify(msg)
-                result = bt.order_target_sync(hold_code, 0, max_rounds=CHASE_MAX_ROUNDS,
-                                              round_timeout=CHASE_ROUND_TIMEOUT)
-                if result:
-                    log.info(f'止损卖出结果 | {hold_code} 成交={result["filled_amount"]} '
-                             f'剩余={result["remaining"]} 完成={result["done"]}')
+                _notify(msg)
+                order_result = _submit_target_amount(hold_code, 0)
+                log.info('止损清仓目标已提交 | {} order_id={}'.format(
+                    hold_code, getattr(order_result, 'order_id', None)))
 
             # 止盈逻辑：涨超成本价110%（10%止盈）
             elif current_price > cost_basis * TAKE_PROFIT_RATIO:
                 msg = (f"止盈触发 | 标的：{hold_code} | 成本价：{cost_basis:.4f} | "
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
-                bt.notify(msg)
-                result = bt.order_target_sync(hold_code, 0, max_rounds=CHASE_MAX_ROUNDS,
-                                              round_timeout=CHASE_ROUND_TIMEOUT)
-                if result:
-                    log.info(f'止盈卖出结果 | {hold_code} 成交={result["filled_amount"]} '
-                             f'剩余={result["remaining"]} 完成={result["done"]}')
+                _notify(msg)
+                order_result = _submit_target_amount(hold_code, 0)
+                log.info('止盈清仓目标已提交 | {} order_id={}'.format(
+                    hold_code, getattr(order_result, 'order_id', None)))
 
     except Exception as e:
         log.error(f"风控执行异常：{e}")
 
 
 def after_market_check(context):
-    """尾盘对账：对比聚宽模拟持仓与券商实际持仓（仅报告，不自动纠偏）"""
-    log.info('===== 尾盘对账开始 =====')
-    try:
-        remote_positions = bt.get_positions()
-        remote_map = {p.security: p for p in remote_positions}
-        sim_map = dict(context.portfolio.positions)
-
-        diff_msgs = []
-        all_codes = list(set(sim_map.keys()) | set(remote_map.keys()))
-        for code in all_codes:
-            sim_amt = sim_map[code].total_amount if code in sim_map else 0
-            rem_amt = remote_map[code].amount if code in remote_map else 0
-            log.info(f'对账 | {code} 模拟={sim_amt} 实盘={rem_amt}')
-            if sim_amt != rem_amt:
-                diff_msgs.append(f'{code} 模拟={sim_amt} 实盘={rem_amt}')
-
-        acct = bt.get_account()
-        log.info(f'对账资金 | 模拟可用={context.portfolio.available_cash:.2f} '
-                 f'实盘可用={acct.available_cash:.2f} 实盘总资产={acct.total_value:.2f}')
-
-        if diff_msgs:
-            msg = '尾盘对账发现持仓差异:\n' + '\n'.join(diff_msgs)
-            log.warn(msg)
-            bt.notify(msg)
-        else:
-            log.info('尾盘对账一致，无持仓差异')
-    except Exception as e:
-        # 回测环境无券商连接时会抛异常，跳过即可
-        log.warn(f'尾盘对账跳过（可能为回测环境）: {e}')
+    """记录聚宽侧组合快照；真实券商对账将在StrategyLedger切片中实现。"""
+    positions = context.portfolio.positions
+    log.info('===== 尾盘聚宽组合快照 =====')
+    log.info('组合资金 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}'.format(
+        context.portfolio.available_cash,
+        context.portfolio.total_value,
+        context.portfolio.positions_value))
+    for code in sorted(positions.keys()):
+        position = positions[code]
+        log.info('组合持仓 | {} 数量={} 可卖={} 成本={:.4f} 现价={:.4f}'.format(
+            code,
+            position.total_amount,
+            getattr(position, 'closeable_amount', 0),
+            position.avg_cost,
+            position.price))
+    if _runtime_mode() in ('SHADOW', 'LIVE'):
+        log.warn('S01尚无StrategyLedger真实成交账本；本快照不能视为券商实盘对账结果')

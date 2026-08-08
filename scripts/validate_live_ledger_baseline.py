@@ -56,15 +56,24 @@ def _iter_files(paths: Iterable[Path], suffixes: Sequence[str]) -> Iterable[Path
 
 
 def check_python_syntax() -> None:
-    strategy = ROOT / "strategies" / "joinquant" / "good_etf.py"
-    compile(strategy.read_text(encoding="utf-8"), str(strategy), "exec")
+    paths = [
+        ROOT / "strategies" / "joinquant" / "good_etf.py",
+        ROOT / "helpers" / "bullet_trade_jq_remote_helper.py",
+        ROOT / "jq_runtime" / "jq_runtime_config.example.py",
+    ]
+    for path in paths:
+        compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
 def check_markdown_links() -> None:
     docs_root = ROOT / "docs" / "live-ledger"
     pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
     missing: List[str] = []
-    for doc in docs_root.glob("*.md"):
+    markdown_files = list(docs_root.glob("*.md")) + [
+        ROOT / "strategies" / "joinquant" / "README.md",
+        ROOT / "jq_runtime" / "README.md",
+    ]
+    for doc in markdown_files:
         for target in pattern.findall(doc.read_text(encoding="utf-8")):
             if target.startswith(("http://", "https://", "#")):
                 continue
@@ -94,7 +103,11 @@ def check_current_tree_secrets() -> None:
     risky_urls = re.compile(r"https?://[^\s'\"]+(?:hook|webhook)[^\s'\"]{12,}", re.I)
     ipv4 = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
     findings: List[str] = []
-    scan_roots = [ROOT / "strategies" / "joinquant", ROOT / "docs" / "live-ledger"]
+    scan_roots = [
+        ROOT / "strategies" / "joinquant",
+        ROOT / "docs" / "live-ledger",
+        ROOT / "jq_runtime" / "jq_runtime_config.example.py",
+    ]
     for path in _iter_files(scan_roots, (".py", ".md")):
         text = path.read_text(encoding="utf-8")
         if risky_urls.search(text):
