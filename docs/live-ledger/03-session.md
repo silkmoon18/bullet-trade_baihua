@@ -40,18 +40,18 @@
 
 ## 当前slice
 
-`S00 Repository Baseline and Documentation`
+`S01 JoinQuant Source and Profile Contract`
 
-出口条件：
+当前目标：
 
-- 文档覆盖现状、计划、决策、session和全部slices。
-- 迁移来源和安全边界可追踪。
-- `.idea/`、缓存、日志和runtime状态不会进入新提交。
-- 文档链接有效，Git diff经过审查。
+- 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
+- BACKTEST不读取profile、不连接网络；SHADOW禁止mutation；LIVE明确为非生产兼容路径。
+- 移除迁移策略对旧定制helper API的调用。
+- 缺helper、旧helper版本、缺profile和无效配置fail-fast且不泄露token。
 
 ## 下一步
 
-完成S00最终SHA复审后进入S01：策略源码、导入和profile契约。类型桩与导出工具分别在后续独立slice完成。
+完成S01实现、测试、独立审查和最终复审后进入S02类型桩与IDE支持。
 
 ## 恢复检查表
 

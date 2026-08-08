@@ -38,8 +38,8 @@
 
 | Slice | 名称 | 状态 | 依赖/结果 |
 |---|---|---|---|
-| S00 | Repository Baseline and Documentation | REVIEW | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
-| S01 | JoinQuant Source and Profile Contract | PENDING | 同源策略、模式/profile、helper API兼容、fail-fast |
+| S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
+| S01 | JoinQuant Source and Profile Contract | IN_PROGRESS | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | PENDING | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | PENDING | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
@@ -99,10 +99,10 @@ Retest:
   - git show --check --oneline --stat 7085155 -> PASS
   - python scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
 Final code candidate SHA: 7085155
-Final reviewer: pending
-Final review result: pending
+Final reviewer: /root/review_s00_final
+Final review result: APPROVE；可达历史、validator、diff/show check、helper差异和元数据一致性通过
 Residual risks/external blockers: 用户私有origin URL未提供，当前仓库local-only；外部token/Webhook尚待用户轮换
-Decision: REVIEW
+Decision: DONE
 ```
 
 ## S01：JoinQuant Source and Profile Contract
