@@ -29,6 +29,16 @@ nav:
   - QMT 服务配置: qmt-server.md
   - 大 QMT 服务向导: big-qmt-server.md
   - API 文档: api.md
+  - 聚宽实盘策略账本（开发中）:
+      - 当前状态与使用指南: live-ledger/07-status-and-usage.md
+      - 改造文档索引: live-ledger/README.md
+      - 当前架构、依赖与状态: live-ledger/00-current-state.md
+      - 完整修改计划: live-ledger/01-modification-plan.md
+      - 架构与工程决策: live-ledger/02-decisions.md
+      - 当前 Session: live-ledger/03-session.md
+      - 实施 Slices: live-ledger/04-slices.md
+      - 聚宽本地开发: live-ledger/05-joinquant-development.md
+      - 聚宽校验与导出: live-ledger/06-joinquant-export.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md

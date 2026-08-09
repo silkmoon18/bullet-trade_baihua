@@ -50,6 +50,7 @@
 - [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
 - [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare、RQData/easy_tdx Beta 以及自定义 Provider 配置。
 - [API 文档](docs/api.md)：策略可用 API、类模型与工具函数。
+- [聚宽实盘策略账本改造（开发中）](docs/live-ledger/07-status-and-usage.md)：本分支的完成度、当前用法、`good_etf`差异和实盘放行条件；当前明确禁止真实资金。
 - [邀请贡献](docs/contributing.md): 贡献与联系方式。 
 
 ## 🔗 链接
