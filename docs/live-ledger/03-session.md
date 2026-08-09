@@ -51,33 +51,34 @@
 - 第6轮正式冻结三路均因同一MINOR文档漂移REWORK：`00-current-state.md`正文仍称处于第5轮，与第6轮PENDING记录矛盾；代码与并发路径没有新finding。该句现改为不随轮次失效的S01 IN_PROGRESS/两阶段复审未完成表述，第7轮冻结待执行。
 - 第7轮预提交冻结的契约、并发/对抗、部署/文档三路均APPROVE；候选提交`a94aa12060c5e8cef479224952e302eeac99f37d`随后再次通过三路精确SHA终审，均无BLOCKER/MAJOR/MINOR，起止工作树clean。
 - 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。S01状态为DONE。
+- S02实现提交`3b54a4a7178fb36ab9f85de22a648bb08bd0448b`已通过三路预提交及精确SHA终审，起止HEAD一致且工作树clean。目标矩阵320 passed；真实策略与契约probe的strict mypy/pyright、Python 3.8 AST、阻断级flake8、S00 baseline和commit格式均PASS。
+- 最新setup在第三个全新空venv完成`pip>=21.3`引导、editable安装和严格检查；`.pth`只写入目标`purelib`，普通Python可解析`jqdata`和helper。S02状态为DONE。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
 ## 最近完成slice
 
-`S01 JoinQuant Source and Profile Contract`（DONE）
+`S02 JoinQuant Typings and IDE`（DONE）
 
 ## 当前slice
 
-`S02 JoinQuant Typings and IDE`（IN_PROGRESS）
+`S02 JoinQuant Typings and IDE`（DONE，等待本收口记录的精确SHA复审后切换S03）
 
 - 为聚宽兼容入口和独立helper提供并列类型桩，不改变上传文件的运行时导入路径。
 - 以独立严格配置检查类型契约，禁止继承项目级`ignore_missing_imports=true`。
 - 类型桩导出面、关键签名、源码/editable开发内容和Python 3.8语法均纳入自动门禁；普通wheel顶层类型文件布局明确留到S17。
 - 聚宽托管环境的实际Python/pandas/numpy版本仍需在S18用平台探针确认，不以本地猜测代替证据。
 
-当前目标：
+完成结果：
 
-- 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
-- 三个合法模式都在原子登记owner时先建立进程远程门禁；BACKTEST不读取profile、不连接网络、不替换聚宽原生函数，有helper时检查历史远程污染、无helper时允许纯回测兜底；SHADOW/LIVE还会先禁止namespace mutation并清除旧客户端，且不连接服务器或接管portfolio；LIVE的namespace变化仅是本地fail-closed保护。
-- runtime只接受普通字符串mode和真实模块`globals()`字典；支持的正常控制流与跨线程并发不能发布虚假成功契约。raw reload、热补丁、same-thread recursive reload和异步catch-and-resume不是受支持的运行方式，检测到后必须终止进程。
-- 移除迁移策略对旧定制helper API的调用。
-- 缺helper、旧helper版本、缺profile和无效配置fail-fast且不泄露token。
+- `jqdata.pyi`、独立helper `.pyi`和typing-only聚宽模型与源码同仓管理，策略仍可原样复制到聚宽。
+- 导出面、参数名称/种类/必填性和runtime-state字段由自动漂移测试保护；真实策略进入strict mypy/pyright。
+- setup安全创建/复用目标venv，引导PEP 660所需pip，仅向目标purelib写入源码路径；轻量/full和wheel边界有明确文档。
+- 聚宽实际托管版本与行为不在S02猜测，保留到S18以平台探针确认。
 
 ## 下一步
 
-完成S02类型桩、严格检查、fresh-venv/PyCharm说明和独立复审；不得提前进入S03或真实StrategyLedger切片。
+本收口记录提交并通过精确SHA复审后，将S03改为IN_PROGRESS；不得提前进入真实StrategyLedger切片。
 
 ## 恢复检查表
 

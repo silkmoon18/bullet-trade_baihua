@@ -40,7 +40,7 @@
 |---|---|---|---|
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
-| S02 | JoinQuant Typings and IDE | IN_PROGRESS | 严格类型桩、IDE导入、目标Python/API矩阵 |
+| S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | PENDING | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
@@ -637,6 +637,37 @@ Decision: DONE
 - 全新venv中editable install后，策略范围严格mypy/pyright通过。
 - 常用`context.portfolio`、Position和helper返回值具有补全。
 - Python目标版本语法编译通过。
+
+### S02审查记录
+
+```text
+Slice: S02
+Implementation commit: 3b54a4a7178fb36ab9f85de22a648bb08bd0448b
+Pre-commit reviewers: /root/precommit_s01_contract_frozen；/root/audit_rlock_reload_v13；/root/update_s01_docs_boundary
+Initial result: REWORK
+Initial findings:
+  - helper runtime-state TypedDict字段/blocked_mutations类型错误，六个交易入口退化为**kwargs: Any，漂移测试覆盖不足
+  - 严格检查只覆盖合成probe而未覆盖真实good_etf.py；setup未验证venv/prefix/purelib，文档夸大--full和轻量环境pytest能力
+  - Windows site.getsitepackages()[0]实际指向venv根；类型收窄引入的runtime cast可被篡改后把SHADOW伪装为BACKTEST
+  - Python 3.8没有ast.unparse，旧pip可能不支持PEP 660 editable安装
+Fixes:
+  - 对齐全部导出函数、类构造器/公共方法的参数名称、种类和必填性；TypedDict按真实builder分为必填和模式可选字段
+  - 真实策略与契约probe同时进入strict mypy/pyright；策略安全路径清除全部runtime cast并增加poisoned-cast fail-close回归
+  - setup校验sys.prefix/base_prefix和目标目录，先确保pip>=21.3，只向sysconfig purelib写.pth并拒绝越界
+  - AST测试移除3.9专属API；文档明确轻量/full、版本范围、editable/wheel和S17/S18边界
+Final pre-commit result: APPROVE（三路均无BLOCKER/MAJOR/MINOR）
+Final exact-SHA reviewers: 同上三路
+Final exact-SHA result: APPROVE；三路起止HEAD均为3b54a4a7178fb36ab9f85de22a648bb08bd0448b且工作树clean
+Verification:
+  - S01+S02目标矩阵 -> 320 passed, 3 warnings
+  - strict mypy -> 2 source files PASS；strict pyright -> 0 errors/0 warnings
+  - Python 3.8 AST、阻断级flake8、S00 baseline、commit diff --check -> PASS
+  - 最新脚本在第三个全新空venv完成pip引导、editable install、严格检查和两模块find_spec；.pth仅位于Lib/site-packages
+Residual risks:
+  - 聚宽托管Python/pandas/numpy和私有API行为仍须S18平台探针确认；普通wheel顶层类型文件布局仍由S17门禁处理
+  - 全仓测试仍受既有jqdatasdk/外部策略路径及若干非S02历史失败影响，本slice不宣称全仓套件已全绿
+Decision: DONE
+```
 
 ## S03：JoinQuant Validation and Export
 
