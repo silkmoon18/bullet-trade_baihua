@@ -19,6 +19,10 @@ from bullet_trade.server.qmt_guard import (
     is_qmt_connectivity_error,
     load_qmt_guard_config,
 )
+from bullet_trade.server.strategy.broker_contract import (
+    MINI_QMT_CAPABILITIES,
+    BrokerCapabilityProfile,
+)
 from bullet_trade.utils.env_loader import get_data_provider_config
 
 from ..config import AccountConfig, ServerConfig
@@ -481,6 +485,10 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         self.guard = guard or QmtAvailabilityGuard(name="qmt-broker")
         self._reconnect_task: Optional[asyncio.Task] = None
         self._stopping = False
+
+    @staticmethod
+    def strategy_ledger_capabilities() -> BrokerCapabilityProfile:
+        return MINI_QMT_CAPABILITIES
 
     async def start(self) -> None:
         """启动 broker 适配器并安排后台 QMT 重连探针。

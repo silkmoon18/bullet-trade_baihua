@@ -41,6 +41,7 @@ nav:
       - 聚宽校验与导出: live-ledger/06-joinquant-export.md
       - StrategyLedger领域模型与Schema: live-ledger/08-strategy-ledger-schema.md
       - StrategyLedger事务Repository: live-ledger/09-transactional-repository.md
+      - QMT券商能力合同: live-ledger/10-broker-capability-contract.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md

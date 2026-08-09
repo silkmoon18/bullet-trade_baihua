@@ -776,6 +776,14 @@ Decision: DONE
 ### 当前状态
 
 - IN_PROGRESS：先盘点现有QMT adapter真实返回字段与查询能力，再冻结最小能力合同；不在本slice提前实现执行编排器。
+- 当前代码已确认MiniQMT/BigQMT都有订单、成交和working order查询路径，但tag持久回显、原生成交号、完整费用和跨日lookback受实际QMT/网关版本影响，必须保留`PROBE_REQUIRED`而不能静态宣称支持。
+
+### 实施计划
+
+- 新增轻量能力状态/合同与`strategy_ledger_v1`验收函数，不引入插件框架。
+- MiniQMT/BigQMT adapter各自暴露静态profile；真实环境证据由后续probe覆盖，不写死未经验证的lookback天数。
+- 规范化成交时保留trade ID来源和费用是否真实出现；side缺失只按order ID映射。
+- 用纯fixture合同测试覆盖可用profile、能力不足阻断、合成ID、费用缺失和side映射。
 
 ### 交付
 
@@ -788,6 +796,14 @@ Decision: DONE
 
 - adapter合同测试覆盖重复/乱序fill、remark roundtrip、断连、跨日working order和费用字段。
 - 能力不足的adapter显式拒绝`strategy_ledger_v1`。
+
+### 当前实现候选（待审查）
+
+- MiniQMT/BigQMT静态profile区分`SUPPORTED / PROBE_REQUIRED / UNSUPPORTED`；当前目标环境未验证，因此不会被静态代码放行。
+- `strategy_ledger_v1`要求tag回显、稳定order/trade ID、trade-order关联、完整费用/状态、current/working查询及至少前一交易日lookback。
+- 成交证据只接受原生成交号；缺side按同一order ID映射，缺费用拒绝，完全重复成交归并而冲突重复报错。
+- 首轮审查修复无效费用误标已知0、负费用放行，以及把order ID关联误等同于order含side三项主链问题。
+- S06合同定向14项、S04至S06/QMT adapter/scheduler联合88项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过，等待复审。
 
 ## S07：Persistent Idempotency and Outbox
 

@@ -123,6 +123,21 @@
 - 最终工作树审查APPROVE；实现提交`9eb36f0`，限定矩阵34 passed。
 - S05决定：DONE。
 
+## S06当前计划
+
+- 为MiniQMT和BigQMT建立同一能力结构，明确区分代码路径存在、需要真实QMT探针和明确不支持三种状态。
+- 只保留StrategyLedger主闭环需要的能力：client tag回显、稳定order/trade ID、trade到order关联、side、费用、状态、working order以及orders/trades跨日lookback。
+- 新增成交观察规范化：缺side时只按broker order ID映射订单；合成trade ID、费用字段缺失或无法映射side时不能通过`strategy_ledger_v1`。
+- 适配器提供静态能力声明；S19再用真实QMT环境把`PROBE_REQUIRED`提升为已验证，本slice不伪造生产就绪。
+
+## S06当前候选
+
+- 新增`BrokerCapabilityProfile`与`require_strategy_ledger_v1()`，MiniQMT/BigQMT均显式返回静态profile；未经探针的能力保持`PROBE_REQUIRED`并拒绝实盘合同。
+- 新增`BrokerTradeEvidence`规范化和批量去重：只接受原生broker trade ID，缺side仅按broker order ID映射，费用字段缺失时拒绝，同ID完全重复归并、冲突记录报错。
+- MiniQMT成交结果保留`trade_id_source`、`commission_known`和`tax_known`；BigQMT规范化补齐同样的证据字段，显式区分真实0费用与缺字段默认0。
+- 首轮审查发现MiniQMT无法解析的费用仍被标成已知0、负费用可进入证据，以及trade-order关联并不能证明order含side；候选已分别改为解析成功才标已知、拒绝负费用，并新增独立`order_side_for_trade`能力。
+- 14项S06合同测试通过；加入S04/S05、MiniQMT订单/成交/等待、BigQMT adapter和scheduler后联合88 passed。新合同完整flake8、targeted mypy/pyright、变更文件Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`均PASS，等待复审。
+
 ## 恢复检查表
 
 新session继续前依次执行：

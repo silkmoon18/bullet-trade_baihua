@@ -21,6 +21,10 @@ from .base import (
     RemoteBrokerAdapter,
     RemoteDataAdapter,
 )
+from bullet_trade.server.strategy.broker_contract import (
+    BIG_QMT_CAPABILITIES,
+    BrokerCapabilityProfile,
+)
 from .qmt import dataframe_to_payload, dict_payload
 
 
@@ -344,6 +348,10 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         self.account_router = account_router
         self.client = client
         self._order_tag_overrides: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def strategy_ledger_capabilities() -> BrokerCapabilityProfile:
+        return BIG_QMT_CAPABILITIES
 
     async def start(self) -> None:
         try:
@@ -1057,10 +1065,36 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         security = _security_from_qmt_fields(item)
         if security:
             item["security"] = security
-    item.setdefault("trade_id", item.get("m_strTradeID") or item.get("deal_id"))
+    trade_id = item.get("trade_id") or item.get("m_strTradeID") or item.get("deal_id")
+    item["trade_id"] = trade_id
+    item.setdefault("trade_id_source", "broker" if trade_id else "missing")
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("trade_price") or item.get("m_dTradePrice"))
+    commission = item.get("commission_fee")
+    if commission is None:
+        commission = item.get("commission")
+    if commission is None:
+        commission = item.get("m_dCommission")
+    tax = item.get("tax")
+    if tax is None:
+        tax = item.get("stamp_tax")
+    if tax is None:
+        tax = item.get("m_dTax")
+    commission_flag = item.get("commission_known")
+    tax_flag = item.get("tax_known")
+    item["commission_known"] = (
+        commission is not None
+        if commission_flag is None
+        else commission_flag is True and commission is not None
+    )
+    item["tax_known"] = (
+        tax is not None if tax_flag is None else tax_flag is True and tax is not None
+    )
+    if commission is not None:
+        item.setdefault("commission_fee", commission)
+    if tax is not None:
+        item.setdefault("tax", tax)
     item.setdefault("order_remark", item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"))
     if item.get("order_remark") and "remark" not in item:
         item["remark"] = item.get("order_remark")

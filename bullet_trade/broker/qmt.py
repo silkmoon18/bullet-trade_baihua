@@ -10,6 +10,7 @@ QMT 券商适配（最小实现）
 import asyncio
 import inspect
 import hashlib
+import math
 import os
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -468,6 +469,7 @@ class QmtBroker(BrokerBase):
             if security and jq_code != security:
                 continue
             trade_id = _pick(item, "trade_id", "deal_no", "trade_no")
+            trade_id_source = "broker"
             price = _first_present(
                 _pick(item, "traded_price"),
                 _pick(item, "trade_price"),
@@ -502,6 +504,7 @@ class QmtBroker(BrokerBase):
             if not trade_id:
                 base = f"{oid}-{trade_time}-{price}-{amount}"
                 trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
+                trade_id_source = "synthetic"
             try:
                 normalized_amount = int(amount or 0)
             except Exception:
@@ -510,14 +513,26 @@ class QmtBroker(BrokerBase):
                 normalized_price = float(price or 0.0)
             except Exception:
                 normalized_price = 0.0
-            try:
-                normalized_commission = float(commission or 0.0)
-            except Exception:
-                normalized_commission = 0.0
-            try:
-                normalized_tax = float(tax or 0.0)
-            except Exception:
-                normalized_tax = 0.0
+            commission_known = False
+            normalized_commission = 0.0
+            if commission is not None:
+                try:
+                    normalized_commission = float(commission)
+                    commission_known = math.isfinite(normalized_commission)
+                except (TypeError, ValueError):
+                    normalized_commission = 0.0
+                if not commission_known:
+                    normalized_commission = 0.0
+            tax_known = False
+            normalized_tax = 0.0
+            if tax is not None:
+                try:
+                    normalized_tax = float(tax)
+                    tax_known = math.isfinite(normalized_tax)
+                except (TypeError, ValueError):
+                    normalized_tax = 0.0
+                if not tax_known:
+                    normalized_tax = 0.0
             if deal_balance in (None, "") and normalized_amount > 0 and normalized_price > 0:
                 deal_balance = normalized_amount * normalized_price
             try:
@@ -526,6 +541,7 @@ class QmtBroker(BrokerBase):
                 normalized_deal_balance = 0.0
             row = {
                 "trade_id": str(trade_id),
+                "trade_id_source": trade_id_source,
                 "order_id": str(oid) if oid is not None else "",
                 "security": jq_code,
                 "amount": normalized_amount,
@@ -535,7 +551,9 @@ class QmtBroker(BrokerBase):
                 "time": trade_time,
                 "commission": normalized_commission,
                 "commission_fee": normalized_commission,
+                "commission_known": commission_known,
                 "tax": normalized_tax,
+                "tax_known": tax_known,
                 "order_remark": order_remark,
                 "strategy_name": strategy_name,
             }

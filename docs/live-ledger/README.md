@@ -15,6 +15,7 @@
 9. [当前状态与使用指南](07-status-and-usage.md)
 10. [StrategyLedger领域模型与SQLite Schema](08-strategy-ledger-schema.md)
 11. [StrategyLedger事务Repository](09-transactional-repository.md)
+12. [QMT券商能力合同](10-broker-capability-contract.md)
 
 ## 权威边界
 

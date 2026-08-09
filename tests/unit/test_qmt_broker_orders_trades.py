@@ -49,6 +49,7 @@ def test_qmt_broker_get_trades_mapping(monkeypatch):
     assert len(trades) == 1
     trade = trades[0]
     assert trade.get("trade_id") == "t1"
+    assert trade.get("trade_id_source") == "broker"
     assert trade.get("order_id") == "o1"
     assert trade.get("security") == "000001.XSHE"
 
@@ -84,6 +85,62 @@ def test_qmt_broker_get_trades_prefers_traded_price_and_preserves_zero_commissio
     assert trade["deal_balance"] == pytest.approx(98222.8)
     assert trade["commission"] == pytest.approx(0.0)
     assert trade["commission_fee"] == pytest.approx(0.0)
+    assert trade["commission_known"] is True
+    assert trade["tax_known"] is True
+
+
+@pytest.mark.unit
+def test_qmt_broker_marks_synthetic_trade_id_and_unknown_fees(monkeypatch):
+    broker = QmtBroker(account_id="demo")
+    broker._connected = True
+
+    class DummyTrade:
+        order_id = "o3"
+        stock_code = "510050.SH"
+        trade_volume = 100
+        trade_price = 2.5
+        trade_time = "2026-08-10 10:00:00"
+
+    class DummyTrader:
+        def query_stock_trades(self, account):
+            return [DummyTrade()]
+
+    broker._xt_trader = DummyTrader()
+    broker._xt_account = object()
+
+    trade = broker.get_trades(order_id="o3")[0]
+    assert trade["trade_id"]
+    assert trade["trade_id_source"] == "synthetic"
+    assert trade["commission_known"] is False
+    assert trade["tax_known"] is False
+
+
+@pytest.mark.unit
+def test_qmt_broker_does_not_mark_invalid_fee_values_as_known(monkeypatch):
+    broker = QmtBroker(account_id="demo")
+    broker._connected = True
+
+    class DummyTrade:
+        trade_id = "t-invalid-fees"
+        order_id = "o-invalid-fees"
+        stock_code = "510050.SH"
+        trade_volume = 100
+        trade_price = 2.5
+        commission_fee = "bad"
+        tax = "NaN"
+
+    class DummyTrader:
+        def query_stock_trades(self, account):
+            return [DummyTrade()]
+
+    broker._xt_trader = DummyTrader()
+    broker._xt_account = object()
+
+    trade = broker.get_trades(order_id="o-invalid-fees")[0]
+    assert trade["commission_fee"] == 0.0
+    assert trade["commission_known"] is False
+    assert trade["tax"] == 0.0
+    assert trade["tax_known"] is False
 
 
 @pytest.mark.unit
