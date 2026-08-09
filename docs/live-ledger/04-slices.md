@@ -41,7 +41,7 @@
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
-| S03 | JoinQuant Validation and Export | IN_PROGRESS | AST校验、敏感扫描、clean-room导入、原样导出 |
+| S03 | JoinQuant Validation and Export | DONE | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | PENDING | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
@@ -688,7 +688,7 @@ Decision: DONE
 - 全新临时目录只使用导出物完成语法、导入和mock runtime smoke。
 - 导出包不含token、Webhook、日志、缓存、数据库或服务器内部模块。
 
-### 当前实现候选（待三路冻结审查）
+### 最终实现与审查
 
 - 固定白名单三文件按一次不可变源码快照原样导出，manifest确定性记录契约、字节数和SHA256；目标必须不存在且路径不得经过symlink/junction/reparse point。
 - 私有profile只按Python 3.8 AST读取字面量，校验schema、字段、精确类型、范围和strategy/profile契约；不执行、不复制、不hash、不输出秘密。
@@ -701,7 +701,10 @@ Decision: DONE
 - 第五次10文件正式冻结为REWORK：bound/unbound/getter形式`__getitem__`可从动态namespace读取`__builtins__`并绕过角色导入白名单。现复用静态callable解析统一检查三种形式的目标、参数和敏感键。
 - 该REWORK之后S03定向127 passed、联合矩阵447 passed；strict mypy/pyright、完整/阻断级flake8、Python 3.8 AST、S00 baseline、`git diff --check`、validate-only和全新目录真实导出均PASS。
 - AST/特征扫描明确只是防误提交门禁，不是Python沙箱、完备别名/数据流证明或完备秘密检测器；真实聚宽行为仍由S18验证。
-- 当前状态：实现完成但未放行；任何旧候选SHA均因后续工作树变化失效，等待当前10文件SHA256三路一致APPROVE。
+- 第六次冻结的部署/文档与独立功能审查均APPROVE；第三个审查代理因平台误判未产出结论，主审使用相同冻结指纹和验证结果补足合同核对。
+- 实现提交：`224a68195eeff11a542885344957132a294c5399`。两路独立精确SHA终审均APPROVE，确认只包含冻结10文件，127项S03测试与447项联合矩阵通过，确定性导出与manifest逐项匹配。
+- 残余边界：该扫描器不是Python沙箱、完备别名/数据流证明或完备秘密检测器；聚宽真实平台、QMT模拟和小额实盘仍分别受S18至S20门禁约束。
+- Decision: DONE
 
 ## S04：Strategy Domain and Schema
 

@@ -12,6 +12,7 @@
 6. [bt_quant迁移清单](05-migration-manifest.md)
 7. [聚宽本地开发与兼容矩阵](05-joinquant-development.md)
 8. [聚宽校验与导出](06-joinquant-export.md)
+9. [当前状态与使用指南](07-status-and-usage.md)
 
 ## 权威边界
 

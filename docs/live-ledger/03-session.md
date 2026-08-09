@@ -58,13 +58,13 @@
 
 ## 最近完成slice
 
-`S02 JoinQuant Typings and IDE`（DONE）
+`S03 JoinQuant Validation and Export`（DONE）
 
 ## 当前slice
 
-`S03 JoinQuant Validation and Export`（IN_PROGRESS）
+`S04 Strategy Domain and Schema`（PENDING，尚未开始）
 
-- 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归；尚待三路预提交冻结审查，因此仍为IN_PROGRESS。
+- 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
 - 最近一轮对抗审查复现helper可经`getattr(..., '__dict__')`、直接下标及`object.__getattribute__`保存当前模块namespace后用动态键改写API版本；导出器现统一拒绝保存或修改原始对象namespace，并把策略/helper内两处合法只读模块查询改为不保存namespace对象的单键读取。
 - 首次10文件正式冻结又发现未绑定`dict.__setitem__/update/pop`把`globals()`或原始`__dict__`作为首参数时可绕过接收者检查；该轮正式REWORK并失效。修复后mutator统一解析真实修改目标，`dict.*`/`builtins.dict.*`以首参数为目标，5个computed-key回归均拒绝。
@@ -85,9 +85,16 @@
 - 部署声明必须先在受控源码中确定并审查；导出后及聚宽侧禁止再次手工修改，否则文件hash和manifest不再代表实际部署物。
 - clean-room仅用导出物完成Python 3.8语法、导入及缺helper/profile/版本不匹配smoke；聚宽真实行为仍留到S18。
 
+## S03收口
+
+- 第六次10文件冻结的部署/文档与独立功能审查均为APPROVE；第三个审查代理因平台误判未产出结论，主审使用相同冻结哈希、文件集合、格式和测试证据补足合同核对。
+- 实现提交：`224a68195eeff11a542885344957132a294c5399`。
+- 两路独立精确SHA终审均APPROVE：提交只含冻结10文件，127项S03测试和447项联合矩阵通过，双份全新导出字节一致，工作树clean。
+- S03决定：DONE。该决定只放行“可上传候选”的生成与验证，不放行真实资金；S04至S20仍未完成。
+
 ## 下一步
 
-冻结当前10文件SHA256并完成三路预提交审查；仅在实现提交和收口文档提交都通过三路精确SHA复审后，才把S03标记DONE并进入S04。
+先完成本收口文档的精确SHA复审，再按同一流程进入S04 Strategy Domain and Schema。
 
 ## 恢复检查表
 
