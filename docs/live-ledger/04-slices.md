@@ -42,7 +42,7 @@
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | DONE | AST校验、敏感扫描、clean-room导入、原样导出 |
-| S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
+| S04 | Strategy Domain and Schema | IN_PROGRESS | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | PENDING | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
 | S07 | Persistent Idempotency and Outbox | PENDING | 请求幂等、operation、outbox、lease、unknown恢复 |
@@ -708,6 +708,12 @@ Decision: DONE
 
 ## S04：Strategy Domain and Schema
 
+### 本轮边界
+
+- 聚焦个人专用账户、单策略和可信进程；不实现共享账户、多租户权限或同进程恶意代码防御。
+- 本slice只定义模型、状态、整数尺度、SQLite表和迁移；事务repository、资金划拨与成交入账分别留在S05、S08、S09。
+- schema为后续主闭环保留必要字段，不提前实现复杂通用框架。
+
 ### 交付
 
 - 账户、现金池、ledger entry、position/lot、intent、order、fill、event、outbox和reconcile领域状态。
@@ -721,6 +727,15 @@ Decision: DONE
 
 - 空库建库、重复迁移、旧schema升级和失败恢复测试。
 - 数据库约束拒绝负数和非法状态。
+
+### 当前实现候选（待审查）
+
+- `domain.py`提供整数尺度、Asia/Shanghai时间、账户/现金/持仓/lot/意图/订单/成交/事件/对账的最小不可变模型。
+- `schema.py`提供两阶段、逐版本事务化SQLite迁移；拒绝向下迁移、非连续或名称不匹配的历史。
+- schema通过整数类型、非负、冻结不超过现金、可卖不超过持仓、lot剩余不超过原始数量、成交数量/价格和状态枚举等约束尽早拒绝坏数据。
+- 备份恢复与表用途记录在`08-strategy-ledger-schema.md`；自动备份、repository和业务写入仍属于后续slice。
+- 当前验证：S04定向12 passed，加入scheduler回归24 passed；新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`通过。
+- 首轮代码审查REWORK已修复两项主流程一致性问题：意图/事件/对账输入在构造时生成递归不可变快照；迁移历史保存SQL SHA-256并与`PRAGMA user_version`交叉校验，禁止静默接受旧迁移漂移。
 
 ## S05：Transactional Repository
 

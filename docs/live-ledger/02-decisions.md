@@ -24,6 +24,7 @@
 | D018 | 自动化交付与真实交易日soak分开；外部门禁允许BLOCKED等待证据 | Accepted |
 | D019 | S01采用profile schema v1和严格模式矩阵；StrategyLedger完成前LIVE必须失败关闭 | Accepted |
 | D020 | helper reload gate仅作误用检测与fail-closed；生产升级一律停止策略后冷启动新进程 | Accepted |
+| D021 | 个人单策略首版采用可信代码/单进程边界，优先账本、成交、对账和聚宽回传；停止扩张同进程对抗性防御 | Accepted |
 
 ## D001：不合并敏感历史
 
@@ -104,3 +105,9 @@ reload gate不是热更新API。生产禁止raw `importlib.reload()`、热补丁
 升级顺序固定为：停止策略并确认旧进程退出；替换helper、私有config和策略文件；启动全新进程；重新完成版本/marker/profile/mode校验。首次从缺少当前primitive anchor的旧helper迁移，尤其raw `Lock`/pre-bootstrap版本，也必须冷启动。`RuntimeReloadAbort`、reload异常或runtime/网络effect期间的任意异步中断一律终止进程，不得catch后继续、同进程重试或切回BACKTEST。
 
 纯Python无法把任意opcode/C返回点的恶意catch-and-resume、许可读取后的旧栈恢复，以及connector返回资源到共享holder之间的handoff全部变成不可分割操作。trace/debugger读取活动authority frame的`frame.f_locals`还会物化旧closure cell值，CPython随后可能把旧`False`同步回已经被递归reload关闭的latch；这类活动帧改写权明确不在可防御契约内。进程退出是这些残余的资源与状态清理边界。若未来LIVE要对抗同进程任意代码执行，需采用独立IO worker/子进程epoch或原生原子gate。
+
+## D021：聚焦个人实盘主闭环
+
+首版运行在用户自有、可信的策略和服务器进程中，不以抵抗同进程恶意Python代码、任意monkey patch、对象协议投毒或热重载攻击为目标。后续审查优先验证资金不变量、数据库事务、幂等、成交去重、未知提交恢复、对账阻断和真实指标一致性。
+
+已有S01门禁继续作为兼容边界，但不再追加对抗性分支。核心闭环稳定后，可以在保留BACKTEST/SHADOW/LIVE基本合同、凭据隔离和失败关闭测试的前提下删除冗余门禁与历史对抗测试。裁剪不得改变以下底线：LIVE未就绪时不下单；响应未知时不盲目重发；重复成交不重复入账；账实不一致时暂停新单。

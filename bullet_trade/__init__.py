@@ -4,7 +4,7 @@ BulletTrade - 专业的量化交易系统
 """
 
 from importlib import import_module
-from typing import Any, TYPE_CHECKING
+from typing import Any, List, TYPE_CHECKING
 
 import warnings
 
@@ -93,6 +93,6 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__() -> list[str]:
+def __dir__() -> List[str]:
     """让内建 dir() 同样展示延迟导出的接口"""
     return sorted(set(globals().keys()) | set(_ANALYSIS_EXPORTS))

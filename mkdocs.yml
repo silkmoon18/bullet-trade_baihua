@@ -39,6 +39,7 @@ nav:
       - 实施 Slices: live-ledger/04-slices.md
       - 聚宽本地开发: live-ledger/05-joinquant-development.md
       - 聚宽校验与导出: live-ledger/06-joinquant-export.md
+      - StrategyLedger领域模型与Schema: live-ledger/08-strategy-ledger-schema.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md
