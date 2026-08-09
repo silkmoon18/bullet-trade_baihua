@@ -46,8 +46,8 @@
 | S05 | Transactional Repository | DONE | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | DONE | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
 | S07 | Persistent Idempotency and Outbox | DONE | 请求幂等、operation、outbox、lease、unknown恢复 |
-| S08 | Capital Allocation Ledger | IN_PROGRESS | 未分配池、初始1万元、冻结/释放、显式资金流 |
-| S09 | Fill Booking and Position Lots | PENDING | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
+| S08 | Capital Allocation Ledger | DONE | 未分配池、初始1万元、按订单冻结/释放、显式资金流 |
+| S09 | Fill Booking and Position Lots | IN_PROGRESS | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | PENDING | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11 | Broker Ingest and Reconciliation | PENDING | 跨日重扫、游标、quarantine、HARD阻断和readiness |
 | S12 | Target Portfolio Planner | PENDING | NAV目标、整手、working exposure、费用缓冲和delta |
@@ -840,7 +840,7 @@ Decision: DONE
 
 ### 当前状态
 
-- IN_PROGRESS：在S05最小资金池扣减之上补齐真实券商现金校准、可重复ensure、reserve/release与显式资金调整；不提前实现订单规划和成交持仓。
+- DONE：真实券商现金校准、可重复ensure、按订单reserve/release与显式资金调整已完成；订单规划和成交持仓留在后续slice。
 
 ### 交付
 
@@ -855,14 +855,21 @@ Decision: DONE
 - 两策略并发不能超分配，即使当前首版API只开放一个策略。
 - `cash-reserved=available`始终成立。
 
-### 当前实现候选（待审查）
+### 实现与审查结果
 
 - `SQLiteCapitalService`实现券商可用现金校准、幂等ensure、按订单隔离的reserve/release和显式allocate/withdraw。
 - 初始资金不足全量拒绝；重复启动不重新分配，配置变化不静默重置；50并发仅一个首次分配。
 - 已有账户的券商现金快照只做账实核对，不覆盖本地资金；显式资金调整用external ref幂等并与资金池/账本/流水同事务。
-- S08定向10项、S04至S08加scheduler联合68项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`通过，等待代码审查。
+- 首轮审查发现订单释放可能占用另一订单冻结额；修复后按`order_id`在同一事务核对余额，并新增两订单重复释放回归。
+- S08定向10项、S04至S08加scheduler联合68项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`通过。
+- 修复后的工作树复审APPROVE；实现提交`4b2f164`。
+- Decision: DONE
 
 ## S09：Fill Booking and Position Lots
+
+### 当前状态
+
+- IN_PROGRESS：聚焦真实成交驱动的现金、冻结、position/lot和费用入账；不提前实现估值、聚宽回传或通用风控平台。
 
 ### 交付
 
