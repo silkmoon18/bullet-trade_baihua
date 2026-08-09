@@ -26,6 +26,134 @@
 - install_strategy_runtime 提供 BACKTEST/SHADOW/LIVE、profile schema和API版本边界；三种模式均先建立进程门禁再读取context，BACKTEST不联网，当前LIVE只校验配置并保持交易关闭。
 """
 
+# importlib.reload()会复用原module字典。以下入口只是误用检测和失败关闭防线，
+# 不是受支持的热更新接口；生产升级必须停止旧进程并冷启动。正常控制流下，
+# 它会在本文件的import和新代初始化前调用上一代闭包锚定的关闭入口。
+_early_public_runtime_reload_bootstrap = globals().get(
+    "_run_runtime_reload_bootstrap"
+)
+if "_STRATEGY_RUNTIME_MODULE_GENERATION" in globals():
+    _early_runtime_reload_bootstrap = None
+    _early_failure_namespaces = []
+    try:
+        _early_primitive_anchor_getter = globals().get(
+            "_get_runtime_primitive_anchor"
+        )
+        if type(_early_primitive_anchor_getter) is not type(lambda: None):
+            raise RuntimeError(
+                "策略运行helper缺少可信primitive anchor；必须使用干净运行进程重启"
+            )
+        _early_primitive_anchor = _early_primitive_anchor_getter()
+        if (
+            type(_early_primitive_anchor) is not tuple
+            or len(_early_primitive_anchor) != 10
+            or type(_early_primitive_anchor[9]) is not tuple
+            or len(_early_primitive_anchor[9]) != 3
+            or type(_early_primitive_anchor[9][0]) is not object
+            or type(_early_primitive_anchor[9][1]) is not type(lambda: None)
+            or type(_early_primitive_anchor[9][2]) is not type(lambda: None)
+        ):
+            raise RuntimeError(
+                "策略运行helper的reload entry anchor无效；必须使用干净运行进程重启"
+            )
+        _early_runtime_reload_bootstrap = _early_primitive_anchor[9][1]()
+        if (
+            type(_early_runtime_reload_bootstrap) is not type(lambda: None)
+            or _early_public_runtime_reload_bootstrap
+            is not _early_runtime_reload_bootstrap
+        ):
+            raise RuntimeError(
+                "策略运行helper的公开reload入口与封存入口不一致；必须使用干净运行进程重启"
+            )
+        # 在bootstrap可能清除commit anchor之前保存namespace identity；若其在
+        # FAILED发布与record删除之间中断，fallback仍能完成guard/record清理。
+        _early_transition_namespace = globals().get(
+            "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE"
+        )
+        if type(_early_transition_namespace) is dict:
+            list.append(_early_failure_namespaces, _early_transition_namespace)
+        _early_commit_anchor_getter = globals().get("_get_runtime_commit_anchor")
+        if type(_early_commit_anchor_getter) is type(lambda: None):
+            _early_commit_capsule = _early_commit_anchor_getter()
+            if type(_early_commit_capsule) is tuple and len(
+                _early_commit_capsule
+            ) == 10:
+                _early_committed_namespace = _early_commit_capsule[8]
+                if type(_early_committed_namespace) is dict and all(
+                    value is not _early_committed_namespace
+                    for value in _early_failure_namespaces
+                ):
+                    list.append(
+                        _early_failure_namespaces,
+                        _early_committed_namespace,
+                    )
+        _early_runtime_reload_bootstrap()
+    except BaseException:
+        # 在异常能进入本fallback的正常控制流下，只使用内建原语执行最小失败
+        # 关闭并传播首个异常；任意异步中断不能靠纯Python证明完整清理。
+        _early_failure_namespaces = globals().get("_early_failure_namespaces")
+        if type(_early_failure_namespaces) is not list:
+            _early_failure_namespaces = []
+        # 防御性重试同一锚定闭包；无论结果如何，调用方都必须终止本次进程，
+        # 不得捕获异常后继续旧调用栈。
+        try:
+            if type(_early_runtime_reload_bootstrap) is type(lambda: None):
+                _early_runtime_reload_bootstrap()
+        except BaseException:
+            pass
+        try:
+            _early_namespace_failure_publisher = globals().get(
+                "_mark_runtime_failed"
+            )
+            if type(_early_namespace_failure_publisher) is type(lambda: None):
+                for _early_failure_namespace in _early_failure_namespaces:
+                    _early_namespace_failure_publisher(_early_failure_namespace)
+        except BaseException:
+            pass
+        try:
+            _early_gate_authority = globals().get(
+                "_STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY"
+            )
+            if (
+                type(_early_gate_authority) is tuple
+                and len(_early_gate_authority) == 7
+                and type(_early_gate_authority[2]) is type(lambda: None)
+            ):
+                _early_gate_authority[2]()
+        except BaseException:
+            pass
+        try:
+            _early_failed_state_publisher = globals().get(
+                "_set_runtime_failed_process_state"
+            )
+            if type(_early_failed_state_publisher) is type(lambda: None):
+                _early_failed_state_publisher()
+        except BaseException:
+            pass
+        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+        _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS = True
+        _early_contract_generation = globals().get(
+            "_STRATEGY_RUNTIME_CONTRACT_GENERATION"
+        )
+        _STRATEGY_RUNTIME_CONTRACT_GENERATION = (
+            _early_contract_generation
+            if type(_early_contract_generation) is int
+            and _early_contract_generation >= 1
+            else 1
+        )
+        _STRATEGY_RUNTIME_PROCESS_SIGNATURE = None
+        _STRATEGY_RUNTIME_CANONICAL_STATE = None
+        _STRATEGY_RUNTIME_COMMIT_CAPSULE = None
+        _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = 0
+        _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+        _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+        _STRATEGY_RUNTIME_TRANSITION_MODE = None
+        _CLIENT = None
+        _DATA_CLIENT = None
+        _BROKER_CLIENT = None
+        raise
+
+import _thread
 import ast
 import functools
 import hashlib
@@ -44,53 +172,461 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
-# importlib.reload()会复用原module字典。锁必须跨reload保留，旧client的方法才会
-# 与新runtime状态使用同一并发边界；generation/token则必须每次加载更新，用于
-# 拒绝旧namespace缓存。任何同进程reload都进入FAILED，要求干净进程重启。
-_PREVIOUS_RUNTIME_GENERATION = int(globals().get("_STRATEGY_RUNTIME_MODULE_GENERATION", 0))
+
+def _create_runtime_socket_gate_authority(thread_ident_getter):
+    """用闭包保存单向reload latch、attempt identity及transport许可。"""
+
+    reload_requested = False
+    active_attempts = {}
+
+    def snapshot():
+        return reload_requested, tuple(dict.items(active_attempts))
+
+    def close_for_reload():
+        nonlocal reload_requested
+        reload_requested = True
+        return len(active_attempts)
+
+    def start_attempt(attempt_token):
+        if type(attempt_token) is not object:
+            return False
+        owner_thread = thread_ident_getter()
+        if type(owner_thread) is not int:
+            return False
+        # 正常跨线程执行以本行为attempt登记线性化点；生产禁止在trace/signal
+        # 回调中递归reload并捕获后续跑旧栈。
+        return False if reload_requested else dict.__setitem__(active_attempts, attempt_token, owner_thread) is None  # noqa: E501
+
+    def finish_attempt(attempt_token):
+        if type(attempt_token) is not object:
+            return False, len(active_attempts)
+        removed_owner = dict.pop(active_attempts, attempt_token, None)
+        return type(removed_owner) is int, len(active_attempts)
+
+    def open_transport(
+        attempt_token,
+        owner_thread,
+        connector,
+        address,
+        timeout,
+        resource_state,
+    ):
+        """校验当前permit并在同一调用边界进入transport。"""
+
+        if (
+            type(attempt_token) is not object
+            or type(owner_thread) is not int
+            or type(resource_state) is not list
+            or len(resource_state) != 1
+            or resource_state[0] is not None
+        ):
+            return False
+        # 正常跨线程执行以latch/token读取为transport许可线性化点。任意opcode
+        # 异步回调后的catch-and-resume不属于支持边界，必须终止运行进程。
+        return False if reload_requested or dict.get(active_attempts, attempt_token) != owner_thread else list.__setitem__(resource_state, 0, connector(address, timeout=timeout)) is None  # noqa: E501
+
+    def run_remote_effect(
+        effect,
+        effect_args,
+        effect_kwargs,
+        handoff_state,
+    ):
+        """在线性化permit后执行TLS/send；mutation先武装不确定性交付。"""
+
+        if (
+            type(effect_args) is not tuple
+            or type(effect_kwargs) is not dict
+            or (
+                handoff_state is not None
+                and (
+                    type(handoff_state) is not list
+                    or len(handoff_state) != 1
+                    or type(handoff_state[0]) is not bool
+                )
+            )
+        ):
+            return False, None
+        # 正常跨线程执行中，reload先关latch则拒绝effect；先读到open则effect
+        # 属于已线性化在途操作。mutation handoff在effect调用前同表达式武装。
+        return (False, None) if reload_requested else (True, ((list.__setitem__(handoff_state, 0, True) if handoff_state is not None else None), effect(*effect_args, **effect_kwargs))[1])  # noqa: E501
+
+    return (
+        object(),
+        snapshot,
+        close_for_reload,
+        start_attempt,
+        finish_attempt,
+        open_transport,
+        run_remote_effect,
+    )
+
+
+def _create_runtime_quarantine_anchor():
+    """永久保留FAILED路径中的不可信对象，避免其析构器在锁存期间执行。"""
+
+    retained_values = []
+
+    def retain(value):
+        list.append(retained_values, value)
+        return len(retained_values)
+
+    return retain
+
+
+def _create_runtime_reload_entry_authority():
+    """一次性封存下一次reload所需入口，公开同名函数不能替换其identity。"""
+
+    reload_entry = None
+
+    def get_entry():
+        return reload_entry
+
+    def set_entry_once(value):
+        nonlocal reload_entry
+        if reload_entry is not None:
+            return False
+        reload_entry = value
+        return True
+
+    return object(), get_entry, set_entry_once
+
+
+# importlib.reload()会复用原module字典。旧状态只通过精确内建类型读取，任何
+# poison值都不得在FAILED状态和client清理完成前中断新模块初始化。
+_HAD_PREVIOUS_RUNTIME_MODULE = "_STRATEGY_RUNTIME_MODULE_GENERATION" in globals()
+_previous_runtime_primitive_anchor = None
+_previous_runtime_primitive_anchor_getter = globals().get(
+    "_get_runtime_primitive_anchor"
+)
+if (
+    _HAD_PREVIOUS_RUNTIME_MODULE
+    and type(_previous_runtime_primitive_anchor_getter) is types.FunctionType
+):
+    try:
+        _candidate_runtime_primitive_anchor = (
+            _previous_runtime_primitive_anchor_getter()
+        )
+        if (
+            type(_candidate_runtime_primitive_anchor) is tuple
+            and len(_candidate_runtime_primitive_anchor) == 10
+        ):
+            _previous_runtime_primitive_anchor = _candidate_runtime_primitive_anchor
+    except BaseException:
+        _previous_runtime_primitive_anchor = None
+_previous_commit_anchor_setter = globals().get("_set_runtime_commit_anchor")
+_previous_failed_anchor = globals().get("_STRATEGY_RUNTIME_FAILED_ANCHOR")
+_reload_gate_condition = None
+_reload_gate_authority = None
+_reload_gate_lock = None
+_reload_quarantine_retain = None
+_previous_condition_lock = None
+if (
+    type(_previous_runtime_primitive_anchor) is tuple
+    and len(_previous_runtime_primitive_anchor) == 10
+    and type(_previous_runtime_primitive_anchor[5]) is threading.Condition
+):
+    try:
+        _previous_condition_lock = object.__getattribute__(
+            _previous_runtime_primitive_anchor[5],
+            "_lock",
+        )
+    except BaseException:
+        _previous_condition_lock = None
+if (
+    _HAD_PREVIOUS_RUNTIME_MODULE
+    and type(_previous_runtime_primitive_anchor) is tuple
+    and type(_previous_runtime_primitive_anchor[0]) is _thread.RLock
+    and type(_previous_runtime_primitive_anchor[1]) is _thread.LockType
+    and _previous_runtime_primitive_anchor[0]
+    is globals().get("_STRATEGY_RUNTIME_LOCK")
+    and _previous_runtime_primitive_anchor[1]
+    is globals().get("_STRATEGY_RUNTIME_OWNER_LOCK")
+    and type(_previous_runtime_primitive_anchor[5]) is threading.Condition
+    and _previous_runtime_primitive_anchor[5]
+    is globals().get("_STRATEGY_RUNTIME_SOCKET_CONDITION")
+    and type(_previous_runtime_primitive_anchor[6]) is tuple
+    and len(_previous_runtime_primitive_anchor[6]) == 7
+    and _previous_runtime_primitive_anchor[6]
+    is globals().get("_STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY")
+    and type(_previous_runtime_primitive_anchor[6][0]) is object
+    and all(
+        type(function) is types.FunctionType
+        for function in _previous_runtime_primitive_anchor[6][1:]
+    )
+    and type(_previous_runtime_primitive_anchor[7]) is _thread.RLock
+    and _previous_runtime_primitive_anchor[7]
+    is globals().get("_STRATEGY_RUNTIME_SOCKET_LOCK")
+    and _previous_condition_lock is _previous_runtime_primitive_anchor[7]
+    and type(_previous_runtime_primitive_anchor[8]) is types.FunctionType
+    and _previous_runtime_primitive_anchor[8]
+    is globals().get("_STRATEGY_RUNTIME_QUARANTINE_RETAIN")
+    and type(_previous_runtime_primitive_anchor[9]) is tuple
+    and len(_previous_runtime_primitive_anchor[9]) == 3
+    and _previous_runtime_primitive_anchor[9]
+    is globals().get("_STRATEGY_RUNTIME_RELOAD_ENTRY_AUTHORITY")
+    and type(_previous_runtime_primitive_anchor[9][0]) is object
+    and all(
+        type(function) is types.FunctionType
+        for function in _previous_runtime_primitive_anchor[9][1:]
+    )
+):
+    _reload_gate_condition = _previous_runtime_primitive_anchor[5]
+    _reload_gate_authority = _previous_runtime_primitive_anchor[6]
+    _reload_gate_lock = _previous_runtime_primitive_anchor[7]
+    _reload_quarantine_retain = _previous_runtime_primitive_anchor[8]
+_reload_gate_error = None
+
+
+def _publish_early_runtime_reload_latch():
+    global _STRATEGY_RUNTIME_ACTIVE_MODE
+    global _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
+    global _STRATEGY_RUNTIME_TRANSITION_OWNER
+    global _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+    global _STRATEGY_RUNTIME_TRANSITION_MODE
+    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT
+
+    if _HAD_PREVIOUS_RUNTIME_MODULE:
+        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+        _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS = True
+        _reload_contract_generation = globals().get(
+            "_STRATEGY_RUNTIME_CONTRACT_GENERATION"
+        )
+        _STRATEGY_RUNTIME_CONTRACT_GENERATION = (
+            _reload_contract_generation
+            if type(_reload_contract_generation) is int
+            and _reload_contract_generation >= 1
+            else 1
+        )
+        _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+        _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+        _STRATEGY_RUNTIME_TRANSITION_MODE = None
+        _CLIENT = None
+        _DATA_CLIENT = None
+        _BROKER_CLIENT = None
+        if (
+            type(_previous_commit_anchor_setter) is types.FunctionType
+            and type(_previous_failed_anchor) is object
+        ):
+            try:
+                _previous_commit_anchor_setter(_previous_failed_anchor)
+            except BaseException:
+                pass
+    else:
+        _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS = False
+
+
+_reload_gate_done = _reload_gate_lock is None
+while not _reload_gate_done:
+    try:
+        # socket-gate RLock的with先建立释放处理，再执行后续Python行。
+        with _reload_gate_lock:
+            gate_snapshot = _reload_gate_authority[1]
+            gate_close_for_reload = _reload_gate_authority[2]
+            try:
+                gate_close_for_reload()
+                while True:
+                    gate_state = gate_snapshot()
+                    if (
+                        type(gate_state) is not tuple
+                        or len(gate_state) != 2
+                        or type(gate_state[0]) is not bool
+                        or not gate_state[0]
+                        or type(gate_state[1]) is not tuple
+                        or any(
+                            type(entry) is not tuple
+                            or len(entry) != 2
+                            or type(entry[0]) is not object
+                            or type(entry[1]) is not int
+                            for entry in gate_state[1]
+                        )
+                    ):
+                        raise RuntimeError("策略运行socket gate闭包状态无效")
+                    if not gate_state[1]:
+                        break
+                    try:
+                        threading.Condition.wait(_reload_gate_condition)
+                    except BaseException as exc:
+                        if _reload_gate_error is None:
+                            _reload_gate_error = exc
+                        break
+            except BaseException as exc:
+                if _reload_gate_error is None:
+                    _reload_gate_error = exc
+            _publish_early_runtime_reload_latch()
+            _reload_gate_done = True
+    except BaseException as exc:
+        if _reload_gate_error is None:
+            _reload_gate_error = exc
+if _reload_gate_lock is None:
+    try:
+        _publish_early_runtime_reload_latch()
+    except BaseException as exc:
+        if _reload_gate_error is None:
+            _reload_gate_error = exc
+if _reload_gate_error is not None:
+    raise _reload_gate_error
+_previous_module_generation = globals().get("_STRATEGY_RUNTIME_MODULE_GENERATION")
+_PREVIOUS_RUNTIME_GENERATION = (
+    _previous_module_generation
+    if type(_previous_module_generation) is int
+    and _previous_module_generation >= 1
+    else (1 if _HAD_PREVIOUS_RUNTIME_MODULE else 0)
+)
 _STRATEGY_RUNTIME_MODULE_GENERATION = _PREVIOUS_RUNTIME_GENERATION + 1
+_runtime_rlock_type = type(threading.RLock())
 _existing_runtime_lock = globals().get("_STRATEGY_RUNTIME_LOCK")
 _STRATEGY_RUNTIME_LOCK = (
     _existing_runtime_lock
-    if _existing_runtime_lock is not None
+    if type(_existing_runtime_lock) is _runtime_rlock_type
+    and type(_previous_runtime_primitive_anchor) is tuple
+    and _previous_runtime_primitive_anchor[0] is _existing_runtime_lock
     else threading.RLock()
 )
+_runtime_owner_lock_type = type(threading.Lock())
 _existing_runtime_owner_lock = globals().get("_STRATEGY_RUNTIME_OWNER_LOCK")
 _STRATEGY_RUNTIME_OWNER_LOCK = (
     _existing_runtime_owner_lock
-    if _existing_runtime_owner_lock is not None
+    if type(_existing_runtime_owner_lock) is _runtime_owner_lock_type
+    and type(_previous_runtime_primitive_anchor) is tuple
+    and _previous_runtime_primitive_anchor[1] is _existing_runtime_owner_lock
     else threading.Lock()
 )
+_STRATEGY_RUNTIME_SOCKET_LOCK = (
+    _reload_gate_lock
+    if type(_reload_gate_lock) is _runtime_rlock_type
+    else threading.RLock()
+)
+_STRATEGY_RUNTIME_SOCKET_CONDITION = (
+    _reload_gate_condition
+    if type(_reload_gate_condition) is threading.Condition
+    else threading.Condition(_STRATEGY_RUNTIME_SOCKET_LOCK)
+)
+_STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY = (
+    _reload_gate_authority
+    if type(_reload_gate_authority) is tuple
+    else _create_runtime_socket_gate_authority(threading.get_ident)
+)
+_STRATEGY_RUNTIME_QUARANTINE_RETAIN = (
+    _reload_quarantine_retain
+    if type(_reload_quarantine_retain) is types.FunctionType
+    else _create_runtime_quarantine_anchor()
+)
 _STRATEGY_RUNTIME_INSTANCE_TOKEN = object()
-_STRATEGY_RUNTIME_INFLIGHT_REQUESTS = int(
-    globals().get("_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
+_STRATEGY_RUNTIME_REQUEST_LEASES: Set[object] = set()
+_previous_inflight_requests = globals().get("_STRATEGY_RUNTIME_INFLIGHT_REQUESTS")
+_STRATEGY_RUNTIME_INFLIGHT_REQUESTS = (
+    _previous_inflight_requests
+    if not _HAD_PREVIOUS_RUNTIME_MODULE
+    and type(_previous_inflight_requests) is int
+    and _previous_inflight_requests >= 0
+    else 0
 )
-_STRATEGY_RUNTIME_CONTRACT_GENERATION = int(
-    globals().get("_STRATEGY_RUNTIME_CONTRACT_GENERATION", 0)
-) + (1 if _PREVIOUS_RUNTIME_GENERATION else 0)
-_STRATEGY_RUNTIME_TRANSITION_OWNER = globals().get(
-    "_STRATEGY_RUNTIME_TRANSITION_OWNER"
+_previous_contract_generation = globals().get("_STRATEGY_RUNTIME_CONTRACT_GENERATION")
+_safe_previous_contract_generation = (
+    _previous_contract_generation
+    if type(_previous_contract_generation) is int
+    and _previous_contract_generation >= 0
+    else 0
 )
-_STRATEGY_RUNTIME_TRANSITION_NAMESPACE = globals().get(
-    "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE"
+_STRATEGY_RUNTIME_CONTRACT_GENERATION = (
+    max(1, _safe_previous_contract_generation)
+    if _HAD_PREVIOUS_RUNTIME_MODULE
+    else _safe_previous_contract_generation
 )
-_STRATEGY_RUNTIME_TRANSITION_MODE = globals().get(
-    "_STRATEGY_RUNTIME_TRANSITION_MODE"
-)
+_STRATEGY_RUNTIME_TRANSITION_OWNER = None
+_STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+_STRATEGY_RUNTIME_TRANSITION_MODE = None
 
 _CLIENT: Optional["_ShortLivedClient"] = None
 _DATA_CLIENT: Optional["RemoteDataClient"] = None
 _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
 _STRATEGY_RUNTIME_ACTIVE_MODE: Optional[str] = (
-    "FAILED" if _PREVIOUS_RUNTIME_GENERATION else None
+    "FAILED" if _HAD_PREVIOUS_RUNTIME_MODULE else None
 )
 _STRATEGY_RUNTIME_PROCESS_SIGNATURE: Optional[Tuple[Any, ...]] = None
 _STRATEGY_RUNTIME_CANONICAL_STATE: Optional[Dict[str, Any]] = None
+_STRATEGY_RUNTIME_COMMIT_CAPSULE: Optional[Tuple[Any, ...]] = None
+_STRATEGY_RUNTIME_FAILED_ANCHOR = (
+    _previous_failed_anchor
+    if _HAD_PREVIOUS_RUNTIME_MODULE and type(_previous_failed_anchor) is object
+    else object()
+)
+
+
+def _create_runtime_commit_anchor(initial_anchor=None):
+    """用闭包保存胶囊identity，避免仅替换模块全局即可伪造提交。"""
+
+    anchored_capsule = initial_anchor
+
+    def get_anchor():
+        return anchored_capsule
+
+    def set_anchor(value):
+        nonlocal anchored_capsule
+        anchored_capsule = value
+
+    return get_anchor, set_anchor
+
+
+def _create_runtime_primitive_anchor(
+    runtime_lock,
+    owner_lock,
+    instance_token,
+    module_generation,
+    request_leases,
+    socket_condition,
+    socket_gate_authority,
+    socket_lock,
+    quarantine_retain,
+    reload_entry_authority,
+):
+    """锚定模块实例、runtime/owner/socket原语，拒绝只替换全局的伪造状态。"""
+
+    anchored_values = (
+        runtime_lock,
+        owner_lock,
+        instance_token,
+        module_generation,
+        request_leases,
+        socket_condition,
+        socket_gate_authority,
+        socket_lock,
+        quarantine_retain,
+        reload_entry_authority,
+    )
+
+    def get_anchor():
+        return anchored_values
+
+    return get_anchor
+
+
+(
+    _get_runtime_commit_anchor,
+    _set_runtime_commit_anchor,
+) = _create_runtime_commit_anchor(
+    _STRATEGY_RUNTIME_FAILED_ANCHOR if _HAD_PREVIOUS_RUNTIME_MODULE else None
+)
+_STRATEGY_RUNTIME_RELOAD_ENTRY_AUTHORITY = _create_runtime_reload_entry_authority()
+_get_runtime_primitive_anchor = _create_runtime_primitive_anchor(
+    _STRATEGY_RUNTIME_LOCK,
+    _STRATEGY_RUNTIME_OWNER_LOCK,
+    _STRATEGY_RUNTIME_INSTANCE_TOKEN,
+    _STRATEGY_RUNTIME_MODULE_GENERATION,
+    _STRATEGY_RUNTIME_REQUEST_LEASES,
+    _STRATEGY_RUNTIME_SOCKET_CONDITION,
+    _STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY,
+    _STRATEGY_RUNTIME_SOCKET_LOCK,
+    _STRATEGY_RUNTIME_QUARANTINE_RETAIN,
+    _STRATEGY_RUNTIME_RELOAD_ENTRY_AUTHORITY,
+)
 
 # 全局调试开关
 _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
 STRATEGY_RUNTIME_API_VERSION: int = 1
+STRATEGY_RUNTIME_HELPER_MARKER: str = "bullet-trade-joinquant-runtime-helper-v1"
 PROFILE_SCHEMA_VERSION: int = 1
 STRATEGY_RUNTIME_STATE_SCHEMA_VERSION: int = 1
 DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
@@ -98,11 +634,218 @@ DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
 
 
+def _runtime_primitive_anchor_snapshot() -> Optional[Tuple[Any, ...]]:
+    """返回经identity校验的模块原语锚；全程不比较候选对象的值。"""
+
+    try:
+        anchor = _get_runtime_primitive_anchor()
+    except BaseException:
+        return None
+    gate_authority_valid = False
+    condition_lock_valid = False
+    if type(anchor) is tuple and len(anchor) == 10 and type(anchor[5]) is threading.Condition:
+        try:
+            condition_lock_valid = (
+                object.__getattribute__(anchor[5], "_lock") is anchor[7]
+            )
+        except BaseException:
+            condition_lock_valid = False
+    if type(anchor) is tuple and len(anchor) == 10 and type(anchor[6]) is tuple:
+        gate_authority_valid = (
+            len(anchor[6]) == 7
+            and type(anchor[6][0]) is object
+            and all(type(function) is types.FunctionType for function in anchor[6][1:])
+        )
+    if (
+        type(anchor) is not tuple
+        or len(anchor) != 10
+        or anchor[0] is not _STRATEGY_RUNTIME_LOCK
+        or anchor[1] is not _STRATEGY_RUNTIME_OWNER_LOCK
+        or type(anchor[2]) is not object
+        or anchor[2] is not _STRATEGY_RUNTIME_INSTANCE_TOKEN
+        or type(anchor[3]) is not int
+        or anchor[3] < 1
+        or type(_STRATEGY_RUNTIME_MODULE_GENERATION) is not int
+        or _STRATEGY_RUNTIME_MODULE_GENERATION != anchor[3]
+        or type(anchor[4]) is not set
+        or anchor[4] is not _STRATEGY_RUNTIME_REQUEST_LEASES
+        or type(anchor[5]) is not threading.Condition
+        or anchor[5] is not _STRATEGY_RUNTIME_SOCKET_CONDITION
+        or type(anchor[6]) is not tuple
+        or anchor[6] is not _STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY
+        or type(anchor[7]) is not _thread.RLock
+        or anchor[7] is not _STRATEGY_RUNTIME_SOCKET_LOCK
+        or type(anchor[8]) is not types.FunctionType
+        or anchor[8] is not _STRATEGY_RUNTIME_QUARANTINE_RETAIN
+        or type(anchor[9]) is not tuple
+        or anchor[9] is not _STRATEGY_RUNTIME_RELOAD_ENTRY_AUTHORITY
+        or len(anchor[9]) != 3
+        or type(anchor[9][0]) is not object
+        or any(type(function) is not types.FunctionType for function in anchor[9][1:])
+        or not condition_lock_valid
+        or not gate_authority_valid
+    ):
+        return None
+    return anchor
+
+
+def _runtime_socket_gate_authority_snapshot(
+    anchor: Any,
+) -> Optional[Tuple[bool, Tuple[Tuple[object, int], ...]]]:
+    """读取闭包权威gate；公开active/reload镜像不能重新打开该单向latch。"""
+
+    if (
+        type(anchor) is not tuple
+        or len(anchor) != 10
+        or type(anchor[6]) is not tuple
+        or len(anchor[6]) != 7
+        or type(anchor[6][1]) is not types.FunctionType
+    ):
+        return None
+    try:
+        state = anchor[6][1]()
+    except BaseException:
+        return None
+    if (
+        type(state) is not tuple
+        or len(state) != 2
+        or type(state[0]) is not bool
+        or type(state[1]) is not tuple
+        or any(
+            type(entry) is not tuple
+            or len(entry) != 2
+            or type(entry[0]) is not object
+            or type(entry[1]) is not int
+            for entry in state[1]
+        )
+    ):
+        return None
+    return state
+
+
+def _require_trusted_runtime_lock(
+    namespace: Optional[Dict[str, Any]] = None,
+):
+    anchor = _runtime_primitive_anchor_snapshot()
+    if anchor is None:
+        _fail_runtime_generation_drift(namespace)
+        raise RuntimeError(
+            "策略运行同步原语或helper代际无效；必须使用干净运行进程重启"
+        )
+    return anchor[0]
+
+
+def _require_trusted_runtime_owner_lock(
+    namespace: Optional[Dict[str, Any]] = None,
+):
+    anchor = _runtime_primitive_anchor_snapshot()
+    if anchor is None:
+        _fail_runtime_generation_drift(namespace)
+        raise RuntimeError(
+            "策略运行同步原语或helper代际无效；必须使用干净运行进程重启"
+        )
+    return anchor[1]
+
+
+def _runtime_transition_snapshot(
+) -> Tuple[bool, Optional[int], Optional[Dict[str, Any]], Optional[str]]:
+    """只接受固定内建类型的transition三元组，避免候选值参与魔术比较。"""
+
+    owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
+    namespace = _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+    mode = _STRATEGY_RUNTIME_TRANSITION_MODE
+    if owner is None:
+        return namespace is None and mode is None, None, None, None
+    if (
+        type(owner) is not int
+        or (namespace is not None and type(namespace) is not dict)
+        or (
+            mode is not None
+            and (
+                type(mode) is not str
+                or mode not in {"BACKTEST", "SHADOW", "LIVE"}
+            )
+        )
+    ):
+        return False, None, None, None
+    return True, owner, namespace, mode
+
+
+def _runtime_request_registry_snapshot(
+    registry: Any,
+) -> Optional[Tuple[object, ...]]:
+    """只通过精确set迭代和元素类型/identity观察lease，不执行元素hash/eq。"""
+
+    if type(registry) is not set:
+        return None
+    try:
+        values = tuple(set.__iter__(registry))
+    except BaseException:
+        return None
+    if any(type(value) is not object for value in values):
+        return None
+    return values
+
+
+def _runtime_request_registry_contains_identity(
+    registry_snapshot: Optional[Tuple[object, ...]],
+    request_token: Any,
+) -> bool:
+    return (
+        type(registry_snapshot) is tuple
+        and type(request_token) is object
+        and any(value is request_token for value in registry_snapshot)
+    )
+
+
+def _discard_runtime_request_lease_by_identity(
+    registry: Any,
+    request_token: Any,
+) -> bool:
+    snapshot = _runtime_request_registry_snapshot(registry)
+    if type(request_token) is not object or snapshot is None:
+        return False
+    for value in snapshot:
+        if value is request_token:
+            set.remove(registry, value)
+            return True
+    return False
+
+
+def _clear_or_quarantine_runtime_request_registry(
+    registry: Any,
+    quarantine_retain: Any,
+) -> None:
+    """清空可信token；不可信元素先保留强引用，避免执行其析构器。"""
+
+    if type(registry) is not set:
+        return
+    try:
+        values = tuple(set.__iter__(registry))
+    except BaseException:
+        return
+    if all(type(value) is object for value in values):
+        set.clear(registry)
+        return
+    if type(quarantine_retain) is not types.FunctionType:
+        return
+    try:
+        retained_count = quarantine_retain(values)
+    except BaseException:
+        return
+    if type(retained_count) is int and retained_count > 0:
+        set.clear(registry)
+
+
 def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., Any]:
     """串行化配置、旧兼容安装和runtime状态切换。"""
 
-    @functools.wraps(function)
-    def locked(*args, **kwargs):
+    boundary_instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
+    boundary_module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
+    boundary_operation = function.__name__
+    is_runtime_install = boundary_operation == "install_strategy_runtime"
+
+    def locked_impl(boundary_attempt_state, *args, **kwargs):
         global _STRATEGY_RUNTIME_TRANSITION_OWNER
         global _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
         global _STRATEGY_RUNTIME_TRANSITION_MODE
@@ -122,17 +865,35 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
             else None
         )
         invalid_runtime_state = False
+        if type(current_thread) is not int or not _runtime_module_generation_matches(
+            boundary_instance_token,
+            boundary_module_generation,
+        ):
+            _fail_runtime_generation_drift(namespace)
+            raise RuntimeError(
+                "策略运行helper代际或线程状态无效；必须使用干净运行进程重启"
+            )
 
         def call_with_generation_check():
-            instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
-            module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
             generation_drift = False
+            if not _runtime_module_generation_matches(
+                boundary_instance_token,
+                boundary_module_generation,
+            ):
+                _fail_runtime_generation_drift(namespace)
+                raise RuntimeError(
+                    "策略运行helper代际无效；必须使用干净运行进程重启"
+                )
             try:
+                if not is_runtime_install:
+                    kwargs["_runtime_boundary_attempt_state"] = (
+                        boundary_attempt_state
+                    )
                 result = function(*args, **kwargs)
             except BaseException:
-                if (
-                    _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
-                    or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+                if not _runtime_module_generation_matches(
+                    boundary_instance_token,
+                    boundary_module_generation,
                 ):
                     generation_drift = True
                 else:
@@ -144,46 +905,180 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
                 raise RuntimeError(
                     "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
                 )
-            if (
-                _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
-                or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+            if not _runtime_module_generation_matches(
+                boundary_instance_token,
+                boundary_module_generation,
             ):
                 _fail_runtime_generation_drift(namespace)
                 raise RuntimeError(
                     "策略运行helper在调用期间发生重载；必须使用干净运行进程重启"
                 )
+            # reload bootstrap先单调关闭权威gate、再等待runtime锁。该检查位于
+            # 最终代际检查之后，确保已开始的reload不能跨过成功返回边界。
+            try:
+                _assert_runtime_reload_latch_open("返回策略运行边界")
+            except BaseException:
+                _fail_runtime_generation_drift(namespace)
+                raise
             return result
 
-        if function.__name__ != "install_strategy_runtime":
-            owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
-            if owner is not None and owner != current_thread:
+        if not is_runtime_install:
+            transition_valid, owner, _, _ = _runtime_transition_snapshot()
+            if not transition_valid:
+                _fail_runtime_generation_drift(namespace)
+                raise RuntimeError(
+                    "策略运行transition状态无效；必须使用干净运行进程重启"
+                )
+            if owner is not None:
+                _assert_runtime_mutation_allowed(boundary_operation)
                 raise RuntimeError("策略运行模式正在切换；拒绝并发配置、请求或重复安装")
-            with _STRATEGY_RUNTIME_LOCK:
-                return call_with_generation_check()
+            runtime_lock = _require_trusted_runtime_lock(namespace)
+            with runtime_lock:
+                transition_valid, owner, _, _ = _runtime_transition_snapshot()
+                if not transition_valid:
+                    _fail_runtime_generation_drift(namespace)
+                    raise RuntimeError(
+                        "策略运行transition状态无效；必须使用干净运行进程重启"
+                    )
+                if owner is not None:
+                    _assert_runtime_mutation_allowed(boundary_operation)
+                    raise RuntimeError(
+                        "策略运行模式正在切换；拒绝并发配置、请求或重复安装"
+                    )
+                # 先执行无副作用的模式策略检查；SHADOW/BACKTEST等预期拒绝不应
+                # 污染已提交runtime。通过后才登记不可重入mutation reservation。
+                _assert_runtime_mutation_allowed(boundary_operation)
+                owner_lock = _require_trusted_runtime_owner_lock(namespace)
+                with owner_lock:
+                    transition_valid, owner, _, _ = _runtime_transition_snapshot()
+                    if not transition_valid or owner is not None:
+                        _fail_runtime_generation_drift(namespace)
+                        raise RuntimeError(
+                            "策略运行mutation reservation无效；必须使用干净运行进程重启"
+                        )
+                    boundary_attempt_state[0] = True
+                    _STRATEGY_RUNTIME_TRANSITION_OWNER = current_thread
+                    _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = namespace
+                    _STRATEGY_RUNTIME_TRANSITION_MODE = None
+                mutation_call_completed = False
+                try:
+                    result = call_with_generation_check()
+                    mutation_call_completed = True
+                    return result
+                finally:
+                    owner_lock = _require_trusted_runtime_owner_lock(namespace)
+                    with owner_lock:
+                        (
+                            transition_valid,
+                            final_owner,
+                            final_namespace,
+                            final_mode,
+                        ) = _runtime_transition_snapshot()
+                        if (
+                            not transition_valid
+                            or final_owner != current_thread
+                            or final_namespace is not namespace
+                            or final_mode is not None
+                        ):
+                            _fail_runtime_generation_drift(namespace)
+                            if mutation_call_completed:
+                                raise RuntimeError(
+                                    "策略运行mutation reservation漂移；必须使用干净运行进程重启"
+                                )
+                        _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+                        _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+                        _STRATEGY_RUNTIME_TRANSITION_MODE = None
 
         # owner reservation使用独立短锁：两个同时到达的安装调用不能都观察到
         # owner=None后在主锁上排队，否则后一个调用会污染前一个已返回的成功状态。
-        with _STRATEGY_RUNTIME_OWNER_LOCK:
-            owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
-            transition_namespace = _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
-            transition_mode = _STRATEGY_RUNTIME_TRANSITION_MODE
+        owner_lock = _require_trusted_runtime_owner_lock(namespace)
+        with owner_lock:
+            (
+                transition_valid,
+                owner,
+                transition_namespace,
+                transition_mode,
+            ) = _runtime_transition_snapshot()
+            if not transition_valid:
+                _fail_runtime_generation_drift(namespace)
+                raise RuntimeError(
+                    "策略运行transition状态无效；必须使用干净运行进程重启"
+                )
             if owner is None:
+                # 从首次generation/active/namespace变更前武装attempt；owner锁已
+                # 排除了并发调用，递归/并发拒绝分支不会误清理别人的reservation。
+                boundary_attempt_state[0] = True
                 if (
                     namespace is not None
-                    and requested_remote_mode in _RUNTIME_MODES
+                    and requested_remote_mode in {"BACKTEST", "SHADOW", "LIVE"}
                 ):
                     active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
-                    if active_mode is None:
-                        _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
-                        _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
-                    elif (
-                        type(active_mode) is not str
-                        or active_mode
-                        not in {"BACKTEST", "SHADOW", "LIVE_BLOCKED", "FAILED"}
-                    ):
-                        _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
-                        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+                    process_signature = _STRATEGY_RUNTIME_PROCESS_SIGNATURE
+                    canonical_state = _STRATEGY_RUNTIME_CANONICAL_STATE
+                    commit_capsule = _STRATEGY_RUNTIME_COMMIT_CAPSULE
+                    anchored_capsule = _get_runtime_commit_anchor()
+                    runtime_record_present = False
+                    runtime_record = None
+                    try:
+                        runtime_record_present = dict.__contains__(
+                            namespace,
+                            _STRATEGY_RUNTIME_STATE_KEY,
+                        )
+                        if runtime_record_present:
+                            runtime_record = dict.get(
+                                namespace,
+                                _STRATEGY_RUNTIME_STATE_KEY,
+                            )
+                    except BaseException:
                         invalid_runtime_state = True
+
+                    if (
+                        not invalid_runtime_state
+                        and not _runtime_contract_constants_are_valid()
+                    ):
+                        invalid_runtime_state = True
+
+                    if active_mode is None and not invalid_runtime_state:
+                        if (
+                            type(_STRATEGY_RUNTIME_CONTRACT_GENERATION) is not int
+                            or _STRATEGY_RUNTIME_CONTRACT_GENERATION != 0
+                            or process_signature is not None
+                            or canonical_state is not None
+                            or commit_capsule is not None
+                            or anchored_capsule is not None
+                            or runtime_record_present
+                        ):
+                            invalid_runtime_state = True
+                        else:
+                            _advance_runtime_contract_generation()
+                            _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
+                    elif (
+                        type(active_mode) is str
+                        and active_mode in {"BACKTEST", "SHADOW", "LIVE_BLOCKED"}
+                    ):
+                        try:
+                            invalid_runtime_state = not _runtime_authority_is_consistent(
+                                active_mode,
+                                process_signature,
+                                canonical_state,
+                                runtime_record,
+                                commit_capsule,
+                                anchored_capsule,
+                                _STRATEGY_RUNTIME_CONTRACT_GENERATION,
+                                _STRATEGY_RUNTIME_INSTANCE_TOKEN,
+                                _STRATEGY_RUNTIME_MODULE_GENERATION,
+                                namespace,
+                            )
+                        except BaseException:
+                            invalid_runtime_state = True
+                    elif type(active_mode) is str and active_mode == "FAILED":
+                        pass
+                    else:
+                        invalid_runtime_state = True
+
+                    if invalid_runtime_state:
+                        _advance_runtime_contract_generation()
+                        _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
                 if namespace is not None and (
                     invalid_runtime_state
                     or requested_remote_mode in {"SHADOW", "LIVE"}
@@ -212,20 +1107,110 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
                 raise RuntimeError("策略运行模式安装不允许递归调用")
             raise RuntimeError("策略运行模式正在切换；拒绝并发配置、请求或重复安装")
 
-        try:
-            with _STRATEGY_RUNTIME_LOCK:
+        call_completed = False
+        runtime_lock = _require_trusted_runtime_lock(namespace)
+        with runtime_lock:
+            try:
                 if invalid_runtime_state:
                     _mark_runtime_failed(namespace)
                     raise RuntimeError(
                         "策略运行进程状态无效；必须使用干净运行进程重启"
                     )
-                return call_with_generation_check()
-        finally:
-            with _STRATEGY_RUNTIME_OWNER_LOCK:
-                if _STRATEGY_RUNTIME_TRANSITION_OWNER == current_thread:
-                    _STRATEGY_RUNTIME_TRANSITION_OWNER = None
-                    _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
-                    _STRATEGY_RUNTIME_TRANSITION_MODE = None
+                result = call_with_generation_check()
+                call_completed = True
+                return result
+            finally:
+                try:
+                    owner_lock = _require_trusted_runtime_owner_lock(namespace)
+                    with owner_lock:
+                        (
+                            transition_valid,
+                            final_owner,
+                            final_namespace,
+                            final_mode,
+                        ) = _runtime_transition_snapshot()
+                        if not transition_valid:
+                            _fail_runtime_generation_drift(namespace)
+                            raise RuntimeError(
+                                "策略运行transition状态无效；必须使用干净运行进程重启"
+                            )
+                        if final_owner is None:
+                            if call_completed:
+                                _fail_runtime_generation_drift(namespace)
+                                raise RuntimeError(
+                                    "策略运行安装reservation在返回前失效；必须使用干净运行进程重启"
+                                )
+                        elif final_owner == current_thread:
+                            anchor = _runtime_primitive_anchor_snapshot()
+                            socket_lock = anchor[7] if anchor is not None else None
+                            if socket_lock is None:
+                                _fail_runtime_generation_drift(namespace)
+                                raise RuntimeError(
+                                    "策略运行安装返回原语无效；必须使用干净运行进程重启"
+                                )
+                            with socket_lock:
+                                gate_state = _runtime_socket_gate_authority_snapshot(
+                                    anchor
+                                )
+                                if (
+                                    not _runtime_module_generation_matches(
+                                        boundary_instance_token,
+                                        boundary_module_generation,
+                                    )
+                                    or gate_state != (False, ())
+                                    or type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS)
+                                    is not bool
+                                    or _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                                    or final_namespace is not namespace
+                                    or final_mode != requested_remote_mode
+                                ):
+                                    _fail_runtime_generation_drift(namespace)
+                                    raise RuntimeError(
+                                        "策略运行安装在返回前发生重载或reservation漂移；必须使用干净运行进程重启"
+                                    )
+                                _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+                                _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+                                _STRATEGY_RUNTIME_TRANSITION_MODE = None
+                        else:
+                            _fail_runtime_generation_drift(namespace)
+                            raise RuntimeError(
+                                "策略运行transition owner发生漂移；必须使用干净运行进程重启"
+                            )
+                except BaseException:
+                    # owner/socket上下文已经释放；runtime RLock仍由外层持有。
+                    # 任意异步中断都必须撤销刚提交的namespace状态后再传播。
+                    _fail_runtime_generation_drift(namespace)
+                    raise
+
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        boundary_attempt_state = [False]
+        boundary_result_sentinel = object()
+        boundary_result = boundary_result_sentinel
+        call_completed = False
+        namespace = None
+        if args and type(args[0]) is dict:
+            namespace = args[0]
+        elif type(kwargs.get("namespace")) is dict:
+            namespace = kwargs["namespace"]
+        try:
+            boundary_result = locked_impl(
+                boundary_attempt_state,
+                *args,
+                **kwargs,
+            )
+            call_completed = True
+            boundary_attempt_state[0] = False
+            return boundary_result
+        except BaseException:
+            if (
+                boundary_attempt_state[0]
+                or boundary_result is not boundary_result_sentinel
+                or call_completed
+            ):
+                _fail_runtime_generation_drift(namespace)
+                boundary_attempt_state[0] = False
+            raise
 
     return locked
 
@@ -233,27 +1218,298 @@ def _serialise_runtime_boundary(function: Callable[..., Any]) -> Callable[..., A
 def _track_runtime_request(function: Callable[..., Any]) -> Callable[..., Any]:
     """登记锁外RPC；runtime切换发现已有请求时必须失败关闭。"""
 
-    @functools.wraps(function)
-    def tracked(self, action, *args, **kwargs):
+    request_instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
+    request_module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
+    request_registry = _STRATEGY_RUNTIME_REQUEST_LEASES
+    request_quarantine_retain = _STRATEGY_RUNTIME_QUARANTINE_RETAIN
+    request_runtime_lock = _STRATEGY_RUNTIME_LOCK
+
+    def tracked_impl(
+        self,
+        action,
+        request_token,
+        request_handoff_state,
+        request_resource_state,
+        *args,
+        **kwargs,
+    ):
         global _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
 
         current_thread = threading.get_ident()
-        owner = _STRATEGY_RUNTIME_TRANSITION_OWNER
-        if owner is not None and owner != current_thread:
+        if type(current_thread) is not int or not _runtime_module_generation_matches(
+            request_instance_token,
+            request_module_generation,
+        ):
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程请求helper代际无效；必须使用干净运行进程重启"
+            )
+        transition_valid, owner, _, _ = _runtime_transition_snapshot()
+        if not transition_valid:
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程请求transition状态无效；必须使用干净运行进程重启"
+            )
+        _assert_runtime_remote_allowed(action)
+        if owner is not None:
             raise RuntimeError("策略运行模式正在切换；禁止远程访问: {}".format(action))
-        with _STRATEGY_RUNTIME_LOCK:
+        runtime_lock = _require_trusted_runtime_lock()
+        with runtime_lock:
+            if not _runtime_module_generation_matches(
+                request_instance_token,
+                request_module_generation,
+            ):
+                _fail_runtime_generation_drift(None)
+                raise RuntimeError(
+                    "策略运行远程请求helper代际无效；必须使用干净运行进程重启"
+                )
+            transition_valid, owner, _, _ = _runtime_transition_snapshot()
+            if not transition_valid:
+                _fail_runtime_generation_drift(None)
+                raise RuntimeError(
+                    "策略运行远程请求transition状态无效；必须使用干净运行进程重启"
+                )
             _assert_runtime_remote_allowed(action)
-            lease_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
-            _STRATEGY_RUNTIME_INFLIGHT_REQUESTS += 1
+            if owner is not None:
+                raise RuntimeError(
+                    "策略运行模式正在切换；禁止远程访问: {}".format(action)
+                )
+            current_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+            current_inflight = _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+            registry_snapshot = _runtime_request_registry_snapshot(request_registry)
+            if (
+                type(current_generation) is not int
+                or current_generation != 0
+                or type(current_inflight) is not int
+                or current_inflight < 0
+                or type(request_registry) is not set
+                or request_registry is not _STRATEGY_RUNTIME_REQUEST_LEASES
+                or registry_snapshot is None
+                or current_inflight != len(registry_snapshot)
+            ):
+                _fail_runtime_generation_drift(None)
+                raise RuntimeError(
+                    "策略运行远程请求状态无效；必须使用干净运行进程重启"
+                )
+            lease_generation = current_generation
+            set.add(request_registry, request_token)
+            _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = len(request_registry)
+        request_result_sentinel = object()
+        request_result = request_result_sentinel
+        request_primary_exception = None
         try:
             kwargs["_runtime_lease_generation"] = lease_generation
-            return function(self, action, *args, **kwargs)
+            kwargs["_runtime_lease_instance_token"] = request_instance_token
+            kwargs["_runtime_lease_module_generation"] = request_module_generation
+            kwargs["_runtime_lease_registry"] = request_registry
+            kwargs["_runtime_lease_token"] = request_token
+            kwargs["_runtime_lease_handoff_state"] = request_handoff_state
+            kwargs["_runtime_lease_resource_state"] = request_resource_state
+            request_result = function(self, action, *args, **kwargs)
+            return request_result
+        except BaseException as exc:
+            request_primary_exception = exc
+            raise
         finally:
-            with _STRATEGY_RUNTIME_LOCK:
-                _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = max(
-                    0,
-                    _STRATEGY_RUNTIME_INFLIGHT_REQUESTS - 1,
+            if request_result is not request_result_sentinel:
+                request_handoff_state[0] = True
+            runtime_lock = _require_trusted_runtime_lock()
+            with runtime_lock:
+                if not _runtime_module_generation_matches(
+                    request_instance_token,
+                    request_module_generation,
+                ):
+                    if not _discard_runtime_request_lease_by_identity(
+                        request_registry,
+                        request_token,
+                    ) and type(request_registry) is set:
+                        _clear_or_quarantine_runtime_request_registry(
+                            request_registry,
+                            request_quarantine_retain,
+                        )
+                    raise RuntimeError(
+                        "策略运行远程请求属于旧helper代际；已拒绝修改当前计数"
+                    )
+                current_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+                current_inflight = _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+                registry_snapshot = _runtime_request_registry_snapshot(
+                    request_registry
                 )
+                token_registered = _runtime_request_registry_contains_identity(
+                    registry_snapshot,
+                    request_token,
+                )
+                active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+                transition_valid, owner, _, _ = _runtime_transition_snapshot()
+                failed_latched = False
+                try:
+                    failed_latched = (
+                        type(active_mode) is str
+                        and active_mode == "FAILED"
+                        and _get_runtime_commit_anchor()
+                        is _STRATEGY_RUNTIME_FAILED_ANCHOR
+                    )
+                except BaseException:
+                    failed_latched = False
+                if (
+                    failed_latched
+                    and type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is bool
+                    and _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                ):
+                    _clear_runtime_request_leases()
+                    _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = 0
+                    if (
+                        request_primary_exception is not None
+                        and isinstance(request_primary_exception, BaseException)
+                        and not isinstance(request_primary_exception, Exception)
+                    ):
+                        raise request_primary_exception
+                    raise RuntimeError(
+                        "策略运行helper正在重载；旧请求不得修改新代际计数"
+                    )
+                if (
+                    failed_latched
+                    and type(current_generation) is int
+                    and current_generation != lease_generation
+                    and request_registry is _STRATEGY_RUNTIME_REQUEST_LEASES
+                    and registry_snapshot is not None
+                    and not token_registered
+                ):
+                    raise RuntimeError(
+                        "策略运行远程请求契约已失效；已拒绝修改当前计数"
+                    )
+                if (
+                    active_mode is not None
+                    or type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is not bool
+                    or _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                    or not transition_valid
+                    or owner is not None
+                ):
+                    _fail_runtime_generation_drift(None)
+                    raise RuntimeError(
+                        "策略运行远程请求收尾状态无效；必须使用干净运行进程重启"
+                    )
+                _assert_runtime_request_lease_current(
+                    action,
+                    lease_generation,
+                    request_instance_token,
+                    request_module_generation,
+                    request_registry,
+                    request_token,
+                )
+                if (
+                    type(current_generation) is not int
+                    or current_generation != lease_generation
+                    or type(current_inflight) is not int
+                    or current_inflight <= 0
+                    or request_registry is not _STRATEGY_RUNTIME_REQUEST_LEASES
+                    or registry_snapshot is None
+                    or not token_registered
+                    or current_inflight != len(registry_snapshot)
+                ):
+                    _fail_runtime_generation_drift(None)
+                    raise RuntimeError(
+                        "策略运行远程请求释放状态无效；必须使用干净运行进程重启"
+                    )
+                if not _discard_runtime_request_lease_by_identity(
+                    request_registry,
+                    request_token,
+                ):
+                    _fail_runtime_generation_drift(None)
+                    raise RuntimeError(
+                        "策略运行远程请求lease identity无效；必须使用干净运行进程重启"
+                    )
+                remaining_leases = _runtime_request_registry_snapshot(request_registry)
+                if remaining_leases is None:
+                    _fail_runtime_generation_drift(None)
+                    raise RuntimeError(
+                        "策略运行远程请求registry无效；必须使用干净运行进程重启"
+                    )
+                _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = len(remaining_leases)
+
+    def emergency_release_request(request_token):
+        """核对token与计数；覆盖释放token后、更新计数前的中断窗口。"""
+
+        with request_runtime_lock:
+            registry_snapshot = _runtime_request_registry_snapshot(
+                request_registry
+            )
+            token_registered = _runtime_request_registry_contains_identity(
+                registry_snapshot,
+                request_token,
+            )
+            if token_registered and not _discard_runtime_request_lease_by_identity(
+                request_registry,
+                request_token,
+            ):
+                _clear_or_quarantine_runtime_request_registry(
+                    request_registry,
+                    request_quarantine_retain,
+                )
+            current_generation_matches = _runtime_module_generation_matches(
+                request_instance_token,
+                request_module_generation,
+            )
+            if (
+                current_generation_matches
+                and request_registry is _STRATEGY_RUNTIME_REQUEST_LEASES
+            ):
+                remaining_leases = _runtime_request_registry_snapshot(
+                    request_registry
+                )
+                current_inflight = _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+                if (
+                    token_registered
+                    or remaining_leases is None
+                    or type(current_inflight) is not int
+                    or current_inflight != len(remaining_leases)
+                ):
+                    _set_runtime_failed_process_state()
+
+    def emergency_close_request_resource(request_resource_state):
+        """关闭尚未由请求体确认释放的socket，不执行候选对象的布尔协议。"""
+
+        if type(request_resource_state) is not list or len(request_resource_state) != 1:
+            return
+        pending_resource = request_resource_state[0]
+        request_resource_state[0] = None
+        if pending_resource is not None:
+            try:
+                pending_resource.close()
+            except BaseException:
+                pass
+
+    @functools.wraps(function)
+    def tracked(self, action, *args, **kwargs):
+        request_token = object()
+        request_handoff_state = [False]
+        request_resource_state = [None]
+        request_result_sentinel = object()
+        request_result = request_result_sentinel
+        try:
+            request_result = tracked_impl(
+                self,
+                action,
+                request_token,
+                request_handoff_state,
+                request_resource_state,
+                *args,
+                **kwargs,
+            )
+            request_handoff_state[0] = False
+            return request_result
+        except BaseException:
+            emergency_close_request_resource(request_resource_state)
+            emergency_release_request(request_token)
+            if (
+                request_handoff_state[0]
+                or request_result is not request_result_sentinel
+            ) and _runtime_module_generation_matches(
+                request_instance_token,
+                request_module_generation,
+            ):
+                _set_runtime_failed_process_state()
+            raise
 
     return tracked
 
@@ -383,6 +1639,55 @@ def _warn(msg: str, *args, **kwargs):
     print(f"[{timestamp}] [WARN] {formatted_msg}", file=sys.stderr)
 
 
+def _configure_remote_clients(
+    host: str,
+    token: str,
+    port: int,
+    account_key: Optional[str],
+    sub_account_id: Optional[str],
+    tls_cert: Optional[str],
+    retries: int,
+    retry_interval: float,
+    rpc_timeout: float,
+    place_order_timeout_margin: float,
+    debug: bool,
+) -> None:
+    """在已持有runtime mutation reservation时原子发布远程client组。"""
+
+    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT, _DEBUG
+
+    _DEBUG = debug
+    _log(
+        "INFO",
+        "初始化远程连接: host={}, port={}, retries={}, debug={}",
+        host,
+        port,
+        retries,
+        debug,
+    )
+    client = _ShortLivedClient(
+        host,
+        port,
+        token,
+        tls_cert=tls_cert,
+        retries=retries,
+        retry_interval=retry_interval,
+        rpc_timeout=rpc_timeout,
+    )
+    data_client = RemoteDataClient(client)
+    broker_client = RemoteBrokerClient(
+        client,
+        account_key=account_key,
+        sub_account_id=sub_account_id,
+        place_order_timeout_margin=place_order_timeout_margin,
+    )
+    broker_client.bind_data_client(data_client)
+    _CLIENT = client
+    _DATA_CLIENT = data_client
+    _BROKER_CLIENT = broker_client
+    _log("INFO", "初始化完成")
+
+
 @_serialise_runtime_boundary
 def configure(
     host: str,
@@ -397,6 +1702,7 @@ def configure(
     rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS,
     place_order_timeout_margin: float = DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
     debug: bool = True,
+    _runtime_boundary_attempt_state: Optional[List[bool]] = None,
 ) -> None:
     """
     初始化远程访问参数；聚宽环境无法常驻进程，因此每次调用都会短连接访问。
@@ -414,33 +1720,33 @@ def configure(
         place_order_timeout_margin: 下单请求超时相对 wait_timeout 的安全余量，默认 30.0
         debug: 是否启用调试日志，默认 True
     """
-    global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT, _DEBUG
-
-    _assert_runtime_mutation_allowed("configure")
+    _assert_runtime_mutation_allowed(
+        "configure",
+        threading.get_ident(),
+    )
     _assert_no_inflight_runtime_requests("configure")
-    
-    _DEBUG = debug
-    _log("INFO", "初始化远程连接: host={}, port={}, retries={}, debug={}", host, port, retries, debug)
-    
-    _CLIENT = _ShortLivedClient(
+    if (
+        type(_runtime_boundary_attempt_state) is not list
+        or len(_runtime_boundary_attempt_state) != 1
+    ):
+        _fail_runtime_generation_drift(None)
+        raise RuntimeError(
+            "策略运行配置attempt状态无效；必须使用干净运行进程重启"
+    )
+    _runtime_boundary_attempt_state[0] = True
+    _configure_remote_clients(
         host,
-        port,
         token,
-        tls_cert=tls_cert,
-        retries=retries,
-        retry_interval=retry_interval,
-        rpc_timeout=rpc_timeout,
+        port,
+        account_key,
+        sub_account_id,
+        tls_cert,
+        retries,
+        retry_interval,
+        rpc_timeout,
+        place_order_timeout_margin,
+        debug,
     )
-    _DATA_CLIENT = RemoteDataClient(_CLIENT)
-    _BROKER_CLIENT = RemoteBrokerClient(
-        _CLIENT,
-        account_key=account_key,
-        sub_account_id=sub_account_id,
-        place_order_timeout_margin=place_order_timeout_margin,
-    )
-    _BROKER_CLIENT.bind_data_client(_DATA_CLIENT)
-    
-    _log("INFO", "初始化完成")
 
 
 def get_data_client() -> "RemoteDataClient":
@@ -1355,6 +2661,12 @@ class _ShortLivedClient:
         timeout: Optional[float] = None,
         *,
         _runtime_lease_generation: Optional[int] = None,
+        _runtime_lease_instance_token: Optional[object] = None,
+        _runtime_lease_module_generation: Optional[int] = None,
+        _runtime_lease_registry: Optional[Set[object]] = None,
+        _runtime_lease_token: Optional[object] = None,
+        _runtime_lease_handoff_state: Optional[List[bool]] = None,
+        _runtime_lease_resource_state: Optional[List[Optional[Any]]] = None,
     ) -> Dict[str, Any]:
         """
         发送 RPC 请求（每次调用都会建立新的 TCP 连接）。
@@ -1371,10 +2683,39 @@ class _ShortLivedClient:
             RuntimeError: 所有重试都失败后抛出最后一个异常
         """
         _assert_runtime_remote_allowed(action)
+        if (
+            type(_runtime_lease_handoff_state) is not list
+            or len(_runtime_lease_handoff_state) != 1
+            or type(_runtime_lease_resource_state) is not list
+            or len(_runtime_lease_resource_state) != 1
+            or _runtime_lease_resource_state[0] is not None
+        ):
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程请求交付状态无效；必须使用干净运行进程重启"
+            )
+        request_anchor = _runtime_primitive_anchor_snapshot()
+        if (
+            request_anchor is None
+            or type(request_anchor[6]) is not tuple
+            or len(request_anchor[6]) != 7
+            or type(request_anchor[6][6]) is not types.FunctionType
+        ):
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程effect authority无效；必须使用干净运行进程重启"
+            )
+        run_remote_effect = request_anchor[6][6]
+        request_socket_lock = request_anchor[7]
         effective_timeout = max(5.0, float(timeout or self.rpc_timeout))
         last_error: Optional[Exception] = None
         attempts = self.retries + 1
         request_start_time = time.time()
+        mutation_action = type(action) is str and action in {
+            "broker.place_order",
+            "broker.cancel_order",
+        }
+        mutation_request_started = False
         
         _log("INFO", "[RPC] 开始请求: action={}, host={}, port={}, attempts={}", action, self.host, self.port, attempts)
         
@@ -1384,6 +2725,10 @@ class _ShortLivedClient:
             _assert_runtime_request_lease_current(
                 action,
                 _runtime_lease_generation,
+                _runtime_lease_instance_token,
+                _runtime_lease_module_generation,
+                _runtime_lease_registry,
+                _runtime_lease_token,
             )
             sock: Optional[socket.socket] = None
             connect_start_time = time.time()
@@ -1391,9 +2736,29 @@ class _ShortLivedClient:
             try:
                 # ========== 1. 建立 TCP 连接 ==========
                 _log("DEBUG", "[RPC] [尝试 {}/{}] 正在连接 TCP: {}:{}", attempt, attempts, self.host, self.port)
-                
+
                 try:
-                    sock = socket.create_connection((self.host, self.port), timeout=10)
+                    # 日志/计时之后再通过共享socket gate原子登记attempt起点；
+                    # reload关闭同一gate并等待已登记的create_connection返回。
+                    sock = _create_runtime_socket_with_lease(
+                        (self.host, self.port),
+                        10,
+                        action,
+                        _runtime_lease_generation,
+                        _runtime_lease_instance_token,
+                        _runtime_lease_module_generation,
+                        _runtime_lease_registry,
+                        _runtime_lease_token,
+                        _runtime_lease_resource_state,
+                    )
+                    _assert_runtime_request_lease_current(
+                        action,
+                        _runtime_lease_generation,
+                        _runtime_lease_instance_token,
+                        _runtime_lease_module_generation,
+                        _runtime_lease_registry,
+                        _runtime_lease_token,
+                    )
                     connect_duration = time.time() - connect_start_time
                     _log("DEBUG", "[RPC] [尝试 {}/{}] TCP 连接成功，耗时 {:.3f}s", attempt, attempts, connect_duration)
                 except socket.gaierror as e:
@@ -1429,8 +2794,28 @@ class _ShortLivedClient:
                 if self.tls_cert:
                     try:
                         _log("DEBUG", "[RPC] [尝试 {}/{}] 开始 TLS 握手", attempt, attempts)
+                        _assert_runtime_request_lease_current(
+                            action,
+                            _runtime_lease_generation,
+                            _runtime_lease_instance_token,
+                            _runtime_lease_module_generation,
+                            _runtime_lease_registry,
+                            _runtime_lease_token,
+                        )
                         context = ssl.create_default_context(cafile=self.tls_cert)
-                        sock = context.wrap_socket(sock, server_hostname=self.host)
+                        with request_socket_lock:
+                            effect_allowed, wrapped_socket = run_remote_effect(
+                                context.wrap_socket,
+                                (sock,),
+                                {"server_hostname": self.host},
+                                None,
+                            )
+                        if not effect_allowed or wrapped_socket is None:
+                            raise RuntimeError(
+                                "策略运行reload已撤销TLS transport许可"
+                            )
+                        _runtime_lease_resource_state[0] = wrapped_socket
+                        sock = wrapped_socket
                         _log("DEBUG", "[RPC] [尝试 {}/{}] TLS 握手成功", attempt, attempts)
                     except Exception as e:
                         error_msg = f"TLS 握手失败: {e}"
@@ -1443,6 +2828,14 @@ class _ShortLivedClient:
                         continue
                 
                 sock.settimeout(effective_timeout)
+                _assert_runtime_request_lease_current(
+                    action,
+                    _runtime_lease_generation,
+                    _runtime_lease_instance_token,
+                    _runtime_lease_module_generation,
+                    _runtime_lease_registry,
+                    _runtime_lease_token,
+                )
                 
                 # ========== 3. 应用层握手 ==========
                 try:
@@ -1453,7 +2846,25 @@ class _ShortLivedClient:
                         "token": self.token,
                         "features": [],
                     }
-                    self._send(sock, handshake_msg)
+                    _assert_runtime_request_lease_current(
+                        action,
+                        _runtime_lease_generation,
+                        _runtime_lease_instance_token,
+                        _runtime_lease_module_generation,
+                        _runtime_lease_registry,
+                        _runtime_lease_token,
+                    )
+                    with request_socket_lock:
+                        effect_allowed, _ = run_remote_effect(
+                            self._send,
+                            (sock, handshake_msg),
+                            {},
+                            None,
+                        )
+                    if not effect_allowed:
+                        raise RuntimeError(
+                            "策略运行reload已撤销handshake send许可"
+                        )
                     ack = self._recv(sock)
                     _log("DEBUG", "[RPC] [尝试 {}/{}] 收到握手响应: {}", attempt, attempts, ack.get("type"))
                     
@@ -1491,13 +2902,39 @@ class _ShortLivedClient:
                      attempt, attempts, action, req_id, list(payload.keys()) if isinstance(payload, dict) else "N/A")
                 
                 try:
-                    self._send(sock, request_msg)
+                    _assert_runtime_request_lease_current(
+                        action,
+                        _runtime_lease_generation,
+                        _runtime_lease_instance_token,
+                        _runtime_lease_module_generation,
+                        _runtime_lease_registry,
+                        _runtime_lease_token,
+                    )
+                    with request_socket_lock:
+                        effect_allowed, _ = run_remote_effect(
+                            self._send,
+                            (sock, request_msg),
+                            {},
+                            _runtime_lease_handoff_state
+                            if mutation_action
+                            else None,
+                        )
+                    if mutation_action and _runtime_lease_handoff_state[0]:
+                        mutation_request_started = True
+                    if not effect_allowed:
+                        raise RuntimeError(
+                            "策略运行reload已撤销RPC send许可"
+                        )
                     _log("DEBUG", "[RPC] [尝试 {}/{}] RPC 请求已发送", attempt, attempts)
                 except Exception as e:
+                    if mutation_action and _runtime_lease_handoff_state[0]:
+                        mutation_request_started = True
                     error_msg = f"发送 RPC 请求失败: {e}"
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
                     _log("ERROR", "[RPC] [尝试 {}/{}] 堆栈:\n{}", attempt, attempts, traceback.format_exc())
                     last_error = RuntimeError(error_msg)
+                    if mutation_request_started:
+                        raise last_error
                     if attempt < attempts:
                         _log("INFO", "[RPC] [尝试 {}/{}] {}s 后重试...", attempt, attempts, self.retry_interval)
                         time.sleep(self.retry_interval)
@@ -1533,6 +2970,8 @@ class _ShortLivedClient:
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
                     _log("ERROR", "[RPC] [尝试 {}/{}] 堆栈:\n{}", attempt, attempts, traceback.format_exc())
                     last_error = RuntimeError(error_msg)
+                    if mutation_request_started:
+                        raise last_error
                     if attempt < attempts:
                         _log("INFO", "[RPC] [尝试 {}/{}] {}s 后重试...", attempt, attempts, self.retry_interval)
                         time.sleep(self.retry_interval)
@@ -1542,6 +2981,8 @@ class _ShortLivedClient:
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
                     _log("ERROR", "[RPC] [尝试 {}/{}] 堆栈:\n{}", attempt, attempts, traceback.format_exc())
                     last_error = RuntimeError(error_msg)
+                    if mutation_request_started:
+                        raise last_error
                     if attempt < attempts:
                         _log("INFO", "[RPC] [尝试 {}/{}] {}s 后重试...", attempt, attempts, self.retry_interval)
                         time.sleep(self.retry_interval)
@@ -1549,6 +2990,8 @@ class _ShortLivedClient:
                 
             except Exception as exc:
                 # 捕获所有其他未预期的异常
+                if mutation_request_started:
+                    raise
                 error_msg = f"未预期的异常: {exc}"
                 _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
                 _log("ERROR", "[RPC] [尝试 {}/{}] 堆栈:\n{}", attempt, attempts, traceback.format_exc())
@@ -1558,12 +3001,20 @@ class _ShortLivedClient:
                     time.sleep(self.retry_interval)
             finally:
                 # ========== 6. 关闭连接 ==========
-                if sock:
+                pending_socket = _runtime_lease_resource_state[0]
+                if pending_socket is not None and pending_socket is not sock:
+                    _runtime_lease_handoff_state[0] = True
+                    try:
+                        pending_socket.close()
+                    except BaseException:
+                        pass
+                if sock is not None:
                     try:
                         _log("DEBUG", "[RPC] [尝试 {}/{}] 关闭 TCP 连接", attempt, attempts)
                         sock.close()
                     except Exception as e:
                         _log("WARN", "[RPC] [尝试 {}/{}] 关闭连接时出错: {}", attempt, attempts, e)
+                _runtime_lease_resource_state[0] = None
         
         # 所有重试都失败
         total_duration = time.time() - request_start_time
@@ -1830,8 +3281,6 @@ def _run_type_from_context(context: Any) -> Optional[str]:
     return getattr(run_params, "type", None)
 
 
-_RUNTIME_MODES = {"BACKTEST", "SHADOW", "LIVE"}
-_BACKTEST_RUN_TYPES = {"simple_backtest", "full_backtest"}
 _PROFILE_REQUIRED_FIELDS = {"strategy_id", "host", "token"}
 _PROFILE_OPTIONAL_FIELDS = {
     "port",
@@ -1855,55 +3304,146 @@ _RUNTIME_MUTATION_NAMES = {
     "order_target_percent",
     "cancel_order",
 }
-_RUNTIME_BLOCKED_ACTIVE_MODES = {
-    "TRANSITIONING",
-    "BACKTEST",
-    "SHADOW",
-    "LIVE_BLOCKED",
-    "FAILED",
-}
 
 
-def _assert_runtime_mutation_allowed(operation: str) -> None:
+def _runtime_importlib_reload_in_progress() -> bool:
+    """观察CPython importlib的稳定进程级reload登记，封住并发/递归首行窗口。"""
+
+    try:
+        importlib_module = dict.get(sys.modules, "importlib")
+        if type(importlib_module) is not types.ModuleType:
+            return False
+        importlib_namespace = object.__getattribute__(
+            importlib_module,
+            "__dict__",
+        )
+        reloading = dict.get(importlib_namespace, "_RELOADING")
+        module_name = globals().get("__name__")
+        if type(reloading) is not dict or type(module_name) is not str:
+            return False
+        current_module = dict.get(sys.modules, module_name)
+        return current_module is not None and dict.get(
+            reloading,
+            module_name,
+        ) is current_module
+    except BaseException:
+        return False
+
+
+def _assert_runtime_mutation_allowed(
+    operation: str,
+    reservation_owner: Optional[int] = None,
+) -> None:
+    if _runtime_importlib_reload_in_progress():
+        _set_runtime_failed_process_state()
+        raise RuntimeError(
+            "策略运行helper正在由importlib重载；禁止交易变更: {}".format(
+                operation
+            )
+        )
     active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
     if active_mode is not None:
-        mode_label = (
-            active_mode
-            if type(active_mode) is str
-            and active_mode in _RUNTIME_BLOCKED_ACTIVE_MODES
-            else "INVALID"
-        )
+        if type(active_mode) is not str or active_mode not in {
+            "TRANSITIONING",
+            "BACKTEST",
+            "SHADOW",
+            "LIVE_BLOCKED",
+            "FAILED",
+        }:
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "INVALID模式禁止交易变更；必须使用干净运行进程重启"
+            )
         raise RuntimeError(
-            "{}模式禁止交易变更: {}".format(
-                mode_label,
-                operation,
+            "{}模式禁止交易变更: {}".format(active_mode, operation)
+        )
+    transition_valid, transition_owner, _, _ = _runtime_transition_snapshot()
+    if not transition_valid:
+        _fail_runtime_generation_drift(None)
+        raise RuntimeError(
+            "策略运行transition状态无效；必须使用干净运行进程重启"
+        )
+    if transition_owner is not None and (
+        type(reservation_owner) is not int
+        or transition_owner != reservation_owner
+    ):
+        raise RuntimeError(
+            "策略运行mutation reservation在途；禁止交易变更: {}".format(
+                operation
+            )
+        )
+    return
+
+
+def _assert_runtime_reload_latch_open(operation: str) -> None:
+    """任何旧调用栈在reload锁存后都不得继续发布运行状态。"""
+
+    importlib_reload_in_progress = _runtime_importlib_reload_in_progress()
+    reload_in_progress = _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+    primitive_anchor = _runtime_primitive_anchor_snapshot()
+    gate_state = _runtime_socket_gate_authority_snapshot(primitive_anchor)
+    if (
+        primitive_anchor is None
+        or gate_state is None
+        or gate_state[0]
+        or importlib_reload_in_progress
+        or type(reload_in_progress) is not bool
+        or reload_in_progress
+        or (type(active_mode) is str and active_mode == "FAILED")
+    ):
+        _set_runtime_failed_process_state()
+        raise RuntimeError(
+            "策略运行helper已重载或失败锁存；禁止继续状态变更: {}".format(
+                operation
             )
         )
 
 
 def _assert_runtime_remote_allowed(operation: str) -> None:
-    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
-    if active_mode is not None:
-        mode_label = (
-            active_mode
-            if type(active_mode) is str
-            and active_mode in _RUNTIME_BLOCKED_ACTIVE_MODES
-            else "INVALID"
-        )
+    if _runtime_importlib_reload_in_progress():
+        _set_runtime_failed_process_state()
         raise RuntimeError(
-            "{}模式禁止远程访问: {}".format(
-                mode_label,
-                operation,
+            "策略运行helper正在由importlib重载；禁止远程访问: {}".format(
+                operation
             )
         )
+    active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+    if active_mode is None:
+        return
+    if type(active_mode) is not str or active_mode not in {
+        "TRANSITIONING",
+        "BACKTEST",
+        "SHADOW",
+        "LIVE_BLOCKED",
+        "FAILED",
+    }:
+        _fail_runtime_generation_drift(None)
+        raise RuntimeError(
+            "INVALID模式禁止远程访问；必须使用干净运行进程重启"
+        )
+    raise RuntimeError("{}模式禁止远程访问: {}".format(active_mode, operation))
 
 
 def _assert_no_inflight_runtime_requests(operation: str) -> None:
-    if _STRATEGY_RUNTIME_INFLIGHT_REQUESTS:
+    inflight_requests = _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+    anchor = _runtime_primitive_anchor_snapshot()
+    request_leases = anchor[4] if anchor is not None else None
+    registry_snapshot = _runtime_request_registry_snapshot(request_leases)
+    if (
+        type(inflight_requests) is not int
+        or inflight_requests < 0
+        or type(request_leases) is not set
+        or registry_snapshot is None
+        or inflight_requests != len(registry_snapshot)
+    ):
+        _fail_runtime_generation_drift(None)
+        raise RuntimeError("远程请求计数状态无效；必须使用干净运行进程重启")
+    if inflight_requests != 0:
         raise RuntimeError(
             "{}时仍有{}个远程请求在途；必须使用干净运行进程重启".format(
                 operation,
-                _STRATEGY_RUNTIME_INFLIGHT_REQUESTS,
+                inflight_requests,
             )
         )
 
@@ -1911,11 +3451,213 @@ def _assert_no_inflight_runtime_requests(operation: str) -> None:
 def _assert_runtime_request_lease_current(
     operation: str,
     lease_generation: Optional[int],
+    lease_instance_token: Optional[object],
+    lease_module_generation: Optional[int],
+    lease_registry: Optional[Set[object]],
+    lease_token: Optional[object],
 ) -> None:
-    with _STRATEGY_RUNTIME_LOCK:
-        if lease_generation != _STRATEGY_RUNTIME_CONTRACT_GENERATION:
-            raise RuntimeError("策略运行契约已切换；禁止旧请求继续远程访问: {}".format(operation))
+    runtime_lock = _require_trusted_runtime_lock()
+    with runtime_lock:
+        current_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+        current_inflight = _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+        registry_snapshot = _runtime_request_registry_snapshot(lease_registry)
+        if (
+            not _runtime_module_generation_matches(
+                lease_instance_token,
+                lease_module_generation,
+            )
+            or type(lease_generation) is not int
+            or lease_generation < 0
+            or type(current_generation) is not int
+            or current_generation < 0
+            or type(current_inflight) is not int
+            or current_inflight <= 0
+            or type(lease_registry) is not set
+            or lease_registry is not _STRATEGY_RUNTIME_REQUEST_LEASES
+            or type(lease_token) is not object
+            or registry_snapshot is None
+            or not _runtime_request_registry_contains_identity(
+                registry_snapshot,
+                lease_token,
+            )
+            or current_inflight != len(registry_snapshot)
+        ):
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程请求代际无效；必须使用干净运行进程重启"
+            )
+        transition_valid, owner, _, _ = _runtime_transition_snapshot()
+        if not transition_valid:
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行远程请求transition状态无效；必须使用干净运行进程重启"
+            )
+        if owner is not None:
+            raise RuntimeError(
+                "策略运行模式正在切换；禁止旧请求继续远程访问: {}".format(operation)
+            )
+        if lease_generation != current_generation:
+            _fail_runtime_generation_drift(None)
+            raise RuntimeError(
+                "策略运行契约已切换；禁止旧请求继续远程访问: {}".format(operation)
+            )
         _assert_runtime_remote_allowed(operation)
+
+
+def _create_runtime_socket_with_lease(
+    address: Tuple[str, int],
+    timeout: float,
+    operation: str,
+    lease_generation: Optional[int],
+    lease_instance_token: Optional[object],
+    lease_module_generation: Optional[int],
+    lease_registry: Optional[Set[object]],
+    lease_token: Optional[object],
+    socket_handoff_state: List[Optional[Any]],
+):
+    """用共享socket gate线性化最终lease检查与attempt起点。"""
+
+    anchor = _runtime_primitive_anchor_snapshot()
+    if anchor is None:
+        _fail_runtime_generation_drift(None)
+        raise RuntimeError("策略运行socket gate无效；必须使用干净运行进程重启")
+    runtime_lock = anchor[0]
+    socket_condition = anchor[5]
+    socket_gate_authority = anchor[6]
+    socket_lock = anchor[7]
+    gate_start_attempt = socket_gate_authority[3]
+    gate_finish_attempt = socket_gate_authority[4]
+    gate_open_transport = socket_gate_authority[5]
+    attempt_token = object()
+    attempt_started = False
+    created_socket = None
+    gate_invalid = False
+    gate_cleanup_error = None
+    gate_cleanup_done = False
+
+    def finish_socket_attempt():
+        """幂等收尾；外层异常边界保证首条清理字节码中断后仍会重试。"""
+
+        nonlocal gate_invalid, gate_cleanup_error, gate_cleanup_done
+
+        cleanup_attempts = 0
+        while not gate_cleanup_done and cleanup_attempts < 3:
+            cleanup_attempts += 1
+            try:
+                with socket_lock:
+                    finish_result = gate_finish_attempt(attempt_token)
+                    if (
+                        type(finish_result) is not tuple
+                        or len(finish_result) != 2
+                        or type(finish_result[0]) is not bool
+                        or type(finish_result[1]) is not int
+                        or finish_result[1] < 0
+                    ):
+                        gate_invalid = True
+                    elif attempt_started and not finish_result[0]:
+                        gate_invalid = True
+                    threading.Condition.notify_all(socket_condition)
+                gate_cleanup_done = True
+            except BaseException as exc:
+                if gate_cleanup_error is None:
+                    gate_cleanup_error = exc
+        if not gate_cleanup_done:
+            gate_cleanup_done = True
+            gate_invalid = True
+        if (
+            gate_invalid or gate_cleanup_error is not None
+        ) and created_socket is not None:
+            try:
+                created_socket.close()
+            except BaseException:
+                pass
+        if gate_invalid:
+            _fail_runtime_generation_drift(None)
+        if gate_cleanup_error is not None:
+            raise gate_cleanup_error
+        if gate_invalid:
+            raise RuntimeError(
+                "策略运行socket gate释放状态无效；必须使用干净运行进程重启"
+            )
+
+    try:
+        try:
+            # 全局锁序固定为runtime -> socket gate；最外层异常边界在登记attempt前
+            # 已建立，因此finally首条字节码中断也会进入幂等应急清理。
+            with runtime_lock:
+                with socket_lock:
+                    _assert_runtime_request_lease_current(
+                        operation,
+                        lease_generation,
+                        lease_instance_token,
+                        lease_module_generation,
+                        lease_registry,
+                        lease_token,
+                    )
+                    start_result = gate_start_attempt(attempt_token)
+                    if type(start_result) is not bool:
+                        _fail_runtime_generation_drift(None)
+                        raise RuntimeError(
+                            "策略运行socket gate登记结果无效；必须使用干净运行进程重启"
+                        )
+                    if not start_result:
+                        raise RuntimeError(
+                            "策略运行helper正在重载；禁止开始新的socket attempt"
+                        )
+                    attempt_started = True
+            current_thread = threading.get_ident()
+            open_result = gate_open_transport(
+                attempt_token,
+                current_thread,
+                socket.create_connection,
+                address,
+                timeout,
+                socket_handoff_state,
+            )
+            if type(socket_handoff_state) is list and len(socket_handoff_state) == 1:
+                created_socket = socket_handoff_state[0]
+            if (
+                type(open_result) is not bool
+                or not open_result
+                or created_socket is None
+            ):
+                _fail_runtime_generation_drift(None)
+                raise RuntimeError(
+                    "策略运行socket transport许可已撤销；必须使用干净运行进程重启"
+                )
+            # connector返回后先释放gate attempt并唤醒reload，再获取runtime锁做
+            # 交付校验；否则reload持runtime等待attempt、当前线程等runtime会锁环。
+            finish_socket_attempt()
+            _assert_runtime_request_lease_current(
+                operation,
+                lease_generation,
+                lease_instance_token,
+                lease_module_generation,
+                lease_registry,
+                lease_token,
+            )
+            return created_socket
+        finally:
+            finish_socket_attempt()
+    except BaseException:
+        if not gate_cleanup_done:
+            try:
+                finish_socket_attempt()
+            except BaseException:
+                pass
+        if created_socket is not None:
+            try:
+                created_socket.close()
+            except BaseException:
+                pass
+        elif type(socket_handoff_state) is list and len(socket_handoff_state) == 1:
+            handed_off_socket = socket_handoff_state[0]
+            if handed_off_socket is not None:
+                try:
+                    handed_off_socket.close()
+                except BaseException:
+                    pass
+        raise
 
 
 def _assert_runtime_install_generation_current(
@@ -1926,18 +3668,175 @@ def _assert_runtime_install_generation_current(
     """拒绝在安装期间发生的helper reload或状态代际漂移。"""
 
     if (
-        _STRATEGY_RUNTIME_INSTANCE_TOKEN is not instance_token
-        or _STRATEGY_RUNTIME_MODULE_GENERATION != module_generation
+        not _runtime_module_generation_matches(instance_token, module_generation)
+        or type(expected_active_mode) is not str
+        or type(_STRATEGY_RUNTIME_ACTIVE_MODE) is not str
         or _STRATEGY_RUNTIME_ACTIVE_MODE != expected_active_mode
     ):
         raise RuntimeError("策略运行helper在安装期间发生重载或状态漂移；必须使用干净运行进程重启")
+
+
+def _capture_runtime_install_lease(
+    namespace: Dict[str, Any],
+    mode: str,
+    instance_token: object,
+    module_generation: int,
+) -> Tuple[Any, ...]:
+    """捕获用户可执行边界前的完整安装reservation。"""
+
+    current_thread = threading.get_ident()
+    anchor = _runtime_primitive_anchor_snapshot()
+    if anchor is None:
+        _set_runtime_failed_process_state()
+        raise RuntimeError("策略运行安装原语无效；必须使用干净运行进程重启")
+    runtime_lock = anchor[0]
+    socket_lock = anchor[7]
+    with runtime_lock:
+        with socket_lock:
+            gate_state = _runtime_socket_gate_authority_snapshot(anchor)
+            transition_valid, owner, transition_namespace, transition_mode = (
+                _runtime_transition_snapshot()
+            )
+            active_mode = _STRATEGY_RUNTIME_ACTIVE_MODE
+            contract_generation = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+            registry_snapshot = _runtime_request_registry_snapshot(
+                _STRATEGY_RUNTIME_REQUEST_LEASES
+            )
+            if (
+                not _runtime_module_generation_matches(
+                    instance_token,
+                    module_generation,
+                )
+                or type(namespace) is not dict
+                or type(mode) is not str
+                or mode not in {"BACKTEST", "SHADOW", "LIVE"}
+                or type(current_thread) is not int
+                or not transition_valid
+                or owner != current_thread
+                or transition_namespace is not namespace
+                or transition_mode != mode
+                or type(active_mode) is not str
+                or active_mode
+                not in {"TRANSITIONING", "BACKTEST", "SHADOW", "LIVE_BLOCKED"}
+                or type(contract_generation) is not int
+                or contract_generation < 1
+                or type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is not bool
+                or _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                or gate_state is None
+                or gate_state != (False, ())
+                or type(_STRATEGY_RUNTIME_INFLIGHT_REQUESTS) is not int
+                or _STRATEGY_RUNTIME_INFLIGHT_REQUESTS != 0
+                or registry_snapshot != ()
+            ):
+                _set_runtime_failed_process_state()
+                raise RuntimeError(
+                    "策略运行安装reservation无效；必须使用干净运行进程重启"
+                )
+            return (
+                object(),
+                instance_token,
+                module_generation,
+                current_thread,
+                namespace,
+                mode,
+                contract_generation,
+                active_mode,
+                anchor[6],
+            )
+
+
+def _assert_runtime_install_lease_current(
+    install_lease: Any,
+    operation: str,
+) -> None:
+    """用户代码返回后，在任何发布前验证完整安装reservation未漂移。"""
+
+    anchor = _runtime_primitive_anchor_snapshot()
+    if type(install_lease) is not tuple or len(install_lease) != 9 or anchor is None:
+        _set_runtime_failed_process_state()
+        raise RuntimeError("策略运行安装lease无效；必须使用干净运行进程重启")
+    (
+        lease_token,
+        instance_token,
+        module_generation,
+        owner_thread,
+        namespace,
+        mode,
+        contract_generation,
+        active_mode,
+        gate_authority,
+    ) = install_lease
+    current_thread = threading.get_ident()
+    runtime_lock = anchor[0]
+    socket_lock = anchor[7]
+    with runtime_lock:
+        with socket_lock:
+            gate_state = _runtime_socket_gate_authority_snapshot(anchor)
+            transition_valid, owner, transition_namespace, transition_mode = (
+                _runtime_transition_snapshot()
+            )
+            registry_snapshot = _runtime_request_registry_snapshot(
+                _STRATEGY_RUNTIME_REQUEST_LEASES
+            )
+            if (
+                type(lease_token) is not object
+                or not _runtime_module_generation_matches(
+                    instance_token,
+                    module_generation,
+                )
+                or type(owner_thread) is not int
+                or type(current_thread) is not int
+                or current_thread != owner_thread
+                or type(namespace) is not dict
+                or type(mode) is not str
+                or type(contract_generation) is not int
+                or contract_generation < 1
+                or type(active_mode) is not str
+                or gate_authority is not anchor[6]
+                or gate_state is None
+                or gate_state != (False, ())
+                or type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is not bool
+                or _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                or type(_STRATEGY_RUNTIME_CONTRACT_GENERATION) is not int
+                or _STRATEGY_RUNTIME_CONTRACT_GENERATION != contract_generation
+                or type(_STRATEGY_RUNTIME_ACTIVE_MODE) is not str
+                or _STRATEGY_RUNTIME_ACTIVE_MODE != active_mode
+                or not transition_valid
+                or owner != owner_thread
+                or transition_namespace is not namespace
+                or transition_mode != mode
+                or type(_STRATEGY_RUNTIME_INFLIGHT_REQUESTS) is not int
+                or _STRATEGY_RUNTIME_INFLIGHT_REQUESTS != 0
+                or registry_snapshot != ()
+            ):
+                _set_runtime_failed_process_state()
+                raise RuntimeError(
+                    "策略运行安装lease已失效；禁止继续状态变更: {}".format(
+                        operation
+                    )
+                )
+
+
+def _runtime_module_generation_matches(
+    instance_token: object,
+    module_generation: int,
+) -> bool:
+    anchor = _runtime_primitive_anchor_snapshot()
+    return (
+        anchor is not None
+        and type(instance_token) is object
+        and anchor[2] is instance_token
+        and type(module_generation) is int
+        and module_generation >= 1
+        and anchor[3] == module_generation
+    )
 
 
 def _normalise_runtime_mode(mode: Any) -> str:
     if type(mode) is not str:
         raise RuntimeError("运行模式必须是普通字符串 BACKTEST、SHADOW 或 LIVE")
     value = str.upper(str.strip(mode))
-    if value not in _RUNTIME_MODES:
+    if value not in {"BACKTEST", "SHADOW", "LIVE"}:
         raise RuntimeError("运行模式必须是 BACKTEST、SHADOW 或 LIVE")
     return value
 
@@ -2252,19 +4151,105 @@ def _clear_runtime_clients() -> None:
     _BROKER_CLIENT = None
 
 
+def _advance_runtime_contract_generation() -> None:
+    """递增单调哨兵；篡改值不得通过算术魔术方法获得执行机会。"""
+
+    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
+
+    current = _STRATEGY_RUNTIME_CONTRACT_GENERATION
+    _STRATEGY_RUNTIME_CONTRACT_GENERATION = (
+        current + 1 if type(current) is int and current >= 0 else 1
+    )
+
+
+def _clear_runtime_request_leases() -> None:
+    """清空可信token；不可信元素先永久隔离，避免析构器在FAILED发布期间执行。"""
+
+    anchored_leases = None
+    quarantine_retain = None
+    try:
+        anchor = _get_runtime_primitive_anchor()
+        if type(anchor) is tuple and len(anchor) == 10 and type(anchor[4]) is set:
+            anchored_leases = anchor[4]
+            quarantine_retain = anchor[8]
+            _clear_or_quarantine_runtime_request_registry(
+                anchored_leases,
+                quarantine_retain,
+            )
+    except BaseException:
+        pass
+    visible_leases = _STRATEGY_RUNTIME_REQUEST_LEASES
+    if type(visible_leases) is set and visible_leases is not anchored_leases:
+        _clear_or_quarantine_runtime_request_registry(
+            visible_leases,
+            quarantine_retain,
+        )
+
+
+def _set_runtime_failed_process_state() -> None:
+    """幂等发布进程期FAILED latch，不依赖任何可替换锁。"""
+
+    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CANONICAL_STATE
+    global _STRATEGY_RUNTIME_PROCESS_SIGNATURE, _STRATEGY_RUNTIME_COMMIT_CAPSULE
+    global _STRATEGY_RUNTIME_INFLIGHT_REQUESTS
+    global _STRATEGY_RUNTIME_TRANSITION_OWNER
+    global _STRATEGY_RUNTIME_TRANSITION_NAMESPACE
+    global _STRATEGY_RUNTIME_TRANSITION_MODE
+    global _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+
+    already_failed = False
+    authoritative_reload_latched = False
+    try:
+        raw_anchor = _get_runtime_primitive_anchor()
+        gate_state = _runtime_socket_gate_authority_snapshot(raw_anchor)
+        authoritative_reload_latched = gate_state is not None and gate_state[0]
+        already_failed = (
+            type(_STRATEGY_RUNTIME_CONTRACT_GENERATION) is int
+            and _STRATEGY_RUNTIME_CONTRACT_GENERATION >= 1
+            and (
+                authoritative_reload_latched
+                or (
+                    type(_STRATEGY_RUNTIME_ACTIVE_MODE) is str
+                    and _STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED"
+                    and (
+                        (
+                            type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is bool
+                            and _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS
+                        )
+                        or _get_runtime_commit_anchor()
+                        is _STRATEGY_RUNTIME_FAILED_ANCHOR
+                    )
+                )
+            )
+        )
+    except BaseException:
+        already_failed = False
+    if not already_failed:
+        _advance_runtime_contract_generation()
+    _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
+    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = None
+    _STRATEGY_RUNTIME_CANONICAL_STATE = None
+    _STRATEGY_RUNTIME_COMMIT_CAPSULE = None
+    _STRATEGY_RUNTIME_INFLIGHT_REQUESTS = 0
+    _STRATEGY_RUNTIME_TRANSITION_OWNER = None
+    _STRATEGY_RUNTIME_TRANSITION_NAMESPACE = None
+    _STRATEGY_RUNTIME_TRANSITION_MODE = None
+    if authoritative_reload_latched:
+        _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS = True
+    elif type(_STRATEGY_RUNTIME_RELOAD_IN_PROGRESS) is not bool:
+        _STRATEGY_RUNTIME_RELOAD_IN_PROGRESS = False
+    _clear_runtime_request_leases()
+    _set_runtime_commit_anchor(_STRATEGY_RUNTIME_FAILED_ANCHOR)
+    _clear_runtime_clients()
+
+
 def _fail_runtime_generation_drift(namespace: Optional[Dict[str, Any]]) -> None:
     """旧调用栈跨helper reload返回时，撤销其刚发布的任何运行状态。"""
 
-    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CANONICAL_STATE
-    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
-
-    if isinstance(namespace, dict):
+    if type(namespace) is dict:
         _mark_runtime_failed(namespace)
         return
-    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
-    _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-    _STRATEGY_RUNTIME_CANONICAL_STATE = None
-    _clear_runtime_clients()
+    _set_runtime_failed_process_state()
 
 
 def _quarantine_legacy_jq_compat(
@@ -2304,8 +4289,9 @@ def _arm_remote_runtime_gate(
 
     global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CONTRACT_GENERATION
 
+    _assert_runtime_reload_latch_open("安装{}运行模式".format(mode))
     active_mode = _runtime_active_mode(mode)
-    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+    _advance_runtime_contract_generation()
     _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
     _clear_runtime_clients()
     legacy_compat, legacy_callables = _quarantine_legacy_jq_compat(namespace)
@@ -2324,19 +4310,235 @@ def _arm_remote_runtime_gate(
 def _mark_runtime_failed(namespace: Dict[str, Any]) -> None:
     """保持失败关闭；后续显式重试安装前，不允许复用任何交易入口。"""
 
-    global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CANONICAL_STATE
-    global _STRATEGY_RUNTIME_CONTRACT_GENERATION
-
-    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
-    _STRATEGY_RUNTIME_ACTIVE_MODE = "FAILED"
-    _STRATEGY_RUNTIME_CANONICAL_STATE = None
-    _clear_runtime_clients()
-    dict.pop(namespace, _STRATEGY_RUNTIME_STATE_KEY, None)
-    legacy_callables: Tuple[Callable[..., Any], ...] = ()
+    failure_namespaces = []
     try:
-        _, legacy_callables = _quarantine_legacy_jq_compat(namespace)
-    finally:
-        _install_runtime_guards(namespace, "FAILED", legacy_callables)
+        commit_capsule = _get_runtime_commit_anchor()
+        if type(commit_capsule) is tuple and len(commit_capsule) == 10:
+            committed_namespace = commit_capsule[8]
+            if type(committed_namespace) is dict:
+                list.append(failure_namespaces, committed_namespace)
+    except BaseException:
+        pass
+    if type(namespace) is dict and all(
+        candidate is not namespace for candidate in failure_namespaces
+    ):
+        list.append(failure_namespaces, namespace)
+
+    # 先清理capsule原namespace和当前调用namespace，再清空commit anchor。
+    # 若清理被异步打断，外层重试仍能从anchor恢复原namespace identity。
+    for failure_namespace in failure_namespaces:
+        dict.pop(failure_namespace, _STRATEGY_RUNTIME_STATE_KEY, None)
+        legacy_callables: Tuple[Callable[..., Any], ...] = ()
+        try:
+            _, legacy_callables = _quarantine_legacy_jq_compat(
+                failure_namespace
+            )
+        finally:
+            _install_runtime_guards(
+                failure_namespace,
+                "FAILED",
+                legacy_callables,
+            )
+    _set_runtime_failed_process_state()
+
+
+def _create_runtime_reload_bootstrap(
+    runtime_lock,
+    socket_lock,
+    socket_condition,
+    socket_gate_authority,
+    condition_wait,
+    get_commit_anchor,
+    set_failed_process_state,
+    mark_runtime_failed,
+    thread_ident_getter,
+):
+    """锚定上一代原语，为误用reload提供import前的失败关闭防线。"""
+
+    class RuntimeReloadAbort(BaseException):
+        """递归reload必须终止旧栈，不能被常规except Exception吞掉。"""
+
+    gate_snapshot = socket_gate_authority[1]
+    gate_close_for_reload = socket_gate_authority[2]
+
+    def bootstrap():
+        bootstrap_error = None
+        gate_closed = False
+        gate_close_attempts = 0
+        reload_thread = None
+        socket_lock_owned_at_entry = False
+        socket_lock_ownership_probe_complete = False
+        try:
+            candidate_thread = thread_ident_getter()
+            if type(candidate_thread) is not int:
+                raise RuntimeError("策略运行reload thread identity无效")
+            reload_thread = candidate_thread
+            if type(socket_lock) is _thread.RLock:
+                candidate_owned = object.__getattribute__(
+                    socket_lock,
+                    "_is_owned",
+                )()
+                if type(candidate_owned) is not bool:
+                    raise RuntimeError(
+                        "策略运行reload socket lock ownership无效"
+                    )
+                socket_lock_owned_at_entry = candidate_owned
+            socket_lock_ownership_probe_complete = True
+        except BaseException as exc:
+            bootstrap_error = exc
+
+        # 第一阶段只短暂持有gate锁并关闭单向latch。不能先等待runtime锁，
+        # 否则持锁安装无法观察到reload已经开始并在最终返回点失败。
+        while not gate_closed:
+            try:
+                gate_close_attempts += 1
+                with socket_lock:
+                    close_result = gate_close_for_reload()
+                    # closure latch已经关闭；即使返回值本身无效也不得重复等待。
+                    gate_closed = True
+                    if type(close_result) is not int or close_result < 0:
+                        raise RuntimeError("策略运行reload gate关闭结果无效")
+            except BaseException as exc:
+                if bootstrap_error is None:
+                    bootstrap_error = exc
+                if gate_close_attempts >= 3:
+                    # 捕获的函数和lock来自可信旧代anchor；连续失败时只能依靠
+                    # 下方公开FAILED发布，不能把reload线程永久困在此处。
+                    gate_closed = True
+
+        # 同线程从socket-only临界区递归reload时，继续等待runtime会与另一个
+        # 持runtime并等待socket的线程形成锁环。权威gate已经单向关闭；此处只做
+        # 无锁FAILED发布并终止reload，外层旧调用随后必须观察closed gate退出。
+        if (
+            socket_lock_owned_at_entry
+            or not socket_lock_ownership_probe_complete
+        ):
+            if bootstrap_error is None:
+                bootstrap_error = RuntimeReloadAbort(
+                    "策略运行reload从socket临界区递归进入；必须使用干净运行进程重启"
+                )
+            try:
+                set_failed_process_state()
+            except BaseException as exc:
+                if bootstrap_error is None:
+                    bootstrap_error = exc
+            raise bootstrap_error
+
+        runtime_closed = False
+        while not runtime_closed:
+            try:
+                # 全局锁序保持runtime -> socket gate。已登记socket attempt的
+                # 清理只需要gate锁，因此这里等待它们退出不会形成锁环。
+                with runtime_lock:
+                    try:
+                        with socket_lock:
+                            while True:
+                                gate_state = gate_snapshot()
+                                if (
+                                    type(gate_state) is not tuple
+                                    or len(gate_state) != 2
+                                    or type(gate_state[0]) is not bool
+                                    or not gate_state[0]
+                                    or type(gate_state[1]) is not tuple
+                                    or any(
+                                        type(entry) is not tuple
+                                        or len(entry) != 2
+                                        or type(entry[0]) is not object
+                                        or type(entry[1]) is not int
+                                        for entry in gate_state[1]
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "策略运行reload gate闭包状态无效"
+                                    )
+                                if not gate_state[1]:
+                                    break
+                                if reload_thread is None or any(
+                                    entry[1] == reload_thread
+                                    for entry in gate_state[1]
+                                ):
+                                    if bootstrap_error is None:
+                                        bootstrap_error = RuntimeReloadAbort(
+                                            "策略运行reload不能等待当前线程自己的socket attempt"
+                                        )
+                                    break
+                                try:
+                                    condition_wait(socket_condition)
+                                except BaseException as exc:
+                                    if bootstrap_error is None:
+                                        bootstrap_error = exc
+                                    break
+                    except BaseException as exc:
+                        if bootstrap_error is None:
+                            bootstrap_error = exc
+
+                    transition_namespace = globals().get(
+                        "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE"
+                    )
+                    committed_namespace = None
+                    try:
+                        commit_capsule = get_commit_anchor()
+                        if type(commit_capsule) is tuple and len(commit_capsule) == 10:
+                            candidate_namespace = commit_capsule[8]
+                            if type(candidate_namespace) is dict:
+                                committed_namespace = candidate_namespace
+                    except BaseException as exc:
+                        if bootstrap_error is None:
+                            bootstrap_error = exc
+
+                    failure_namespaces = []
+                    if type(transition_namespace) is dict:
+                        list.append(failure_namespaces, transition_namespace)
+                    if type(committed_namespace) is dict and all(
+                        value is not committed_namespace for value in failure_namespaces
+                    ):
+                        list.append(failure_namespaces, committed_namespace)
+
+                    if failure_namespaces:
+                        for failure_namespace in failure_namespaces:
+                            try:
+                                mark_runtime_failed(failure_namespace)
+                            except BaseException as exc:
+                                if bootstrap_error is None:
+                                    bootstrap_error = exc
+                    else:
+                        try:
+                            set_failed_process_state()
+                        except BaseException as exc:
+                            if bootstrap_error is None:
+                                bootstrap_error = exc
+                runtime_closed = True
+            except BaseException as exc:
+                if bootstrap_error is None:
+                    bootstrap_error = exc
+                # 确定性无效状态不得让bootstrap无限循环。gate已经单向关闭；
+                # 这里再尝试最小FAILED发布，然后终止本阶段并传播首个异常。
+                try:
+                    set_failed_process_state()
+                except BaseException as fail_exc:
+                    if bootstrap_error is None:
+                        bootstrap_error = fail_exc
+                runtime_closed = True
+
+        if bootstrap_error is not None:
+            raise bootstrap_error
+
+    return bootstrap
+
+
+def _create_runtime_reload_dispatch(bootstrap):
+    """防御性重试bootstrap并传播最初异常；该入口不支持进程内升级。"""
+
+    def dispatch():
+        try: bootstrap()  # noqa: E701
+        except BaseException:
+            try:
+                bootstrap()
+            except BaseException:
+                pass
+            raise
+
+    return dispatch
 
 
 def _context_uses_remote_snapshot(context: Any) -> bool:
@@ -2366,10 +4568,21 @@ def _enforce_remote_postconditions(
     namespace: Dict[str, Any],
     context: Any,
     active_mode: str,
+    install_lease: Tuple[Any, ...],
 ) -> Tuple[str, ...]:
     """修复远程模式保护，并清除一切可复用的远程客户端。"""
 
+    _assert_runtime_install_lease_current(
+        install_lease,
+        "读取远程context前",
+    )
+    _assert_runtime_reload_latch_open("发布{}运行后置条件".format(active_mode))
     inherited_remote_context = _context_uses_remote_snapshot(context)
+    _assert_runtime_install_lease_current(
+        install_lease,
+        "读取远程context后",
+    )
+    _assert_runtime_reload_latch_open("发布{}运行后置条件".format(active_mode))
     legacy_compat, legacy_callables = _quarantine_legacy_jq_compat(namespace)
     _clear_runtime_clients()
     blocked_names = _install_runtime_guards(
@@ -2391,17 +4604,32 @@ def _enforce_remote_postconditions(
 def _prepare_backtest_postconditions(
     namespace: Dict[str, Any],
     context: Any,
-) -> None:
+    install_instance_token: object,
+    install_module_generation: int,
+) -> Tuple[Any, ...]:
     """BACKTEST只接受从未被旧远程兼容层或client污染的干净进程。"""
 
     global _STRATEGY_RUNTIME_ACTIVE_MODE, _STRATEGY_RUNTIME_CONTRACT_GENERATION
 
-    _STRATEGY_RUNTIME_CONTRACT_GENERATION += 1
+    _assert_runtime_reload_latch_open("安装BACKTEST运行模式")
+    _advance_runtime_contract_generation()
     _STRATEGY_RUNTIME_ACTIVE_MODE = "TRANSITIONING"
     _assert_no_inflight_runtime_requests("安装BACKTEST运行模式")
+    callback_lease = _capture_runtime_install_lease(
+        namespace,
+        "BACKTEST",
+        install_instance_token,
+        install_module_generation,
+    )
+    inherited_remote_context = _context_uses_remote_snapshot(context)
+    _assert_runtime_install_lease_current(
+        callback_lease,
+        "读取BACKTEST context后",
+    )
+    _assert_runtime_reload_latch_open("安装BACKTEST运行模式")
     if (
         dict.__contains__(namespace, _JQ_COMPAT_STATE_KEY)
-        or _context_uses_remote_snapshot(context)
+        or inherited_remote_context
         or _CLIENT is not None
         or _DATA_CLIENT is not None
         or _BROKER_CLIENT is not None
@@ -2410,14 +4638,272 @@ def _prepare_backtest_postconditions(
         raise RuntimeError("BACKTEST检测到旧远程运行状态；必须使用干净运行进程重启")
     _clear_runtime_clients()
     _STRATEGY_RUNTIME_ACTIVE_MODE = "BACKTEST"
+    return _capture_runtime_install_lease(
+        namespace,
+        "BACKTEST",
+        install_instance_token,
+        install_module_generation,
+    )
 
 
-_STRATEGY_RUNTIME_RECORD_KEYS = {
-    "schema_version",
-    "runtime_instance_token",
-    "signature",
-    "state",
-}
+def _runtime_contract_constants_are_valid() -> bool:
+    """公开版本常量被篡改时必须在任何context getter前失败。"""
+
+    return (
+        type(STRATEGY_RUNTIME_API_VERSION) is int
+        and STRATEGY_RUNTIME_API_VERSION == 1
+        and type(PROFILE_SCHEMA_VERSION) is int
+        and PROFILE_SCHEMA_VERSION == 1
+        and type(STRATEGY_RUNTIME_STATE_SCHEMA_VERSION) is int
+        and STRATEGY_RUNTIME_STATE_SCHEMA_VERSION == 1
+        and type(STRATEGY_RUNTIME_HELPER_MARKER) is str
+        and STRATEGY_RUNTIME_HELPER_MARKER
+        == "bullet-trade-joinquant-runtime-helper-v1"
+    )
+
+
+def _safe_runtime_state_snapshot(state: Any) -> Optional[Tuple[Any, ...]]:
+    """只读取已提交状态中的普通内建值，避免篡改对象执行魔术方法。"""
+
+    if type(state) is not dict:
+        return None
+    state_keys = tuple(dict.keys(state))
+    if any(type(key) is not str for key in state_keys):
+        return None
+
+    base_state_keys = {
+        "api_version",
+        "profile_schema_version",
+        "profile",
+        "mode",
+        "run_type",
+        "strategy_id",
+        "enabled",
+        "orders_enabled",
+        "production_ready",
+        "reason",
+    }
+
+    mode = dict.get(state, "mode")
+    if type(mode) is not str:
+        return None
+    if mode == "BACKTEST":
+        expected_keys = base_state_keys
+        expected_flags = (False, True, False, "backtest")
+    elif mode == "SHADOW":
+        expected_keys = base_state_keys | {
+            "profile_module",
+            "blocked_mutations",
+        }
+        expected_flags = (True, False, False, "shadow_read_only")
+    elif mode == "LIVE":
+        expected_keys = base_state_keys | {
+            "profile_module",
+            "blocked_mutations",
+            "mirror_jq_orders",
+        }
+        expected_flags = (
+            False,
+            False,
+            False,
+            "live_blocked_until_strategy_ledger",
+        )
+    else:
+        return None
+    if len(state_keys) != len(expected_keys) or set(state_keys) != expected_keys:
+        return None
+
+    api_version = dict.get(state, "api_version")
+    profile_schema_version = dict.get(state, "profile_schema_version")
+    profile = dict.get(state, "profile")
+    run_type = dict.get(state, "run_type")
+    strategy_id = dict.get(state, "strategy_id")
+    enabled = dict.get(state, "enabled")
+    orders_enabled = dict.get(state, "orders_enabled")
+    production_ready = dict.get(state, "production_ready")
+    reason = dict.get(state, "reason")
+    if (
+        type(api_version) is not int
+        or api_version != 1
+        or type(profile_schema_version) is not int
+        or profile_schema_version != 1
+        or type(profile) is not str
+        or type(run_type) is not str
+        or type(strategy_id) is not str
+        or type(enabled) is not bool
+        or type(orders_enabled) is not bool
+        or type(production_ready) is not bool
+        or type(reason) is not str
+        or (enabled, orders_enabled, production_ready, reason) != expected_flags
+    ):
+        return None
+
+    profile_module = None
+    blocked_mutations: Tuple[str, ...] = ()
+    mirror_jq_orders = None
+    if mode in {"SHADOW", "LIVE"}:
+        profile_module = dict.get(state, "profile_module")
+        blocked_mutations = dict.get(state, "blocked_mutations")
+        if (
+            type(profile_module) is not str
+            or type(blocked_mutations) is not tuple
+            or any(type(name) is not str for name in blocked_mutations)
+        ):
+            return None
+    if mode == "LIVE":
+        mirror_jq_orders = dict.get(state, "mirror_jq_orders")
+        if type(mirror_jq_orders) is not bool or mirror_jq_orders is not False:
+            return None
+
+    return (
+        api_version,
+        profile_schema_version,
+        profile,
+        mode,
+        run_type,
+        strategy_id,
+        enabled,
+        orders_enabled,
+        production_ready,
+        reason,
+        profile_module,
+        blocked_mutations,
+        mirror_jq_orders,
+    )
+
+
+def _runtime_authority_is_consistent(
+    active_mode: Any,
+    process_signature: Any,
+    canonical_state: Any,
+    runtime_record: Any,
+    commit_capsule: Any,
+    anchored_capsule: Any,
+    contract_generation: Any,
+    instance_token: Any,
+    module_generation: Any,
+    expected_namespace: Any,
+    allow_transition_generation: bool = False,
+) -> bool:
+    """在读取context前验证进程权威和namespace副本是同一已提交状态。"""
+
+    if (
+        not _runtime_contract_constants_are_valid()
+        or type(active_mode) is not str
+        or type(process_signature) is not tuple
+        or len(process_signature) != 7
+        or type(canonical_state) is not dict
+        or type(runtime_record) is not dict
+        or type(commit_capsule) is not tuple
+        or commit_capsule is not anchored_capsule
+        or len(commit_capsule) != 10
+        or type(contract_generation) is not int
+        or contract_generation <= 0
+        or type(instance_token) is not object
+        or type(module_generation) is not int
+        or module_generation < 1
+        or type(expected_namespace) is not dict
+        or type(allow_transition_generation) is not bool
+    ):
+        return False
+    (
+        commit_token,
+        capsule_instance_token,
+        capsule_module_generation,
+        capsule_signature,
+        capsule_state,
+        capsule_record,
+        capsule_record_state,
+        capsule_generation,
+        capsule_namespace,
+        committed_state_snapshot,
+    ) = commit_capsule
+    if (
+        type(commit_token) is not object
+        or type(capsule_instance_token) is not object
+        or capsule_instance_token is not instance_token
+        or type(capsule_module_generation) is not int
+        or capsule_module_generation != module_generation
+        or capsule_signature is not process_signature
+        or capsule_state is not canonical_state
+        or capsule_record is not runtime_record
+        or dict.get(runtime_record, "state") is not capsule_record_state
+        or type(capsule_generation) is not int
+        or capsule_generation <= 0
+        or type(capsule_namespace) is not dict
+        or capsule_namespace is not expected_namespace
+        or dict.get(capsule_namespace, _STRATEGY_RUNTIME_STATE_KEY)
+        is not capsule_record
+        or contract_generation
+        != capsule_generation + (1 if allow_transition_generation else 0)
+    ):
+        return False
+
+    record_keys = tuple(dict.keys(runtime_record))
+    expected_record_keys = {
+        "schema_version",
+        "runtime_instance_token",
+        "signature",
+        "state",
+    }
+    if (
+        any(type(key) is not str for key in record_keys)
+        or len(record_keys) != len(expected_record_keys)
+        or set(record_keys) != expected_record_keys
+        or type(dict.get(runtime_record, "schema_version")) is not int
+        or dict.get(runtime_record, "schema_version") != 1
+        or dict.get(runtime_record, "runtime_instance_token")
+        is not capsule_instance_token
+        or dict.get(runtime_record, "signature") is not process_signature
+    ):
+        return False
+
+    (
+        signature_mode,
+        signature_run_type,
+        signature_strategy_id,
+        signature_profile,
+        signature_profile_module,
+        signature_api_version,
+        signature_context_id,
+    ) = process_signature
+    if (
+        type(signature_mode) is not str
+        or signature_mode not in {"BACKTEST", "SHADOW", "LIVE"}
+        or type(signature_run_type) is not str
+        or type(signature_strategy_id) is not str
+        or type(signature_profile) is not str
+        or type(signature_profile_module) is not str
+        or type(signature_api_version) is not int
+        or signature_api_version != 1
+        or type(signature_context_id) is not int
+    ):
+        return False
+
+    canonical_snapshot = _safe_runtime_state_snapshot(canonical_state)
+    record_snapshot = _safe_runtime_state_snapshot(dict.get(runtime_record, "state"))
+    if (
+        type(committed_state_snapshot) is not tuple
+        or canonical_snapshot is None
+        or canonical_snapshot != committed_state_snapshot
+        or record_snapshot != committed_state_snapshot
+    ):
+        return False
+    if (
+        canonical_snapshot[2] != signature_profile
+        or canonical_snapshot[3] != signature_mode
+        or canonical_snapshot[4] != signature_run_type
+        or canonical_snapshot[5] != signature_strategy_id
+        or (
+            signature_mode in {"SHADOW", "LIVE"}
+            and canonical_snapshot[10] != signature_profile_module
+        )
+    ):
+        return False
+    expected_active_mode = (
+        "LIVE_BLOCKED" if signature_mode == "LIVE" else signature_mode
+    )
+    return active_mode == expected_active_mode
 
 
 def _build_strategy_runtime_state(
@@ -2470,31 +4956,68 @@ def _commit_strategy_runtime_state(
     state: Dict[str, Any],
 ) -> None:
     global _STRATEGY_RUNTIME_PROCESS_SIGNATURE, _STRATEGY_RUNTIME_CANONICAL_STATE
+    global _STRATEGY_RUNTIME_COMMIT_CAPSULE
 
-    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = signature
-    _STRATEGY_RUNTIME_CANONICAL_STATE = dict(state)
-    dict.__setitem__(namespace, _STRATEGY_RUNTIME_STATE_KEY, {
-        "schema_version": STRATEGY_RUNTIME_STATE_SCHEMA_VERSION,
-        "runtime_instance_token": _STRATEGY_RUNTIME_INSTANCE_TOKEN,
+    _assert_runtime_reload_latch_open("提交策略运行状态")
+    primitive_anchor = _runtime_primitive_anchor_snapshot()
+    if primitive_anchor is None:
+        raise RuntimeError("策略运行helper代际或同步原语无效；必须使用干净运行进程重启")
+    instance_token = primitive_anchor[2]
+    module_generation = primitive_anchor[3]
+    canonical_state = dict(state)
+    record_state = dict(state)
+    runtime_record = {
+        "schema_version": 1,
+        "runtime_instance_token": instance_token,
         "signature": signature,
-        "state": dict(state),
-    })
+        "state": record_state,
+    }
+    committed_state_snapshot = _safe_runtime_state_snapshot(canonical_state)
+    if (
+        committed_state_snapshot is None
+        or _safe_runtime_state_snapshot(record_state) != committed_state_snapshot
+    ):
+        raise RuntimeError("策略运行内部提交状态无效；必须使用干净运行进程重启")
+    commit_capsule = (
+        object(),
+        instance_token,
+        module_generation,
+        signature,
+        canonical_state,
+        runtime_record,
+        record_state,
+        _STRATEGY_RUNTIME_CONTRACT_GENERATION,
+        namespace,
+        committed_state_snapshot,
+    )
+    _STRATEGY_RUNTIME_PROCESS_SIGNATURE = signature
+    _STRATEGY_RUNTIME_CANONICAL_STATE = canonical_state
+    _STRATEGY_RUNTIME_COMMIT_CAPSULE = commit_capsule
+    _set_runtime_commit_anchor(commit_capsule)
+    dict.__setitem__(namespace, _STRATEGY_RUNTIME_STATE_KEY, runtime_record)
 
 
 def _validate_existing_strategy_runtime_state(
     existing: Any,
     signature: Tuple[Any, ...],
     expected_active_mode: str,
+    expected_namespace: Dict[str, Any],
 ) -> Dict[str, Any]:
     if (
-        type(existing) is not dict
-        or set(dict.keys(existing)) != _STRATEGY_RUNTIME_RECORD_KEYS
-        or dict.get(existing, "schema_version") != STRATEGY_RUNTIME_STATE_SCHEMA_VERSION
-        or dict.get(existing, "runtime_instance_token") is not _STRATEGY_RUNTIME_INSTANCE_TOKEN
-        or dict.get(existing, "signature") != signature
+        not _runtime_authority_is_consistent(
+            _STRATEGY_RUNTIME_ACTIVE_MODE,
+            _STRATEGY_RUNTIME_PROCESS_SIGNATURE,
+            _STRATEGY_RUNTIME_CANONICAL_STATE,
+            existing,
+            _STRATEGY_RUNTIME_COMMIT_CAPSULE,
+            _get_runtime_commit_anchor(),
+            _STRATEGY_RUNTIME_CONTRACT_GENERATION,
+            _STRATEGY_RUNTIME_INSTANCE_TOKEN,
+            _STRATEGY_RUNTIME_MODULE_GENERATION,
+            expected_namespace,
+            True,
+        )
         or _STRATEGY_RUNTIME_PROCESS_SIGNATURE != signature
-        or _STRATEGY_RUNTIME_CANONICAL_STATE is None
-        or dict.get(existing, "state") != _STRATEGY_RUNTIME_CANONICAL_STATE
         or _STRATEGY_RUNTIME_ACTIVE_MODE != expected_active_mode
     ):
         raise RuntimeError("策略运行时缓存、进程契约或helper实例不一致；必须使用干净运行进程重启")
@@ -2510,13 +5033,22 @@ def _install_strategy_runtime_impl(
     strategy_id: str,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
     profile_module: str = "jq_runtime_config",
-) -> Dict[str, Any]:
+    _runtime_install_lease: Tuple[Any, ...],
+) -> Tuple[Dict[str, Any], Tuple[Any, ...]]:
     """安装版本化的聚宽策略运行入口。"""
 
     if type(namespace) is not dict:
         raise RuntimeError("namespace 必须是策略globals()字典")
     normalised_mode = _normalise_runtime_mode(mode)
     run_type = _normalise_run_type(context)
+    _assert_runtime_install_lease_current(
+        _runtime_install_lease,
+        "读取策略运行context后",
+    )
+    _assert_runtime_reload_latch_open("读取策略运行context")
+    current_install_lease = _runtime_install_lease
+    install_instance_token = current_install_lease[1]
+    install_module_generation = current_install_lease[2]
     normalised_strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     if type(expected_api_version) is not int or expected_api_version != STRATEGY_RUNTIME_API_VERSION:
         safe_expected_api_version = (
@@ -2539,13 +5071,26 @@ def _install_strategy_runtime_impl(
         )
 
     if normalised_mode == "BACKTEST":
-        if run_type not in _BACKTEST_RUN_TYPES:
+        if run_type not in {"simple_backtest", "full_backtest"}:
             raise RuntimeError(
                 "BACKTEST模式仅允许聚宽回测，当前run_type={}".format(run_type or "<empty>")
             )
-        normalised_profile = str(profile)
-        normalised_profile_module = str(profile_module)
-        _prepare_backtest_postconditions(namespace, context)
+        if type(profile) is not str:
+            raise RuntimeError("profile 必须是普通字符串")
+        if type(profile_module) is not str:
+            raise RuntimeError("profile_module 必须是普通字符串")
+        normalised_profile = profile
+        normalised_profile_module = profile_module
+        _assert_runtime_install_lease_current(
+            current_install_lease,
+            "准备BACKTEST运行后置条件前",
+        )
+        current_install_lease = _prepare_backtest_postconditions(
+            namespace,
+            context,
+            install_instance_token,
+            install_module_generation,
+        )
     else:
         if run_type != "sim_trade":
             raise RuntimeError(
@@ -2556,7 +5101,12 @@ def _install_strategy_runtime_impl(
             )
         normalised_profile = _validate_runtime_identifier(profile, "profile")
         normalised_profile_module = _validate_profile_module_name(profile_module)
-        if _context_uses_remote_snapshot(context):
+        inherited_remote_context = _context_uses_remote_snapshot(context)
+        _assert_runtime_install_lease_current(
+            current_install_lease,
+            "检查远程context后",
+        )
+        if inherited_remote_context:
             raise RuntimeError(
                 "{}不能复用已被远程兼容层接管的context；请在干净运行进程中重启策略".format(
                     _runtime_active_mode(normalised_mode)
@@ -2584,12 +5134,14 @@ def _install_strategy_runtime_impl(
             existing,
             install_signature,
             _runtime_active_mode(normalised_mode),
+            namespace,
         )
         if normalised_mode != "BACKTEST":
             blocked_names = _enforce_remote_postconditions(
                 namespace,
                 context,
                 _runtime_active_mode(normalised_mode),
+                current_install_lease,
             )
             state = _build_strategy_runtime_state(
                 mode=normalised_mode,
@@ -2599,8 +5151,12 @@ def _install_strategy_runtime_impl(
                 profile_module=normalised_profile_module,
                 blocked_mutations=blocked_names,
             )
+        _assert_runtime_install_lease_current(
+            current_install_lease,
+            "提交既有策略运行状态前",
+        )
         _commit_strategy_runtime_state(namespace, install_signature, state)
-        return dict(state)
+        return dict(state), current_install_lease
 
     if normalised_mode == "BACKTEST":
         state = _build_strategy_runtime_state(
@@ -2611,12 +5167,18 @@ def _install_strategy_runtime_impl(
         )
     else:
         config = _load_runtime_profile(normalised_profile_module, normalised_profile)
+        _assert_runtime_install_lease_current(
+            current_install_lease,
+            "加载策略运行profile后",
+        )
+        _assert_runtime_reload_latch_open("加载策略运行profile")
         if config["strategy_id"] != normalised_strategy_id:
             raise RuntimeError("profile.strategy_id 与策略声明的 strategy_id 不一致")
         blocked_names = _enforce_remote_postconditions(
             namespace,
             context,
             _runtime_active_mode(normalised_mode),
+            current_install_lease,
         )
         state = _build_strategy_runtime_state(
             mode=normalised_mode,
@@ -2627,8 +5189,12 @@ def _install_strategy_runtime_impl(
             blocked_mutations=blocked_names,
         )
 
+    _assert_runtime_install_lease_current(
+        current_install_lease,
+        "提交策略运行状态前",
+    )
     _commit_strategy_runtime_state(namespace, install_signature, state)
-    return dict(state)
+    return dict(state), current_install_lease
 
 
 @_serialise_runtime_boundary
@@ -2648,15 +5214,15 @@ def install_strategy_runtime(
         raise RuntimeError("namespace 必须是策略globals()字典")
     if _STRATEGY_RUNTIME_ACTIVE_MODE == "FAILED":
         _mark_runtime_failed(namespace)
-        raise RuntimeError("策略运行安装已经失败；必须使用干净运行进程重启")
+        raise RuntimeError("策略运行进程状态无效：安装已经失败；必须使用干净运行进程重启")
     install_instance_token = _STRATEGY_RUNTIME_INSTANCE_TOKEN
     install_module_generation = _STRATEGY_RUNTIME_MODULE_GENERATION
 
     try:
         normalised_mode = _normalise_runtime_mode(mode)
-        if (
-            _STRATEGY_RUNTIME_INSTANCE_TOKEN is not install_instance_token
-            or _STRATEGY_RUNTIME_MODULE_GENERATION != install_module_generation
+        if not _runtime_module_generation_matches(
+            install_instance_token,
+            install_module_generation,
         ):
             raise RuntimeError("策略运行helper在安装期间发生重载或状态漂移；必须使用干净运行进程重启")
         expected_active_mode = _runtime_active_mode(normalised_mode)
@@ -2669,7 +5235,16 @@ def install_strategy_runtime(
             # profile是可执行Python模块；在其导入发生任何副作用前先阻断进程、
             # 缓存客户端和策略namespace中的所有交易变更入口。
             _arm_remote_runtime_gate(namespace, normalised_mode)
-        state = _install_strategy_runtime_impl(
+        _assert_no_inflight_runtime_requests(
+            "安装{}运行模式".format(normalised_mode)
+        )
+        install_lease = _capture_runtime_install_lease(
+            namespace,
+            normalised_mode,
+            install_instance_token,
+            install_module_generation,
+        )
+        state, final_install_lease = _install_strategy_runtime_impl(
             namespace,
             context=context,
             profile=profile,
@@ -2677,6 +5252,11 @@ def install_strategy_runtime(
             strategy_id=strategy_id,
             expected_api_version=expected_api_version,
             profile_module=profile_module,
+            _runtime_install_lease=install_lease,
+        )
+        _assert_runtime_install_lease_current(
+            final_install_lease,
+            "完成策略运行安装前",
         )
         _assert_runtime_install_generation_current(
             install_instance_token,
@@ -2780,6 +5360,7 @@ def install_jq_compat(
     rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS,
     place_order_timeout_margin: float = DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
     debug: bool = True,
+    _runtime_boundary_attempt_state: Optional[List[bool]] = None,
 ) -> Dict[str, Any]:
     """安装聚宽模拟盘完全接管兼容层。
 
@@ -2789,9 +5370,21 @@ def install_jq_compat(
 
     if type(namespace) is not dict:
         raise RuntimeError("namespace 必须是策略globals()字典")
-    _assert_runtime_mutation_allowed("install_jq_compat")
+    _assert_runtime_mutation_allowed(
+        "install_jq_compat",
+        threading.get_ident(),
+    )
     _assert_no_inflight_runtime_requests("install_jq_compat")
 
+    if (
+        type(_runtime_boundary_attempt_state) is not list
+        or len(_runtime_boundary_attempt_state) != 1
+    ):
+        _fail_runtime_generation_drift(namespace)
+        raise RuntimeError(
+            "聚宽兼容层attempt状态无效；必须使用干净运行进程重启"
+    )
+    _runtime_boundary_attempt_state[0] = True
     run_type = _run_type_from_context(context)
     state = namespace.get(_JQ_COMPAT_STATE_KEY)
     if not isinstance(state, dict):
@@ -2811,18 +5404,18 @@ def install_jq_compat(
         _warn("聚宽兼容层未识别运行环境 run_params.type={}，默认不接管远程交易", run_type)
         return {"enabled": False, "run_type": run_type, "reason": "unsupported_run_type"}
 
-    configure(
-        host=host,
-        port=port,
-        token=token,
-        account_key=account_key,
-        sub_account_id=sub_account_id,
-        tls_cert=tls_cert,
-        retries=retries,
-        retry_interval=retry_interval,
-        rpc_timeout=rpc_timeout,
-        place_order_timeout_margin=place_order_timeout_margin,
-        debug=debug,
+    _configure_remote_clients(
+        host,
+        token,
+        port,
+        account_key,
+        sub_account_id,
+        tls_cert,
+        retries,
+        retry_interval,
+        rpc_timeout,
+        place_order_timeout_margin,
+        debug,
     )
     broker = get_broker_client()
     cache = _RemoteSnapshotCache(broker)
@@ -3347,8 +5940,38 @@ def get_positions() -> List[RemotePosition]:
     return get_broker_client().get_positions()
 
 
+# 封存reload误用检测入口。闭包直接锚定本代锁、gate和清理函数；生产更新
+# 必须冷重启，不能把该防线当作进程内热更新协议。
+_runtime_reload_bootstrap_impl = _create_runtime_reload_bootstrap(
+    _STRATEGY_RUNTIME_LOCK,
+    _STRATEGY_RUNTIME_SOCKET_LOCK,
+    _STRATEGY_RUNTIME_SOCKET_CONDITION,
+    _STRATEGY_RUNTIME_SOCKET_GATE_AUTHORITY,
+    threading.Condition.wait,
+    _get_runtime_commit_anchor,
+    _set_runtime_failed_process_state,
+    _mark_runtime_failed,
+    threading.get_ident,
+)
+_run_runtime_reload_bootstrap = _create_runtime_reload_dispatch(
+    _runtime_reload_bootstrap_impl
+)
+_runtime_reload_entry_publish_result = _STRATEGY_RUNTIME_RELOAD_ENTRY_AUTHORITY[2](
+    _run_runtime_reload_bootstrap
+)
+if (
+    type(_runtime_reload_entry_publish_result) is not bool
+    or not _runtime_reload_entry_publish_result
+):
+    _set_runtime_failed_process_state()
+    raise RuntimeError(
+        "策略运行helper无法封存reload入口；必须使用干净运行进程重启"
+    )
+
+
 __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
+    "STRATEGY_RUNTIME_HELPER_MARKER",
     "PROFILE_SCHEMA_VERSION",
     "configure",
     "install_strategy_runtime",

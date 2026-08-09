@@ -519,10 +519,10 @@ def test_helper_direct_percent_orders_use_remote_total_value():
 def test_install_jq_compat_noops_in_backtest(monkeypatch):
     calls = []
 
-    def fake_configure(**kwargs):
+    def fake_configure(*args, **kwargs):
         calls.append(kwargs)
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {"order": lambda *args, **kwargs: "jq-order"}
     context = _FakeContext("full_backtest")
 
@@ -543,11 +543,11 @@ def test_install_jq_compat_uses_remote_portfolio_and_default_wait(monkeypatch):
     broker = helper.RemoteBrokerClient(client, account_key="default")
     broker.bind_data_client(_FakeDataClient())
 
-    def fake_configure(**kwargs):
+    def fake_configure(*args, **kwargs):
         helper._BROKER_CLIENT = broker
         helper._DATA_CLIENT = broker._data_client
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {}
     context = _FakeContext("sim_trade")
 
@@ -583,11 +583,11 @@ def test_install_jq_compat_percent_orders_use_remote_total_value(monkeypatch):
     broker = helper.RemoteBrokerClient(client, account_key="default")
     broker.bind_data_client(_FakeDataClient())
 
-    def fake_configure(**kwargs):
+    def fake_configure(*args, **kwargs):
         helper._BROKER_CLIENT = broker
         helper._DATA_CLIENT = broker._data_client
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {}
     context = _FakeContext("sim_trade")
     helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
@@ -610,10 +610,10 @@ def test_install_jq_compat_order_style_mapping(monkeypatch):
     client = _CompatClient()
     broker = helper.RemoteBrokerClient(client, account_key="default")
 
-    def fake_configure(**kwargs):
+    def fake_configure(*args, **kwargs):
         helper._BROKER_CLIENT = broker
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {}
     context = _FakeContext("sim_trade")
     helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
@@ -634,10 +634,10 @@ def test_install_jq_compat_order_target_value_rejects_conflicting_value_aliases(
     client = _CompatClient()
     broker = helper.RemoteBrokerClient(client, account_key="default")
 
-    def fake_configure(**kwargs):
+    def fake_configure(*args, **kwargs):
         helper._BROKER_CLIENT = broker
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {}
     context = _FakeContext("sim_trade")
     helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
@@ -657,10 +657,10 @@ def test_install_jq_compat_order_target_value_rejects_conflicting_value_aliases(
 def test_install_jq_compat_rejects_unsupported_scope(monkeypatch, kwargs):
     broker = helper.RemoteBrokerClient(_CompatClient(), account_key="default")
 
-    def fake_configure(**configure_kwargs):
+    def fake_configure(*args, **configure_kwargs):
         helper._BROKER_CLIENT = broker
 
-    monkeypatch.setattr(helper, "configure", fake_configure)
+    monkeypatch.setattr(helper, "_configure_remote_clients", fake_configure)
     namespace = {}
     context = _FakeContext("sim_trade")
     helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")

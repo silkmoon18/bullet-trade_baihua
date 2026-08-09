@@ -38,6 +38,9 @@ PROFILE = 'good_etf-prod'
 MODE = 'BACKTEST'
 STRATEGY_ID = 'good_etf'
 _EXPECTED_RUNTIME_API_VERSION = 1
+_EXPECTED_PROFILE_SCHEMA_VERSION = 1
+_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v1'
+_EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
 MAX_HOLD_NUM = 3           # 最大持仓只数：选折价最深的前 N 只
@@ -100,23 +103,244 @@ def _context_uses_remote_snapshot(context):
     return any(_is_remote_portfolio(item) for item in subportfolios)
 
 
+def _is_remote_helper_module_name(value):
+    helper_basename = 'bullet_trade_jq_remote_helper'
+    return type(value) is str and (
+        value == helper_basename
+        or str.endswith(value, '.' + helper_basename)
+    )
+
+
 def _has_loaded_remote_helper_alias():
     helper_basename = 'bullet_trade_jq_remote_helper'
-    return any(
-        type(module_name) is str
-        and (
-            module_name == helper_basename
-            or str.endswith(module_name, '.' + helper_basename)
-        )
-        for module_name in tuple(sys.modules)
+    module_type = type(sys)
+    try:
+        loaded_modules = tuple(dict.items(sys.modules))
+    except BaseException:
+        return True
+
+    for module_key, module in loaded_modules:
+        if _is_remote_helper_module_name(module_key):
+            return True
+        if not isinstance(module, module_type):
+            continue
+        try:
+            module_namespace = module_type.__getattribute__(module, '__dict__')
+            module_name = dict.get(module_namespace, '__name__')
+            module_file = dict.get(module_namespace, '__file__')
+            helper_marker = dict.get(
+                module_namespace,
+                'STRATEGY_RUNTIME_HELPER_MARKER',
+            )
+        except BaseException:
+            return True
+
+        if _is_remote_helper_module_name(module_name):
+            return True
+        if (
+            type(helper_marker) is str
+            and helper_marker == 'bullet-trade-joinquant-runtime-helper-v1'
+        ):
+            return True
+        if type(module_file) is str:
+            normalised_file = str.replace(module_file, '\\', '/')
+            filename = str.rsplit(normalised_file, '/', 1)[-1]
+            if (
+                filename == helper_basename + '.py'
+                or (
+                    str.startswith(filename, helper_basename + '.')
+                    and str.endswith(filename, '.pyc')
+                )
+            ):
+                return True
+    return False
+
+
+def _runtime_state_matches_request(state, requested_mode):
+    """只读取普通内建值，确认helper返回状态与策略请求完全一致。"""
+    if (
+        type(state) is not dict
+        or type(requested_mode) is not str
+        or requested_mode not in ('BACKTEST', 'SHADOW')
+        or type(_EXPECTED_RUNTIME_API_VERSION) is not int
+        or _EXPECTED_RUNTIME_API_VERSION != 1
+        or type(_EXPECTED_PROFILE_SCHEMA_VERSION) is not int
+        or _EXPECTED_PROFILE_SCHEMA_VERSION != 1
+        or type(PROFILE) is not str
+        or type(STRATEGY_ID) is not str
+        or not PROFILE
+        or not STRATEGY_ID
+    ):
+        return False
+
+    state_keys = tuple(dict.keys(state))
+    if any([type(key) is not str for key in state_keys]):
+        return False
+    base_keys = {
+        'api_version',
+        'profile_schema_version',
+        'profile',
+        'mode',
+        'run_type',
+        'strategy_id',
+        'enabled',
+        'orders_enabled',
+        'production_ready',
+        'reason',
+    }
+    expected_keys = (
+        base_keys
+        if requested_mode == 'BACKTEST'
+        else base_keys | {'profile_module', 'blocked_mutations'}
     )
+    if len(state_keys) != len(expected_keys) or set(state_keys) != expected_keys:
+        return False
+
+    api_version = dict.get(state, 'api_version')
+    profile_schema_version = dict.get(state, 'profile_schema_version')
+    profile = dict.get(state, 'profile')
+    state_mode = dict.get(state, 'mode')
+    run_type = dict.get(state, 'run_type')
+    strategy_id = dict.get(state, 'strategy_id')
+    enabled = dict.get(state, 'enabled')
+    orders_enabled = dict.get(state, 'orders_enabled')
+    production_ready = dict.get(state, 'production_ready')
+    reason = dict.get(state, 'reason')
+    if (
+        type(api_version) is not int
+        or api_version != _EXPECTED_RUNTIME_API_VERSION
+        or type(profile_schema_version) is not int
+        or profile_schema_version != _EXPECTED_PROFILE_SCHEMA_VERSION
+        or type(profile) is not str
+        or profile != PROFILE
+        or type(state_mode) is not str
+        or state_mode != requested_mode
+        or type(run_type) is not str
+        or type(strategy_id) is not str
+        or strategy_id != STRATEGY_ID
+        or type(enabled) is not bool
+        or type(orders_enabled) is not bool
+        or type(production_ready) is not bool
+        or type(reason) is not str
+    ):
+        return False
+
+    if requested_mode == 'BACKTEST':
+        return (
+            run_type in ('simple_backtest', 'full_backtest')
+            and (enabled, orders_enabled, production_ready, reason)
+            == (False, True, False, 'backtest')
+        )
+
+    profile_module = dict.get(state, 'profile_module')
+    blocked_mutations = dict.get(state, 'blocked_mutations')
+    if (
+        run_type != 'sim_trade'
+        or (enabled, orders_enabled, production_ready, reason)
+        != (True, False, False, 'shadow_read_only')
+        or type(_EXPECTED_RUNTIME_PROFILE_MODULE) is not str
+        or _EXPECTED_RUNTIME_PROFILE_MODULE != 'jq_runtime_config'
+        or type(profile_module) is not str
+        or profile_module != _EXPECTED_RUNTIME_PROFILE_MODULE
+        or type(blocked_mutations) is not tuple
+        or any([type(name) is not str for name in blocked_mutations])
+    ):
+        return False
+    required_mutations = {
+        'order',
+        'order_value',
+        'order_percent',
+        'order_target',
+        'order_target_value',
+        'order_target_percent',
+        'cancel_order',
+    }
+    blocked_set = set(blocked_mutations)
+    return (
+        len(blocked_set) == len(blocked_mutations)
+        and required_mutations <= blocked_set
+        and tuple(sorted(blocked_mutations)) == blocked_mutations
+    )
+
+
+def _new_runtime_mode_authority():
+    """把已验证模式封存在闭包中；g.bt_runtime只用于平台侧展示。"""
+    holder = [None]
+    authority_token = object()
+    type_fn = type
+    len_fn = len
+    str_type = type_fn('')
+    tuple_type = type_fn(())
+    holder_type = type_fn(holder)
+    holder_get = holder_type.__getitem__
+    holder_set = holder_type.__setitem__
+    tuple_get = tuple_type.__getitem__
+
+    def commit(requested_mode):
+        if (
+            type_fn(requested_mode) is not str_type
+            or requested_mode not in ('BACKTEST', 'SHADOW')
+        ):
+            raise RuntimeError('good_etf运行时模式权威无效，必须使用干净运行进程')
+        existing = holder_get(holder, 0)
+        if existing is None:
+            holder_set(holder, 0, (authority_token, requested_mode))
+            return requested_mode
+        if type_fn(existing) is not tuple_type or len_fn(existing) != 2:
+            raise RuntimeError('good_etf运行时模式权威损坏，必须使用干净运行进程')
+        existing_token = tuple_get(existing, 0)
+        existing_mode = tuple_get(existing, 1)
+        if (
+            existing_token is not authority_token
+            or type_fn(existing_mode) is not str_type
+            or existing_mode != requested_mode
+        ):
+            raise RuntimeError('good_etf运行时模式权威漂移，必须使用干净运行进程')
+        return existing_mode
+
+    def read(requested_mode):
+        if (
+            type_fn(requested_mode) is not str_type
+            or requested_mode not in ('BACKTEST', 'SHADOW')
+        ):
+            raise RuntimeError('good_etf运行时部署模式无效，拒绝执行交易动作')
+        existing = holder_get(holder, 0)
+        if type_fn(existing) is not tuple_type or len_fn(existing) != 2:
+            raise RuntimeError('good_etf运行时模式尚未安装，拒绝执行交易动作')
+        existing_token = tuple_get(existing, 0)
+        existing_mode = tuple_get(existing, 1)
+        if (
+            existing_token is not authority_token
+            or type_fn(existing_mode) is not str_type
+            or existing_mode != requested_mode
+        ):
+            raise RuntimeError('good_etf运行时模式与部署请求不一致，拒绝执行交易动作')
+        return existing_mode
+
+    return commit, read
+
+
+_commit_runtime_mode_authority, _read_runtime_mode_authority = (
+    _new_runtime_mode_authority()
+)
 
 
 def _install_runtime(context):
     """安装运行模式；此异常不得被策略业务层吞掉。"""
-    mode = str(MODE or '').strip().upper()
+    if type(MODE) is not str:
+        raise RuntimeError('good_etf MODE必须是普通字符串')
+    mode = str.upper(str.strip(MODE))
     if mode not in ('BACKTEST', 'SHADOW', 'LIVE'):
         raise RuntimeError('good_etf MODE必须是BACKTEST、SHADOW或LIVE')
+    if type(PROFILE) is not str or not PROFILE:
+        raise RuntimeError('good_etf PROFILE必须是非空普通字符串')
+    if type(STRATEGY_ID) is not str or not STRATEGY_ID:
+        raise RuntimeError('good_etf STRATEGY_ID必须是非空普通字符串')
+    if (
+        type(_EXPECTED_PROFILE_SCHEMA_VERSION) is not int
+        or _EXPECTED_PROFILE_SCHEMA_VERSION != 1
+    ):
+        raise RuntimeError('good_etf profile schema版本无效')
 
     # helper未上传时只允许聚宽原生回测兜底；此路径不导入profile、不访问网络。
     # helper存在时，所有模式都必须进入版本化入口，由helper在读取context前先
@@ -138,6 +362,9 @@ def _install_runtime(context):
                 'good_etf运行模式不匹配: MODE=BACKTEST 仅允许聚宽回测，当前run_type={}'.format(
                     run_type or '<empty>'))
         state = {
+            'api_version': _EXPECTED_RUNTIME_API_VERSION,
+            'profile_schema_version': _EXPECTED_PROFILE_SCHEMA_VERSION,
+            'profile': PROFILE,
             'mode': mode,
             'run_type': run_type,
             'strategy_id': STRATEGY_ID,
@@ -146,11 +373,38 @@ def _install_runtime(context):
             'production_ready': False,
             'reason': 'backtest',
         }
+        if not _runtime_state_matches_request(state, mode):
+            raise RuntimeError('good_etf本地回测运行时状态无效，拒绝继续运行')
+        _commit_runtime_mode_authority(mode)
         g.bt_runtime = state
         return state
 
-    actual_api_version = getattr(bt, 'STRATEGY_RUNTIME_API_VERSION', None)
-    if type(actual_api_version) is not int or actual_api_version != _EXPECTED_RUNTIME_API_VERSION:
+    if type(bt) is not type(sys):
+        raise RuntimeError('聚宽helper模块类型无效，必须重新上传并使用干净运行进程')
+    helper_namespace = type(sys).__getattribute__(bt, '__dict__')
+    actual_helper_marker = dict.get(
+        helper_namespace,
+        'STRATEGY_RUNTIME_HELPER_MARKER',
+    )
+    if (
+        type(_EXPECTED_RUNTIME_HELPER_MARKER) is not str
+        or _EXPECTED_RUNTIME_HELPER_MARKER
+        != 'bullet-trade-joinquant-runtime-helper-v1'
+        or type(actual_helper_marker) is not str
+        or actual_helper_marker != _EXPECTED_RUNTIME_HELPER_MARKER
+    ):
+        raise RuntimeError('聚宽helper运行时marker不匹配，必须重新上传并使用干净运行进程')
+
+    actual_api_version = dict.get(
+        helper_namespace,
+        'STRATEGY_RUNTIME_API_VERSION',
+    )
+    if (
+        type(_EXPECTED_RUNTIME_API_VERSION) is not int
+        or _EXPECTED_RUNTIME_API_VERSION != 1
+        or type(actual_api_version) is not int
+        or actual_api_version != _EXPECTED_RUNTIME_API_VERSION
+    ):
         safe_expected_api_version = (
             _EXPECTED_RUNTIME_API_VERSION
             if type(_EXPECTED_RUNTIME_API_VERSION) is int
@@ -166,9 +420,15 @@ def _install_runtime(context):
         raise RuntimeError(
             '聚宽helper运行时API版本不匹配: expected={} actual={}'.format(
                 safe_expected_api_version, safe_actual_api_version))
+    runtime_entry = dict.get(
+        helper_namespace,
+        'install_strategy_runtime',
+    )
+    if type(runtime_entry) is not type(lambda: None):
+        raise RuntimeError('聚宽helper运行时入口无效，必须重新上传并使用干净运行进程')
     if mode == 'LIVE':
         raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
-    state = bt.install_strategy_runtime(
+    state = runtime_entry(
         globals(),
         context=context,
         profile=PROFILE,
@@ -176,17 +436,18 @@ def _install_runtime(context):
         strategy_id=STRATEGY_ID,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
     )
-    if not isinstance(state, dict):
+    if not _runtime_state_matches_request(state, mode):
         raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
+    _commit_runtime_mode_authority(mode)
     g.bt_runtime = state
     return state
 
 
 def _runtime_mode():
-    state = getattr(g, 'bt_runtime', None)
-    if isinstance(state, dict):
-        return state.get('mode', str(MODE).upper())
-    return str(MODE).upper()
+    if type(MODE) is not str:
+        raise RuntimeError('good_etf MODE必须是普通字符串')
+    mode = str.upper(str.strip(MODE))
+    return _read_runtime_mode_authority(mode)
 
 
 def _notify(message):
@@ -225,6 +486,9 @@ def _submit_target_value(security, target_value, last_price=None, current_value=
 
 
 def initialize(context):
+    # 安全门必须是第一条可执行语句；门前不得访问任何聚宽平台对象。
+    _install_runtime(context)
+
     # 设置日志级别
     log.set_level('system', 'error')
     # 避免使用未来数据（聚宽平台级未来数据防护）
@@ -243,9 +507,6 @@ def initialize(context):
 
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
-
-    # 运行模式安装失败必须阻断初始化，不能被业务层的宽泛异常捕获。
-    _install_runtime(context)
 
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
@@ -271,8 +532,8 @@ def process_initialize(context):
     """
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
-    log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
     _install_runtime(context)
+    log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 
 def before_market_open(context):

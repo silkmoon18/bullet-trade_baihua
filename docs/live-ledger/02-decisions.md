@@ -23,6 +23,7 @@
 | D017 | 每个slice修复审查问题后必须对最终SHA再次独立复审 | Accepted |
 | D018 | 自动化交付与真实交易日soak分开；外部门禁允许BLOCKED等待证据 | Accepted |
 | D019 | S01采用profile schema v1和严格模式矩阵；StrategyLedger完成前LIVE必须失败关闭 | Accepted |
+| D020 | helper reload gate仅作误用检测与fail-closed；生产升级一律停止策略后冷启动新进程 | Accepted |
 
 ## D001：不合并敏感历史
 
@@ -82,6 +83,24 @@ shadow、QMT模拟和小额实盘依赖真实交易日及用户外部授权，�
 
 ## D019：过渡运行边界
 
-聚宽策略默认`MODE='BACKTEST'`。三个合法模式都必须在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；任何未知、被篡改或owner缺失的孤儿`TRANSITIONING`进程状态必须在context前固定失败，不得执行其字符串化。SHADOW/LIVE还会先把普通模块`globals()`中的交易入口置为`TRANSITIONING`，然后校验可信Python profile。BACKTEST不得读取私有profile、连接远端或替换聚宽原生下单函数；helper已上传时必须经版本化入口检查旧client/remote portfolio污染。只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底；helper内部导入失败、进程中仍加载任何helper别名或兜底context仍带旧远程portfolio必须在读取context前中止。两个BACKTEST并发时失败方保留原生函数；涉及任一远程模式时失败namespace继续失败关闭。SHADOW严格校验profile但不建远程连接；S01的LIVE只校验profile，返回`orders_enabled=False`和`production_ready=False`，不安装旧兼容层或替换portfolio，但会有意安装本地交易阻断函数。profile导入及导入后属性读取的意外异常必须固定脱敏并断开异常链，profile schema只接受精确内建容器和值类型，未知字段名不得回显，异常大的schema、数值和API版本必须得到稳定契约错误。任何合法runtime安装失败、旧兼容层污染、旧远程portfolio、在途RPC、helper热重载或状态完整性故障都保持`FAILED`并要求干净进程重启；污染进程不得切回BACKTEST。`good_etf.py`还必须在调用helper前拒绝LIVE启动。
+聚宽策略默认`MODE='BACKTEST'`。三个合法模式都必须在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；transition owner/namespace/mode只接受精确内建`int`/`dict`/`str`或`None`，任何未知、被篡改或owner缺失的孤儿状态必须在context前固定失败，不得执行其比较、hash或字符串化。成功状态只有在active mode、进程signature、canonical state、进程commit capsule、独立闭包anchor和namespace runtime record按identity共同匹配，且当前安全state快照、原helper instance token和精确module generation都等于capsule封存值时才可重入；另一闭包anchor按identity绑定runtime、owner、socket三把锁及socket condition、helper token/generation与request-token registry，模块全局锁的代理或同类型替换不得被进入。fresh install还要求权威状态为空且单调contract generation精确为0。全部/部分擦除、等值浅拷贝、协同替换、helper token/generation改写或保持字典identity的原地值篡改都必须在context前失败关闭。公开版本和marker先做精确内建类型与固定值校验，poison对象不得进入比较。SHADOW/LIVE还会先把普通模块`globals()`中的交易入口置为`TRANSITIONING`，然后校验可信Python profile。BACKTEST不得读取私有profile、连接远端或替换聚宽原生下单函数；helper已上传时必须经版本化入口检查旧client/remote portfolio污染。只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底；helper内部导入失败、进程中仍加载任何helper模块对象或兜底context仍带旧远程portfolio必须在读取context前中止。模块对象识别不得只信sys.modules键名，必须接受ModuleType子类并使用项目专属marker、模块自身名称或文件名；不能仅凭通用API版本与可调用入口误判无关模块。两个BACKTEST并发时失败方保留原生函数；涉及任一远程模式时失败namespace继续失败关闭。SHADOW严格校验profile但不建远程连接；S01的LIVE只校验profile，返回`orders_enabled=False`和`production_ready=False`，不安装旧兼容层或替换portfolio，但会有意安装本地交易阻断函数。profile导入及导入后属性读取的意外异常必须固定脱敏并断开异常链，profile schema只接受精确内建容器和值类型，未知字段名不得回显，异常大的schema、数值和API版本必须得到稳定契约错误。任何合法runtime安装失败、旧兼容层污染、旧远程portfolio、在途RPC、检测到helper重载或状态完整性故障都保持`FAILED`并要求干净进程重启；污染进程不得切回BACKTEST。`good_etf.py`还必须在调用helper前拒绝LIVE启动。
+
+FAILED在独立闭包anchor中保留进程期latch；只复位模块全局不能恢复fresh状态，必须启动真正的新进程。
+
+RPC wrapper在定义时捕获helper instance token/module generation，并在请求入口为每个调用登记独立object token；入口、每次重试和紧邻socket边界前都必须验证精确contract/module generation、精确inflight计数、三把闭包锚定锁及helper token identity、当前request token仍在闭包锚定registry且`inflight == len(registry)`。无效类型或identity固定失败且不得执行对象魔术方法或污染锁协议。同代际finally只移除自己的token；reload/FAILED后的旧finally不得递减新代际计数或重复推进失败generation。每次成功加载还会生成闭包reload bootstrap；支持的跨线程reload误用检测会关闭单向socket gate、等待已登记attempt并发布FAILED。commit capsule按identity绑定提交namespace，reload完成时删除旧record并安装FAILED guard。该行为不构成热更新或任意`BaseException`后可在原进程恢复的保证，完整生产边界见D020。
+
+安装reservation绑定helper token/generation、线程、namespace/mode、contract generation、active mode和gate authority identity；每个可执行context/profile回调之后及任何发布之前都要复核。BACKTEST的profile参数只接受精确`str`，不能通过`__str__`执行回调并掩盖reservation漂移。成功返回的最终线性化点在`runtime→owner→gate`锁内同时验证helper代际、gate仍开放、公开reload镜像和transition identity；在正常控制流和受测跨线程并发中，收尾异常会撤销namespace提交并进入FAILED。任意异步中断的终止边界及纯Python残余见D020。
 
 后果：runtime只接受普通字符串mode和真实模块`globals()`字典。namespace record不能恢复进程权威状态；并发/递归安装不会排队覆盖已返回契约。门禁覆盖标准交易名、直接别名及可安全识别的函数名/partial/wrapped/直接闭包，但无法撤销藏在其他模块、容器、任意callable对象或局部变量中的原生引用。策略必须先完成单线程初始化再启动回调；profile属于维护者可信代码，运行门禁不承诺沙箱化任意Python副作用。S01只可安全验证同源策略和配置契约，不能被解释为已经具备实盘能力。只有S15替换为StrategyLedger runtime且S18至S20门禁通过后，才允许真实资金。
+
+策略不得仅凭helper返回值是`dict`就信任运行模式；必须验证完整state schema、strategy identity、mode/run_type、布尔flags、reason及模式专属字段。验证成功后的执行模式写入一次性闭包权威；`g.bt_runtime`只是聚宽侧展示副本，任何交易决策不得读取其属性协议，当前MODE与闭包权威漂移必须固定失败。`initialize`与`process_initialize`的首条可执行语句必须安装runtime，任何jqdata/platform调用均不得先于helper gate。
+
+## D020：reload只失败关闭，升级必须冷启动
+
+D019中关于reload、最终线性化和`BaseException`的保证，仅适用于正常控制流和受测的跨线程并发；不得解释为任意异步中断后可以在原进程恢复。当前三锁模型由runtime `RLock`、owner `Lock`和socket `RLock`组成，支持路径遵循`runtime -> owner -> socket`。socket authority以`attempt token -> thread id`登记连接；lease检查与attempt登记在`runtime -> socket`临界区原子完成，connector随后通过独立最终permit进入且不持续持gate锁，reload关闭gate后等待已登记attempt收尾。TLS包装、握手与request/mutation发送effect在socket锁内线性化；mutation调用effect前发布handoff，发送结果不确定时不自动重试。同线程持有socket锁或拥有attempt时触发reload不得等待自身，而是终止进程。
+
+reload gate不是热更新API。生产禁止raw `importlib.reload()`、热补丁、same-thread recursive reload，以及借助`sys.settrace`、`sys.setprofile`或signal handler在任意字节码/C返回点reload、捕获异常并恢复旧栈。即使`importlib.reload()`返回成功，旧代bootstrap也已把进程永久锁存为`FAILED`；后续安装或请求均不受支持。
+
+升级顺序固定为：停止策略并确认旧进程退出；替换helper、私有config和策略文件；启动全新进程；重新完成版本/marker/profile/mode校验。首次从缺少当前primitive anchor的旧helper迁移，尤其raw `Lock`/pre-bootstrap版本，也必须冷启动。`RuntimeReloadAbort`、reload异常或runtime/网络effect期间的任意异步中断一律终止进程，不得catch后继续、同进程重试或切回BACKTEST。
+
+纯Python无法把任意opcode/C返回点的恶意catch-and-resume、许可读取后的旧栈恢复，以及connector返回资源到共享holder之间的handoff全部变成不可分割操作。trace/debugger读取活动authority frame的`frame.f_locals`还会物化旧closure cell值，CPython随后可能把旧`False`同步回已经被递归reload关闭的latch；这类活动帧改写权明确不在可防御契约内。进程退出是这些残余的资源与状态清理边界。若未来LIVE要对抗同进程任意代码执行，需采用独立IO worker/子进程epoch或原生原子gate。

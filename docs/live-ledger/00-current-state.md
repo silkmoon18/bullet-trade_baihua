@@ -1,6 +1,6 @@
 # 当前架构、依赖与状态
 
-更新时间：2026-08-08（Asia/Shanghai）
+更新时间：2026-08-09（Asia/Shanghai）
 
 ## 1. 仓库与版本状态
 
@@ -63,9 +63,23 @@ bullet-trade/
 
 `v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
 
-S01候选在同一helper上增加了`install_strategy_runtime(...)`和profile schema v1：三个合法模式都在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；未知、被篡改或owner缺失的孤儿`TRANSITIONING`进程状态会在context前固定失败，且未知状态对象不会进入错误格式化。SHADOW/LIVE还会同时保护namespace并在读取可信profile前清除旧远程客户端。BACKTEST不读取profile或连接网络，也不替换聚宽原生下单函数；helper已上传时，`good_etf.py`必须经版本化入口检查旧client/remote portfolio等污染，只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底。helper内部导入失败、进程中仍加载任何helper别名或兜底context仍带旧远程portfolio都会在读取context前中止。并发BACKTEST的失败方保留原生下单函数；涉及任一远程模式的并发失败namespace仍安装本地门禁。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、helper热重载或公开状态篡改都失败关闭。profile导入和导入后属性读取的意外异常使用固定消息并断开异常链，profile容器和值只接受精确内建类型；未知字段名不回显，异常大的schema、数值或API版本也只产生稳定契约错误。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+S01候选在同一helper上增加了`install_strategy_runtime(...)`、稳定helper marker和profile schema v1：三个合法模式都在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；owner/namespace/mode只接受精确内建类型，未知、被篡改或owner缺失的孤儿状态会在context前固定失败，且poison对象不会进入比较、membership或错误格式化。已经成功安装时，active mode、进程signature、canonical state、commit capsule、独立闭包anchor与namespace runtime record必须在context读取前构成同一identity封套；capsule还封存提交时的原helper instance token、module generation和不可变安全state snapshot。runtime、owner、socket三把锁及socket condition、helper token/generation、请求lease registry由另一闭包anchor绑定，模块全局锁即使替换为同类型对象也不能被使用。fresh install要求权威状态为空且单调generation精确为0；全部/部分擦除、等值浅拷贝、协同替换、module token/generation改写或保持字典identity的原地值篡改均失败关闭。公开版本/marker先做精确类型与固定值校验，poison不会进入比较。SHADOW/LIVE还会同时保护namespace并在读取可信profile前清除旧远程客户端。BACKTEST不读取profile或连接网络，也不替换聚宽原生下单函数；helper已上传时，`good_etf.py`必须经版本化入口检查旧client/remote portfolio等污染，只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底。helper内部导入失败、进程中仍加载任何helper模块对象或兜底context仍带旧远程portfolio都会在读取context前中止；模块对象识别接受ModuleType子类，并使用项目专属模块名、稳定marker或文件名，不能通过任意sys.modules缓存键隐藏，也不会仅因无关模块具有相似API入口而误判。并发BACKTEST的失败方保留原生下单函数；涉及任一远程模式的并发失败namespace仍安装本地门禁。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、检测到helper重载或公开状态篡改都失败关闭。profile导入和导入后属性读取的意外异常使用固定消息并断开异常链，profile容器和值只接受精确内建类型；未知字段名不回显，异常大的schema、数值或API版本也只产生稳定契约错误。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
 
-该边界要求直接传普通模块`globals()`字典和普通字符串mode。它会保护标准交易名、直接别名及可安全识别的函数名、partial、wrapped和直接闭包引用，但无法撤销已经藏在其他模块、容器、任意callable对象或局部变量中的原生函数引用；因此策略初始化必须单线程、先安装runtime再启动任何回调，profile仍属于可信代码而非沙箱。namespace runtime record不是权威恢复源，进程内signature/canonical state与当前helper实例必须同时匹配。
+FAILED会把独立闭包anchor保留为进程期失败latch；即使随后复位active mode、generation及其他模块全局，也不能伪装成fresh install。只有真正新进程的anchor为空。
+
+远程RPC wrapper在定义时捕获helper instance token/module generation，请求时再登记独立object token；入口、每次重试和紧邻`socket.create_connection`前都要求精确generation/count、当前token仍在闭包锚定registry且`inflight == len(registry)`。类型/identity污染会在socket前固定失败且不执行对象比较或锁上下文协议；同代际finally只移除自己的token，reload后的旧finally不能改写新代际计数。helper reload先于任何generation变化发布FAILED并清client，随后只读取旧状态中的精确内建计数；poison旧值或初始化中断都不能留下可远程访问的混合代际。
+
+该边界要求直接传普通模块`globals()`字典和普通字符串mode。它会保护标准交易名、直接别名及可安全识别的函数名、partial、wrapped和直接闭包引用，但无法撤销已经藏在其他模块、容器、任意callable对象或局部变量中的原生函数引用；因此策略初始化必须单线程、先安装runtime再启动任何回调，profile仍属于可信代码而非沙箱。namespace runtime record不是权威恢复源，进程内signature/canonical state、commit capsule、单调generation与当前helper实例必须同时匹配。
+
+### S01当前并发模型与生产边界（取代上述v11重载表述）
+
+当前候选使用三把闭包锚定锁：runtime `RLock`保护权威状态，owner `Lock`保护安装所有权，socket `RLock`保护gate和远程effect；支持路径遵循`runtime -> owner -> socket`锁序。socket authority以`attempt token -> thread id`登记在途连接。lease检查与attempt登记在`runtime -> socket`临界区原子完成；随后connector通过独立的最终latch/token permit进入，且不持续持有socket锁，所以跨线程reload可以关闭gate，但必须等待该attempt结束。TLS包装、握手及request/mutation发送等远程effect在socket `RLock`内线性化；mutation在调用effect前发布handoff，发送已开始或结果不确定时不得自动重试。post-connector的runtime复核发生前先结束attempt，以避免reload持runtime等待attempt、请求持attempt等待runtime的锁循环。同线程持有socket锁或拥有attempt时发起递归reload不会等待自身，而是进入进程终止型失败。
+
+reload gate只是误用检测和fail-closed防线，不是热更新API。生产禁止直接调用`importlib.reload()`、热补丁、same-thread recursive reload，以及用`sys.settrace`、`sys.setprofile`或signal handler在任意字节码/C返回点触发reload后捕获异常并恢复旧栈。即使普通`importlib.reload()`自身返回成功，旧代bootstrap也已经把该进程永久置为`FAILED`；这不代表热升级成功，后续不得重新安装runtime、发起请求或切回BACKTEST。
+
+`RuntimeReloadAbort`、任何reload异常和在runtime/网络effect期间发生的任意异步中断都按进程终止事件处理：不得捕获后继续旧调用栈，不得在同一进程重试，不得用BACKTEST“恢复”。支持的保证限定为正常控制流和受测的跨线程并发；上文关于reload或`BaseException`失败关闭的描述也只在这个边界内成立。纯Python无法对恶意catch-and-resume、任意opcode/C返回点的中断，以及connector返回资源到共享holder之间的极短handoff窗口给出不可绕过的原子保证。尤其是trace/debugger读取活动authority frame的`frame.f_locals`会物化旧closure cell值；递归reload关闭latch后，CPython的trace locals同步可能把旧`False`写回同一cell并回滚gate，所以具有活动帧改写权的调试/跟踪代码不在可防御契约内。进程退出是释放这类残余OS资源和清除旧闭包状态的最终边界。未来若LIVE要求抵抗这类同进程任意代码执行，应把网络IO移到带epoch的独立worker/子进程，或使用原生原子gate。
+
+helper升级必须冷升级：停止聚宽策略并确认旧进程退出，替换helper/config/策略文件，再由平台启动全新进程并重新校验marker、profile和模式。首次从缺少当前primitive anchor的旧helper升级，尤其raw `Lock`/pre-bootstrap版本，也只能走此流程，绝不能在旧进程内reload。
 
 ### BulletTrade服务器侧
 
@@ -182,6 +196,8 @@ S01候选已经处理：
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
 S01候选只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。S03导出smoke、S15 StrategyLedger runtime和S18至S20真实门禁均不可省略。
+
+第四轮冻结后，策略还收紧了helper返回契约与生命周期入口：runtime state必须是完整、精确且自洽的schema/identity/mode/run_type/flags/reason/profile_module/blocked_mutations组合；`initialize`和`process_initialize`的首条可执行语句都是runtime安装，jqdata/platform调用不得先于helper gate。随后冻结前对抗探针证明读取`g.bt_runtime`本身可执行平台属性协议并协同降级MODE，因此执行模式现封存在安装后的一次性闭包权威中，`g.bt_runtime`只保留为聚宽侧展示副本，交易入口完全不读取它；当前MODE与闭包权威漂移会固定失败。该阶段共增加17个策略回归；S01仍为IN_PROGRESS，预提交审查与精确SHA复审尚未全部完成。
 
 ## 7. 安全现状
 

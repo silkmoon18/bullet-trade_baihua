@@ -15,6 +15,55 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
 PROFILE_EXAMPLE_PATH = ROOT / "jq_runtime" / "jq_runtime_config.example.py"
+EXPECTED_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v1"
+
+
+def _runtime_helper(api_version=1):
+    helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    helper.STRATEGY_RUNTIME_HELPER_MARKER = EXPECTED_RUNTIME_HELPER_MARKER
+    helper.STRATEGY_RUNTIME_API_VERSION = api_version
+    return helper
+
+
+REQUIRED_BLOCKED_MUTATIONS = tuple(
+    sorted(
+        {
+            "order",
+            "order_value",
+            "order_percent",
+            "order_target",
+            "order_target_value",
+            "order_target_percent",
+            "cancel_order",
+        }
+    )
+)
+
+
+def _runtime_state(mode="BACKTEST", run_type=None, **overrides):
+    if run_type is None:
+        run_type = "sim_trade" if mode == "SHADOW" else "full_backtest"
+    state = {
+        "api_version": 1,
+        "profile_schema_version": 1,
+        "profile": "good_etf-prod",
+        "mode": mode,
+        "run_type": run_type,
+        "strategy_id": "good_etf",
+        "enabled": mode == "SHADOW",
+        "orders_enabled": mode == "BACKTEST",
+        "production_ready": False,
+        "reason": "shadow_read_only" if mode == "SHADOW" else "backtest",
+    }
+    if mode == "SHADOW":
+        state.update(
+            {
+                "profile_module": "jq_runtime_config",
+                "blocked_mutations": REQUIRED_BLOCKED_MUTATIONS,
+            }
+        )
+    state.update(overrides)
+    return state
 
 
 class _Log:
@@ -118,7 +167,7 @@ def test_strategy_deployment_contract_has_no_legacy_connection_assignments():
 
 
 def test_strategy_calls_only_the_versioned_helper_entrypoint():
-    _, tree = _source_and_tree()
+    source, tree = _source_and_tree()
     helper_calls = {
         node.func.attr
         for node in ast.walk(tree)
@@ -127,7 +176,87 @@ def test_strategy_calls_only_the_versioned_helper_entrypoint():
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "bt"
     }
-    assert helper_calls == {"install_strategy_runtime"}
+    runtime_entry_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "runtime_entry"
+    ]
+    assert helper_calls == set()
+    assert "runtime_entry = dict.get(" in source
+    assert "'install_strategy_runtime'," in source
+    assert len(runtime_entry_calls) == 1
+
+
+def test_lifecycle_functions_enter_runtime_gate_as_first_executable_statement():
+    _, tree = _source_and_tree()
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"initialize", "process_initialize"}
+    }
+
+    assert set(functions) == {"initialize", "process_initialize"}
+    for function in functions.values():
+        executable = list(function.body)
+        if (
+            executable
+            and isinstance(executable[0], ast.Expr)
+            and isinstance(executable[0].value, ast.Constant)
+            and isinstance(executable[0].value.value, str)
+        ):
+            executable = executable[1:]
+        first = executable[0]
+        assert isinstance(first, ast.Expr)
+        assert isinstance(first.value, ast.Call)
+        assert isinstance(first.value.func, ast.Name)
+        assert first.value.func.id == "_install_runtime"
+
+
+@pytest.mark.parametrize("lifecycle_name", ["initialize", "process_initialize"])
+def test_lifecycle_gate_runs_before_platform_callbacks(monkeypatch, lifecycle_name):
+    events = []
+
+    class GateStop(RuntimeError):
+        pass
+
+    class PoisonPlatformObject:
+        def __getattribute__(self, name):
+            pytest.fail("runtime gate前不得读取平台对象属性: {}".format(name))
+
+        def __setattr__(self, name, value):
+            pytest.fail("runtime gate前不得写入平台对象属性: {}".format(name))
+
+    def install(namespace, **kwargs):
+        events.append("HELPER_GATE")
+        raise GateStop("stop after helper gate")
+
+    def poison_call(*args, **kwargs):
+        pytest.fail("runtime gate前不得调用聚宽平台函数")
+
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = install
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.log = PoisonPlatformObject()
+    strategy.g = PoisonPlatformObject()
+    strategy.datetime = PoisonPlatformObject()
+    for name in (
+        "set_option",
+        "set_benchmark",
+        "set_order_cost",
+        "set_slippage",
+        "OrderCost",
+        "FixedSlippage",
+        "run_daily",
+    ):
+        setattr(strategy, name, poison_call)
+
+    with pytest.raises(GateStop, match="stop after helper gate"):
+        getattr(strategy, lifecycle_name)(_Context("full_backtest"))
+
+    assert events == ["HELPER_GATE"]
 
 
 @pytest.mark.parametrize("run_type", ["simple_backtest", "full_backtest"])
@@ -142,6 +271,32 @@ def test_backtest_installs_without_helper_profile_or_network(monkeypatch, run_ty
     assert state["orders_enabled"] is True
     assert state["production_ready"] is False
     assert strategy.g.bt_runtime == state
+
+
+@pytest.mark.parametrize("mode_case", ("boolean", "poison"))
+def test_strategy_rejects_non_string_mode_without_callbacks_or_runtime(
+    monkeypatch,
+    mode_case,
+):
+    class PoisonMode:
+        def __bool__(self):
+            pytest.fail("MODE校验不得执行__bool__")
+
+        def __str__(self):
+            pytest.fail("MODE校验不得执行__str__")
+
+    helper = _runtime_helper()
+    install_calls = []
+    helper.install_strategy_runtime = lambda *args, **kwargs: install_calls.append(
+        (args, kwargs)
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = True if mode_case == "boolean" else PoisonMode()
+
+    with pytest.raises(RuntimeError, match="MODE必须是普通字符串"):
+        strategy._install_runtime(object())
+
+    assert install_calls == []
 
 
 @pytest.mark.parametrize(
@@ -186,13 +341,20 @@ def test_backtest_without_helper_rejects_old_remote_portfolio(monkeypatch):
         strategy._install_runtime(context)
 
 
-def test_backtest_without_top_level_helper_rejects_loaded_helper_alias(monkeypatch):
+@pytest.mark.parametrize(
+    "alias_name",
+    ["helpers.bullet_trade_jq_remote_helper", "innocent_runtime_cache"],
+)
+def test_backtest_without_top_level_helper_rejects_loaded_helper_alias(
+    monkeypatch,
+    alias_name,
+):
     from helpers import bullet_trade_jq_remote_helper as runtime_helper
 
     strategy = _load_strategy(monkeypatch)
     monkeypatch.setitem(
         sys.modules,
-        "helpers.bullet_trade_jq_remote_helper",
+        alias_name,
         runtime_helper,
     )
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
@@ -226,21 +388,65 @@ def test_backtest_without_top_level_helper_rejects_loaded_helper_alias(monkeypat
     assert socket_calls == []
 
 
+def test_backtest_without_helper_rejects_module_subclass_alias(monkeypatch):
+    from helpers import bullet_trade_jq_remote_helper as runtime_helper
+
+    strategy = _load_strategy(monkeypatch)
+
+    class HelperModuleSubclass(types.ModuleType):
+        pass
+
+    hidden_helper = HelperModuleSubclass("innocent_runtime_cache")
+    hidden_helper.__dict__.update(runtime_helper.__dict__)
+    monkeypatch.setitem(sys.modules, "innocent_runtime_cache", hidden_helper)
+    socket_calls = []
+    portfolio_reads = []
+    cached_client = runtime_helper._ShortLivedClient(
+        "127.0.0.1", 58620, "unit-test-token", retries=0
+    )
+    monkeypatch.setattr(
+        runtime_helper.socket,
+        "create_connection",
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)),
+    )
+
+    class ContextWithSideEffect:
+        run_params = _RunParams("full_backtest")
+
+        @property
+        def portfolio(self):
+            portfolio_reads.append("portfolio")
+            cached_client.request("broker.place_order", {"amount": 100})
+            return None
+
+    with pytest.raises(RuntimeError, match="已加载的远程helper"):
+        strategy._install_runtime(ContextWithSideEffect())
+
+    assert socket_calls == []
+    assert portfolio_reads == []
+
+
+def test_backtest_without_helper_ignores_unrelated_runtime_api_module(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    unrelated_module = types.ModuleType("unrelated_runtime")
+    unrelated_module.STRATEGY_RUNTIME_API_VERSION = 77
+    unrelated_module.install_strategy_runtime = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "innocent_runtime_cache", unrelated_module)
+
+    assert strategy._has_loaded_remote_helper_alias() is False
+    state = strategy._install_runtime(_Context("full_backtest"))
+
+    assert state["mode"] == "BACKTEST"
+    assert state["orders_enabled"] is True
+
+
 def test_backtest_uses_versioned_helper_before_strategy_reads_context(monkeypatch):
     calls = []
-    helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper = _runtime_helper()
 
     def install(namespace, **kwargs):
         calls.append((namespace, kwargs))
-        return {
-            "mode": "BACKTEST",
-            "run_type": "full_backtest",
-            "strategy_id": "good_etf",
-            "enabled": False,
-            "orders_enabled": True,
-            "production_ready": False,
-        }
+        return _runtime_state()
 
     helper.install_strategy_runtime = install
     strategy = _load_strategy(monkeypatch, helper)
@@ -260,9 +466,83 @@ def test_backtest_uses_versioned_helper_before_strategy_reads_context(monkeypatc
     assert kwargs["mode"] == "BACKTEST"
 
 
+@pytest.mark.parametrize(
+    "marker_case",
+    ("missing", "wrong", "boolean", "poison"),
+)
+def test_strategy_rejects_invalid_helper_marker_before_runtime(
+    monkeypatch,
+    marker_case,
+):
+    class PoisonMarker:
+        def __bool__(self):
+            pytest.fail("marker校验不得执行__bool__")
+
+        def __eq__(self, other):
+            pytest.fail("marker校验不得执行__eq__")
+
+        def __repr__(self):
+            pytest.fail("marker校验不得执行__repr__")
+
+        def __str__(self):
+            pytest.fail("marker校验不得执行__str__")
+
+    helper = types.ModuleType("bullet_trade_jq_remote_helper")
+    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    if marker_case == "wrong":
+        helper.STRATEGY_RUNTIME_HELPER_MARKER = "wrong-helper-marker"
+    elif marker_case == "boolean":
+        helper.STRATEGY_RUNTIME_HELPER_MARKER = True
+    elif marker_case == "poison":
+        helper.STRATEGY_RUNTIME_HELPER_MARKER = PoisonMarker()
+
+    install_calls = []
+
+    def install(*args, **kwargs):
+        install_calls.append((args, kwargs))
+        return {}
+
+    helper.install_strategy_runtime = install
+    strategy = _load_strategy(monkeypatch, helper)
+
+    with pytest.raises(RuntimeError, match="marker不匹配"):
+        strategy._install_runtime(object())
+
+    assert install_calls == []
+
+
+@pytest.mark.parametrize("entry_case", ("missing", "poison_callable"))
+def test_strategy_rejects_untrusted_runtime_entry_without_magic_callbacks(
+    monkeypatch,
+    entry_case,
+):
+    events = []
+    helper = _runtime_helper()
+
+    def module_getattr(name):
+        events.append(("module_getattr", name))
+        return lambda *args, **kwargs: {}
+
+    class PoisonCallable:
+        def __call__(self, *args, **kwargs):
+            events.append(("callable", args, kwargs))
+            return {}
+
+    if entry_case == "missing":
+        helper.__getattr__ = module_getattr
+    else:
+        helper.install_strategy_runtime = PoisonCallable()
+    strategy = _load_strategy(monkeypatch, helper)
+    events.clear()
+
+    with pytest.raises(RuntimeError, match="运行时入口无效"):
+        strategy._install_runtime(object())
+
+    assert events == []
+
+
 def test_backtest_rejects_old_helper_api(monkeypatch):
-    old_helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    old_helper.STRATEGY_RUNTIME_API_VERSION = 0
+    old_helper = _runtime_helper(api_version=0)
     strategy = _load_strategy(monkeypatch, old_helper)
 
     with pytest.raises(RuntimeError, match="API版本不匹配"):
@@ -270,8 +550,7 @@ def test_backtest_rejects_old_helper_api(monkeypatch):
 
 
 def test_backtest_rejects_huge_helper_api_with_stable_error(monkeypatch):
-    malformed_helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    malformed_helper.STRATEGY_RUNTIME_API_VERSION = 10 ** 5000
+    malformed_helper = _runtime_helper(api_version=10 ** 5000)
     malformed_helper.install_strategy_runtime = lambda *args, **kwargs: pytest.fail(
         "API版本错误不得进入runtime"
     )
@@ -282,8 +561,7 @@ def test_backtest_rejects_huge_helper_api_with_stable_error(monkeypatch):
 
 
 def test_backtest_rejects_huge_expected_api_with_stable_error(monkeypatch):
-    helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper = _runtime_helper()
     helper.install_strategy_runtime = lambda *args, **kwargs: pytest.fail(
         "API版本错误不得进入runtime"
     )
@@ -294,12 +572,50 @@ def test_backtest_rejects_huge_expected_api_with_stable_error(monkeypatch):
         strategy._install_runtime(_Context("full_backtest"))
 
 
+@pytest.mark.parametrize("expected_case", ("boolean", "poison"))
+def test_strategy_rejects_invalid_expected_api_without_comparison_callback(
+    monkeypatch,
+    expected_case,
+):
+    class PoisonExpectedApi:
+        def __eq__(self, other):
+            pytest.fail("expected API校验不得执行__eq__")
+
+        def __ne__(self, other):
+            pytest.fail("expected API校验不得执行__ne__")
+
+        def __repr__(self):
+            pytest.fail("expected API校验不得执行__repr__")
+
+        def __str__(self):
+            pytest.fail("expected API校验不得执行__str__")
+
+    helper = _runtime_helper()
+    install_calls = []
+    helper.install_strategy_runtime = lambda *args, **kwargs: install_calls.append(
+        (args, kwargs)
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy._EXPECTED_RUNTIME_API_VERSION = (
+        True if expected_case == "boolean" else PoisonExpectedApi()
+    )
+
+    with pytest.raises(RuntimeError, match="expected=<invalid>"):
+        strategy._install_runtime(object())
+
+    assert install_calls == []
+
+
 def test_backtest_with_helper_rejects_remote_process_contamination(monkeypatch):
     from helpers import bullet_trade_jq_remote_helper as runtime_helper
 
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_ACTIVE_MODE", None)
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_PROCESS_SIGNATURE", None)
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_CANONICAL_STATE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_COMMIT_CAPSULE", None)
+    monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_CONTRACT_GENERATION", 0)
+    runtime_helper._set_runtime_commit_anchor(None)
+    set.clear(runtime_helper._STRATEGY_RUNTIME_REQUEST_LEASES)
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_INFLIGHT_REQUESTS", 0)
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_TRANSITION_OWNER", None)
     monkeypatch.setattr(runtime_helper, "_STRATEGY_RUNTIME_TRANSITION_NAMESPACE", None)
@@ -337,8 +653,7 @@ def test_shadow_requires_uploaded_helper(monkeypatch):
 
 
 def test_shadow_rejects_old_helper_api_before_profile_or_network(monkeypatch):
-    old_helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    old_helper.STRATEGY_RUNTIME_API_VERSION = 0
+    old_helper = _runtime_helper(api_version=0)
     strategy = _load_strategy(monkeypatch, old_helper)
     strategy.MODE = "SHADOW"
 
@@ -347,8 +662,7 @@ def test_shadow_rejects_old_helper_api_before_profile_or_network(monkeypatch):
 
 
 def test_shadow_rejects_boolean_helper_api_version(monkeypatch):
-    malformed_helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    malformed_helper.STRATEGY_RUNTIME_API_VERSION = True
+    malformed_helper = _runtime_helper(api_version=True)
     strategy = _load_strategy(monkeypatch, malformed_helper)
     strategy.MODE = "SHADOW"
 
@@ -358,17 +672,11 @@ def test_shadow_rejects_boolean_helper_api_version(monkeypatch):
 
 def test_strategy_passes_only_deployment_identity_to_runtime(monkeypatch):
     calls = []
-    helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper = _runtime_helper()
 
     def install(namespace, **kwargs):
         calls.append((namespace, kwargs))
-        return {
-            "mode": kwargs["mode"],
-            "run_type": "sim_trade",
-            "strategy_id": kwargs["strategy_id"],
-            "production_ready": False,
-        }
+        return _runtime_state(mode=kwargs["mode"])
 
     helper.install_strategy_runtime = install
     strategy = _load_strategy(monkeypatch, helper)
@@ -390,8 +698,7 @@ def test_strategy_passes_only_deployment_identity_to_runtime(monkeypatch):
 
 
 def test_strategy_rejects_malformed_runtime_state(monkeypatch):
-    helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper = _runtime_helper()
     helper.install_strategy_runtime = lambda namespace, **kwargs: None
     strategy = _load_strategy(monkeypatch, helper)
     strategy.MODE = "SHADOW"
@@ -400,9 +707,172 @@ def test_strategy_rejects_malformed_runtime_state(monkeypatch):
         strategy._install_runtime(_Context("sim_trade"))
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        {"mode": "BACKTEST", "run_type": "full_backtest"},
+        {"profile": "other-profile"},
+        {"strategy_id": "other-strategy"},
+        {"run_type": "full_backtest"},
+        {"orders_enabled": True},
+        {"production_ready": True},
+        {"reason": "backtest"},
+        {"profile_module": "other_runtime_config"},
+        {"blocked_mutations": ()},
+    ],
+)
+def test_shadow_rejects_runtime_state_contract_mismatch(monkeypatch, tamper):
+    helper = _runtime_helper()
+
+    def install(namespace, **kwargs):
+        state = _runtime_state("SHADOW")
+        state.update(tamper)
+        return state
+
+    helper.install_strategy_runtime = install
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+
+    with pytest.raises(RuntimeError, match="无效的运行时状态"):
+        strategy._install_runtime(_Context("sim_trade"))
+
+
+def test_shadow_rejects_state_mode_downgrade_before_native_order(monkeypatch):
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = (
+        lambda namespace, **kwargs: _runtime_state("BACKTEST")
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+
+    with pytest.raises(RuntimeError, match="无效的运行时状态"):
+        strategy._install_runtime(_Context("sim_trade"))
+
+    native_orders = []
+    strategy.g.bt_runtime = _runtime_state("BACKTEST")
+    strategy.order_target = lambda *args, **kwargs: native_orders.append((args, kwargs))
+    with pytest.raises(RuntimeError, match="拒绝执行交易动作"):
+        strategy._submit_target_amount("510001.XSHG", 100)
+    assert native_orders == []
+
+
+def test_shadow_uses_closure_authority_without_reading_poison_g(monkeypatch):
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = (
+        lambda namespace, **kwargs: _runtime_state("SHADOW")
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+    strategy._install_runtime(_Context("sim_trade"))
+
+    g_reads = []
+    native_mutations = []
+
+    class PoisonG:
+        def __getattribute__(self, name):
+            g_reads.append(name)
+            strategy.MODE = "BACKTEST"
+            return _runtime_state("BACKTEST")
+
+    strategy.g = PoisonG()
+    strategy.get_open_orders = lambda: native_mutations.append("get_open_orders")
+    strategy.cancel_order = lambda order: native_mutations.append("cancel_order")
+    strategy.order_target = lambda *args, **kwargs: native_mutations.append(
+        "order_target"
+    )
+    strategy.order_target_value = lambda *args, **kwargs: native_mutations.append(
+        "order_target_value"
+    )
+
+    assert strategy._cancel_open_orders_for_runtime() == 0
+    assert strategy._submit_target_amount("510001.XSHG", 100) is None
+    assert (
+        strategy._submit_target_value(
+            "510001.XSHG",
+            1_000.0,
+            last_price=10.0,
+            current_value=0.0,
+        )
+        is None
+    )
+    assert g_reads == []
+    assert native_mutations == []
+    assert strategy.MODE == "SHADOW"
+
+
+def test_shadow_closure_authority_rejects_global_mode_drift(monkeypatch):
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = (
+        lambda namespace, **kwargs: _runtime_state("SHADOW")
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+    strategy._install_runtime(_Context("sim_trade"))
+    strategy.g.bt_runtime = _runtime_state("BACKTEST")
+    strategy.MODE = "BACKTEST"
+    native_orders = []
+    strategy.order_target = lambda *args, **kwargs: native_orders.append((args, kwargs))
+
+    with pytest.raises(RuntimeError, match="模式与部署请求不一致"):
+        strategy._submit_target_amount("510001.XSHG", 100)
+
+    assert native_orders == []
+
+
+@pytest.mark.parametrize("poison_field", ["mode", "blocked_mutations"])
+def test_strategy_rejects_poison_runtime_state_without_magic_callbacks(
+    monkeypatch,
+    poison_field,
+):
+    class PoisonValue:
+        def __bool__(self):
+            pytest.fail("state校验不得执行__bool__")
+
+        def __eq__(self, other):
+            pytest.fail("state校验不得执行__eq__")
+
+        def __iter__(self):
+            pytest.fail("state校验不得执行__iter__")
+
+        def __repr__(self):
+            pytest.fail("state校验不得执行__repr__")
+
+        def __str__(self):
+            pytest.fail("state校验不得执行__str__")
+
+    state = _runtime_state("SHADOW")
+    if poison_field == "mode":
+        state[poison_field] = PoisonValue()
+    else:
+        state[poison_field] = (PoisonValue(),)
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = lambda namespace, **kwargs: state
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+
+    with pytest.raises(RuntimeError, match="无效的运行时状态"):
+        strategy._install_runtime(_Context("sim_trade"))
+
+
+def test_strategy_rejects_runtime_state_dict_subclass_without_callbacks(monkeypatch):
+    class PoisonState(dict):
+        def __iter__(self):
+            pytest.fail("无效state不得执行__iter__")
+
+        def __repr__(self):
+            pytest.fail("无效state不得执行__repr__")
+
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = lambda namespace, **kwargs: PoisonState()
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+
+    with pytest.raises(RuntimeError, match="无效的运行时状态"):
+        strategy._install_runtime(_Context("sim_trade"))
+
+
 def test_good_etf_refuses_transitional_live_runtime(monkeypatch):
-    helper = types.ModuleType("bullet_trade_jq_remote_helper")
-    helper.STRATEGY_RUNTIME_API_VERSION = 1
+    helper = _runtime_helper()
     helper.install_strategy_runtime = lambda namespace, **kwargs: pytest.fail(
         "S01 LIVE必须在安装helper runtime前失败关闭"
     )
@@ -420,7 +890,7 @@ def test_target_values_use_total_nav_not_available_cash(monkeypatch):
         "510001.XSHG": types.SimpleNamespace(last_price=9.0, high_limit=11.0, paused=False),
         "510002.XSHG": types.SimpleNamespace(last_price=9.5, high_limit=11.0, paused=False),
     }
-    strategy.g.bt_runtime = {"mode": "BACKTEST"}
+    strategy._install_runtime(_Context("full_backtest"))
     strategy.g.fund_list = pd.DataFrame(
         {"unit_net_value": [10.0, 10.0]},
         index=["510001.XSHG", "510002.XSHG"],
@@ -457,7 +927,7 @@ def test_target_value_reduction_does_not_use_buy_side_limit_price(monkeypatch):
         "510001.XSHG": types.SimpleNamespace(last_price=9.0, high_limit=11.0, paused=False),
         "510002.XSHG": types.SimpleNamespace(last_price=9.5, high_limit=11.0, paused=False),
     }
-    strategy.g.bt_runtime = {"mode": "BACKTEST"}
+    strategy._install_runtime(_Context("full_backtest"))
     strategy.g.fund_list = pd.DataFrame(
         {"unit_net_value": [10.0, 10.0]},
         index=["510001.XSHG", "510002.XSHG"],
