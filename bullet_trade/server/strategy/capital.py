@@ -313,14 +313,21 @@ class SQLiteCapitalService:
                 SELECT entry_type, payload_json FROM ledger_entries
                 WHERE strategy_account_id = ? AND reference_type = 'order'
                   AND reference_id = ?
-                  AND entry_type IN ('CASH_RESERVED', 'CASH_RELEASED')
+                  AND entry_type IN (
+                      'CASH_RESERVED', 'CASH_RELEASED', 'BUY_FILL_BOOKED'
+                  )
                 ORDER BY event_seq
                 """,
                 (account_id, order_id),
             ).fetchall()
             for row in rows:
                 try:
-                    recorded_amount = json.loads(row["payload_json"])["amount_units"]
+                    payload = json.loads(row["payload_json"])
+                    recorded_amount = (
+                        payload["reservation_released_units"]
+                        if row["entry_type"] == "BUY_FILL_BOOKED"
+                        else payload["amount_units"]
+                    )
                 except (KeyError, TypeError, ValueError) as exc:
                     raise RepositoryError("order reservation ledger is invalid") from exc
                 if type(recorded_amount) is not int or recorded_amount <= 0:

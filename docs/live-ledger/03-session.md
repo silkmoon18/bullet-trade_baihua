@@ -180,6 +180,16 @@
 - 先覆盖部分成交、撤单/拒单释放余款、卖出不存在持仓返回0、A股T+1可卖约束；不提前建设估值、聚宽指标回传或通用风控平台。
 - 为QMT成交证据补齐可靠成交时间，并以账本重放和重复fill no-op作为本slice出口。
 
+## S09当前候选
+
+- 新增`SQLiteFillBookingService`：登记策略订单、真实成交入账、撤单/拒单终态和订单余款释放。
+- 买入只按实际成交金额与费用扣现金，部分成交保留余单冻结，全部成交释放价格缓冲；真实卖出按FIFO lot扣持仓并按净回款增加现金。
+- 买入lot显式保存下一可卖交易日；同日卖出、超卖和无持仓成交拒绝。卖出不存在持仓但券商返回拒单/零成交时，只更新订单终态，策略现金保持不变。
+- broker trade ID或fingerprint重复成交为no-op，ID内容冲突拒绝；现金、订单、fill、position、lot、ledger和event在同一事务提交，故障全量回滚。
+- QMT成交合同新增可靠`traded_at`，MiniQMT沿用`time`，BigQMT补齐常见原生时间字段映射；缺失或非法时间拒绝进入账本。
+- 首轮审查发现BigQMT分离日期/时间可能被误解为1970年，以及同日lot按本地到达顺序而非成交顺序FIFO；候选现合成完整券商时间并让lot按真实`traded_at`排序。
+- S09成交入账定向8项、S04至S09加scheduler联合77项通过；变更模块flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS，等待复审。
+
 ## 恢复检查表
 
 新session继续前依次执行：

@@ -79,6 +79,7 @@ def test_trade_side_maps_only_through_its_broker_order_id():
             "commission_known": True,
             "tax": 0.0,
             "tax_known": True,
+            "time": "2026-08-10 10:00:00",
         },
         {"O-1": {"order_id": "O-1", "is_buy": False}},
     )
@@ -100,6 +101,7 @@ def test_trade_without_matching_side_is_rejected():
                 "price": 2.5,
                 "commission_fee": 0,
                 "tax": 0,
+                "time": "2026-08-10 10:00:00",
             },
             {},
         )
@@ -119,6 +121,7 @@ def test_trade_without_matching_side_is_rejected():
                 "side": "BUY",
                 "commission_fee": 0,
                 "tax": 0,
+                "time": "2026-08-10 10:00:00",
             },
             "missing or synthetic",
         ),
@@ -135,6 +138,7 @@ def test_trade_without_matching_side_is_rejected():
                 "commission_known": False,
                 "tax": 0,
                 "tax_known": True,
+                "time": "2026-08-10 10:00:00",
             },
             "fee fields are incomplete",
         ),
@@ -160,6 +164,7 @@ def test_negative_broker_fees_are_rejected(fee_field, fee_value):
         "side": "BUY",
         "commission_fee": 0,
         "tax": 0,
+        "time": "2026-08-10 10:00:00",
     }
     trade[fee_field] = fee_value
     with pytest.raises(BrokerContractError, match="cannot be negative"):
@@ -176,6 +181,7 @@ def test_duplicate_identical_trades_are_one_fill_but_conflicts_are_rejected():
         "price": "2.50",
         "commission_fee": "1.00",
         "tax": "0",
+        "time": "2026-08-10 10:00:00",
     }
     second = dict(first)
     trades = normalize_trade_batch(
@@ -207,6 +213,15 @@ def test_big_qmt_normalization_marks_native_ids_and_fee_presence():
     assert normalized["commission_known"] is True
     assert normalized["tax_known"] is True
 
+    native_time = _normalize_trade(
+        {
+            "m_strTradeID": "T-time",
+            "m_strTradeDate": "20260810",
+            "m_strTradeTime": "100000",
+        }
+    )
+    assert native_time["time"] == "2026-08-10 10:00:00"
+
     missing = _normalize_trade({"m_strOrderSysID": "O-2"})
     assert missing["trade_id_source"] == "missing"
     assert missing["commission_known"] is False
@@ -223,3 +238,22 @@ def test_big_qmt_normalization_marks_native_ids_and_fee_presence():
     )
     assert upstream_default["commission_known"] is False
     assert upstream_default["tax_known"] is False
+
+
+def test_hhmmss_without_trade_date_is_not_misread_as_unix_time():
+    with pytest.raises(BrokerContractError, match="trade time is invalid"):
+        normalize_trade_evidence(
+            {
+                "trade_id": "T-1",
+                "trade_id_source": "broker",
+                "order_id": "O-1",
+                "security": "510050.XSHG",
+                "amount": 100,
+                "price": 2.5,
+                "side": "BUY",
+                "commission_fee": 0,
+                "tax": 0,
+                "time": 100000,
+            },
+            {},
+        )

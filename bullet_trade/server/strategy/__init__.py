@@ -59,6 +59,13 @@ from .capital import (
     SQLiteCapitalService,
     StrategyAccountEnsureResult,
 )
+from .fill_booking import (
+    FillBookingError,
+    FillBookingResult,
+    FillConflictError,
+    OrderFinalizationResult,
+    SQLiteFillBookingService,
+)
 
 __all__ = [
     "MONEY_SCALE",
@@ -79,12 +86,16 @@ __all__ = [
     "CapabilityState",
     "IntentState",
     "IdempotencyConflictError",
+    "FillBookingError",
+    "FillBookingResult",
+    "FillConflictError",
     "LATEST_SCHEMA_VERSION",
     "LedgerEntry",
     "LedgerInvariantError",
     "MINI_QMT_CAPABILITIES",
     "OrderSide",
     "OrderState",
+    "OrderFinalizationResult",
     "OperationCreateResult",
     "OperationRecord",
     "OperationState",
@@ -98,6 +109,7 @@ __all__ = [
     "SQLiteStrategyRepository",
     "SQLiteOperationRepository",
     "SQLiteCapitalService",
+    "SQLiteFillBookingService",
     "StrategyEvent",
     "StrategyAccount",
     "StrategyAccountEnsureResult",

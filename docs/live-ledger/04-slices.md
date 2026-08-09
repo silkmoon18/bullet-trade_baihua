@@ -884,6 +884,14 @@ Decision: DONE
 - 重复fill no-op、累计成交越界quarantine。
 - 随机事件序列验证资产和lot不变量。
 
+### 当前实现候选（待审查）
+
+- `SQLiteFillBookingService`实现订单登记、买卖fill原子入账与撤单/拒单终态；不含估值、对账摄取和执行规划。
+- 部分买入按真实成交价费扣账并保留余单冻结，全部成交/撤单释放订单余款；卖出按FIFO可卖lot计算净回款和已实现盈亏。
+- 重复broker trade ID/fingerprint no-op，冲突ID、累计超额、同日卖出和无持仓卖出fill拒绝；卖出零成交/拒单不改变现金。
+- 成交时间进入QMT证据合同，BigQMT分离日期/HHMMSS先合成完整时间，缺失或非法时间不能入账；同日lot按真实成交时间FIFO。
+- S09成交入账定向8项、联合77项和静态/语法/格式检查通过，等待复审。
+
 ## S10：Valuation and Atomic Snapshot
 
 ### 交付

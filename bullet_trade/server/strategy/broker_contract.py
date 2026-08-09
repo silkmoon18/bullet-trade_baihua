@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union, cast
 
-from .domain import OrderSide, money_to_units, price_to_units
+from .domain import SHANGHAI_TZ, OrderSide, as_shanghai_time, money_to_units, price_to_units
 
 
 class BrokerContractError(RuntimeError):
@@ -127,6 +128,7 @@ class BrokerTradeEvidence:
     price_units: int
     commission_units: int
     tax_units: int
+    traded_at: datetime
 
     def __post_init__(self) -> None:
         if not self.broker_trade_id or not self.broker_order_id or not self.security:
@@ -139,6 +141,7 @@ class BrokerTradeEvidence:
             raise ValueError("broker trade commission must be a non-negative integer")
         if type(self.tax_units) is not int or self.tax_units < 0:
             raise ValueError("broker trade tax must be a non-negative integer")
+        object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 
 def _text(value: object) -> str:
@@ -215,6 +218,43 @@ def _positive_quantity(value: object) -> int:
     return quantity
 
 
+def _broker_trade_time(value: object) -> datetime:
+    parsed: Optional[datetime]
+    if isinstance(value, datetime):
+        parsed = value
+    elif type(value) in (int, float):
+        timestamp = float(cast(Union[int, float], value))
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        if timestamp < 946_684_800:
+            raise BrokerContractError("broker trade time is invalid")
+        try:
+            parsed = datetime.fromtimestamp(timestamp, tz=SHANGHAI_TZ)
+        except (OSError, OverflowError, ValueError) as exc:
+            raise BrokerContractError("broker trade time is invalid") from exc
+    elif type(value) is str:
+        text = cast(str, value).strip()
+        parsed = None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            for pattern in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(text, pattern)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            raise BrokerContractError("broker trade time is invalid")
+    else:
+        raise BrokerContractError("broker trade time is missing")
+    if parsed is None:
+        raise BrokerContractError("broker trade time is invalid")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return cast(datetime, as_shanghai_time(parsed))
+
+
 def normalize_trade_evidence(
     trade: Mapping[str, object],
     orders_by_id: Mapping[str, Mapping[str, object]],
@@ -256,6 +296,7 @@ def normalize_trade_evidence(
     tax_units = _broker_money_to_units(tax)
     if commission_units < 0 or tax_units < 0:
         raise BrokerContractError("broker trade fees cannot be negative")
+    traded_at = _broker_trade_time(trade.get("time") or trade.get("trade_time"))
     return BrokerTradeEvidence(
         broker_trade_id=trade_id,
         broker_order_id=order_id,
@@ -265,6 +306,7 @@ def normalize_trade_evidence(
         price_units=price_units,
         commission_units=commission_units,
         tax_units=tax_units,
+        traded_at=traded_at,
     )
 
 

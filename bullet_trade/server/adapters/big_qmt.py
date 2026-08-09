@@ -1059,6 +1059,24 @@ def _normalize_order(row: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
+def _qmt_trade_datetime(item: Dict[str, Any]) -> Any:
+    raw_time = item.get("trade_time") or item.get("m_nTradeTime") or item.get("m_strTradeTime")
+    raw_date = item.get("trade_date") or item.get("m_nTradeDate") or item.get("m_strTradeDate")
+    if raw_date in (None, "") or raw_time in (None, ""):
+        return raw_time
+    date_text = str(raw_date).strip().replace("-", "").replace("/", "")
+    time_text = str(raw_time).strip().replace(":", "")
+    if date_text.isdigit() and len(date_text) == 8 and time_text.isdigit():
+        time_text = time_text.zfill(6)
+        if len(time_text) == 6:
+            try:
+                parsed = datetime.strptime(date_text + time_text, "%Y%m%d%H%M%S")
+            except ValueError:
+                return raw_time
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    return raw_time
+
+
 def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     item = dict(row)
     if "security" not in item:
@@ -1071,6 +1089,7 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("trade_price") or item.get("m_dTradePrice"))
+    item.setdefault("time", _qmt_trade_datetime(item))
     commission = item.get("commission_fee")
     if commission is None:
         commission = item.get("commission")
