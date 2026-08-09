@@ -14,9 +14,18 @@
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
 import sys
+from types import ModuleType
+from typing import (Callable, Dict, List, Optional, Tuple, Type, TYPE_CHECKING,
+                    Union)  # noqa: F401
 
 from jqdata import *
 
+if TYPE_CHECKING:
+    # 仅供本地IDE使用；聚宽运行时不会导入该本地类型模块。
+    from joinquant_typing import Context  # noqa: F401
+
+bt: Optional[ModuleType]
+_bt_import_error_message: Optional[str]
 try:
     import bullet_trade_jq_remote_helper as bt
 except ModuleNotFoundError as exc:
@@ -57,12 +66,12 @@ BUY_PRICE_FLOAT_PCT = 0.002   # 限价买入浮动比例：限价 = 最新价 ×
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 
 
-def _run_type(context):
+def _run_type(context: 'Context') -> str:
     run_params = getattr(context, 'run_params', None)
     return str(getattr(run_params, 'type', '') or '').strip().lower()
 
 
-def _is_remote_portfolio(value):
+def _is_remote_portfolio(value: object) -> bool:
     if value is None:
         return False
     value_type = type(value)
@@ -93,17 +102,18 @@ def _is_remote_portfolio(value):
     )
 
 
-def _context_uses_remote_snapshot(context):
+def _context_uses_remote_snapshot(context: 'Context') -> bool:
     portfolio = getattr(context, 'portfolio', None)
     if _is_remote_portfolio(portfolio):
         return True
     subportfolios = getattr(context, 'subportfolios', None)
     if type(subportfolios) not in (list, tuple):
         return False
-    return any(_is_remote_portfolio(item) for item in subportfolios)
+    safe_subportfolios: Union[List[object], Tuple[object, ...]] = subportfolios  # type: ignore[assignment]  # pyright: ignore[reportAssignmentType]
+    return any(_is_remote_portfolio(item) for item in safe_subportfolios)
 
 
-def _is_remote_helper_module_name(value):
+def _is_remote_helper_module_name(value: object) -> bool:
     helper_basename = 'bullet_trade_jq_remote_helper'
     return type(value) is str and (
         value == helper_basename
@@ -111,11 +121,13 @@ def _is_remote_helper_module_name(value):
     )
 
 
-def _has_loaded_remote_helper_alias():
+def _has_loaded_remote_helper_alias() -> bool:
     helper_basename = 'bullet_trade_jq_remote_helper'
-    module_type = type(sys)
+    module_type: Type[ModuleType] = type(sys)  # pyright: ignore[reportUnknownVariableType]
     try:
-        loaded_modules = tuple(dict.items(sys.modules))
+        loaded_modules: Tuple[Tuple[object, object], ...] = tuple(  # pyright: ignore[reportUnknownVariableType]
+            dict.items(sys.modules)  # type: ignore[arg-type]  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        )
     except BaseException:
         return True
 
@@ -125,13 +137,13 @@ def _has_loaded_remote_helper_alias():
         if not isinstance(module, module_type):
             continue
         try:
-            module_namespace = module_type.__getattribute__(module, '__dict__')
-            module_name = dict.get(module_namespace, '__name__')
-            module_file = dict.get(module_namespace, '__file__')
-            helper_marker = dict.get(
-                module_namespace,
-                'STRATEGY_RUNTIME_HELPER_MARKER',
+            module_namespace: Dict[str, object] = object.__getattribute__(
+                module, '__dict__'
             )
+            module_name = module_namespace.get('__name__')
+            module_file = module_namespace.get('__file__')
+            helper_marker = module_namespace.get(
+                'STRATEGY_RUNTIME_HELPER_MARKER')
         except BaseException:
             return True
 
@@ -156,7 +168,10 @@ def _has_loaded_remote_helper_alias():
     return False
 
 
-def _runtime_state_matches_request(state, requested_mode):
+def _runtime_state_matches_request(
+    state: object,
+    requested_mode: object,
+) -> bool:
     """只读取普通内建值，确认helper返回状态与策略请求完全一致。"""
     if (
         type(state) is not dict
@@ -173,7 +188,8 @@ def _runtime_state_matches_request(state, requested_mode):
     ):
         return False
 
-    state_keys = tuple(dict.keys(state))
+    safe_state: Dict[object, object] = state  # pyright: ignore[reportUnknownVariableType]
+    state_keys = tuple(safe_state.keys())
     if any([type(key) is not str for key in state_keys]):
         return False
     base_keys = {
@@ -196,16 +212,16 @@ def _runtime_state_matches_request(state, requested_mode):
     if len(state_keys) != len(expected_keys) or set(state_keys) != expected_keys:
         return False
 
-    api_version = dict.get(state, 'api_version')
-    profile_schema_version = dict.get(state, 'profile_schema_version')
-    profile = dict.get(state, 'profile')
-    state_mode = dict.get(state, 'mode')
-    run_type = dict.get(state, 'run_type')
-    strategy_id = dict.get(state, 'strategy_id')
-    enabled = dict.get(state, 'enabled')
-    orders_enabled = dict.get(state, 'orders_enabled')
-    production_ready = dict.get(state, 'production_ready')
-    reason = dict.get(state, 'reason')
+    api_version = safe_state.get('api_version')
+    profile_schema_version = safe_state.get('profile_schema_version')
+    profile = safe_state.get('profile')
+    state_mode = safe_state.get('mode')
+    run_type = safe_state.get('run_type')
+    strategy_id = safe_state.get('strategy_id')
+    enabled = safe_state.get('enabled')
+    orders_enabled = safe_state.get('orders_enabled')
+    production_ready = safe_state.get('production_ready')
+    reason = safe_state.get('reason')
     if (
         type(api_version) is not int
         or api_version != _EXPECTED_RUNTIME_API_VERSION
@@ -232,8 +248,8 @@ def _runtime_state_matches_request(state, requested_mode):
             == (False, True, False, 'backtest')
         )
 
-    profile_module = dict.get(state, 'profile_module')
-    blocked_mutations = dict.get(state, 'blocked_mutations')
+    profile_module = safe_state.get('profile_module')
+    blocked_mutations = safe_state.get('blocked_mutations')
     if (
         run_type != 'sim_trade'
         or (enabled, orders_enabled, production_ready, reason)
@@ -242,10 +258,14 @@ def _runtime_state_matches_request(state, requested_mode):
         or _EXPECTED_RUNTIME_PROFILE_MODULE != 'jq_runtime_config'
         or type(profile_module) is not str
         or profile_module != _EXPECTED_RUNTIME_PROFILE_MODULE
-        or type(blocked_mutations) is not tuple
-        or any([type(name) is not str for name in blocked_mutations])
     ):
         return False
+    if type(blocked_mutations) is not tuple:
+        return False
+    raw_blocked_mutations: Tuple[object, ...] = blocked_mutations  # pyright: ignore[reportUnknownVariableType]
+    if any([type(name) is not str for name in raw_blocked_mutations]):
+        return False
+    safe_blocked_mutations: Tuple[str, ...] = raw_blocked_mutations  # type: ignore[assignment]
     required_mutations = {
         'order',
         'order_value',
@@ -255,17 +275,18 @@ def _runtime_state_matches_request(state, requested_mode):
         'order_target_percent',
         'cancel_order',
     }
-    blocked_set = set(blocked_mutations)
+    blocked_set = set(safe_blocked_mutations)
     return (
-        len(blocked_set) == len(blocked_mutations)
+        len(blocked_set) == len(safe_blocked_mutations)
         and required_mutations <= blocked_set
-        and tuple(sorted(blocked_mutations)) == blocked_mutations
+        and tuple(sorted(safe_blocked_mutations)) == safe_blocked_mutations
     )
 
 
-def _new_runtime_mode_authority():
+def _new_runtime_mode_authority(
+) -> Tuple[Callable[[str], str], Callable[[str], str]]:
     """把已验证模式封存在闭包中；g.bt_runtime只用于平台侧展示。"""
-    holder = [None]
+    holder: List[Optional[Tuple[object, str]]] = [None]
     authority_token = object()
     type_fn = type
     len_fn = len
@@ -276,46 +297,55 @@ def _new_runtime_mode_authority():
     holder_set = holder_type.__setitem__
     tuple_get = tuple_type.__getitem__
 
-    def commit(requested_mode):
+    def commit(requested_mode: str) -> str:
         if (
             type_fn(requested_mode) is not str_type
             or requested_mode not in ('BACKTEST', 'SHADOW')
         ):
             raise RuntimeError('good_etf运行时模式权威无效，必须使用干净运行进程')
-        existing = holder_get(holder, 0)
+        existing = holder_get(holder, 0)  # type: ignore[arg-type]
         if existing is None:
-            holder_set(holder, 0, (authority_token, requested_mode))
+            holder_set(  # pyright: ignore[reportCallIssue]
+                holder, 0, (authority_token, requested_mode)  # pyright: ignore[reportArgumentType]
+            )
             return requested_mode
-        if type_fn(existing) is not tuple_type or len_fn(existing) != 2:
+        if (  # pyright: ignore[reportArgumentType]
+            type_fn(existing) is not tuple_type
+            or len_fn(existing) != 2  # type: ignore[arg-type]
+        ):
             raise RuntimeError('good_etf运行时模式权威损坏，必须使用干净运行进程')
-        existing_token = tuple_get(existing, 0)
-        existing_mode = tuple_get(existing, 1)
+        existing_token: object = tuple_get(  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]
+            existing, 0  # pyright: ignore[reportArgumentType]
+        )
+        existing_mode: object = tuple_get(  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue]
+            existing, 1  # pyright: ignore[reportArgumentType]
+        )
         if (
             existing_token is not authority_token
-            or type_fn(existing_mode) is not str_type
+            or type_fn(existing_mode) is not str_type  # pyright: ignore[reportUnknownArgumentType]
             or existing_mode != requested_mode
         ):
             raise RuntimeError('good_etf运行时模式权威漂移，必须使用干净运行进程')
-        return existing_mode
+        return existing_mode  # type: ignore[return-value]
 
-    def read(requested_mode):
+    def read(requested_mode: str) -> str:
         if (
             type_fn(requested_mode) is not str_type
             or requested_mode not in ('BACKTEST', 'SHADOW')
         ):
             raise RuntimeError('good_etf运行时部署模式无效，拒绝执行交易动作')
-        existing = holder_get(holder, 0)
-        if type_fn(existing) is not tuple_type or len_fn(existing) != 2:
+        existing = holder_get(holder, 0)  # type: ignore[arg-type]
+        if type_fn(existing) is not tuple_type or len_fn(existing) != 2:  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
             raise RuntimeError('good_etf运行时模式尚未安装，拒绝执行交易动作')
-        existing_token = tuple_get(existing, 0)
-        existing_mode = tuple_get(existing, 1)
+        existing_token: object = tuple_get(existing, 0)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue, reportArgumentType]
+        existing_mode: object = tuple_get(existing, 1)  # type: ignore[call-overload]  # pyright: ignore[reportCallIssue, reportArgumentType]
         if (
             existing_token is not authority_token
-            or type_fn(existing_mode) is not str_type
+            or type_fn(existing_mode) is not str_type  # pyright: ignore[reportUnknownArgumentType]
             or existing_mode != requested_mode
         ):
             raise RuntimeError('good_etf运行时模式与部署请求不一致，拒绝执行交易动作')
-        return existing_mode
+        return existing_mode  # type: ignore[return-value]
 
     return commit, read
 
@@ -325,7 +355,7 @@ _commit_runtime_mode_authority, _read_runtime_mode_authority = (
 )
 
 
-def _install_runtime(context):
+def _install_runtime(context: 'Context') -> Dict[str, object]:
     """安装运行模式；此异常不得被策略业务层吞掉。"""
     if type(MODE) is not str:
         raise RuntimeError('good_etf MODE必须是普通字符串')
@@ -361,7 +391,7 @@ def _install_runtime(context):
             raise RuntimeError(
                 'good_etf运行模式不匹配: MODE=BACKTEST 仅允许聚宽回测，当前run_type={}'.format(
                     run_type or '<empty>'))
-        state = {
+        state: Dict[str, object] = {
             'api_version': _EXPECTED_RUNTIME_API_VERSION,
             'profile_schema_version': _EXPECTED_PROFILE_SCHEMA_VERSION,
             'profile': PROFILE,
@@ -381,28 +411,26 @@ def _install_runtime(context):
 
     if type(bt) is not type(sys):
         raise RuntimeError('聚宽helper模块类型无效，必须重新上传并使用干净运行进程')
-    helper_namespace = type(sys).__getattribute__(bt, '__dict__')
-    actual_helper_marker = dict.get(
-        helper_namespace,
-        'STRATEGY_RUNTIME_HELPER_MARKER',
+    helper_namespace: Dict[str, object] = type(sys).__getattribute__(  # pyright: ignore[reportUnknownVariableType]
+        bt, '__dict__'  # pyright: ignore[reportCallIssue]
     )
+    actual_helper_marker: object = helper_namespace.get(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        'STRATEGY_RUNTIME_HELPER_MARKER')
     if (
         type(_EXPECTED_RUNTIME_HELPER_MARKER) is not str
         or _EXPECTED_RUNTIME_HELPER_MARKER
         != 'bullet-trade-joinquant-runtime-helper-v1'
-        or type(actual_helper_marker) is not str
+        or type(actual_helper_marker) is not str  # pyright: ignore[reportUnknownArgumentType]
         or actual_helper_marker != _EXPECTED_RUNTIME_HELPER_MARKER
     ):
         raise RuntimeError('聚宽helper运行时marker不匹配，必须重新上传并使用干净运行进程')
 
-    actual_api_version = dict.get(
-        helper_namespace,
-        'STRATEGY_RUNTIME_API_VERSION',
-    )
+    actual_api_version: object = helper_namespace.get(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        'STRATEGY_RUNTIME_API_VERSION')
     if (
         type(_EXPECTED_RUNTIME_API_VERSION) is not int
         or _EXPECTED_RUNTIME_API_VERSION != 1
-        or type(actual_api_version) is not int
+        or type(actual_api_version) is not int  # pyright: ignore[reportUnknownArgumentType]
         or actual_api_version != _EXPECTED_RUNTIME_API_VERSION
     ):
         safe_expected_api_version = (
@@ -413,22 +441,22 @@ def _install_runtime(context):
         )
         safe_actual_api_version = (
             actual_api_version
-            if type(actual_api_version) is int
+            if type(actual_api_version) is int  # pyright: ignore[reportUnknownArgumentType]
             and -1_000_000 <= actual_api_version <= 1_000_000
             else '<invalid>'
         )
         raise RuntimeError(
             '聚宽helper运行时API版本不匹配: expected={} actual={}'.format(
                 safe_expected_api_version, safe_actual_api_version))
-    runtime_entry = dict.get(
-        helper_namespace,
+    runtime_entry = dict.get(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        helper_namespace,  # pyright: ignore[reportUnknownArgumentType]
         'install_strategy_runtime',
     )
-    if type(runtime_entry) is not type(lambda: None):
+    if type(runtime_entry) is not type(lambda: None):  # pyright: ignore[reportUnknownArgumentType]
         raise RuntimeError('聚宽helper运行时入口无效，必须重新上传并使用干净运行进程')
     if mode == 'LIVE':
         raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
-    state = runtime_entry(
+    remote_state: object = runtime_entry(  # type: ignore[operator]
         globals(),
         context=context,
         profile=PROFILE,
@@ -436,26 +464,29 @@ def _install_runtime(context):
         strategy_id=STRATEGY_ID,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
     )
-    if not _runtime_state_matches_request(state, mode):
+    if not _runtime_state_matches_request(  # pyright: ignore[reportUnknownArgumentType]
+        remote_state,  # pyright: ignore[reportUnknownArgumentType]
+        mode,
+    ):
         raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
     _commit_runtime_mode_authority(mode)
-    g.bt_runtime = state
-    return state
+    g.bt_runtime = remote_state
+    return remote_state  # type: ignore[return-value]
 
 
-def _runtime_mode():
+def _runtime_mode() -> str:
     if type(MODE) is not str:
         raise RuntimeError('good_etf MODE必须是普通字符串')
     mode = str.upper(str.strip(MODE))
     return _read_runtime_mode_authority(mode)
 
 
-def _notify(message):
+def _notify(message: str) -> None:
     # S01不在聚宽策略中保存Webhook；后续由服务器状态事件统一通知。
     log.info('[策略通知] {}'.format(message))
 
 
-def _cancel_open_orders_for_runtime():
+def _cancel_open_orders_for_runtime() -> int:
     if _runtime_mode() == 'SHADOW':
         log.info('SHADOW计划 | 跳过撤单')
         return 0
@@ -467,14 +498,22 @@ def _cancel_open_orders_for_runtime():
     return cancelled
 
 
-def _submit_target_amount(security, target_amount):
+def _submit_target_amount(
+    security: str,
+    target_amount: int,
+) -> Optional[object]:
     if _runtime_mode() == 'SHADOW':
         log.info('SHADOW目标数量 | {} -> {}'.format(security, target_amount))
         return None
     return order_target(security, target_amount)
 
 
-def _submit_target_value(security, target_value, last_price=None, current_value=0.0):
+def _submit_target_value(
+    security: str,
+    target_value: float,
+    last_price: Optional[float] = None,
+    current_value: float = 0.0,
+) -> Optional[object]:
     if _runtime_mode() == 'SHADOW':
         log.info('SHADOW目标市值 | {} -> {:.2f}'.format(security, target_value))
         return None
@@ -485,7 +524,7 @@ def _submit_target_value(security, target_value, last_price=None, current_value=
     return order_target_value(security, target_value, style=style)
 
 
-def initialize(context):
+def initialize(context: 'Context') -> None:
     # 安全门必须是第一条可执行语句；门前不得访问任何聚宽平台对象。
     _install_runtime(context)
 
@@ -528,7 +567,7 @@ def initialize(context):
     log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 09:30/10:30/13:30/14:50 | 14:55 尾盘快照')
 
 
-def process_initialize(context):
+def process_initialize(context: 'Context') -> None:
     """
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
@@ -536,7 +575,7 @@ def process_initialize(context):
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 
-def before_market_open(context):
+def before_market_open(context: 'Context') -> None:
     """开盘前预处理：获取ETF数据（基于前一交易日数据，无未来函数）"""
     start_time = datetime.datetime.now()
     log.info('===== 盘前预处理开始 =====')
@@ -549,16 +588,17 @@ def before_market_open(context):
         # 注意：必须用列表推导式 any([...])，不能用生成器 any(...)。
         # 聚宽环境中 any 可能被 numpy 的 np.any 覆盖，np.any(生成器) 恒为 True，
         # 会导致全部标的被误判为港股ETF而过滤掉（np.any(列表) 则行为正常）。
-        fund_list = []
-        hk_samples = []
+        fund_list: List[str] = []
+        hk_samples: List[str] = []
         hk_count = 0
         for code, name in zip(all_etf.index, all_etf['display_name']):
+            safe_code: str = code
             if isinstance(name, str) and any([kw in name for kw in HK_KEYWORDS]):
                 hk_count += 1
                 if len(hk_samples) < 5:
-                    hk_samples.append(f'{code}({name})')
+                    hk_samples.append(f'{safe_code}({name})')
                 continue
-            fund_list.append(code)
+            fund_list.append(safe_code)
         log.info(f'过滤港股ETF {hk_count} 只 | 剩余 {len(fund_list)} 只')
         if hk_samples:
             log.info(f'被过滤ETF样例: {hk_samples}')
@@ -610,7 +650,7 @@ def before_market_open(context):
         g.fund_list = None  # 异常时置空，避免后续报错
 
 
-def market_open(context):
+def market_open(context: 'Context') -> None:
     """开盘执行：选股+按折价率权重下单"""
     log.info('===== 开盘选股下单开始 =====')
     try:
@@ -627,12 +667,14 @@ def market_open(context):
         current_data = get_current_data()
 
         # 获取实时最新价（开盘时的真实价格，无未来函数）
-        df['last_price'] = [current_data[code].last_price for code in df.index.tolist()]
+        dataframe_codes: List[str] = df.index.tolist()
+        df['last_price'] = [current_data[code].last_price for code in dataframe_codes]
 
         # 剔除停牌/涨停标的（避免选中后委托无法成交，浪费名额）
         if SKIP_SUSPENDED_LIMITUP:
-            keep = []
-            for code in df.index:
+            keep: List[str] = []
+            keep_codes: List[str] = df.index.tolist()
+            for code in keep_codes:
                 cd = current_data[code]
                 if cd.paused or df.loc[code, 'last_price'] >= cd.high_limit:
                     continue
@@ -721,7 +763,7 @@ def market_open(context):
         log.error(f"开盘下单异常：{e}")
 
 
-def handle_risk_management(context):
+def handle_risk_management(context: 'Context') -> None:
     """风控函数：9:30/14:50 双触发，止盈10%/止损5%（实时价格，无未来函数）"""
     hold_codes = list(context.portfolio.positions.keys())
     if not hold_codes:
@@ -762,7 +804,7 @@ def handle_risk_management(context):
         log.error(f"风控执行异常：{e}")
 
 
-def after_market_check(context):
+def after_market_check(context: 'Context') -> None:
     """记录聚宽侧组合快照；真实券商对账将在StrategyLedger切片中实现。"""
     positions = context.portfolio.positions
     log.info('===== 尾盘聚宽组合快照 =====')

@@ -327,7 +327,11 @@ def _effective_aliases() -> Dict[str, str]:
     return get_time_aliases()
 
 
-def run_daily(func: Callable, time: str = 'every_bar'):
+def run_daily(
+    func: Callable,
+    time: str = 'every_bar',
+    reference_security: Optional[str] = None,
+):
     """
     每日运行
     
@@ -337,6 +341,7 @@ def run_daily(func: Callable, time: str = 'every_bar'):
             - 'every_bar': 每个交易分钟 bar 触发，回测与实盘语义一致
             - 'every_minute': 每分钟触发一次，与 every_bar 等价
             - 'HH:MM': 特定时间，如 '09:30', '14:00'
+        reference_security: 参考标的（决定交易时段，未提供时使用默认）
     """
     aliases = _effective_aliases()
     expression = TimeExpression.parse(time, aliases)
@@ -345,6 +350,7 @@ def run_daily(func: Callable, time: str = 'every_bar'):
         schedule_type=ScheduleType.DAILY,
         time=time,
         expression=expression,
+        reference_security=reference_security,
     )
     _tasks.append(task)
 

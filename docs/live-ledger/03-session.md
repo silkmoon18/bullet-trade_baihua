@@ -58,6 +58,15 @@
 
 `S01 JoinQuant Source and Profile Contract`（DONE）
 
+## 当前slice
+
+`S02 JoinQuant Typings and IDE`（IN_PROGRESS）
+
+- 为聚宽兼容入口和独立helper提供并列类型桩，不改变上传文件的运行时导入路径。
+- 以独立严格配置检查类型契约，禁止继承项目级`ignore_missing_imports=true`。
+- 类型桩导出面、关键签名、源码/editable开发内容和Python 3.8语法均纳入自动门禁；普通wheel顶层类型文件布局明确留到S17。
+- 聚宽托管环境的实际Python/pandas/numpy版本仍需在S18用平台探针确认，不以本地猜测代替证据。
+
 当前目标：
 
 - 策略只保留`PROFILE`、`MODE`、`STRATEGY_ID`部署契约。
@@ -68,7 +77,7 @@
 
 ## 下一步
 
-提交并复核本次S01关闭记录后，按`04-slices.md`启动S02类型桩与IDE支持；不得提前进入S03或真实StrategyLedger切片。
+完成S02类型桩、严格检查、fresh-venv/PyCharm说明和独立复审；不得提前进入S03或真实StrategyLedger切片。
 
 ## 恢复检查表
 

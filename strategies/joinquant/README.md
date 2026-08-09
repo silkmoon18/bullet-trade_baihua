@@ -43,3 +43,7 @@ helper的reload gate仅用于误用检测和fail-closed，不是热更新API。�
 更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/MODE校验。首次从旧raw `Lock`/pre-bootstrap helper升级也必须如此；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
 
 “代码一致”指同一份策略源码和已验证API契约，不代表本地兼容引擎与聚宽私有撮合实现绝对相同。
+
+本地解释器、PyCharm和严格类型检查的设置见
+[`聚宽本地开发与兼容矩阵`](../../docs/live-ledger/05-joinquant-development.md)。类型模型只在
+`TYPE_CHECKING`分支加载，不会让上传后的策略依赖BulletTrade服务器包。

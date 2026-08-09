@@ -819,6 +819,25 @@ def test_shadow_closure_authority_rejects_global_mode_drift(monkeypatch):
     assert native_orders == []
 
 
+def test_shadow_closure_authority_does_not_call_poisoned_typing_cast(monkeypatch):
+    helper = _runtime_helper()
+    helper.install_strategy_runtime = (
+        lambda namespace, **kwargs: _runtime_state("SHADOW")
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.MODE = "SHADOW"
+    strategy._install_runtime(_Context("sim_trade"))
+
+    native_orders = []
+    strategy.order_target = lambda *args, **kwargs: native_orders.append(
+        (args, kwargs)
+    ) or "native-order"
+    strategy.cast = lambda type_, value: "BACKTEST"
+
+    assert strategy._submit_target_amount("510001.XSHG", 100) is None
+    assert native_orders == []
+
+
 @pytest.mark.parametrize("poison_field", ["mode", "blocked_mutations"])
 def test_strategy_rejects_poison_runtime_state_without_magic_callbacks(
     monkeypatch,

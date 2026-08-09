@@ -40,7 +40,7 @@
 |---|---|---|---|
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
-| S02 | JoinQuant Typings and IDE | PENDING | 严格类型桩、IDE导入、目标Python/API矩阵 |
+| S02 | JoinQuant Typings and IDE | IN_PROGRESS | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | PENDING | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
@@ -627,7 +627,7 @@ Decision: DONE
 ### 交付
 
 - `jqdata.pyi`、helper `.pyi`和typing-only Context/Portfolio/Position/Snapshot模型。
-- pyi与runtime API同步测试，导出符号和签名漂移即失败。
+- pyi与runtime API同步测试，导出符号、参数名称/种类和必填/可选形状漂移即失败。
 - 独立严格类型配置，不受项目全局`ignore_missing_imports`掩盖。
 - 记录聚宽目标Python、pandas/numpy及使用API兼容矩阵；未知版本明确为待平台核验。
 - fresh venv/PyCharm源码路径配置说明和自动化setup。

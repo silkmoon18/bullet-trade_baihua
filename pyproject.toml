@@ -56,7 +56,12 @@ dev = [
     "black>=22.0.0",
     "flake8>=4.0.0",
     "mypy>=0.950",
+    "pyright>=1.1.390",
     "isort>=5.10.0",
+]
+joinquant-dev = [
+    "mypy>=1.8,<1.12",
+    "pyright>=1.1.390,<2",
 ]
 tushare = [
     "tushare>=1.2.0",

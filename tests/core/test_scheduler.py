@@ -60,6 +60,24 @@ def test_daily_explicit_time():
     assert expected_dt in schedule
 
 
+def test_daily_reference_security_is_forwarded_to_market_resolver():
+    reference = "000300.XSHG"
+    seen = []
+    run_daily(lambda ctx: None, "10:00", reference_security=reference)
+    trade_day = dt.datetime(2024, 6, 12)
+    periods = get_market_periods()
+    set_trade_calendar([trade_day.date()], trade_day.date())
+
+    schedule = generate_daily_schedule(
+        trade_day,
+        get_trade_calendar(),
+        lambda ref=None: seen.append(ref) or periods,
+    )
+
+    assert dt.datetime(2024, 6, 12, 10, 0) in schedule
+    assert seen == [reference]
+
+
 def test_daily_every_minute_range():
     run_daily(lambda ctx: None, "every_minute")
     trade_day = dt.datetime(2024, 6, 12)

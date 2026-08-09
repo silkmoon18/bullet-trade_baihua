@@ -11,6 +11,9 @@ include env.live.example
 recursive-include bullet_trade/notebook *.ipynb
 recursive-include bullet_trade/notebook *.md
 recursive-include helpers *.py
+include jqdata.pyi
+include joinquant_typing.pyi
+recursive-include helpers *.pyi
 
 # 排除文件
 recursive-exclude * __pycache__

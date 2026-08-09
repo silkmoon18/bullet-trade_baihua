@@ -1,0 +1,12 @@
+{
+  "include": [
+    "strategies/joinquant/good_etf.py",
+    "typecheck/joinquant_contract.py"
+  ],
+  "exclude": ["build", "dist", ".venv"],
+  "extraPaths": [".", "helpers"],
+  "pythonVersion": "3.8",
+  "typeCheckingMode": "strict",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "error"
+}
