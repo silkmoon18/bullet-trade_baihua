@@ -45,8 +45,8 @@
 | S04 | Strategy Domain and Schema | DONE | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | DONE | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | DONE | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
-| S07 | Persistent Idempotency and Outbox | IN_PROGRESS | 请求幂等、operation、outbox、lease、unknown恢复 |
-| S08 | Capital Allocation Ledger | PENDING | 未分配池、初始1万元、冻结/释放、显式资金流 |
+| S07 | Persistent Idempotency and Outbox | DONE | 请求幂等、operation、outbox、lease、unknown恢复 |
+| S08 | Capital Allocation Ledger | IN_PROGRESS | 未分配池、初始1万元、冻结/释放、显式资金流 |
 | S09 | Fill Booking and Position Lots | PENDING | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | PENDING | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11 | Broker Ingest and Reconciliation | PENDING | 跨日重扫、游标、quarantine、HARD阻断和readiness |
@@ -826,15 +826,21 @@ Decision: DONE
 - 相同key不同payload明确冲突。
 - 各crash point重启不产生第二次外部提交。
 
-### 当前实现候选（待审查）
+### 最终实现与审查
 
 - schema v4持久保存operation、请求hash、client tag、状态与响应，outbox通过唯一`operation_id`一对一关联。
 - operation/outbox同事务创建；同key同payload重放，不同payload冲突，100并发仅一个首次创建。
 - claim在`begin_submission`前过期可重领；`begin_submission`是外部effect边界，之后的未知响应或重启遗留均进入`SUBMIT_UNKNOWN`且不重投。
 - 首轮审查修复operation hash与outbox二次读取可变payload后可能使用不同请求快照的问题。
-- S07定向10项、S04至S07加scheduler联合58项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过，等待复审。
+- S07定向10项、S04至S07加scheduler联合58项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过。
+- 修复后工作树复审APPROVE；实现提交`661f153`。
+- Decision: DONE
 
 ## S08：Capital Allocation Ledger
+
+### 当前状态
+
+- IN_PROGRESS：在S05最小资金池扣减之上补齐真实券商现金校准、可重复ensure、reserve/release与显式资金调整；不提前实现订单规划和成交持仓。
 
 ### 交付
 

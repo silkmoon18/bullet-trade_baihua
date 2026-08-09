@@ -62,7 +62,7 @@
 
 ## 当前slice
 
-`S07 Persistent Idempotency and Outbox`（IN_PROGRESS）
+`S08 Capital Allocation Ledger`（IN_PROGRESS）
 
 - 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
@@ -146,14 +146,22 @@
 - 同一`(strategy_id, endpoint, idempotency_key)`与相同payload重放既有结果，不同payload明确冲突。
 - 外部下单前持久化client tag和operation；发送结果未知时保持`SUBMIT_UNKNOWN`，只能按S06查询合同恢复，不能自动重发。
 
-## S07当前候选
+## S07收口
 
 - schema v4新增`strategy_operations`，outbox增加唯一`operation_id`关联；operation保存canonical payload hash、持久client tag、状态和响应。
 - `SQLiteOperationRepository.create_operation()`原子创建operation/outbox；同key同payload重放原记录，不同payload冲突，100并发只有一个首次创建。
 - `claim_next()`只重领尚未越过外部调用边界的过期claim；`begin_submission()`先把operation置为`SUBMITTING`，随后才允许调用QMT。
 - 确定响应进入`COMPLETED`并持久化；响应未知或启动时发现遗留`SUBMITTING`进入`SUBMIT_UNKNOWN`，outbox停止投递。
 - 首轮审查发现可变payload被读取两次，可能使operation hash与outbox effect不一致；候选改为首次canonical JSON后所有记录共享同一请求快照。
-- 10项S07定向测试覆盖相同请求重放、payload冲突、单一请求快照、100并发、原子回滚、双worker单claim、确定响应、未知响应、重启隔离和调用前lease重领；加入S04至S06及scheduler后联合58 passed。新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`均PASS，等待复审。
+- 10项S07定向测试覆盖相同请求重放、payload冲突、单一请求快照、100并发、原子回滚、双worker单claim、确定响应、未知响应、重启隔离和调用前lease重领；加入S04至S06及scheduler后联合58 passed。新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`均PASS。
+- 修复后的工作树复审APPROVE；实现提交`661f153`。
+- S07决定：DONE。
+
+## S08当前计划
+
+- 以券商可用现金校准物理账户现金池，检查聚宽配置的初始资金是否足够；不足明确报错，不创建策略账户。
+- 已存在策略账户重复启动只返回原分配，不因聚宽初始资金变化静默重置；调整资金必须使用显式allocate/withdraw并写资金流水。
+- 为下单资金提供reserve/release原子入口，使后续实际成交只按返回结果扣账；不在本slice实现订单规划或成交持仓。
 
 ## 恢复检查表
 
