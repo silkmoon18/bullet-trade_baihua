@@ -4,13 +4,16 @@
 
 ## 准备配置
 
-1. 将 `jq_runtime_config.example.py` 复制为 `jq_runtime_config.py`。
+1. 在仓库外的受限目录中复制 `jq_runtime_config.example.py` 并命名为 `jq_runtime_config.py`；不要在本目录
+   创建或维护真实配置。
 2. 在私有文件中填写服务器地址、长随机 token，以及可选的账户定位和 TLS 证书名。
 3. 保持 `PROFILE_SCHEMA_VERSION = 1`，并确保 profile 中的 `strategy_id` 与策略声明一致。
-4. 将私有文件以 `jq_runtime_config.py` 的名字上传到聚宽研究根目录。
-5. 同时上传仓库中的 `helpers/bullet_trade_jq_remote_helper.py`；不要把连接信息写回策略源码。
+4. 从仓库根运行 `python -X utf8 scripts/export_joinquant.py --validate-only --private-profile <仓库外文件>`；
+   该校验不执行、不复制且不输出其中的秘密。
+5. 将已校验私有文件以 `jq_runtime_config.py` 的名字上传到聚宽研究根目录。
+6. 同时上传仓库中的 `helpers/bullet_trade_jq_remote_helper.py`；不要把连接信息写回策略源码。
 
-`jq_runtime_config.py` 和 `*.local.py` 已被 Git 忽略。示例中的 `host` 与 `token` 故意留空，因此误用示例会在初始化阶段明确失败，不会静默连接。
+`jq_runtime_config.py` 和 `*.local.py` 仍被 Git 忽略，作为旧流程的最后防线；忽略规则不等于推荐把秘密放进仓库目录。示例中的 `host` 与 `token` 故意留空，因此误用示例会在初始化阶段明确失败，不会静默连接。
 
 `jq_runtime_config.py`是会被Python导入执行的可信配置代码，不是沙箱。运行门禁能在导入前阻断BulletTrade的`configure`、缓存客户端、broker和策略namespace交易入口，但无法阻止配置文件自行`import socket`或执行其他任意Python代码。因此该文件只能由策略维护者生成和上传，不得接受外部内容，也不应包含网络调用或业务逻辑。
 

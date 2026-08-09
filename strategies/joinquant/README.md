@@ -33,12 +33,17 @@ helper的reload gate仅用于误用检测和fail-closed，不是热更新API。�
 
 标准工作流是：
 
-1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在本地私有文件中维护连接配置。
-2. 首次部署时，将统一helper和私有`jq_runtime_config.py`上传到聚宽研究根目录。
-3. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入。
-4. 本地和聚宽使用同一个策略文件，不维护本地专用分支。
-5. 复制策略源码到聚宽策略编辑器；只修改顶部的`PROFILE`、`MODE`和`STRATEGY_ID`部署声明。
-6. S03完成后使用导出工具生成可校验的上传清单；单文件bundle是可选方案。
+1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
+2. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入；本地和聚宽使用同一个策略文件，
+   不维护本地专用分支。
+3. 在仓库源码中先确定并审查顶部的`PROFILE`、`MODE`和`STRATEGY_ID`部署声明；默认BACKTEST源码不能在
+   上传后手工改成SHADOW/LIVE。
+4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、导入能力、契约、
+   敏感信息和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
+   [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。
+5. 核对manifest中的mode/profile/strategy_id和各文件SHA256，停止旧进程后上传统一helper与已校验的私有
+   `jq_runtime_config.py`，最后把导出的策略原样复制到聚宽编辑器。
+6. 导出后和聚宽侧均禁止再次编辑部署声明或helper；任何变更都回到受控源码重新校验、导出并冷升级。
 
 更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/MODE校验。首次从旧raw `Lock`/pre-bootstrap helper升级也必须如此；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
 

@@ -3313,11 +3313,10 @@ def _runtime_importlib_reload_in_progress() -> bool:
         importlib_module = dict.get(sys.modules, "importlib")
         if type(importlib_module) is not types.ModuleType:
             return False
-        importlib_namespace = object.__getattribute__(
-            importlib_module,
-            "__dict__",
+        reloading = dict.get(
+            object.__getattribute__(importlib_module, "__dict__"),
+            "_RELOADING",
         )
-        reloading = dict.get(importlib_namespace, "_RELOADING")
         module_name = globals().get("__name__")
         if type(reloading) is not dict or type(module_name) is not str:
             return False

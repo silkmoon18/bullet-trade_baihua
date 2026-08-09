@@ -41,7 +41,7 @@
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
-| S03 | JoinQuant Validation and Export | PENDING | AST校验、敏感扫描、clean-room导入、原样导出 |
+| S03 | JoinQuant Validation and Export | IN_PROGRESS | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | PENDING | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
@@ -677,6 +677,9 @@ Decision: DONE
 - 敏感信息扫描和配置引用检查。
 - 导出工具输出原样策略、helper、example profile和manifest。
 - 非bundle模式源策略和导出策略hash一致。
+- 校验、契约、hash、写出和manifest来自同一次不可变源码快照；部署声明在源码中先确定，导出/上传后禁止编辑。
+- 可选私有profile只读校验不执行、不复制且不输出秘密；最终私有文件未显式传入时不得宣称已校验。
+- 目标目录必须不存在且不经过symlink/junction/reparse point，失败保持调用前状态。
 - clean-room目录导入测试以及helper/profile缺失、版本不匹配fail-fast测试。
 - 明确：自动化通过只表示“可上传候选”，真实聚宽运行证据在S18。
 
@@ -684,6 +687,21 @@ Decision: DONE
 
 - 全新临时目录只使用导出物完成语法、导入和mock runtime smoke。
 - 导出包不含token、Webhook、日志、缓存、数据库或服务器内部模块。
+
+### 当前实现候选（待三路冻结审查）
+
+- 固定白名单三文件按一次不可变源码快照原样导出，manifest确定性记录契约、字节数和SHA256；目标必须不存在且路径不得经过symlink/junction/reparse point。
+- 私有profile只按Python 3.8 AST读取字面量，校验schema、字段、精确类型、范围和strategy/profile契约；不执行、不复制、不hash、不输出秘密。
+- 127项S03回归覆盖确定性、失败原子性、契约漂移、危险能力、敏感信息、clean-room、私有profile和namespace改写；与S01/S02联合矩阵为447 passed、3个既有warning。
+- 冻结前REWORK已修复不可变快照、契约重绑定、动态/相对导入、`TYPE_CHECKING`污染、危险builtin别名、组合秘密、路径reparse/断链以及通过`globals/locals/vars/sys.modules/__dict__`改写契约等问题。最新修复拒绝保存或修改`getattr`/`object.__getattribute__`取得的原始namespace；策略与helper的合法只读模块查询改为单键读取而不保存namespace对象。
+- 首次10文件正式冻结为REWORK：未绑定`dict.__setitem__/update/pop`可把`globals()`或原始`__dict__`作为首参数并配合computed key改写契约。mutator现统一解析真实修改目标，`dict.*`与`builtins.dict.*`以首参数为目标，新增5个拒绝回归。
+- 第二次10文件正式冻结为REWORK：`object.__setattr__`/模块`.__setattr__`computed field可改运行时契约；`type({})`、`globals().__class__`等派生dict未绑定mutator仍可绕过；helper静态`__import__`未复用角色白名单。修复后mutator对其接收者和全部参数中的动态/raw namespace失败关闭，四种属性mutator形态统一验证静态字段，静态动态导入复用角色白名单且仅helper受控`profile_module`变量可动态解析。
+- 第三次10文件正式冻结为REWORK：静态getter取得`__setattr__/__delattr__`后可绕过字段验证，关键字或`**kwargs`形式的`__import__`可绕过导入目标检查。被调函数名/owner现统一解析直接、属性和getter形式；导入目标统一规范化首位置参数或唯一`name=`，歧义/缺失/`**kwargs`失败关闭。
+- 第四次10文件正式冻结为REWORK：helper的`__builtins__`下标可绕过动态导入白名单，嵌套/条件`TYPE_CHECKING`导入可通过校验但让策略加载NameError。所有角色现禁止直接`__builtins__`访问，并拒绝动态namespace直接下标和敏感内建键读取；`TYPE_CHECKING`只接受无条件模块顶层单次显式导入，typing通配符也被拒绝。
+- 第五次10文件正式冻结为REWORK：bound/unbound/getter形式`__getitem__`可从动态namespace读取`__builtins__`并绕过角色导入白名单。现复用静态callable解析统一检查三种形式的目标、参数和敏感键。
+- 该REWORK之后S03定向127 passed、联合矩阵447 passed；strict mypy/pyright、完整/阻断级flake8、Python 3.8 AST、S00 baseline、`git diff --check`、validate-only和全新目录真实导出均PASS。
+- AST/特征扫描明确只是防误提交门禁，不是Python沙箱、完备别名/数据流证明或完备秘密检测器；真实聚宽行为仍由S18验证。
+- 当前状态：实现完成但未放行；任何旧候选SHA均因后续工作树变化失效，等待当前10文件SHA256三路一致APPROVE。
 
 ## S04：Strategy Domain and Schema
 

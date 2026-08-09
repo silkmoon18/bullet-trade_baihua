@@ -62,23 +62,32 @@
 
 ## 当前slice
 
-`S02 JoinQuant Typings and IDE`（DONE，等待本收口记录的精确SHA复审后切换S03）
+`S03 JoinQuant Validation and Export`（IN_PROGRESS）
 
-- 为聚宽兼容入口和独立helper提供并列类型桩，不改变上传文件的运行时导入路径。
-- 以独立严格配置检查类型契约，禁止继承项目级`ignore_missing_imports=true`。
-- 类型桩导出面、关键签名、源码/editable开发内容和Python 3.8语法均纳入自动门禁；普通wheel顶层类型文件布局明确留到S17。
-- 聚宽托管环境的实际Python/pandas/numpy版本仍需在S18用平台探针确认，不以本地猜测代替证据。
+- 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归；尚待三路预提交冻结审查，因此仍为IN_PROGRESS。
+- 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
+- 最近一轮对抗审查复现helper可经`getattr(..., '__dict__')`、直接下标及`object.__getattribute__`保存当前模块namespace后用动态键改写API版本；导出器现统一拒绝保存或修改原始对象namespace，并把策略/helper内两处合法只读模块查询改为不保存namespace对象的单键读取。
+- 首次10文件正式冻结又发现未绑定`dict.__setitem__/update/pop`把`globals()`或原始`__dict__`作为首参数时可绕过接收者检查；该轮正式REWORK并失效。修复后mutator统一解析真实修改目标，`dict.*`/`builtins.dict.*`以首参数为目标，5个computed-key回归均拒绝。
+- 第二次正式冻结发现BLOCKER：`object.__setattr__`和模块`.__setattr__`可用computed field把静态BACKTEST/API=1改为运行时LIVE/API=2；另有派生dict类型未绑定mutator以及helper静态`__import__`绕过角色白名单两个MAJOR。该轮正式REWORK并失效。修复后所有namespace mutator对接收者和参数中的动态/raw namespace失败关闭，四种属性mutator调用形态统一要求静态字段并保护契约字段，静态`__import__`复用角色白名单，只有helper的`profile_module`变量保留受控动态导入。
+- 第三次正式冻结发现两个MAJOR：通过`getattr`/`object.__getattribute__`直接取得`__setattr__/__delattr__`后调用仍可绕过字段门禁；`__import__(name=...)`和`**kwargs`绕过仅看位置参数的导入检查。该轮正式REWORK并失效。修复后统一静态解析直接/属性/getter形式的被调函数名与owner，属性修改字段索引按bound/unbound语义确定；动态导入统一规范化首位置参数或唯一`name=`，歧义、缺失和`**kwargs`失败关闭。
+- 第四次正式冻结发现两个MAJOR：helper可经`__builtins__['__import__']`绕过动态导入白名单；函数体或不可达分支中的`TYPE_CHECKING`导入会被误认成有效模块绑定并让导出策略运行时报NameError。该轮正式REWORK并失效。修复后所有角色禁止直接访问`__builtins__`，并额外拒绝动态namespace直接下标及其敏感内建键读取；`TYPE_CHECKING`只接受无条件模块顶层的单次显式导入，拒绝嵌套、条件和typing通配符导入。
+- 第五次正式冻结发现MAJOR：`dict.__getitem__(globals(), '__builtins__')`和bound/getter等价形式绕过只覆盖`[]/.get`的敏感namespace读取门禁。该轮正式REWORK并失效。修复后复用静态callable解析，统一识别bound/unbound/getter形式的`__getitem__`，只要目标或参数含动态namespace且参数含敏感内建键即失败关闭。
+- 所有旧冻结摘要在后续工作树变更后均已失效，不构成放行证据；只接受下一次10文件SHA256冻结的三路一致APPROVE。
+- 第五次冻结候选的444项结果已随REWORK失效；本次修复后S03定向127 passed、联合矩阵447 passed（3个既有warning），strict mypy/pyright、完整/阻断级flake8、Python 3.8 AST、S00 baseline、`git diff --check`、validate-only及全新目录真实导出均PASS。
 
-完成结果：
+当前边界：
 
-- `jqdata.pyi`、独立helper `.pyi`和typing-only聚宽模型与源码同仓管理，策略仍可原样复制到聚宽。
-- 导出面、参数名称/种类/必填性和runtime-state字段由自动漂移测试保护；真实策略进入strict mypy/pyright。
-- setup安全创建/复用目标venv，引导PEP 660所需pip，仅向目标purelib写入源码路径；轻量/full和wheel边界有明确文档。
-- 聚宽实际托管版本与行为不在S02猜测，保留到S18以平台探针确认。
+- 只导出固定白名单中的策略、独立helper和示例profile；非bundle文件字节必须与一次读取形成的不可变源快照完全相同。
+- AST门禁按角色限制导入和危险能力；所有名称绑定、受测`globals/locals/vars`与静态保留键改写、`vars(obj)`/原始`__dict__`可写namespace、helper契约改写、`TYPE_CHECKING`来源/重绑定、相对/静态可判定动态服务器包导入、危险别名、敏感命名/位置参数和组合Webhook均有拒绝回归。该扫描不是完备别名/数据流证明；helper允许其远程客户端所需网络模块，但策略/profile不得自行访问网络、文件或进程。
+- 敏感扫描只接受空值或明确占位符，不把真实host、token、Webhook、账户值写入产物或manifest；它是防误提交门禁，不是完备秘密检测器。
+- 私有profile可通过显式`--private-profile`只读校验assignment-only/schema/字段类型/范围及profile/strategy契约；不执行、不复制、不hash或输出秘密。
+- 导出目录必须不存在且路径不得经过含断链在内的symlink/junction/reparse point；manifest确定性记录角色、相对路径、字节数、SHA256和部署mode契约，不宣称产物已获真实资金授权。
+- 部署声明必须先在受控源码中确定并审查；导出后及聚宽侧禁止再次手工修改，否则文件hash和manifest不再代表实际部署物。
+- clean-room仅用导出物完成Python 3.8语法、导入及缺helper/profile/版本不匹配smoke；聚宽真实行为仍留到S18。
 
 ## 下一步
 
-本收口记录提交并通过精确SHA复审后，将S03改为IN_PROGRESS；不得提前进入真实StrategyLedger切片。
+冻结当前10文件SHA256并完成三路预提交审查；仅在实现提交和收口文档提交都通过三路精确SHA复审后，才把S03标记DONE并进入S04。
 
 ## 恢复检查表
 

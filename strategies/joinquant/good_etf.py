@@ -121,6 +121,11 @@ def _is_remote_helper_module_name(value: object) -> bool:
     )
 
 
+def _raw_module_namespace_get(module: object, key: str) -> object:
+    return dict.get(  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportUnknownVariableType]
+        object.__getattribute__(module, '__dict__'), key)
+
+
 def _has_loaded_remote_helper_alias() -> bool:
     helper_basename = 'bullet_trade_jq_remote_helper'
     module_type: Type[ModuleType] = type(sys)  # pyright: ignore[reportUnknownVariableType]
@@ -137,13 +142,10 @@ def _has_loaded_remote_helper_alias() -> bool:
         if not isinstance(module, module_type):
             continue
         try:
-            module_namespace: Dict[str, object] = object.__getattribute__(
-                module, '__dict__'
-            )
-            module_name = module_namespace.get('__name__')
-            module_file = module_namespace.get('__file__')
-            helper_marker = module_namespace.get(
-                'STRATEGY_RUNTIME_HELPER_MARKER')
+            module_name = _raw_module_namespace_get(module, '__name__')
+            module_file = _raw_module_namespace_get(module, '__file__')
+            helper_marker = _raw_module_namespace_get(
+                module, 'STRATEGY_RUNTIME_HELPER_MARKER')
         except BaseException:
             return True
 

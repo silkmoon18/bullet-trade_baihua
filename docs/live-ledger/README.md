@@ -10,6 +10,8 @@
 4. [当前 session](03-session.md)
 5. [实施 slices](04-slices.md)
 6. [bt_quant迁移清单](05-migration-manifest.md)
+7. [聚宽本地开发与兼容矩阵](05-joinquant-development.md)
+8. [聚宽校验与导出](06-joinquant-export.md)
 
 ## 权威边界
 
