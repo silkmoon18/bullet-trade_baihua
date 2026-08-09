@@ -39,7 +39,7 @@
 | Slice | 名称 | 状态 | 依赖/结果 |
 |---|---|---|---|
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
-| S01 | JoinQuant Source and Profile Contract | IN_PROGRESS | 同源策略、模式/profile、helper API兼容、fail-fast |
+| S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | PENDING | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | PENDING | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | PENDING | 整数尺度、状态、不变量、schema和迁移 |
@@ -516,10 +516,10 @@ Decision: REWORK（被后续工作树取代）
 
 ```text
 Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..current-worktree
-Review result: IN_PROGRESS；逐轮结论与当前冻结状态见本记录下方
-Fix commit: PENDING
-Fixes in current worktree:
+Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..a94aa12060c5e8cef479224952e302eeac99f37d
+Review result: DONE；逐轮结论与最终精确SHA见本记录下方
+Implementation commit: a94aa12060c5e8cef479224952e302eeac99f37d
+Committed candidate changes:
   - 三把闭包锚定锁分别为runtime RLock、owner Lock和socket RLock；支持路径采用runtime -> owner -> socket锁序
   - socket authority用attempt token -> thread id登记在途连接；lease检查与attempt登记在runtime -> socket临界区原子完成，connector随后通过独立最终permit进入且不持续持gate锁，reload关闭gate后等待已登记attempt结束
   - TLS包装、握手和request/mutation发送effect在socket RLock内线性化；mutation在调用effect前发布handoff，发送结果不确定时禁止自动重试
@@ -605,13 +605,21 @@ Pre-commit round 6 finding:
   - MINOR: `00-current-state.md`正文仍称处于第5轮预提交审查，与round 5已REWORK、round 6 PENDING的session/slice记录矛盾
 Fix after round 6:
   - 现状正文改为不随审查轮次失效的“S01仍为IN_PROGRESS，预提交审查与精确SHA复审尚未全部完成”
-Pre-commit round 7 reviewers: PENDING（三路独立审查；此前结论全部无效）
-Pre-commit round 7 result: PENDING
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
+Pre-commit round 7 reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/audit_rlock_reload_v13 -> APPROVE；/root/update_s01_docs_boundary -> APPROVE
+Pre-commit round 7 result: APPROVE（三路均无BLOCKER/MAJOR/MINOR；冻结tracked指纹0c97824c8fdc5861ec8f2bd5427759b353e82e38，deadlock test SHA256=ACE880F2434643ABC73593D8E42DAC28131B9780E26B3436BD41C179C4FD2874）
+Final candidate SHA: a94aa12060c5e8cef479224952e302eeac99f37d
+Final reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/audit_rlock_reload_v13 -> APPROVE；/root/update_s01_docs_boundary -> APPROVE
+Final review result: APPROVE（三路均无BLOCKER/MAJOR/MINOR；起止HEAD精确匹配且工作树clean；完整目标测试295 passed，并发/死锁定向矩阵20 passed）
+Final verification commands:
+  - root提交前实跑：`$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:DEFAULT_DATA_PROVIDER='easy_tdx'; $env:EASY_TDX_USE_STUB='1'; python -X utf8 -m pytest -p no:cacheprovider tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py tests/test_jq_remote_helper.py tests/strategies/test_good_etf_contract.py -q` -> 295 passed, 3 warnings
+  - 契约路精确SHA终审实跑：`$env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py tests/test_jq_runtime_reload_deadlock_regression.py -q -o addopts='' -p no:cacheprovider` -> 295 passed, 3 warnings
+  - 部署/文档路精确SHA终审实跑：`$env:PYTHONUTF8='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; $env:PYTHONDONTWRITEBYTECODE='1'; pytest tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py tests/test_jq_remote_helper.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider` -> 295 passed, 3 warnings
+  - 并发/对抗路精确SHA终审实跑：`$env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py -q -o addopts='' -p no:cacheprovider -k "reload_from_own_socket_attempt or recursive_reload_while_holding_socket_gate_lock or mutation_send_base_exception or mutation_response_base_exception or recursive_reload_after_socket_attempt_registration or recursive_reload_during_final_socket_validation or recursive_reload_after_phase_lease_check or reload_waits_for_linearized_mutation_effect or reload_waiting_for_completed_connector or reload_ownership_probe_interrupt"` -> 20 passed, 184 deselected
+  - `python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py strategies/joinquant/good_etf.py tests/test_jq_strategy_runtime.py tests/test_jq_remote_helper.py tests/test_jq_runtime_reload_deadlock_regression.py tests/strategies/test_good_etf_contract.py --select=E9,F63,F7,F82` -> PASS
+  - `python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant` -> S00_BASELINE_CHECK_OK
+  - `git diff --check c336d241d75f0e19c7ab02649b956e2652e5d4a6 a94aa12060c5e8cef479224952e302eeac99f37d` -> PASS
 Residual risks/external blockers: 纯Python无法对任意opcode/C返回点的恶意catch-and-resume、最终许可读取后的旧栈恢复、connector返回资源到共享holder之间的极短handoff窗口提供不可绕过的原子保证。生产以禁止这些机制并在任何异常时终止进程作为边界；进程退出负责最终释放残余OS资源。活动authority frame的f_locals物化/同步还可能把旧closure cell值写回并回滚已关闭latch，因此trace/debugger/frame introspection具有活动帧改写权，不在可防御契约内。若未来LIVE需抵抗同进程任意代码执行，须引入带epoch的独立IO worker/子进程或原生原子gate。真实聚宽/QMT证据仍分别在S18-S20，S01禁止真实资金
-Decision: IN_PROGRESS
+Decision: DONE
 ```
 
 ## S02：JoinQuant Typings and IDE

@@ -49,13 +49,14 @@
 - 第5轮冻结前对抗探针又发现MAJOR：`_runtime_mode`先读取`g.bt_runtime`会执行平台属性协议，poison getter可先把SHADOW改成BACKTEST并触发原生order。修复后已验证模式封存在一次性闭包权威中，`g.bt_runtime`仅作展示且三个交易入口完全不读取它；当前MODE与闭包权威漂移固定失败。
 - 第5轮正式冻结审查为1 APPROVE、2 REWORK；代码、并发和部署边界均未发现问题，两路REWORK源于同两项MINOR文档漂移：当前候选摘要仍停在首轮marker阶段，现状文档日期仍为2026-08-08。两处现已更正，前五轮历史均保留，第6轮冻结待执行。
 - 第6轮正式冻结三路均因同一MINOR文档漂移REWORK：`00-current-state.md`正文仍称处于第5轮，与第6轮PENDING记录矛盾；代码与并发路径没有新finding。该句现改为不随轮次失效的S01 IN_PROGRESS/两阶段复审未完成表述，第7轮冻结待执行。
-- 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56）；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。下一轮三路预提交审查、实现提交和精确SHA三路复审仍为PENDING，S01保持IN_PROGRESS。
+- 第7轮预提交冻结的契约、并发/对抗、部署/文档三路均APPROVE；候选提交`a94aa12060c5e8cef479224952e302eeac99f37d`随后再次通过三路精确SHA终审，均无BLOCKER/MAJOR/MINOR，起止工作树clean。
+- 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。S01状态为DONE。
 - 尚未开始真实StrategyLedger实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
-## 当前slice
+## 最近完成slice
 
-`S01 JoinQuant Source and Profile Contract`
+`S01 JoinQuant Source and Profile Contract`（DONE）
 
 当前目标：
 
@@ -67,7 +68,7 @@
 
 ## 下一步
 
-对当前冻结工作树完成S01三路预提交独立审查并修复全部finding；提交代码和行为文档后，对新的精确SHA重新执行安全、契约和对抗三方复审。三方全部APPROVE后才能关闭S01并进入S02类型桩与IDE支持。
+提交并复核本次S01关闭记录后，按`04-slices.md`启动S02类型桩与IDE支持；不得提前进入S03或真实StrategyLedger切片。
 
 ## 恢复检查表
 

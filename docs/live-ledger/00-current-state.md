@@ -12,6 +12,7 @@
 - 基线提交：`be0451b`
 - 开发分支：`feat/joinquant-live-ledger`
 - S00策略和文档已压平为 `v0.9.2` 之上的单个脱敏基线提交 `7085155`，返工期间的提交不再位于分支可达历史。
+- S01实现候选提交为`a94aa12060c5e8cef479224952e302eeac99f37d`；预提交与精确SHA的契约、并发/对抗、部署/文档三路审查均APPROVE。
 - 官方远端已改名为只读 `upstream`；fetch URL保留官方GitHub，push URL为`DISABLED`。
 - 用户私有 `origin` 尚未配置；在提供私有fork URL前，本分支仅允许本地提交。
 - `.idea/`、根目录`runtime/`、聚宽导出目录和本地运行profile已经加入忽略规则。
@@ -197,7 +198,7 @@ S01候选已经处理：
 
 S01候选只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。S03导出smoke、S15 StrategyLedger runtime和S18至S20真实门禁均不可省略。
 
-第四轮冻结后，策略还收紧了helper返回契约与生命周期入口：runtime state必须是完整、精确且自洽的schema/identity/mode/run_type/flags/reason/profile_module/blocked_mutations组合；`initialize`和`process_initialize`的首条可执行语句都是runtime安装，jqdata/platform调用不得先于helper gate。随后冻结前对抗探针证明读取`g.bt_runtime`本身可执行平台属性协议并协同降级MODE，因此执行模式现封存在安装后的一次性闭包权威中，`g.bt_runtime`只保留为聚宽侧展示副本，交易入口完全不读取它；当前MODE与闭包权威漂移会固定失败。该阶段共增加17个策略回归；S01仍为IN_PROGRESS，预提交审查与精确SHA复审尚未全部完成。
+第四轮冻结后，策略还收紧了helper返回契约与生命周期入口：runtime state必须是完整、精确且自洽的schema/identity/mode/run_type/flags/reason/profile_module/blocked_mutations组合；`initialize`和`process_initialize`的首条可执行语句都是runtime安装，jqdata/platform调用不得先于helper gate。随后冻结前对抗探针证明读取`g.bt_runtime`本身可执行平台属性协议并协同降级MODE，因此执行模式现封存在安装后的一次性闭包权威中，`g.bt_runtime`只保留为聚宽侧展示副本，交易入口完全不读取它；当前MODE与闭包权威漂移会固定失败。该阶段共增加17个策略回归；S01的预提交审查与精确SHA复审均已通过，状态为DONE。
 
 ## 7. 安全现状
 
