@@ -44,8 +44,8 @@
 | S03 | JoinQuant Validation and Export | DONE | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | DONE | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | DONE | 事务、CAS、事件序列、并发和重放基础 |
-| S06 | Broker Capability Contract | IN_PROGRESS | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
-| S07 | Persistent Idempotency and Outbox | PENDING | 请求幂等、operation、outbox、lease、unknown恢复 |
+| S06 | Broker Capability Contract | DONE | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
+| S07 | Persistent Idempotency and Outbox | IN_PROGRESS | 请求幂等、operation、outbox、lease、unknown恢复 |
 | S08 | Capital Allocation Ledger | PENDING | 未分配池、初始1万元、冻结/释放、显式资金流 |
 | S09 | Fill Booking and Position Lots | PENDING | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | PENDING | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
@@ -797,15 +797,21 @@ Decision: DONE
 - adapter合同测试覆盖重复/乱序fill、remark roundtrip、断连、跨日working order和费用字段。
 - 能力不足的adapter显式拒绝`strategy_ledger_v1`。
 
-### 当前实现候选（待审查）
+### 最终实现与审查
 
 - MiniQMT/BigQMT静态profile区分`SUPPORTED / PROBE_REQUIRED / UNSUPPORTED`；当前目标环境未验证，因此不会被静态代码放行。
 - `strategy_ledger_v1`要求tag回显、稳定order/trade ID、trade-order关联、完整费用/状态、current/working查询及至少前一交易日lookback。
 - 成交证据只接受原生成交号；缺side按同一order ID映射，缺费用拒绝，完全重复成交归并而冲突重复报错。
 - 首轮审查修复无效费用误标已知0、负费用放行，以及把order ID关联误等同于order含side三项主链问题。
-- S06合同定向14项、S04至S06/QMT adapter/scheduler联合88项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过，等待复审。
+- S06合同定向14项、S04至S06/QMT adapter/scheduler联合88项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过。
+- 修复后工作树复审APPROVE；实现提交`8679bc9`。
+- Decision: DONE
 
 ## S07：Persistent Idempotency and Outbox
+
+### 当前状态
+
+- IN_PROGRESS：先实现单机SQLite operation/outbox原子写入和请求重放；只保留未知提交恢复所需状态，不提前建设通用消息平台。
 
 ### 交付
 
