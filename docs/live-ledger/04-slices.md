@@ -47,8 +47,8 @@
 | S06 | Broker Capability Contract | DONE | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
 | S07 | Persistent Idempotency and Outbox | DONE | 请求幂等、operation、outbox、lease、unknown恢复 |
 | S08 | Capital Allocation Ledger | DONE | 未分配池、初始1万元、按订单冻结/释放、显式资金流 |
-| S09 | Fill Booking and Position Lots | IN_PROGRESS | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
-| S10 | Valuation and Atomic Snapshot | PENDING | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
+| S09 | Fill Booking and Position Lots | DONE | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
+| S10 | Valuation and Atomic Snapshot | IN_PROGRESS | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11 | Broker Ingest and Reconciliation | PENDING | 跨日重扫、游标、quarantine、HARD阻断和readiness |
 | S12 | Target Portfolio Planner | PENDING | NAV目标、整手、working exposure、费用缓冲和delta |
 | S13 | Execution Orchestrator and Baseline Risk | PENDING | 卖后买、部分成交、unknown、恢复、kill switch |
@@ -869,7 +869,7 @@ Decision: DONE
 
 ### 当前状态
 
-- IN_PROGRESS：聚焦真实成交驱动的现金、冻结、position/lot和费用入账；不提前实现估值、聚宽回传或通用风控平台。
+- DONE：真实成交已驱动现金、订单冻结、position/lot、费用和已实现盈亏入账；估值与聚宽回传留在后续slice。
 
 ### 交付
 
@@ -884,15 +884,22 @@ Decision: DONE
 - 重复fill no-op、累计成交越界quarantine。
 - 随机事件序列验证资产和lot不变量。
 
-### 当前实现候选（待审查）
+### 实现与审查结果
 
 - `SQLiteFillBookingService`实现订单登记、买卖fill原子入账与撤单/拒单终态；不含估值、对账摄取和执行规划。
 - 部分买入按真实成交价费扣账并保留余单冻结，全部成交/撤单释放订单余款；卖出按FIFO可卖lot计算净回款和已实现盈亏。
 - 重复broker trade ID/fingerprint no-op，冲突ID、累计超额、同日卖出和无持仓卖出fill拒绝；卖出零成交/拒单不改变现金。
 - 成交时间进入QMT证据合同，BigQMT分离日期/HHMMSS先合成完整时间，缺失或非法时间不能入账；同日lot按真实成交时间FIFO。
-- S09成交入账定向8项、联合77项和静态/语法/格式检查通过，等待复审。
+- 首轮审查发现BigQMT分离日期/HHMMSS会导致错误交易日，以及同日lot按入账时间而非成交时间FIFO；修复后均有真实字段/逆序回归。
+- S09成交入账定向8项、联合77项和静态/语法/格式检查通过。
+- 修复后的工作树复审APPROVE；实现提交`08081c9`。
+- Decision: DONE
 
 ## S10：Valuation and Atomic Snapshot
+
+### 当前状态
+
+- IN_PROGRESS：实现同一读事务的现金、持仓市值、总资产和PnL快照，作为聚宽只读组合视图的数据基础；不扩展通用行情或风控平台。
 
 ### 交付
 

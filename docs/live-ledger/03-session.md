@@ -58,11 +58,11 @@
 
 ## 最近完成slice
 
-`S08 Capital Allocation Ledger`（DONE）
+`S09 Fill Booking and Position Lots`（DONE）
 
 ## 当前slice
 
-`S09 Fill Booking and Position Lots`（IN_PROGRESS）
+`S10 Valuation and Atomic Snapshot`（IN_PROGRESS）
 
 - 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
@@ -180,7 +180,7 @@
 - 先覆盖部分成交、撤单/拒单释放余款、卖出不存在持仓返回0、A股T+1可卖约束；不提前建设估值、聚宽指标回传或通用风控平台。
 - 为QMT成交证据补齐可靠成交时间，并以账本重放和重复fill no-op作为本slice出口。
 
-## S09当前候选
+## S09收口
 
 - 新增`SQLiteFillBookingService`：登记策略订单、真实成交入账、撤单/拒单终态和订单余款释放。
 - 买入只按实际成交金额与费用扣现金，部分成交保留余单冻结，全部成交释放价格缓冲；真实卖出按FIFO lot扣持仓并按净回款增加现金。
@@ -188,7 +188,15 @@
 - broker trade ID或fingerprint重复成交为no-op，ID内容冲突拒绝；现金、订单、fill、position、lot、ledger和event在同一事务提交，故障全量回滚。
 - QMT成交合同新增可靠`traded_at`，MiniQMT沿用`time`，BigQMT补齐常见原生时间字段映射；缺失或非法时间拒绝进入账本。
 - 首轮审查发现BigQMT分离日期/时间可能被误解为1970年，以及同日lot按本地到达顺序而非成交顺序FIFO；候选现合成完整券商时间并让lot按真实`traded_at`排序。
-- S09成交入账定向8项、S04至S09加scheduler联合77项通过；变更模块flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS，等待复审。
+- S09成交入账定向8项、S04至S09加scheduler联合77项通过；变更模块flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS。
+- 修复后的工作树复审APPROVE；实现提交`08081c9`。
+- S09决定：DONE。
+
+## S10当前计划
+
+- 基于同一SQLite读事务生成现金、冻结、持仓市值、总资产、费用与已实现盈亏快照，作为后续聚宽PortfolioView唯一数据源。
+- 行情输入必须带`as_of`，只实现缺价/过期价的明确阻断和最小估值，不扩展通用行情平台或复杂风控。
+- 快照版本绑定账户ledger version和持仓版本，确保聚宽一次读取不会混合成交前后的状态。
 
 ## 恢复检查表
 
