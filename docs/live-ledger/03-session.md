@@ -53,16 +53,16 @@
 - 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。S01状态为DONE。
 - S02实现提交`3b54a4a7178fb36ab9f85de22a648bb08bd0448b`已通过三路预提交及精确SHA终审，起止HEAD一致且工作树clean。目标矩阵320 passed；真实策略与契约probe的strict mypy/pyright、Python 3.8 AST、阻断级flake8、S00 baseline和commit格式均PASS。
 - 最新setup在第三个全新空venv完成`pip>=21.3`引导、editable安装和严格检查；`.pth`只写入目标`purelib`，普通Python可解析`jqdata`和helper。S02状态为DONE。
-- 尚未开始真实StrategyLedger实现。
+- 尚未实现可运行的StrategyLedger repository、资金分配、成交入账和对账闭环。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
 ## 最近完成slice
 
-`S03 JoinQuant Validation and Export`（DONE）
+`S04 Strategy Domain and Schema`（DONE）
 
 ## 当前slice
 
-`S04 Strategy Domain and Schema`（IN_PROGRESS）
+`S05 Transactional Repository`（PENDING）
 
 - 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
@@ -94,9 +94,9 @@
 
 ## 下一步
 
-实现S04最小领域模型与两阶段SQLite迁移，验证整数尺度、约束、重复迁移、旧版本升级和失败回滚。根据D021，不为可信个人策略增加新的同进程对抗门禁。
+收口文档通过精确提交复审后进入S05，实现最小SQLite事务repository、CAS、单调事件序列和重放，不扩展多节点或多租户框架。
 
-## S04当前候选
+## S04收口
 
 - 新增`bullet_trade.server.strategy`领域模型：现金池、策略账户、持仓/lot、组合意图、订单、成交、账本项、事件和对账结果。
 - 金额、价格和NAV使用固定整数尺度；入口拒绝float并使用`ROUND_HALF_UP`，成交/事件时间转为Asia/Shanghai，lot显式保存可卖交易日。
@@ -104,8 +104,10 @@
 - 12项S04定向测试通过；加入既有scheduler回归后24 passed。新模块完整flake8、Python 3.8 AST、targeted mypy、targeted pyright和S00 baseline均PASS。
 - 首次收集因默认`jqdatasdk`未安装失败；按仓库约定使用离线easy_tdx stub后通过。这暴露既有顶层数据源初始化耦合，但不在S04扩大重构范围。
 - 修复两个包入口的Python 3.8运行注解：`list[str]`改为兼容写法，避免StrategyLedger导入在目标版本先失败。
-- 当前等待实现候选代码审查；尚未接入服务器、分配1万元或处理真实成交。
+- 尚未接入服务器、分配1万元或处理真实成交；这些能力继续由S05及后续slice完成。
 - 首轮只读审查为REWORK：组合意图/事件/对账对象保留调用方可变Mapping，迁移历史不绑定SQL且未核对`user_version`。候选现改为构造时递归冻结JSON数据，迁移记录SHA-256并校验双版本源；新增3项回归后重新审查。
+- 修复后的工作树复审为两路APPROVE。实现提交`6bfb4469f3b8d32a0121d164bd2af96ac3e94326`再次通过两路精确SHA复审：提交只含批准的14文件，工作树clean，12项定向/24项联合矩阵通过。
+- S04决定：DONE。
 
 ## 恢复检查表
 

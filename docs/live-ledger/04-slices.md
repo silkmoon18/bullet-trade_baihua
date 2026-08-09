@@ -42,7 +42,7 @@
 | S01 | JoinQuant Source and Profile Contract | DONE | 同源策略、模式/profile、helper API兼容、fail-fast |
 | S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | DONE | AST校验、敏感扫描、clean-room导入、原样导出 |
-| S04 | Strategy Domain and Schema | IN_PROGRESS | 整数尺度、状态、不变量、schema和迁移 |
+| S04 | Strategy Domain and Schema | DONE | 整数尺度、状态、不变量、schema和迁移 |
 | S05 | Transactional Repository | PENDING | 事务、CAS、事件序列、并发和重放基础 |
 | S06 | Broker Capability Contract | PENDING | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
 | S07 | Persistent Idempotency and Outbox | PENDING | 请求幂等、operation、outbox、lease、unknown恢复 |
@@ -728,7 +728,7 @@ Decision: DONE
 - 空库建库、重复迁移、旧schema升级和失败恢复测试。
 - 数据库约束拒绝负数和非法状态。
 
-### 当前实现候选（待审查）
+### 最终实现与审查
 
 - `domain.py`提供整数尺度、Asia/Shanghai时间、账户/现金/持仓/lot/意图/订单/成交/事件/对账的最小不可变模型。
 - `schema.py`提供两阶段、逐版本事务化SQLite迁移；拒绝向下迁移、非连续或名称不匹配的历史。
@@ -736,6 +736,8 @@ Decision: DONE
 - 备份恢复与表用途记录在`08-strategy-ledger-schema.md`；自动备份、repository和业务写入仍属于后续slice。
 - 当前验证：S04定向12 passed，加入scheduler回归24 passed；新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`通过。
 - 首轮代码审查REWORK已修复两项主流程一致性问题：意图/事件/对账输入在构造时生成递归不可变快照；迁移历史保存SQL SHA-256并与`PRAGMA user_version`交叉校验，禁止静默接受旧迁移漂移。
+- 实现提交：`6bfb4469f3b8d32a0121d164bd2af96ac3e94326`。修复后工作树和精确提交两阶段均获两路APPROVE；最终定向12 passed、联合24 passed，工作树clean。
+- Decision: DONE
 
 ## S05：Transactional Repository
 
