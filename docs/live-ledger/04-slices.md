@@ -43,8 +43,8 @@
 | S02 | JoinQuant Typings and IDE | DONE | 严格类型桩、IDE导入、目标Python/API矩阵 |
 | S03 | JoinQuant Validation and Export | DONE | AST校验、敏感扫描、clean-room导入、原样导出 |
 | S04 | Strategy Domain and Schema | DONE | 整数尺度、状态、不变量、schema和迁移 |
-| S05 | Transactional Repository | IN_PROGRESS | 事务、CAS、事件序列、并发和重放基础 |
-| S06 | Broker Capability Contract | PENDING | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
+| S05 | Transactional Repository | DONE | 事务、CAS、事件序列、并发和重放基础 |
+| S06 | Broker Capability Contract | IN_PROGRESS | QMT标识、订单/成交唯一性、费用、lookback和unknown能力 |
 | S07 | Persistent Idempotency and Outbox | PENDING | 请求幂等、operation、outbox、lease、unknown恢复 |
 | S08 | Capital Allocation Ledger | PENDING | 未分配池、初始1万元、冻结/释放、显式资金流 |
 | S09 | Fill Booking and Position Lots | PENDING | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
@@ -760,15 +760,22 @@ Decision: DONE
 - crash前后事务全有或全无。
 - ledger replay得到相同物化状态。
 
-### 当前实现候选（待审查）
+### 最终实现与审查
 
 - 标准库SQLite显式SQL；每个写操作独立连接和`BEGIN IMMEDIATE`，不引入ORM或分布式框架。
 - `create_strategy_account`原子扣减物理账户未分配资金、建策略账户并写初始`ALLOCATE`资金流水，资金不足时全量回滚。
 - `append_account_event`以`ledger_version`做CAS，在同一事务更新物化账户并追加ledger/event；序列共同单调递增。
 - v3触发器保证ledger/event只能追加；`replay_account`在单一读事务快照中从初始资本重建并与物化账户核对。
-- repository定向10项、S04+S05+scheduler联合34项通过；新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`通过，等待代码审查。
+- repository定向10项、S04+S05+scheduler联合34项通过；新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`通过。
+- 审查修复了三类主链问题：重放改为单连接读事务快照；开户资金原子来自物理账户可用资金池并记录`ALLOCATE`；开户中途失败完整回滚资金池、账户和资金流水。
+- 实现提交：`9eb36f0`。最终工作树复审APPROVE。
+- Decision: DONE
 
 ## S06：Broker Capability Contract
+
+### 当前状态
+
+- IN_PROGRESS：先盘点现有QMT adapter真实返回字段与查询能力，再冻结最小能力合同；不在本slice提前实现执行编排器。
 
 ### 交付
 

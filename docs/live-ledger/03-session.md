@@ -53,7 +53,7 @@
 - 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。S01状态为DONE。
 - S02实现提交`3b54a4a7178fb36ab9f85de22a648bb08bd0448b`已通过三路预提交及精确SHA终审，起止HEAD一致且工作树clean。目标矩阵320 passed；真实策略与契约probe的strict mypy/pyright、Python 3.8 AST、阻断级flake8、S00 baseline和commit格式均PASS。
 - 最新setup在第三个全新空venv完成`pip>=21.3`引导、editable安装和严格检查；`.pth`只写入目标`purelib`，普通Python可解析`jqdata`和helper。S02状态为DONE。
-- StrategyLedger事务repository和最小初始资金划拨已进入S05候选；成交入账和对账闭环尚未实现。
+- StrategyLedger事务repository和最小初始资金划拨已完成；成交入账和对账闭环尚未实现。
 - 尚未轮换外部token/Webhook；这是需要用户在对应平台执行的外部动作。
 
 ## 最近完成slice
@@ -62,7 +62,7 @@
 
 ## 当前slice
 
-`S05 Transactional Repository`（IN_PROGRESS）
+`S06 Broker Capability Contract`（IN_PROGRESS）
 
 - 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
@@ -104,20 +104,24 @@
 - 12项S04定向测试通过；加入既有scheduler回归后24 passed。新模块完整flake8、Python 3.8 AST、targeted mypy、targeted pyright和S00 baseline均PASS。
 - 首次收集因默认`jqdatasdk`未安装失败；按仓库约定使用离线easy_tdx stub后通过。这暴露既有顶层数据源初始化耦合，但不在S04扩大重构范围。
 - 修复两个包入口的Python 3.8运行注解：`list[str]`改为兼容写法，避免StrategyLedger导入在目标版本先失败。
-- 尚未接入服务器、分配1万元或处理真实成交；这些能力继续由S05及后续slice完成。
+- 尚未接入服务器、校准真实账户或处理真实成交；这些能力继续由S06及后续slice完成。
 - 首轮只读审查为REWORK：组合意图/事件/对账对象保留调用方可变Mapping，迁移历史不绑定SQL且未核对`user_version`。候选现改为构造时递归冻结JSON数据，迁移记录SHA-256并校验双版本源；新增3项回归后重新审查。
 - 修复后的工作树复审为两路APPROVE。实现提交`6bfb4469f3b8d32a0121d164bd2af96ac3e94326`再次通过两路精确SHA复审：提交只含批准的14文件，工作树clean，12项定向/24项联合矩阵通过。
 - S04决定：DONE。
 
-## S05当前候选
+## S05收口
 
 - 新增`SQLiteStrategyRepository`：显式初始化、账户读取、CAS事件提交、append-only读取和账户重放。
 - 每次写入使用独立连接和`BEGIN IMMEDIATE`；账户物化、ledger entry和strategy event在同一事务中提交。
 - schema新增v3 append-only触发器，禁止UPDATE/DELETE账本项和策略事件；旧v1/v2只向前升级，不修改已应用迁移。
 - `create_strategy_account`在单一事务内校验并扣减物理账户未分配现金、创建策略账户并追加初始`ALLOCATE`资金流水；资金不足时全部回滚。
 - `replay_account`使用一个SQLite读事务快照读取账户、账本和事件，避免与并发写入交错产生假不一致。
-- 10项repository回归覆盖初始划拨、资金不足/预留资金不可挪用、开户中途失败全回滚、提交/重放、并发快照、同版本双写、事件注入失败全回滚、负现金无半写和append-only约束；加入S04与scheduler后联合34 passed。新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`均PASS，等待代码审查。
+- 10项repository回归覆盖初始划拨、资金不足/预留资金不可挪用、开户中途失败全回滚、提交/重放、并发快照、同版本双写、事件注入失败全回滚、负现金无半写和append-only约束；加入S04与scheduler后联合34 passed。新模块flake8、Python 3.8 AST、targeted mypy/pyright、S00 baseline和`git diff --check`均PASS。
 - 当前仍不读取真实券商余额、不做可重复启动资金校准、不冻结订单资金或处理成交；这些由S08/S09完成。
+- 首轮审查发现重放跨连接可能读到混合快照、初始资金无资金池来源，以及事务起点异常未统一收口；修复后重放改为单一读事务，开户原子扣减资金池并写资金流水。
+- 第二轮审查发现开户必须按`unallocated-reserved`计算可用额，且缺少“资金池已扣减后建档失败”的回滚证据；修复后新增CAS可用额约束和故障注入回归。
+- 最终工作树审查APPROVE；实现提交`9eb36f0`，限定矩阵34 passed。
+- S05决定：DONE。
 
 ## 恢复检查表
 
