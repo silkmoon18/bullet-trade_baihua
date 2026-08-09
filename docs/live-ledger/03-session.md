@@ -146,6 +146,15 @@
 - 同一`(strategy_id, endpoint, idempotency_key)`与相同payload重放既有结果，不同payload明确冲突。
 - 外部下单前持久化client tag和operation；发送结果未知时保持`SUBMIT_UNKNOWN`，只能按S06查询合同恢复，不能自动重发。
 
+## S07当前候选
+
+- schema v4新增`strategy_operations`，outbox增加唯一`operation_id`关联；operation保存canonical payload hash、持久client tag、状态和响应。
+- `SQLiteOperationRepository.create_operation()`原子创建operation/outbox；同key同payload重放原记录，不同payload冲突，100并发只有一个首次创建。
+- `claim_next()`只重领尚未越过外部调用边界的过期claim；`begin_submission()`先把operation置为`SUBMITTING`，随后才允许调用QMT。
+- 确定响应进入`COMPLETED`并持久化；响应未知或启动时发现遗留`SUBMITTING`进入`SUBMIT_UNKNOWN`，outbox停止投递。
+- 首轮审查发现可变payload被读取两次，可能使operation hash与outbox effect不一致；候选改为首次canonical JSON后所有记录共享同一请求快照。
+- 10项S07定向测试覆盖相同请求重放、payload冲突、单一请求快照、100并发、原子回滚、双worker单claim、确定响应、未知响应、重启隔离和调用前lease重领；加入S04至S06及scheduler后联合58 passed。新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`均PASS，等待复审。
+
 ## 恢复检查表
 
 新session继续前依次执行：

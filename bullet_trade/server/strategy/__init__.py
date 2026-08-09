@@ -44,6 +44,14 @@ from .broker_contract import (
     require_strategy_ledger_v1,
     strategy_ledger_v1_blockers,
 )
+from .idempotency import (
+    IdempotencyConflictError,
+    OperationCreateResult,
+    OperationRecord,
+    OperationState,
+    OutboxClaim,
+    SQLiteOperationRepository,
+)
 
 __all__ = [
     "MONEY_SCALE",
@@ -60,12 +68,17 @@ __all__ = [
     "CashPool",
     "CapabilityState",
     "IntentState",
+    "IdempotencyConflictError",
     "LATEST_SCHEMA_VERSION",
     "LedgerEntry",
     "LedgerInvariantError",
     "MINI_QMT_CAPABILITIES",
     "OrderSide",
     "OrderState",
+    "OperationCreateResult",
+    "OperationRecord",
+    "OperationState",
+    "OutboxClaim",
     "PortfolioIntent",
     "Position",
     "PositionLot",
@@ -73,6 +86,7 @@ __all__ = [
     "ReconciliationResult",
     "RepositoryError",
     "SQLiteStrategyRepository",
+    "SQLiteOperationRepository",
     "StrategyEvent",
     "StrategyAccount",
     "StrategyRepository",

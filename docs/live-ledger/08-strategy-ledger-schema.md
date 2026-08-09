@@ -42,6 +42,8 @@ S04交付领域数据结构和可迁移SQLite schema；S05在其上增加事务r
 
 迁移v3为`ledger_entries`和`strategy_events`增加禁止UPDATE/DELETE的触发器，业务修复只能追加新事件。
 
+迁移v4新增`strategy_operations`，并为`outbox`增加一对一`operation_id`：同一策略、endpoint和幂等键只能创建一个operation；请求hash、client tag、状态和最终响应持久保存。
+
 S04只保证schema和静态约束；事件追加、CAS、资金划拨、成交入账和对账业务不在本slice中伪实现。
 
 ## 迁移接口

@@ -15,7 +15,7 @@ repository = SQLiteStrategyRepository(r"E:\bullet-trade-data\strategy-ledger.db"
 repository.initialize()
 ```
 
-运行目录必须位于仓库外。`initialize()`执行S04定义的向前迁移；当前schema v3额外为`ledger_entries`和`strategy_events`安装禁止UPDATE/DELETE的append-only触发器。
+运行目录必须位于仓库外。`initialize()`执行向前迁移；schema v3为`ledger_entries`和`strategy_events`安装禁止UPDATE/DELETE的append-only触发器，v4增加S07持久operation与outbox关联。
 
 ## 原子事件提交
 

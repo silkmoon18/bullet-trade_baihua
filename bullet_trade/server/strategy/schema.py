@@ -330,6 +330,43 @@ MIGRATIONS: Tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        4,
+        "persistent_operations",
+        (
+            """
+            CREATE TABLE strategy_operations (
+                operation_id TEXT PRIMARY KEY,
+                strategy_account_id TEXT NOT NULL
+                    REFERENCES strategy_accounts(strategy_account_id),
+                strategy_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN (
+                        'PENDING','SUBMITTING','SUBMIT_UNKNOWN',
+                        'COMPLETED','FAILED'
+                    )
+                ),
+                client_tag TEXT NOT NULL UNIQUE,
+                response_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (strategy_id, endpoint, idempotency_key)
+            )
+            """,
+            (
+                "ALTER TABLE outbox ADD COLUMN operation_id TEXT "
+                "REFERENCES strategy_operations(operation_id)"
+            ),
+            (
+                "CREATE UNIQUE INDEX idx_outbox_operation_id "
+                "ON outbox(operation_id) WHERE operation_id IS NOT NULL"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

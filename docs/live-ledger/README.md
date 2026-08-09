@@ -16,6 +16,7 @@
 10. [StrategyLedger领域模型与SQLite Schema](08-strategy-ledger-schema.md)
 11. [StrategyLedger事务Repository](09-transactional-repository.md)
 12. [QMT券商能力合同](10-broker-capability-contract.md)
+13. [持久幂等与Outbox](11-persistent-idempotency-outbox.md)
 
 ## 权威边界
 

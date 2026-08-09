@@ -826,6 +826,14 @@ Decision: DONE
 - 相同key不同payload明确冲突。
 - 各crash point重启不产生第二次外部提交。
 
+### 当前实现候选（待审查）
+
+- schema v4持久保存operation、请求hash、client tag、状态与响应，outbox通过唯一`operation_id`一对一关联。
+- operation/outbox同事务创建；同key同payload重放，不同payload冲突，100并发仅一个首次创建。
+- claim在`begin_submission`前过期可重领；`begin_submission`是外部effect边界，之后的未知响应或重启遗留均进入`SUBMIT_UNKNOWN`且不重投。
+- 首轮审查修复operation hash与outbox二次读取可变payload后可能使用不同请求快照的问题。
+- S07定向10项、S04至S07加scheduler联合58项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST、旧文件阻断级flake8、S00 baseline和`git diff --check`通过，等待复审。
+
 ## S08：Capital Allocation Ledger
 
 ### 交付

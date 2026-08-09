@@ -42,6 +42,7 @@ nav:
       - StrategyLedger领域模型与Schema: live-ledger/08-strategy-ledger-schema.md
       - StrategyLedger事务Repository: live-ledger/09-transactional-repository.md
       - QMT券商能力合同: live-ledger/10-broker-capability-contract.md
+      - 持久幂等与Outbox: live-ledger/11-persistent-idempotency-outbox.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md
