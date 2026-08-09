@@ -24,18 +24,28 @@ from .domain import (
     units_to_decimal,
 )
 from .schema import LATEST_SCHEMA_VERSION, connect_database, migrate_database
+from .repository import (
+    AccountNotFoundError,
+    LedgerInvariantError,
+    RepositoryError,
+    SQLiteStrategyRepository,
+    StrategyRepository,
+    VersionConflictError,
+)
 
 __all__ = [
     "MONEY_SCALE",
     "NAV_SCALE",
     "PRICE_SCALE",
     "AccountStatus",
+    "AccountNotFoundError",
     "BrokerFill",
     "BrokerOrder",
     "CashPool",
     "IntentState",
     "LATEST_SCHEMA_VERSION",
     "LedgerEntry",
+    "LedgerInvariantError",
     "OrderSide",
     "OrderState",
     "PortfolioIntent",
@@ -43,8 +53,12 @@ __all__ = [
     "PositionLot",
     "ReconciliationState",
     "ReconciliationResult",
+    "RepositoryError",
+    "SQLiteStrategyRepository",
     "StrategyEvent",
     "StrategyAccount",
+    "StrategyRepository",
+    "VersionConflictError",
     "connect_database",
     "migrate_database",
     "money_to_units",

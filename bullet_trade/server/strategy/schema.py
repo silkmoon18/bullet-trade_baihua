@@ -296,6 +296,40 @@ MIGRATIONS: Tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        3,
+        "append_only_guards",
+        (
+            """
+            CREATE TRIGGER ledger_entries_no_update
+            BEFORE UPDATE ON ledger_entries
+            BEGIN
+                SELECT RAISE(ABORT, 'ledger_entries is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER ledger_entries_no_delete
+            BEFORE DELETE ON ledger_entries
+            BEGIN
+                SELECT RAISE(ABORT, 'ledger_entries is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER strategy_events_no_update
+            BEFORE UPDATE ON strategy_events
+            BEGIN
+                SELECT RAISE(ABORT, 'strategy_events is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER strategy_events_no_delete
+            BEFORE DELETE ON strategy_events
+            BEGIN
+                SELECT RAISE(ABORT, 'strategy_events is append-only');
+            END
+            """,
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

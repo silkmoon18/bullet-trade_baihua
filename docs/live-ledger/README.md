@@ -14,6 +14,7 @@
 8. [聚宽校验与导出](06-joinquant-export.md)
 9. [当前状态与使用指南](07-status-and-usage.md)
 10. [StrategyLedger领域模型与SQLite Schema](08-strategy-ledger-schema.md)
+11. [StrategyLedger事务Repository](09-transactional-repository.md)
 
 ## 权威边界
 

@@ -73,11 +73,11 @@ def test_empty_database_migrates_and_repeat_is_noop(tmp_path):
     connection = connect_database(database)
     try:
         assert _table_names(connection) == EXPECTED_TABLES
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2]
+        assert [row[0] for row in versions] == [1, 2, 3]
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -93,11 +93,11 @@ def test_version_one_database_upgrades_to_latest(tmp_path):
         assert "strategy_orders" not in _table_names(connection)
     finally:
         connection.close()
-    assert migrate_database(database) == 2
+    assert migrate_database(database) == LATEST_SCHEMA_VERSION
     connection = connect_database(database)
     try:
         assert "strategy_orders" in _table_names(connection)
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
     finally:
         connection.close()
 

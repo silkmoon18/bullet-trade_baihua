@@ -2,7 +2,7 @@
 
 ## 当前边界
 
-S04只交付领域数据结构和可迁移SQLite schema。它还没有接入BulletTrade服务器，也不会自动读取真实账户、分配1万元、下单或入账成交；这些能力分别由S05至S15实现。
+S04交付领域数据结构和可迁移SQLite schema；S05在其上增加事务repository和最小初始资金池划拨。当前仍未接入BulletTrade API，也不会自动读取真实账户、校准1万元、下单或入账成交；这些能力由S06至S15继续实现。
 
 首版假设：个人专用QMT账户、单策略、可信服务器进程、无融资融券。保留真正影响资金正确性的约束，不处理同进程恶意Python代码或共享账户归属。
 
@@ -39,6 +39,8 @@ S04只交付领域数据结构和可迁移SQLite schema。它还没有接入Bull
 - `outbox`：后续S07用于事务内创建外部提交任务。
 - `reconciliation_runs`：对账时间、状态和差异摘要。
 - `capital_flows`、`corporate_actions`：显式资金流和公司行动扩展钩子。
+
+迁移v3为`ledger_entries`和`strategy_events`增加禁止UPDATE/DELETE的触发器，业务修复只能追加新事件。
 
 S04只保证schema和静态约束；事件追加、CAS、资金划拨、成交入账和对账业务不在本slice中伪实现。
 
