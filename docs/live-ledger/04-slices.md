@@ -855,6 +855,13 @@ Decision: DONE
 - 两策略并发不能超分配，即使当前首版API只开放一个策略。
 - `cash-reserved=available`始终成立。
 
+### 当前实现候选（待审查）
+
+- `SQLiteCapitalService`实现券商可用现金校准、幂等ensure、按订单隔离的reserve/release和显式allocate/withdraw。
+- 初始资金不足全量拒绝；重复启动不重新分配，配置变化不静默重置；50并发仅一个首次分配。
+- 已有账户的券商现金快照只做账实核对，不覆盖本地资金；显式资金调整用external ref幂等并与资金池/账本/流水同事务。
+- S08定向10项、S04至S08加scheduler联合68项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`通过，等待代码审查。
+
 ## S09：Fill Booking and Position Lots
 
 ### 交付

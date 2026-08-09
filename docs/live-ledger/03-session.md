@@ -163,6 +163,14 @@
 - 已存在策略账户重复启动只返回原分配，不因聚宽初始资金变化静默重置；调整资金必须使用显式allocate/withdraw并写资金流水。
 - 为下单资金提供reserve/release原子入口，使后续实际成交只按返回结果扣账；不在本slice实现订单规划或成交持仓。
 
+## S08当前候选
+
+- 新增`SQLiteCapitalService`：券商可用现金初始校准、策略账户幂等ensure、现金reserve/release和显式allocate/withdraw。
+- 初始1万元只从已校准物理现金池原子划拨；真实可用资金不足不建账户。50并发ensure只分配一次，重复启动返回原账户，配置变化明确冲突。
+- 策略账户存在后，券商可用现金必须等于物理未分配可用现金加策略可用现金；差异只报错，不覆盖本地账本。
+- reserve/release在同一事务按`order_id`核对各订单剩余冻结额，避免重复释放某订单时误释放其他订单资金；显式资金调整由`external_ref`幂等，任何中途失败回滚资金池、账户、账本和资金流水。
+- 10项S08定向测试、加入S04至S07与scheduler后联合68项通过；新模块完整flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS，等待代码审查。
+
 ## 恢复检查表
 
 新session继续前依次执行：

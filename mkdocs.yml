@@ -43,6 +43,7 @@ nav:
       - StrategyLedger事务Repository: live-ledger/09-transactional-repository.md
       - QMT券商能力合同: live-ledger/10-broker-capability-contract.md
       - 持久幂等与Outbox: live-ledger/11-persistent-idempotency-outbox.md
+      - 真实现金校准与策略资金: live-ledger/12-capital-allocation.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md

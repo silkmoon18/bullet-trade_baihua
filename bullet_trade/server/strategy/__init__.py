@@ -52,6 +52,13 @@ from .idempotency import (
     OutboxClaim,
     SQLiteOperationRepository,
 )
+from .capital import (
+    BrokerCashMismatchError,
+    CapitalAdjustmentResult,
+    CapitalConfigurationError,
+    SQLiteCapitalService,
+    StrategyAccountEnsureResult,
+)
 
 __all__ = [
     "MONEY_SCALE",
@@ -62,10 +69,13 @@ __all__ = [
     "BIG_QMT_CAPABILITIES",
     "BrokerCapabilityProfile",
     "BrokerContractError",
+    "BrokerCashMismatchError",
     "BrokerFill",
     "BrokerOrder",
     "BrokerTradeEvidence",
     "CashPool",
+    "CapitalAdjustmentResult",
+    "CapitalConfigurationError",
     "CapabilityState",
     "IntentState",
     "IdempotencyConflictError",
@@ -87,8 +97,10 @@ __all__ = [
     "RepositoryError",
     "SQLiteStrategyRepository",
     "SQLiteOperationRepository",
+    "SQLiteCapitalService",
     "StrategyEvent",
     "StrategyAccount",
+    "StrategyAccountEnsureResult",
     "StrategyRepository",
     "VersionConflictError",
     "connect_database",
