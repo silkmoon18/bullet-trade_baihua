@@ -338,7 +338,7 @@ def test_order_and_fill_emit_structured_trade_notifications(services):
     )
     booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
     capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
-    booking.book_fill(
+    bought = booking.book_fill(
         "good-etf",
         _fill("f-1", "buy-1", OrderSide.BUY, 1000),
         1,
@@ -352,3 +352,30 @@ def test_order_and_fill_emit_structured_trade_notifications(services):
     assert str(notifications[0].amount) == "2000"
     assert str(notifications[1].price) == "2"
     assert str(notifications[1].amount) == "2005"
+
+    booking.register_order(
+        _order(
+            "sell-1",
+            OrderSide.SELL,
+            1000,
+            trading_day=date(2026, 8, 11),
+            limit_price="3.00",
+        )
+    )
+    booking.book_fill(
+        "good-etf",
+        _fill(
+            "f-2",
+            "sell-1",
+            OrderSide.SELL,
+            1000,
+            price="3.00",
+            commission="5.00",
+            tax="1.00",
+            traded_day=date(2026, 8, 11),
+        ),
+        bought.account.ledger_version,
+    )
+
+    assert notifications[-1].event == "FILLED"
+    assert str(notifications[-1].amount) == "2994"

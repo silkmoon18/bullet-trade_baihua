@@ -409,7 +409,11 @@ class SQLiteFillBookingService:
                     status=order_state.value,
                     quantity=fill.quantity,
                     price=price_units_to_display(fill.price_units),
-                    amount=money_units_to_display(gross_units + fee_units),
+                    amount=money_units_to_display(
+                        gross_units + fee_units
+                        if fill.side is OrderSide.BUY
+                        else gross_units - fee_units
+                    ),
                     order_id=fill.order_id,
                     trade_id=fill.broker_trade_id,
                     detail="佣金及税费 ¥{}".format(
