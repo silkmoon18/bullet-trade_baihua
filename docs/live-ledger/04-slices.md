@@ -913,6 +913,15 @@ Decision: DONE
 - 账户与持仓不发生非原子拼接快照。
 - 陈旧价格不能用于新调仓。
 
+### 当前实现候选（待审查）
+
+- `SQLiteValuationService`在同一SQLite读事务生成现金、持仓市值、总资产、净投入、费用、三类PnL和NAV快照。
+- mark必须包含来源与时间；缺失、陈旧和未来mark明确阻断。快照版本绑定ledger、position和mark证据，重复计算确定一致。
+- lot成本改为按原fill总价费精确保留，部分卖出按剩余成本差结转，避免每股成本舍入累计漂移。
+- 固定初始资金可输出performance-ready NAV；存在后续增减资时快照仍可估值，但不宣称严格绩效NAV可用。
+- 首轮审查发现T+1可卖数物化值陈旧和mark校验/使用可能跨批；现改为按快照日期汇总lot可卖数，并在入口捕获单一marks副本。
+- S10定向11项、联合88项和静态/语法/格式检查通过，等待复审。
+
 ## S11：Broker Ingest and Reconciliation
 
 ### 交付

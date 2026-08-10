@@ -205,6 +205,30 @@ class SQLiteFillBookingService:
 
             gross_units = _trade_value_units(fill.price_units, fill.quantity)
             fee_units = fill.commission_units + fill.tax_units
+            timestamp = _timestamp()
+            connection.execute(
+                """
+                INSERT INTO fills(
+                    fill_id, order_id, broker_trade_id, fill_fingerprint,
+                    security, side, quantity, price_units, commission_units,
+                    tax_units, traded_at, booked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill.fill_id,
+                    fill.order_id,
+                    fill.broker_trade_id,
+                    fill.fingerprint,
+                    fill.security,
+                    fill.side.value,
+                    fill.quantity,
+                    fill.price_units,
+                    fill.commission_units,
+                    fill.tax_units,
+                    fill.traded_at.isoformat(),
+                    timestamp,
+                ),
+            )
             realized_pnl_units = 0
             if fill.side is OrderSide.BUY:
                 cash_delta = -(gross_units + fee_units)
@@ -251,7 +275,6 @@ class SQLiteFillBookingService:
             )
             next_version = account.ledger_version + 1
             next_event_seq = account.event_seq + 1
-            timestamp = _timestamp()
             updated = connection.execute(
                 """
                 UPDATE strategy_accounts
@@ -301,29 +324,6 @@ class SQLiteFillBookingService:
             }
             payload_json = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-            connection.execute(
-                """
-                INSERT INTO fills(
-                    fill_id, order_id, broker_trade_id, fill_fingerprint,
-                    security, side, quantity, price_units, commission_units,
-                    tax_units, traded_at, booked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    fill.fill_id,
-                    fill.order_id,
-                    fill.broker_trade_id,
-                    fill.fingerprint,
-                    fill.security,
-                    fill.side.value,
-                    fill.quantity,
-                    fill.price_units,
-                    fill.commission_units,
-                    fill.tax_units,
-                    fill.traded_at.isoformat(),
-                    timestamp,
-                ),
             )
             connection.execute(
                 """
@@ -622,10 +622,14 @@ class SQLiteFillBookingService:
             raise LedgerInvariantError("sell fill has no strategy position")
         lots = connection.execute(
             """
-            SELECT * FROM position_lots
-            WHERE strategy_account_id = ? AND security = ? AND remaining_qty > 0
-              AND sellable_from_trade_date <= ?
-            ORDER BY acquired_trade_date, created_at, lot_id
+            SELECT l.*, f.price_units AS source_price_units,
+                   f.commission_units AS source_commission_units,
+                   f.tax_units AS source_tax_units
+            FROM position_lots l
+            JOIN fills f ON f.fill_id = l.source_fill_id
+            WHERE l.strategy_account_id = ? AND l.security = ?
+              AND l.remaining_qty > 0 AND l.sellable_from_trade_date <= ?
+            ORDER BY l.acquired_trade_date, l.created_at, l.lot_id
             """,
             (account_id, fill.security, trade_date.isoformat()),
         ).fetchall()
@@ -635,11 +639,23 @@ class SQLiteFillBookingService:
             consumed = min(remaining, lot["remaining_qty"])
             if not consumed:
                 continue
+            remaining_after = lot["remaining_qty"] - consumed
             connection.execute(
                 "UPDATE position_lots SET remaining_qty = remaining_qty - ? WHERE lot_id = ?",
                 (consumed, lot["lot_id"]),
             )
-            cost_basis += _trade_value_units(lot["cost_price_units"], consumed)
+            original_cost = (
+                _trade_value_units(lot["source_price_units"], lot["original_qty"])
+                + lot["source_commission_units"]
+                + lot["source_tax_units"]
+            )
+            cost_before = _round_div(
+                original_cost * lot["remaining_qty"], lot["original_qty"]
+            )
+            cost_after = _round_div(
+                original_cost * remaining_after, lot["original_qty"]
+            )
+            cost_basis += cost_before - cost_after
             remaining -= consumed
             if not remaining:
                 break
@@ -657,22 +673,37 @@ class SQLiteFillBookingService:
         security: str,
         trade_date: date,
     ) -> Position:
-        aggregates = connection.execute(
+        lot_rows = connection.execute(
             """
-            SELECT COALESCE(SUM(remaining_qty), 0) AS total_qty,
-                   COALESCE(SUM(CASE WHEN sellable_from_trade_date <= ?
-                                     THEN remaining_qty ELSE 0 END), 0) AS sellable_qty,
-                   COALESCE(SUM(remaining_qty * cost_price_units), 0) AS weighted_cost
-            FROM position_lots
-            WHERE strategy_account_id = ? AND security = ?
+            SELECT l.*, f.price_units AS source_price_units,
+                   f.commission_units AS source_commission_units,
+                   f.tax_units AS source_tax_units
+            FROM position_lots l
+            JOIN fills f ON f.fill_id = l.source_fill_id
+            WHERE l.strategy_account_id = ? AND l.security = ?
+              AND l.remaining_qty > 0
             """,
-            (trade_date.isoformat(), account_id, security),
-        ).fetchone()
-        total_qty = aggregates["total_qty"]
-        sellable_qty = aggregates["sellable_qty"]
-        avg_cost = (
-            _round_div(aggregates["weighted_cost"], total_qty) if total_qty else 0
+            (account_id, security),
+        ).fetchall()
+        total_qty = sum(row["remaining_qty"] for row in lot_rows)
+        sellable_qty = sum(
+            row["remaining_qty"]
+            for row in lot_rows
+            if row["sellable_from_trade_date"] <= trade_date.isoformat()
         )
+        remaining_cost = sum(
+            _round_div(
+                (
+                    _trade_value_units(row["source_price_units"], row["original_qty"])
+                    + row["source_commission_units"]
+                    + row["source_tax_units"]
+                )
+                * row["remaining_qty"],
+                row["original_qty"],
+            )
+            for row in lot_rows
+        )
+        avg_cost = _cost_price_units(remaining_cost, total_qty) if total_qty else 0
         connection.execute(
             """
             UPDATE positions

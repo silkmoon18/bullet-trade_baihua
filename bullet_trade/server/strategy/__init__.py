@@ -66,6 +66,13 @@ from .fill_booking import (
     OrderFinalizationResult,
     SQLiteFillBookingService,
 )
+from .valuation import (
+    MarketMark,
+    PortfolioPositionSnapshot,
+    PortfolioSnapshot,
+    SQLiteValuationService,
+    ValuationReadinessError,
+)
 
 __all__ = [
     "MONEY_SCALE",
@@ -93,6 +100,7 @@ __all__ = [
     "LedgerEntry",
     "LedgerInvariantError",
     "MINI_QMT_CAPABILITIES",
+    "MarketMark",
     "OrderSide",
     "OrderState",
     "OrderFinalizationResult",
@@ -101,6 +109,8 @@ __all__ = [
     "OperationState",
     "OutboxClaim",
     "PortfolioIntent",
+    "PortfolioPositionSnapshot",
+    "PortfolioSnapshot",
     "Position",
     "PositionLot",
     "ReconciliationState",
@@ -110,11 +120,13 @@ __all__ = [
     "SQLiteOperationRepository",
     "SQLiteCapitalService",
     "SQLiteFillBookingService",
+    "SQLiteValuationService",
     "StrategyEvent",
     "StrategyAccount",
     "StrategyAccountEnsureResult",
     "StrategyRepository",
     "VersionConflictError",
+    "ValuationReadinessError",
     "connect_database",
     "migrate_database",
     "money_to_units",

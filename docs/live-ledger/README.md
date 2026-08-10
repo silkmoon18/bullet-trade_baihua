@@ -19,6 +19,7 @@
 13. [持久幂等与Outbox](11-persistent-idempotency-outbox.md)
 14. [真实现金校准与策略资金](12-capital-allocation.md)
 15. [真实成交入账与持仓批次](13-fill-booking.md)
+16. [原子估值与组合快照](14-valuation-snapshot.md)
 
 ## 权威边界
 

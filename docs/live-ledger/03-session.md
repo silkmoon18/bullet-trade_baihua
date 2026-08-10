@@ -198,6 +198,17 @@
 - 行情输入必须带`as_of`，只实现缺价/过期价的明确阻断和最小估值，不扩展通用行情平台或复杂风控。
 - 快照版本绑定账户ledger version和持仓版本，确保聚宽一次读取不会混合成交前后的状态。
 
+## S10当前候选
+
+- 新增`SQLiteValuationService`与只读`PortfolioSnapshot`：现金、冻结、可用现金、持仓市值、总资产、净投入资金、费用、已实现/未实现/总盈亏和NAV一次返回。
+- 账户、持仓、lot、fill、资金流水和PnL账本均在同一SQLite读事务读取；并发成交发生在账户读取之后时，当前快照仍完整保持成交前版本。
+- `MarketMark`显式携带证券、价格、来源和`as_of`；持仓缺价、价格过期或来自快照未来时不生成估值。
+- `snapshot_version`绑定ledger/event、持仓版本和mark证据；相同账本与mark重算结果一致。
+- 修复S09每股成本舍入尾差：lot剩余成本从原始fill总价费精确分摊，部分卖出用卖前与卖后剩余成本之差结转，佣金不能整除股数时也不丢金额。
+- 初始固定资金场景可直接使用NAV；发生后续显式增减资时`performance_ready=False`，防止把简单资产/净投入比率误当成严格份额净值。
+- 首轮审查发现物化`positions.sellable_qty`不会随T+1日期自动刷新，以及可变marks可能在校验与使用之间换批；候选现从同一lot快照按估值日计算可卖数，并在入口只复制一次mark证据。
+- S10定向11项、S04至S10加scheduler联合88项通过；flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS，等待复审。
+
 ## 恢复检查表
 
 新session继续前依次执行：
