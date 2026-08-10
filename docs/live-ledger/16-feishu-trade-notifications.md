@@ -27,6 +27,19 @@ booking = SQLiteFillBookingService(
 
 通知只在数据库事务提交成功后发送。飞书超时或发送失败只返回 `False`，不会回滚已经确认的订单或成交，也不会改变交易状态。
 
+## 覆盖旧 `bt_quant` 脚本
+
+本文件同时提供旧版同名类 `FeishuNotifier`，兼容以下旧调用：
+
+- `FeishuNotifier()`
+- `queue_message(text)` 与 `flush()`
+- `send_text(text)`
+- `send_rich_text(title, text)`
+
+因此可以把 `bullet_trade/server/feishu_notifier.py` 直接复制并覆盖旧仓库根目录的 `feishu_notifier.py`，旧 `log.py` 无需修改。覆盖前在服务器设置一次环境变量 `FEISHU_WEBHOOK_URL`；机器人开启签名校验时再设置 `FEISHU_SIGNING_SECRET`。新文件不再携带写死的 Webhook。
+
+旧的纯文本调用会改成橙色日志卡片。需要标的、金额、数量和单价的订单/回报应传入 `TradeNotification`；BulletTrade 新账本已经自动这样调用。
+
 ## 当前边界
 
 - 已接入订单登记、成交、撤单和拒单事件。

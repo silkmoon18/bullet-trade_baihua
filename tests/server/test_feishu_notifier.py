@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from bullet_trade.server.feishu_notifier import (
+    FeishuNotifier,
     FeishuTradeNotifier,
     TradeNotification,
 )
@@ -52,3 +53,39 @@ def test_rejected_order_card_keeps_empty_trade_values_visible():
     content = payload["card"]["elements"][0]["text"]["content"]
     assert "**金额：** ¥-" in content
     assert "**单价：** ¥-" in content
+
+
+def test_legacy_notifier_is_drop_in_compatible(monkeypatch):
+    monkeypatch.setenv(
+        "FEISHU_WEBHOOK_URL", "https://example.invalid/hook/legacy"
+    )
+    notifier = FeishuNotifier()
+    sent = []
+    monkeypatch.setattr(notifier, "_send_request", sent.append)
+
+    notifier.queue_message("legacy log message")
+    notifier.flush()
+
+    assert notifier.webhook_url.endswith("/legacy")
+    assert sent[0]["msg_type"] == "interactive"
+    assert "legacy log message" in str(sent[0])
+
+
+def test_legacy_notifier_accepts_structured_trade_notification(monkeypatch):
+    notifier = FeishuNotifier("https://example.invalid/hook/trade")
+    sent = []
+    monkeypatch.setattr(notifier._sender, "send", sent.append)
+    trade = TradeNotification(
+        event="FILLED",
+        security="510050.XSHG",
+        side="BUY",
+        status="FILLED",
+        quantity=100,
+        price="2.50",
+        amount="255.00",
+    )
+
+    notifier.queue_message(trade)
+    notifier.flush()
+
+    assert sent == [trade]
