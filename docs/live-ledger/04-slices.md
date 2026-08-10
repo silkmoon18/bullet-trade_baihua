@@ -48,8 +48,8 @@
 | S07 | Persistent Idempotency and Outbox | DONE | 请求幂等、operation、outbox、lease、unknown恢复 |
 | S08 | Capital Allocation Ledger | DONE | 未分配池、初始1万元、按订单冻结/释放、显式资金流 |
 | S09 | Fill Booking and Position Lots | DONE | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
-| S10 | Valuation and Atomic Snapshot | IN_PROGRESS | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
-| S11 | Broker Ingest and Reconciliation | PENDING | 跨日重扫、游标、quarantine、HARD阻断和readiness |
+| S10 | Valuation and Atomic Snapshot | DONE | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
+| S11 | Broker Ingest and Reconciliation | IN_PROGRESS | 跨日重扫、归属、quarantine、HARD阻断和readiness |
 | S12 | Target Portfolio Planner | PENDING | NAV目标、整手、working exposure、费用缓冲和delta |
 | S13 | Execution Orchestrator and Baseline Risk | PENDING | 卖后买、部分成交、unknown、恢复、kill switch |
 | S14 | Strategy API and Authorization | PENDING | strategy.*、scope、feature握手、审计和统一错误 |
@@ -899,7 +899,7 @@ Decision: DONE
 
 ### 当前状态
 
-- IN_PROGRESS：实现同一读事务的现金、持仓市值、总资产和PnL快照，作为聚宽只读组合视图的数据基础；不扩展通用行情或风控平台。
+- DONE：同一读事务的现金、持仓市值、总资产、PnL、NAV和版本快照已完成；聚宽回传留在S15/S16。
 
 ### 交付
 
@@ -913,16 +913,23 @@ Decision: DONE
 - 账户与持仓不发生非原子拼接快照。
 - 陈旧价格不能用于新调仓。
 
-### 当前实现候选（待审查）
+### 实现与审查结果
 
 - `SQLiteValuationService`在同一SQLite读事务生成现金、持仓市值、总资产、净投入、费用、三类PnL和NAV快照。
 - mark必须包含来源与时间；缺失、陈旧和未来mark明确阻断。快照版本绑定ledger、position和mark证据，重复计算确定一致。
 - lot成本改为按原fill总价费精确保留，部分卖出按剩余成本差结转，避免每股成本舍入累计漂移。
 - 固定初始资金可输出performance-ready NAV；存在后续增减资时快照仍可估值，但不宣称严格绩效NAV可用。
 - 首轮审查发现T+1可卖数物化值陈旧和mark校验/使用可能跨批；现改为按快照日期汇总lot可卖数，并在入口捕获单一marks副本。
-- S10定向11项、联合88项和静态/语法/格式检查通过，等待复审。
+- 首轮审查发现T+1可卖数物化值陈旧和mark校验/使用可能跨批；修复后分别从同一lot快照重算并捕获单一mark副本。
+- S10定向11项、联合88项和静态/语法/格式检查通过。
+- 修复后的工作树复审APPROVE；实现提交`4e190cc`。
+- Decision: DONE
 
 ## S11：Broker Ingest and Reconciliation
+
+### 当前状态
+
+- IN_PROGRESS：实现单账户QMT订单/成交/资金/持仓重复重扫、策略归属、差异结果和readiness；不扩展消息队列或多节点worker。
 
 ### 交付
 

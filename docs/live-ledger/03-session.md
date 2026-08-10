@@ -58,11 +58,11 @@
 
 ## 最近完成slice
 
-`S09 Fill Booking and Position Lots`（DONE）
+`S10 Valuation and Atomic Snapshot`（DONE）
 
 ## 当前slice
 
-`S10 Valuation and Atomic Snapshot`（IN_PROGRESS）
+`S11 Broker Ingest and Reconciliation`（IN_PROGRESS）
 
 - 已实现固定白名单导出器、确定性manifest、私有profile只读校验、clean-room smoke和127项S03回归。
 - 多轮冻结前审查已依次推动修复：单次不可变源码快照、严格契约唯一绑定和精确类型、`TYPE_CHECKING`来源/重绑定、相对与动态服务器包导入、危险builtin别名、敏感字段组合构造、私有profile占位值、目标路径reparse/断链、动态namespace与契约字段改写。
@@ -198,7 +198,7 @@
 - 行情输入必须带`as_of`，只实现缺价/过期价的明确阻断和最小估值，不扩展通用行情平台或复杂风控。
 - 快照版本绑定账户ledger version和持仓版本，确保聚宽一次读取不会混合成交前后的状态。
 
-## S10当前候选
+## S10收口
 
 - 新增`SQLiteValuationService`与只读`PortfolioSnapshot`：现金、冻结、可用现金、持仓市值、总资产、净投入资金、费用、已实现/未实现/总盈亏和NAV一次返回。
 - 账户、持仓、lot、fill、资金流水和PnL账本均在同一SQLite读事务读取；并发成交发生在账户读取之后时，当前快照仍完整保持成交前版本。
@@ -207,7 +207,15 @@
 - 修复S09每股成本舍入尾差：lot剩余成本从原始fill总价费精确分摊，部分卖出用卖前与卖后剩余成本之差结转，佣金不能整除股数时也不丢金额。
 - 初始固定资金场景可直接使用NAV；发生后续显式增减资时`performance_ready=False`，防止把简单资产/净投入比率误当成严格份额净值。
 - 首轮审查发现物化`positions.sellable_qty`不会随T+1日期自动刷新，以及可变marks可能在校验与使用之间换批；候选现从同一lot快照按估值日计算可卖数，并在入口只复制一次mark证据。
-- S10定向11项、S04至S10加scheduler联合88项通过；flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS，等待复审。
+- S10定向11项、S04至S10加scheduler联合88项通过；flake8、targeted mypy/pyright、Python 3.8 AST和`git diff --check`均PASS。
+- 修复后的工作树复审APPROVE；实现提交`4e190cc`。
+- S10决定：DONE。
+
+## S11当前计划
+
+- 从QMT按配置lookback重复拉取订单、成交、资金和持仓，用broker order/trade ID归属到策略账户；不依赖进程内“上次看到哪里”。
+- 已映射成交复用S09幂等入账；无法映射的订单/成交进入明确待处理列表，账实现金或持仓差异阻断后续执行，但不自动覆盖本地账本。
+- 首版只实现单账户轮询摄取、对账结果和readiness，不扩展消息队列、多节点worker或通用告警平台。
 
 ## 恢复检查表
 
