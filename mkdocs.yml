@@ -46,6 +46,8 @@ nav:
       - 真实现金校准与策略资金: live-ledger/12-capital-allocation.md
       - 真实成交入账与持仓批次: live-ledger/13-fill-booking.md
       - 原子估值与组合快照: live-ledger/14-valuation-snapshot.md
+      - 个人量化精简计划: live-ledger/15-lean-personal-plan.md
+      - 飞书交易卡片通知: live-ledger/16-feishu-trade-notifications.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md

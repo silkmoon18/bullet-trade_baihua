@@ -36,6 +36,8 @@
 
 ## 3. Slice总览
 
+> D023已取代原S11至S20的机构级展开。S11至S20条目保留用于历史映射，不再逐项实施；当前权威剩余计划见[个人量化精简计划](15-lean-personal-plan.md)。
+
 | Slice | 名称 | 状态 | 依赖/结果 |
 |---|---|---|---|
 | S00 | Repository Baseline and Documentation | DONE | 检查点、最新基线、只读upstream、脱敏迁移、事实文档 |
@@ -49,16 +51,7 @@
 | S08 | Capital Allocation Ledger | DONE | 未分配池、初始1万元、按订单冻结/释放、显式资金流 |
 | S09 | Fill Booking and Position Lots | DONE | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | DONE | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
-| S11 | Broker Ingest and Reconciliation | IN_PROGRESS | 跨日重扫、归属、quarantine、HARD阻断和readiness |
-| S12 | Target Portfolio Planner | PENDING | NAV目标、整手、working exposure、费用缓冲和delta |
-| S13 | Execution Orchestrator and Baseline Risk | PENDING | 卖后买、部分成交、unknown、恢复、kill switch |
-| S14 | Strategy API and Authorization | PENDING | strategy.*、scope、feature握手、审计和统一错误 |
-| S15 | JoinQuant Live Runtime and good_etf | PENDING | PortfolioView、事件恢复、record、组合提交和策略重构 |
-| S16 | Performance and Observability | PENDING | TWR/回撤/费用、结构化日志、指标和告警 |
-| S17 | Automated E2E and Deployment Artifacts | PENDING | chaos、恢复、Windows服务、备份和runbook |
-| S18 | JoinQuant/Shadow Release Gate | BLOCKED | 真实平台smoke和至少5交易日只读证据 |
-| S19 | QMT Simulation Release Gate | BLOCKED | 至少5交易日模拟、凭据/TLS/对账证据 |
-| S20 | Small Live Approval Gate | BLOCKED | 用户审批、专用账户、小额实盘和扩资门禁 |
+| S11-S20 | 原机构级剩余计划 | PENDING | 已由D023合并为L00至L04；仅保留历史需求映射 |
 
 ## S00：Repository Baseline and Documentation
 

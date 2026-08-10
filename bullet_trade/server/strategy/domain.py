@@ -240,12 +240,15 @@ class BrokerOrder:
     state: OrderState
     trading_day: date
     broker_order_id: Optional[str] = None
+    limit_price_units: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_int(self.requested_qty, "requested_qty", minimum=1)
         _require_int(self.filled_qty, "filled_qty")
         if self.filled_qty > self.requested_qty:
             raise ValueError("filled_qty cannot exceed requested_qty")
+        if self.limit_price_units is not None:
+            _require_int(self.limit_price_units, "limit_price_units", minimum=1)
 
 
 @dataclass(frozen=True)

@@ -37,7 +37,13 @@ def services(tmp_path):
     return repository, capital, SQLiteFillBookingService(database_path)
 
 
-def _order(order_id, side, quantity, trading_day=date(2026, 8, 10)):
+def _order(
+    order_id,
+    side,
+    quantity,
+    trading_day=date(2026, 8, 10),
+    limit_price="2.00",
+):
     return BrokerOrder(
         order_id=order_id,
         account_id="good-etf",
@@ -50,6 +56,9 @@ def _order(order_id, side, quantity, trading_day=date(2026, 8, 10)):
         filled_qty=0,
         state=OrderState.SUBMITTED,
         trading_day=trading_day,
+        limit_price_units=(
+            price_to_units(limit_price) if limit_price is not None else None
+        ),
     )
 
 
@@ -318,3 +327,28 @@ def test_same_day_lots_use_trade_time_fifo_even_when_fills_arrive_out_of_order(s
     assert sold.realized_pnl_units == money_to_units("200")
     assert sold.position.total_qty == 100
     assert sold.position.avg_cost_price_units == price_to_units("3")
+
+
+def test_order_and_fill_emit_structured_trade_notifications(services):
+    _, capital, existing_booking = services
+    notifications = []
+    booking = SQLiteFillBookingService(
+        existing_booking.database_path,
+        notification_handler=notifications.append,
+    )
+    booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
+    booking.book_fill(
+        "good-etf",
+        _fill("f-1", "buy-1", OrderSide.BUY, 1000),
+        1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    assert [item.event for item in notifications] == ["ORDER_SUBMITTED", "FILLED"]
+    assert notifications[0].security == SECURITY
+    assert notifications[0].quantity == 1000
+    assert str(notifications[0].price) == "2"
+    assert str(notifications[0].amount) == "2000"
+    assert str(notifications[1].price) == "2"
+    assert str(notifications[1].amount) == "2005"

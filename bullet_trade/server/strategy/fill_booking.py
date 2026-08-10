@@ -7,7 +7,13 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional, Tuple, Union, cast
+from typing import Callable, Optional, Tuple, Union, cast
+
+from ..feishu_notifier import (
+    TradeNotification,
+    money_units_to_display,
+    price_units_to_display,
+)
 
 from .domain import (
     MONEY_SCALE,
@@ -100,8 +106,13 @@ def _position_from_row(row: sqlite3.Row) -> Position:
 
 
 class SQLiteFillBookingService:
-    def __init__(self, database_path: DatabasePath):
+    def __init__(
+        self,
+        database_path: DatabasePath,
+        notification_handler: Optional[Callable[[TradeNotification], object]] = None,
+    ):
         self.database_path = Path(database_path)
+        self._notification_handler = notification_handler
 
     def register_order(self, order: BrokerOrder) -> BrokerOrder:
         connection = connect_database(self.database_path)
@@ -124,8 +135,8 @@ class SQLiteFillBookingService:
                 INSERT INTO strategy_orders(
                     order_id, strategy_account_id, intent_id, client_tag,
                     broker_order_id, security, side, requested_qty, filled_qty,
-                    state, trading_day, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    state, trading_day, limit_price_units, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.order_id,
@@ -139,11 +150,36 @@ class SQLiteFillBookingService:
                     order.filled_qty,
                     order.state.value,
                     order.trading_day.isoformat(),
+                    order.limit_price_units,
                     timestamp,
                     timestamp,
                 ),
             )
             connection.commit()
+            self._notify(
+                TradeNotification(
+                    event="ORDER_SUBMITTED",
+                    security=order.security,
+                    side=order.side.value,
+                    status=order.state.value,
+                    quantity=order.requested_qty,
+                    price=(
+                        price_units_to_display(order.limit_price_units)
+                        if order.limit_price_units is not None
+                        else None
+                    ),
+                    amount=(
+                        money_units_to_display(
+                            _trade_value_units(
+                                order.limit_price_units, order.requested_qty
+                            )
+                        )
+                        if order.limit_price_units is not None
+                        else None
+                    ),
+                    order_id=order.order_id,
+                )
+            )
             return order
         except (AccountNotFoundError, FillConflictError):
             connection.rollback()
@@ -358,13 +394,31 @@ class SQLiteFillBookingService:
                 self._select_account(connection, account_id)
             )
             connection.commit()
-            return FillBookingResult(
+            result = FillBookingResult(
                 account=updated_account,
                 position=position,
                 order_state=order_state,
                 realized_pnl_units=realized_pnl_units,
                 duplicate=False,
             )
+            self._notify(
+                TradeNotification(
+                    event=order_state.value,
+                    security=fill.security,
+                    side=fill.side.value,
+                    status=order_state.value,
+                    quantity=fill.quantity,
+                    price=price_units_to_display(fill.price_units),
+                    amount=money_units_to_display(gross_units + fee_units),
+                    order_id=fill.order_id,
+                    trade_id=fill.broker_trade_id,
+                    detail="佣金及税费 ¥{}".format(
+                        money_units_to_display(fee_units)
+                    ),
+                    occurred_at=fill.traded_at,
+                )
+            )
+            return result
         except (
             AccountNotFoundError,
             FillBookingError,
@@ -474,7 +528,21 @@ class SQLiteFillBookingService:
                 self._select_account(connection, account_id)
             )
             connection.commit()
-            return OrderFinalizationResult(updated_account, released, False)
+            result = OrderFinalizationResult(updated_account, released, False)
+            self._notify(
+                TradeNotification(
+                    event=terminal_state.value,
+                    security=order["security"],
+                    side=order["side"],
+                    status=terminal_state.value,
+                    quantity=order["requested_qty"] - order["filled_qty"],
+                    order_id=order_id,
+                    detail="释放冻结资金 ¥{}".format(
+                        money_units_to_display(released)
+                    ),
+                )
+            )
+            return result
         except (
             AccountNotFoundError,
             FillBookingError,
@@ -787,4 +855,13 @@ class SQLiteFillBookingService:
             filled_qty=row["filled_qty"],
             state=OrderState(row["state"]),
             trading_day=date.fromisoformat(row["trading_day"]),
+            limit_price_units=row["limit_price_units"],
         )
+
+    def _notify(self, notification: TradeNotification) -> None:
+        if self._notification_handler is None:
+            return
+        try:
+            self._notification_handler(notification)
+        except Exception:
+            pass

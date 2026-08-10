@@ -20,6 +20,8 @@
 14. [真实现金校准与策略资金](12-capital-allocation.md)
 15. [真实成交入账与持仓批次](13-fill-booking.md)
 16. [原子估值与组合快照](14-valuation-snapshot.md)
+17. [个人量化精简计划](15-lean-personal-plan.md)
+18. [飞书交易卡片通知](16-feishu-trade-notifications.md)
 
 ## 权威边界
 
