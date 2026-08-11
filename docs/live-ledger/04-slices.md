@@ -52,8 +52,8 @@
 | S09 | Fill Booking and Position Lots | DONE | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | DONE | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11-S20 | 原机构级剩余计划 | PENDING | 已由D023合并为L00至L04；仅保留历史需求映射 |
-| L00 | Existing Code Pruning | IN_PROGRESS | 裁剪helper对抗门禁、深层导出扫描、多worker lease和历史审查正文 |
-| L01 | QMT Sync and Reconciliation | PENDING | 单账户订单/成交/资金/持仓同步与READY/BLOCKED |
+| L00 | Existing Code Pruning | DONE | `cd5ed99`：净删除约1.6万行，334项定向矩阵通过 |
+| L01 | QMT Sync and Reconciliation | REVIEW | 单账户订单/成交/资金/持仓同步与READY/BLOCKED |
 | L02 | Target Planner and Executor | PENDING | 目标权重、先卖后买、整手/现金缓冲、kill switch |
 | L03 | Strategy API and JoinQuant View | PENDING | ensure/snapshot/targets/intent/events/reconciliation与PortfolioView |
 | L04 | Local Deployment and Small Live | PENDING | 服务启动、备份、飞书通知、SHADOW/模拟/小额人工验收 |
@@ -482,7 +482,7 @@ Decision: DONE
 
 ### 当前状态
 
-- 裁剪实施完成，两路独立审查APPROVE且findings已修复复测；待实现提交后标记DONE。
+- DONE：实现提交`cd5ed99`。主审撤销破坏性删表迁移、补齐旧接口文档失效提示后，334项定向矩阵及静态检查通过。
 
 ### 实施计划
 
@@ -512,8 +512,27 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 - 文档：S01/S03逐轮审查历史归档至`docs/live-ledger/archive/`（结论失效仅作记录）；00/03/04/06/08/11/12/14与两份README对齐现状；三篇上游接管文档与notebook 04添加失效标注。
 - 测试证据：L00定向矩阵334 passed（runtime 121、策略契约25、helpers 31、typings 12、export 36、server 97、scheduler 12；PYTHONUTF8=1、DEFAULT_DATA_PROVIDER=easy_tdx）；全量724 passed、8个既有环境失败（pre-L00基线worktree复跑同样8失败，与L00无关）；strict mypy/pyright 0 issues；阻断级flake8、py3.8 AST、S00 baseline、`git diff --check`均PASS。
 - 审查：helper/策略路APPROVE（MAJOR“profile校验零覆盖”已补64用例；MINOR幂等重装重装guard、签名含run_type已修复）；导出器/server/文档路APPROVE（无BLOCKER/MAJOR；两条MINOR为已声明的能力收窄）。
-- 实现提交：（待用户确认git提交后补录SHA）。
-- L00决定：DONE（提交后生效）。
+- 实现提交：`cd5ed99`。
+- L00决定：DONE。
+
+## L01：QMT Sync and Reconciliation
+
+### 当前状态
+
+- REVIEW：核心实现和9项定向测试完成，等待提交前联合回归与最终审查。
+
+### 最小实现
+
+- 同时支持同步QMT broker和BulletTrade异步server adapter采集账户、持仓、订单、成交快照。
+- 只有通过`strategy_ledger_v1`能力合同的适配器才能进入同步；未完成真实探针时持久化BLOCKED。
+- 已知broker trade按成交证据转换为现有`BrokerFill`并复用S09事务/去重/T+1入账。
+- 未知订单、未知成交、丢失working order、现金差异或持仓差异均BLOCKED，不自动覆盖本地账本。
+- 每轮结果写入`reconciliation_runs`并更新物理/策略账户状态；READY只解除`RECONCILIATION_BLOCKED`，不会清掉人工`TRADING_BLOCKED`或CLOSED。
+- 首版为专用账户单策略；跨日遗漏最终通过现金/持仓差异失败关闭，真实lookback能力仍必须由QMT探针确认。
+
+### 验证
+
+- 空账户READY、真实买入fill及重复快照no-op、未知订单、未知成交、现金/持仓差异、撤单释放、kill switch保持、能力未证明BLOCKED、同步/异步采集。
 
 ## 4. Review记录模板
 

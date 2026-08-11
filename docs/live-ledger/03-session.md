@@ -2,7 +2,7 @@
 
 ## Session元数据
 
-- 日期：2026-08-10
+- 日期：2026-08-11
 - 时区：Asia/Shanghai
 - 工作分支：`feat/joinquant-live-ledger`
 - 上游基线：`v0.9.2 / be0451b`
@@ -41,17 +41,16 @@
 
 ## 最近完成slice
 
-`S10 Valuation and Atomic Snapshot`（DONE）
+`L00 Existing Code Pruning`（DONE，`cd5ed99`）
 
 ## 当前slice
 
-`L00 Existing Code Pruning`（IN_PROGRESS，2026-08-10 开始）
+`L01 QMT Sync and Reconciliation`（REVIEW）
 
-- 按`15-lean-personal-plan.md`执行裁剪；实施计划见`04-slices.md`的L00章节。
-- 基线定向矩阵576 passed：tests/test_jq_strategy_runtime.py、tests/test_jq_runtime_reload_deadlock_regression.py、tests/test_jq_remote_helper.py、tests/strategies/test_good_etf_contract.py、tests/helpers/、tests/test_joinquant_export.py、tests/test_joinquant_typings.py、tests/server/、tests/test_async_scheduler.py（PYTHONUTF8=1、DEFAULT_DATA_PROVIDER=easy_tdx）。
-
-- helper精简完成：6001→403行，旧远程交易API与同进程对抗机制已删除；`good_etf.py` 826→489行；导出器1500→615行（127→36用例）；idempotency裁剪为单进程原子认领；`adjust_capital`固化为仅管理员修复入口。未新增破坏性schema迁移，暂不用的`corporate_actions`表保留兼容。
-- 本小节此前残留的S03时期逐轮冻结记录与"当前边界"块已按L00归档（见`archive/`），不再构成有效证据。
+- 新增同步/异步QMT快照采集和`SQLiteReconciliationService`。
+- 已知fill复用S09原子入账；未知活动、现金/持仓差异和缺失working order持久化BLOCKED。
+- READY不解除人工kill switch；未完成QMT能力探针时明确BLOCKED。
+- 9项L01定向测试、86项StrategyLedger联合回归通过；pyright、flake8和Python 3.8检查通过。
 
 ## S03收口
 
@@ -62,7 +61,7 @@
 
 ## 下一步
 
-实现最小SQLite事务repository、CAS、单调事件序列和重放，不扩展多节点或多租户框架。
+完成L01提交前审查；通过后进入L02目标规划与执行。
 
 ## S04收口
 
@@ -181,8 +180,7 @@
 
 ## D023后的下一步计划
 
-- 本次只更新计划，未执行裁剪。权威计划见`15-lean-personal-plan.md`。
-- L00先删除早期过重的helper对抗门禁、深层导出扫描、通用化预留和历史审查正文，同时保留实盘账务底线。
+- L00已在`cd5ed99`完成并保留实盘账务底线。
 - L01至L04依次完成单账户同步对账、目标规划执行、聚宽真实视图、本机部署与小额验收。
 
 ## 恢复检查表
