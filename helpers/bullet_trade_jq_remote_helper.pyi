@@ -10,6 +10,8 @@ PROFILE_SCHEMA_VERSION: int
 
 
 class PositionView:
+    def __init__(self, payload: Dict[str, Any]) -> None: ...
+
     security: str
     total_amount: int
     closeable_amount: int
@@ -20,6 +22,8 @@ class PositionView:
 
 
 class PortfolioView:
+    def __init__(self, payload: Dict[str, Any]) -> None: ...
+
     account_id: str
     as_of: str
     snapshot_version: str
@@ -90,5 +94,4 @@ def get_intent(
     intent_id: Optional[str] = ...,
     idempotency_key: Optional[str] = ...,
 ) -> Dict[str, Any]: ...
-def get_events(after_seq: int = ...) -> Dict[str, Any]: ...
 def get_reconciliation() -> Dict[str, Any]: ...

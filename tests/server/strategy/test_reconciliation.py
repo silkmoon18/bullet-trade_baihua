@@ -296,3 +296,54 @@ def test_async_server_adapter_snapshot_is_supported():
 
     assert snapshot.available_cash_units == money_to_units("10000")
     assert snapshot.positions == (BrokerPositionSnapshot(SECURITY, 100, 50),)
+
+
+def test_async_server_adapter_wrapped_account_snapshot_is_supported():
+    class Adapter:
+        async def get_account_info(self, account):
+            return {"dtype": "dict", "value": {"available_cash": 10000.0}}
+
+        async def get_positions(self, account):
+            return []
+
+        async def list_orders(self, account, filters=None):
+            return []
+
+        async def list_trades(self, account, filters=None):
+            return []
+
+    snapshot = asyncio.run(collect_async_broker_snapshot(Adapter(), object()))
+
+    assert snapshot.available_cash_units == money_to_units("10000")
+
+
+def test_submit_unknown_order_is_adopted_by_exact_client_tag(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    local = replace(_order(), state=OrderState.SUBMIT_UNKNOWN, broker_order_id=None)
+    booking.register_order(local)
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, local.order_id)
+    broker_order = {
+        "order_id": "broker-recovered-1",
+        "security": SECURITY,
+        "status": "open",
+        "is_buy": True,
+        "order_remark": "sub:personal|{}".format(local.client_tag),
+    }
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID, PHYSICAL_ID, _snapshot("17900", orders=(broker_order,))
+    )
+
+    assert result.state is ReconciliationState.READY
+    assert result.details["adopted_order_ids"] == (local.order_id,)
+    connection = connect_database(database)
+    try:
+        row = connection.execute(
+            "SELECT state, broker_order_id FROM strategy_orders WHERE order_id = ?",
+            (local.order_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row["state"] == OrderState.SUBMITTED.value
+    assert row["broker_order_id"] == "broker-recovered-1"

@@ -174,6 +174,19 @@ def _portfolio(context: 'Context') -> Any:
     return portfolio
 
 
+def _ensure_live_ready(context: 'Context') -> None:
+    if bt is None:
+        raise RuntimeError('LIVE缺少聚宽helper')
+    ensured = bt.ensure_account(INITIAL_CAPITAL)
+    reconciliation = ensured.get('reconciliation', {})
+    if reconciliation.get('state') != 'READY':
+        raise RuntimeError('真实账户对账未就绪: {}'.format(
+            reconciliation.get('details', {}).get('blockers', [])))
+    _portfolio(context)
+    _restore_live_intent()
+    g.bt_runtime['production_ready'] = True
+
+
 def _submit_live_targets(
     context: 'Context',
     weights: Dict[str, float],
@@ -299,15 +312,7 @@ def initialize(context: 'Context') -> None:
     g.fund_list = None
     g.bt_intent_id = None
     if _runtime_mode() == 'LIVE':
-        if bt is None:
-            raise RuntimeError('LIVE缺少聚宽helper')
-        ensured = bt.ensure_account(INITIAL_CAPITAL)
-        reconciliation = ensured.get('reconciliation', {})
-        if reconciliation.get('state') != 'READY':
-            raise RuntimeError('真实账户对账未就绪: {}'.format(
-                reconciliation.get('details', {}).get('blockers', [])))
-        _portfolio(context)
-        _restore_live_intent()
+        _ensure_live_ready(context)
 
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
@@ -333,11 +338,7 @@ def process_initialize(context: 'Context') -> None:
     """
     _install_runtime(context)
     if _runtime_mode() == 'LIVE':
-        if bt is None:
-            raise RuntimeError('LIVE缺少聚宽helper')
-        bt.ensure_account(INITIAL_CAPITAL)
-        _portfolio(context)
-        _restore_live_intent()
+        _ensure_live_ready(context)
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 

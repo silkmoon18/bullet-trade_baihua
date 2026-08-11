@@ -72,7 +72,6 @@ _SENSITIVE_NAMES = {
     "host",
     "password",
     "secret",
-    "sub_account_id",
     "tls_cert",
     "token",
     "webhook",
@@ -83,14 +82,8 @@ _PROFILE_REQUIRED_FIELDS = {"strategy_id", "host", "token"}
 _PROFILE_OPTIONAL_FIELDS = {
     "port",
     "account_key",
-    "sub_account_id",
     "tls_cert",
-    "retries",
-    "retry_interval",
     "rpc_timeout",
-    "place_order_timeout_margin",
-    "default_wait_timeout",
-    "debug",
 }
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
 
@@ -293,17 +286,9 @@ def _validate_profile_shape(
                 "{} template host/token must remain empty".format(source_name)
             )
         port = profile.get("port", 58620)
-        retries = profile.get("retries", 2)
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValidationError("{} profile has invalid port".format(source_name))
-        if type(retries) is not int or not 0 <= retries <= 10:
-            raise ValidationError("{} profile has invalid retries".format(source_name))
-        for field, minimum, maximum in (
-            ("retry_interval", 0.1, 30.0),
-            ("rpc_timeout", 5.0, 300.0),
-            ("place_order_timeout_margin", 0.0, 300.0),
-            ("default_wait_timeout", 0.0, 300.0),
-        ):
+        for field, minimum, maximum in (("rpc_timeout", 5.0, 300.0),):
             if field not in profile:
                 continue
             value = profile[field]
@@ -311,9 +296,7 @@ def _validate_profile_shape(
                 raise ValidationError(
                     "{} profile has invalid {}".format(source_name, field)
                 )
-        if type(profile.get("debug", True)) is not bool:
-            raise ValidationError("{} profile has invalid debug".format(source_name))
-        for field in ("account_key", "sub_account_id", "tls_cert"):
+        for field in ("account_key", "tls_cert"):
             value = profile.get(field)
             if value is not None and (
                 type(value) is not str

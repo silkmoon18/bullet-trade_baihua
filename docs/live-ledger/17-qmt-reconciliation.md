@@ -6,7 +6,7 @@
 
 1. 采集券商可用资金、持仓、订单和成交。服务同时提供同步broker和异步server adapter采集函数。
 2. 校验适配器已经通过`strategy_ledger_v1`能力探针；未证明稳定订单号、成交号、费用、状态和lookback时直接BLOCKED。
-3. broker order ID映射本地策略订单；任何未知订单或成交都视为专用账户中的人工/外部活动并BLOCKED。
+3. 优先用broker order ID映射本地策略订单；提交响应丢失时，允许用券商原样返回的完整`client_tag`备注认领唯一的`SUBMIT_UNKNOWN`订单。除此之外的未知订单或成交仍视为专用账户中的人工/外部活动并BLOCKED。
 4. 已知真实成交按现有FillBooking事务入账；重复成交自动no-op，买入lot按T+1处理。
 5. 处理撤单/拒单并释放对应冻结资金。
 6. 比较券商可用资金与物理未分配资金＋策略可用资金，比较券商持仓与策略lot持仓。
@@ -26,6 +26,6 @@ if result.state is not ReconciliationState.READY:
     log.error("账实对账阻断: %s", result.details["blockers"])
 ```
 
-BulletTrade server内部使用`collect_async_broker_snapshot(adapter, account_context)`采集相同结构。
+BulletTrade server内部使用`collect_async_broker_snapshot(adapter, account_context)`采集相同结构，并兼容MiniQMT adapter的`{"dtype":"dict","value":...}`账户包装。
 
 READY只表示本轮券商事实与账本一致。它只会解除此前的`RECONCILIATION_BLOCKED`，不会清除人工`TRADING_BLOCKED`、CLOSED或其它kill switch。当前MiniQMT/BigQMT预置能力仍为`PROBE_REQUIRED`，真实环境探针通过前不会放行下单。

@@ -880,6 +880,23 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         if amount != raw_amount:
             logger.info(f"{security} 数量从 {raw_amount} 取整为 {amount}")
 
+        # StrategyLedger persists one broker order id per local order. The
+        # legacy QMT broker can split a large request and return only its first
+        # id, which would make the remaining child orders unaccounted for.
+        # Fail explicitly for ledger orders instead of creating an inconsistent
+        # one-to-many relationship.
+        live_cfg = get_live_trade_config()
+        max_volume = int(live_cfg.get("order_max_volume") or 1_000_000)
+        remark_tokens = tuple(
+            item.strip() for item in str(remark or "").split("|") if item.strip()
+        )
+        if any(item.startswith("bt:") for item in remark_tokens) and amount > max_volume:
+            raise ValueError(
+                "StrategyLedger单笔数量不能超过ORDER_MAX_VOLUME（{} > {}）".format(
+                    amount, max_volume
+                )
+            )
+
         # ========== 4. 价格处理 ==========
         requested_price = style.get("price")
         if requested_price in (None, ""):
@@ -906,7 +923,6 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                     )
                 logger.info(f"{security} 市价单沿用客户端保护价: {price:.4f} " f"（基准价={last_price:.4f}）")
             else:
-                live_cfg = get_live_trade_config()
                 buy_percent = float(live_cfg.get("market_buy_price_percent", 0.015))
                 sell_percent = float(live_cfg.get("market_sell_price_percent", -0.015))
                 percent = buy_percent if is_buy else sell_percent

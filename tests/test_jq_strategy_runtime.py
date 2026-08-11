@@ -63,7 +63,7 @@ def _state(mode, run_type, **extra):
         "strategy_id": STRATEGY_ID,
         "enabled": mode in ("SHADOW", "LIVE"),
         "orders_enabled": mode in ("BACKTEST", "LIVE"),
-        "production_ready": mode == "LIVE",
+        "production_ready": False,
         "reason": "backtest",
     }
     state.update(extra)
@@ -78,7 +78,6 @@ def test_public_contract_exports_and_constants(helper):
         "STRATEGY_RUNTIME_API_VERSION",
         "STRATEGY_RUNTIME_HELPER_MARKER",
         "ensure_account",
-        "get_events",
         "get_intent",
         "get_portfolio",
         "get_reconciliation",
@@ -142,7 +141,7 @@ def test_live_state_exact(helper, monkeypatch):
     _profile_module(monkeypatch)
     assert _install(helper, mode="LIVE") == _state(
         "LIVE", "sim_trade",
-        reason="strategy_ledger_v1",
+        reason="profile_validated",
         profile_module=PROFILE_MODULE,
         mirror_jq_orders=False,
         blocked_mutations=BLOCKED_MUTATIONS)
@@ -271,12 +270,9 @@ def test_profile_strategy_id_mismatch_rejected(helper, monkeypatch):
 
 
 _NUMERIC_FIELDS = {
-    "retry_interval": (0.1, 30.0),
     "rpc_timeout": (5.0, 300.0),
-    "place_order_timeout_margin": (0.0, 300.0),
-    "default_wait_timeout": (0.0, 300.0),
 }
-_OPTIONAL_STRING_FIELDS = ["account_key", "sub_account_id", "tls_cert"]
+_OPTIONAL_STRING_FIELDS = ["account_key", "tls_cert"]
 
 
 @pytest.mark.parametrize("field", sorted(_NUMERIC_FIELDS))
@@ -298,14 +294,8 @@ def test_profile_numeric_fields_reject_non_finite(helper, monkeypatch, field, va
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("retry_interval", 0.05),
-        ("retry_interval", 30.5),
         ("rpc_timeout", 4.9),
         ("rpc_timeout", 300.1),
-        ("place_order_timeout_margin", -0.1),
-        ("place_order_timeout_margin", 300.1),
-        ("default_wait_timeout", -0.1),
-        ("default_wait_timeout", 300.1),
     ],
 )
 def test_profile_numeric_fields_reject_out_of_range(helper, monkeypatch, field, value):
@@ -321,13 +311,6 @@ def test_profile_numeric_fields_reject_out_of_range(helper, monkeypatch, field, 
 def test_profile_numeric_fields_accept_boundaries(helper, monkeypatch, field, value):
     _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(**{field: value})})
     assert _install(helper)["mode"] == "SHADOW"
-
-
-@pytest.mark.parametrize("debug", [0, 1, "true", None])
-def test_profile_debug_must_be_bool(helper, monkeypatch, debug):
-    _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(debug=debug)})
-    with pytest.raises(RuntimeError, match=r"profile\.debug 必须是布尔值"):
-        _install(helper)
 
 
 @pytest.mark.parametrize("field", _OPTIONAL_STRING_FIELDS)
@@ -349,9 +332,9 @@ def test_profile_optional_strings_reject_invalid(helper, monkeypatch, field, val
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("port", 1), ("port", 65535), ("retries", 0), ("retries", 10)],
+    [("port", 1), ("port", 65535)],
 )
-def test_profile_port_and_retries_accept_boundaries(helper, monkeypatch, field, value):
+def test_profile_port_accepts_boundaries(helper, monkeypatch, field, value):
     _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(**{field: value})})
     assert _install(helper)["mode"] == "SHADOW"
 

@@ -15,13 +15,7 @@ PROFILES = {
         "token": "",
         "port": 58620,
         "account_key": None,
-        "sub_account_id": None,
         "tls_cert": None,
-        "retries": 2,
-        "retry_interval": 0.5,
         "rpc_timeout": 60.0,
-        "place_order_timeout_margin": 30.0,
-        "default_wait_timeout": 16.0,
-        "debug": False,
     },
 }

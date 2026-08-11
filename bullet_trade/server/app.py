@@ -280,8 +280,6 @@ class ServerApplication:
             return await self.strategy_api.submit_targets(account_context, resolved_key, payload)
         if method == "get_intent":
             return self.strategy_api.get_intent(payload)
-        if method == "get_events":
-            return self.strategy_api.get_events(payload)
         if method == "get_reconciliation":
             return self.strategy_api.get_reconciliation(resolved_key, payload)
         raise ValueError(f"未知策略接口: {method}")

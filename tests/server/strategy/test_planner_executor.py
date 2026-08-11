@@ -94,14 +94,33 @@ def test_weight_target_creates_one_lot_rounded_buy_and_reserves_cash(tmp_path):
     assert len(result.orders) == 1
     assert result.orders[0].side is OrderSide.BUY
     assert result.orders[0].quantity == 500
+    assert result.orders[0].limit_price_units == price_to_units("10.02")
     account = repository.get_strategy_account(ACCOUNT)
-    assert account.reserved_cash_units == money_to_units("5005")
+    assert account.reserved_cash_units == money_to_units("5015")
     connection = connect_database(database)
     try:
         row = connection.execute("SELECT state FROM strategy_orders").fetchone()
         assert row[0] == OrderState.PENDING_SUBMIT.value
     finally:
         connection.close()
+
+
+def test_cash_buffer_does_not_shrink_weight_target(tmp_path):
+    database, _, _, _, _, snapshot, marks, as_of = _setup(tmp_path)
+    planner = SQLiteTargetExecutionService(
+        database,
+        PlannerConfig(
+            cash_buffer_units=money_to_units("100"),
+            trading_enabled=True,
+            max_age=timedelta(minutes=10),
+        ),
+    )
+
+    result = planner.submit_target_weights(
+        ACCOUNT, "whole-portfolio-weight", {A: 0.5}, snapshot, marks, as_of
+    )
+
+    assert result.orders[0].quantity == 500
 
 
 def test_same_joinquant_key_does_not_create_duplicate_order(tmp_path):
@@ -149,6 +168,23 @@ def test_dispatch_success_attaches_real_broker_order_id(tmp_path):
         assert tuple(row) == (OrderState.SUBMITTED.value, "broker-100")
     finally:
         connection.close()
+
+
+def test_submitted_order_becomes_stale_after_timeout(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planner.submit_target_weights(
+        ACCOUNT, "stale-order", {A: "0.5"}, snapshot, marks, as_of
+    )
+
+    async def submit(_):
+        return {"order_id": "broker-stale"}
+
+    asyncio.run(planner.dispatch_next(submit))
+
+    assert planner.stale_broker_order_ids(ACCOUNT) == ()
+    assert planner.stale_broker_order_ids(
+        ACCOUNT, datetime.now(SHANGHAI_TZ) + timedelta(minutes=11)
+    ) == ("broker-stale",)
 
 
 def test_dispatch_exception_becomes_submit_unknown_and_is_not_retried(tmp_path):

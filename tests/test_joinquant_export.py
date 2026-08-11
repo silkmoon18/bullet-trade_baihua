@@ -311,10 +311,7 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
         "PROFILES = {'good_etf-prod': {"
         "'strategy_id': 'good_etf', 'host': '10.0.0.8', "
         "'token': 'hard-coded-real-token', 'port': 58620, "
-        "'account_key': None, 'sub_account_id': None, 'tls_cert': None, "
-        "'retries': 2, 'retry_interval': 0.5, 'rpc_timeout': 60.0, "
-        "'place_order_timeout_margin': 30.0, "
-        "'default_wait_timeout': 16.0, 'debug': False}}\n",
+        "'account_key': None, 'tls_cert': None, 'rpc_timeout': 60.0}}\n",
         encoding="utf-8",
     )
 
@@ -354,8 +351,8 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
             "PROFILE_SCHEMA_VERSION = 1\n"
             "PROFILES = {'good_etf-prod': {'strategy_id': 'good_etf', "
             "'host': '10.0.0.8', 'token': 'real-token', "
-            "'retry_interval': None}}\n",
-            "invalid retry_interval",
+            "'rpc_timeout': None}}\n",
+            "invalid rpc_timeout",
         ),
         (
             "PROFILE_SCHEMA_VERSION = 1\n"

@@ -12,6 +12,7 @@ from bullet_trade.server.strategy import (
     money_to_units,
     MINI_QMT_CAPABILITIES,
 )
+from bullet_trade.server.strategy.schema import connect_database
 
 
 SECURITY = "510050.XSHG"
@@ -42,6 +43,7 @@ class FakeBroker:
         self.cash = 20_000.0
         self.orders = []
         self.order_calls = 0
+        self.cancel_calls = []
 
     async def get_account_info(self, account):
         return {"available_cash": self.cash}
@@ -71,6 +73,10 @@ class FakeBroker:
             }
         )
         return {"order_id": order_id}
+
+    async def cancel_order(self, account, order_id):
+        self.cancel_calls.append(order_id)
+        return {"order_id": order_id, "canceled": True}
 
 
 class FakeData:
@@ -137,22 +143,31 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     }
 
     first = await service.submit_targets(account, "default", request)
+    connection = connect_database(service.database_path)
+    try:
+        connection.execute(
+            "UPDATE strategy_orders SET submitted_at = ?",
+            ("2020-01-01T10:00:00+08:00",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     second = await service.submit_targets(account, "default", request)
     intent_id = first["intent"]["intent_id"]
-    events = service.get_events({"strategy_id": "good_etf", "after_seq": 0})
     restored = service.get_intent({"strategy_id": "good_etf"})
 
     assert broker.order_calls == 1
+    assert broker.cancel_calls == ["broker-1"]
+    assert second["cancel_requested_order_ids"] == ["broker-1"]
     assert any(item.event == "ORDER_SUBMITTED" for item in notifications)
     assert first["intent"]["intent_id"] == second["intent"]["intent_id"]
     assert restored["intent_id"] == intent_id
     assert restored["weights"] == {SECURITY: 0.5}
-    assert first["snapshot"]["available_cash"] == 4_995.0
-    assert first["snapshot"]["reserved_cash"] == 5_005.0
+    assert first["snapshot"]["available_cash"] == 4_985.0
+    assert first["snapshot"]["reserved_cash"] == 5_015.0
     assert service.get_intent(
         {"strategy_id": "good_etf", "intent_id": intent_id}
     )["intent_id"] == intent_id
-    assert events["last_seq"] > 0
     assert service.get_reconciliation(
         "default", {"strategy_id": "good_etf"}
     )["reconciliation"]["state"] == "READY"

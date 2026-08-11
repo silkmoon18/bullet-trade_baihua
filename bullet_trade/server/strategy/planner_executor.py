@@ -45,7 +45,9 @@ class PlannerConfig:
     cash_buffer_units: int = 1_000_000
     minimum_order_units: int = 0
     buy_fee_buffer_units: int = 50_000
+    limit_price_offset_ppm: int = 2_000
     max_age: timedelta = timedelta(minutes=5)
+    working_order_timeout: timedelta = timedelta(minutes=10)
     order_wait_timeout_seconds: float = 16.0
     trading_enabled: bool = False
     allow_buys: bool = True
@@ -56,8 +58,15 @@ class PlannerConfig:
         for name in ("cash_buffer_units", "minimum_order_units", "buy_fee_buffer_units"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError("{} must be non-negative".format(name))
+        if (
+            type(self.limit_price_offset_ppm) is not int
+            or not 0 <= self.limit_price_offset_ppm <= 50_000
+        ):
+            raise ValueError("limit_price_offset_ppm must be between 0 and 50000")
         if self.max_age < timedelta(0):
             raise ValueError("max_age cannot be negative")
+        if self.working_order_timeout <= timedelta(0):
+            raise ValueError("working_order_timeout must be positive")
         if (
             type(self.order_wait_timeout_seconds) not in (int, float)
             or not 0 < self.order_wait_timeout_seconds <= 120
@@ -148,7 +157,10 @@ class SQLiteTargetExecutionService:
                 raise TargetPlanningError("idempotency key has different weights")
             return self.advance_intent(existing.intent_id, snapshot, marks, now)
         self._require_ready(account_id, snapshot, now or datetime.now(SHANGHAI_TZ))
-        investable = max(0, snapshot.total_assets_units - self.config.cash_buffer_units)
+        # Weights describe the whole portfolio. Enforce the cash buffer only
+        # when buys are made; subtracting it here shrinks existing positions
+        # and double-applies a strategy-level reserve such as DEPLOY_RATIO.
+        investable = snapshot.total_assets_units
         quantities = {}
         for security, weight in normalized.items():
             mark = marks.get(security)
@@ -202,11 +214,23 @@ class SQLiteTargetExecutionService:
                 desired = min(-delta, position.sellable_qty if position else 0)
                 quantity = desired if target == 0 and desired == current else desired // self.config.lot_size * self.config.lot_size
                 if quantity:
-                    sells.append((security, quantity, mark.price_units))
+                    sells.append(
+                        (
+                            security,
+                            quantity,
+                            self._limit_price(mark.price_units, OrderSide.SELL),
+                        )
+                    )
             elif self.config.allow_buys:
                 quantity = delta // self.config.lot_size * self.config.lot_size
                 if quantity:
-                    buys.append((security, quantity, mark.price_units))
+                    buys.append(
+                        (
+                            security,
+                            quantity,
+                            self._limit_price(mark.price_units, OrderSide.BUY),
+                        )
+                    )
 
         if sell_pending and not sells:
             return IntentAdvanceResult(
@@ -264,6 +288,29 @@ class SQLiteTargetExecutionService:
             return _intent(cast(sqlite3.Row, row))
         finally:
             connection.close()
+
+    def stale_broker_order_ids(
+        self,
+        account_id: str,
+        now: Optional[datetime] = None,
+    ) -> Tuple[str, ...]:
+        current = now or datetime.now(SHANGHAI_TZ)
+        result = []
+        for row in self._working_orders(account_id):
+            if row["state"] not in (
+                OrderState.SUBMITTED.value,
+                OrderState.PARTIALLY_FILLED.value,
+            ) or not row["broker_order_id"]:
+                continue
+            submitted_at = row["submitted_at"] or row["updated_at"]
+            if not submitted_at:
+                continue
+            timestamp = datetime.fromisoformat(submitted_at)
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                timestamp = timestamp.replace(tzinfo=SHANGHAI_TZ)
+            if current - timestamp >= self.config.working_order_timeout:
+                result.append(str(row["broker_order_id"]))
+        return tuple(result)
 
     def _create_intent(self, account_id, key, version, weights, quantities):
         if not key:
@@ -364,6 +411,12 @@ class SQLiteTargetExecutionService:
                 result.append((security, quantity, price))
                 available -= value + self.config.buy_fee_buffer_units
         return result
+
+    def _limit_price(self, mark_price_units, side):
+        offset = self.config.limit_price_offset_ppm
+        if side is OrderSide.BUY:
+            return (mark_price_units * (NAV_SCALE + offset) + NAV_SCALE - 1) // NAV_SCALE
+        return max(1, mark_price_units * (NAV_SCALE - offset) // NAV_SCALE)
 
     def _require_ready(self, account_id, snapshot, now):
         if not self.config.trading_enabled:

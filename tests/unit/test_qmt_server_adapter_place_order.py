@@ -143,6 +143,48 @@ async def test_qmt_server_market_order_prefers_client_protect_price(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_strategy_ledger_order_rejects_legacy_qmt_auto_split(monkeypatch):
+    async def _fake_snapshot(_security):
+        return {
+            "last_price": 2.0,
+            "high_limit": 2.2,
+            "low_limit": 1.8,
+            "paused": False,
+        }
+
+    monkeypatch.setenv("ORDER_MAX_VOLUME", "500")
+    config = ServerConfig(
+        server_type="qmt",
+        listen="127.0.0.1",
+        port=0,
+        token="t",
+        enable_data=False,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    adapter = QmtBrokerAdapter(config, router)
+    ctx = router.get("default")
+    fake_broker = _FakeBroker()
+    adapter._brokers[ctx.config.key] = fake_broker
+    monkeypatch.setattr(adapter, "_get_live_snapshot", _fake_snapshot)
+
+    with pytest.raises(ValueError, match="ORDER_MAX_VOLUME"):
+        await adapter.place_order(
+            ctx,
+            {
+                "security": "159967.SZ",
+                "side": "BUY",
+                "amount": 1000,
+                "style": {"type": "limit", "price": 2.0},
+                "order_remark": "bt:test:split",
+            },
+        )
+
+    assert fake_broker.calls == []
+
+
+@pytest.mark.asyncio
 async def test_qmt_server_clamps_explicit_market_buy_protect_price_to_cage(monkeypatch):
     async def _fake_snapshot(_security):
         return {

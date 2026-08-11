@@ -25,9 +25,9 @@
 - `host`：BulletTrade 服务地址；
 - `token`：服务端认证 token。
 
-可选字段为 `port`、`account_key`、`sub_account_id`、`tls_cert`、`retries`、`retry_interval`、`rpc_timeout`、`place_order_timeout_margin`、`default_wait_timeout` 和 `debug`。`PROFILES`和单个profile必须是普通`dict`，字段名和字符串值必须是普通`str`，数值与布尔字段也只接受对应的精确内建类型。未知字段会被拒绝且不会回显字段名；配置导入或属性读取的意外异常使用固定消息且不保留异常链，避免日志/异常采集器通过错误文本或`__context__`取回 token。超范围或异常大的精确整数也只产生稳定的契约错误。
+可选字段仅为 `port`、`account_key`、`tls_cert` 和 `rpc_timeout`。`PROFILES`和单个profile必须是普通`dict`，字段名和字符串值必须是普通`str`。未知字段会被拒绝且不会回显字段名；配置导入或属性读取的意外异常使用固定消息且不保留异常链，避免日志/异常采集器通过错误文本或`__context__`取回 token。
 
-为避免配置笔误造成无限等待，schema v1限制`retries`为0至10、`retry_interval`为0.1至30秒、`rpc_timeout`为5至300秒、下单等待及其安全余量为0至300秒。
+为避免配置笔误造成无限等待，schema v1限制`rpc_timeout`为5至300秒。helper当前不执行自动重试，避免一次聚宽调用在网络不确定时重复提交。
 
 ## 模式边界
 
@@ -35,11 +35,11 @@
 |---|---|---|---|
 | `BACKTEST` | `simple_backtest`、`full_backtest` | helper可缺省；存在时校验marker/API版本与回测run_type，仍不导入私有profile或连接网络 | 使用聚宽原生回测订单，不替换下单函数 |
 | `SHADOW` | `sim_trade` | 必须通过profile schema v1校验；不建远程连接 | 只生成计划和日志；所有下单、撤单入口均被替换为抛错guard |
-| `LIVE` | `sim_trade` | 必须通过profile schema v1校验；不建远程连接 | helper保持`enabled=False`阻断态并安装同样的guard；`good_etf.py`在调用helper前即因尚无StrategyLedger而拒绝启动 |
+| `LIVE` | `sim_trade` | 必须通过profile schema v1校验；实际RPC在策略调用时建立短连接 | 聚宽原生交易函数保持guard；`good_etf.py`通过StrategyLedger下单，并仅在真实账户对账READY后标记`production_ready` |
 
 只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失并仅在BACKTEST本地兜底；helper文件已上传但其内部导入失败会直接中止，不能静默降级为BACKTEST。helper导出稳定`STRATEGY_RUNTIME_HELPER_MARKER`和`STRATEGY_RUNTIME_API_VERSION`，策略用普通`getattr`校验二者。
 
-`install_strategy_runtime`的第一个参数必须直接传模块的普通`globals()`字典，`mode`必须是普通字符串。SHADOW和helper级LIVE会把namespace中的七个聚宽交易函数替换为抛错guard，这是有意的本地fail-closed保护；旧`install_jq_compat`远程接管API已在L00删除，helper不会替换`context.portfolio`或连接服务器。
+`install_strategy_runtime`的第一个参数必须直接传模块的普通`globals()`字典，`mode`必须是普通字符串。SHADOW和LIVE都会把namespace中的七个聚宽原生交易函数替换为抛错guard；LIVE订单只允许经StrategyLedger目标接口提交。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 

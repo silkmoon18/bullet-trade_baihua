@@ -177,6 +177,9 @@ def _build_broker_snapshot(
     as_of: Optional[datetime],
 ) -> BrokerAccountSnapshot:
     account = dict(account_row)
+    wrapped = account.get("value")
+    if account.get("dtype") == "dict" and isinstance(wrapped, Mapping):
+        account = dict(wrapped)
     cash = None
     for name in ("available_cash", "cash", "enable_balance", "fund_avail"):
         if account.get(name) is not None:
@@ -286,15 +289,45 @@ class SQLiteReconciliationService:
             )
         blockers = []
         booked_trade_ids = []
-        orders_by_broker_id = self._local_orders(account_id)
+        orders_by_broker_id, orders_by_client_tag = self._local_orders(account_id)
         broker_orders = {}
+        adopted_order_ids = []
         for row in snapshot.orders:
             broker_order_id = _text(row.get("order_id"))
             if not broker_order_id:
                 blockers.append("broker_order_missing_id")
                 continue
             broker_orders[broker_order_id] = row
-            if broker_order_id not in orders_by_broker_id:
+            local = orders_by_broker_id.get(broker_order_id)
+            if local is None:
+                remark = _text(row.get("order_remark") or row.get("remark"))
+                matches = {
+                    orders_by_client_tag[token]["order_id"]: orders_by_client_tag[token]
+                    for token in (item.strip() for item in remark.split("|"))
+                    if token in orders_by_client_tag
+                }
+                if len(matches) == 1:
+                    local = next(iter(matches.values()))
+                    try:
+                        adopted = self._booking.mark_order_submitted(
+                            account_id,
+                            local["order_id"],
+                            broker_order_id,
+                        )
+                        local = dict(local)
+                        local["broker_order_id"] = broker_order_id
+                        local["state"] = adopted.state.value
+                        orders_by_broker_id[broker_order_id] = local
+                        adopted_order_ids.append(local["order_id"])
+                    except (RepositoryError, ValueError) as exc:
+                        blockers.append(
+                            "order_adoption_error:{}:{}".format(
+                                broker_order_id, str(exc)
+                            )
+                        )
+                elif len(matches) > 1:
+                    blockers.append("ambiguous_order_remark:{}".format(broker_order_id))
+            if local is None:
                 blockers.append("unknown_order:{}".format(broker_order_id))
 
         for trade in sorted(snapshot.trades, key=lambda row: _text(row.get("time") or row.get("trade_time"))):
@@ -381,6 +414,7 @@ class SQLiteReconciliationService:
         details = {
             "blockers": sorted(set(blockers)),
             "booked_trade_ids": booked_trade_ids,
+            "adopted_order_ids": adopted_order_ids,
             "broker_order_count": len(snapshot.orders),
             "broker_trade_count": len(snapshot.trades),
             "broker_position_count": len(snapshot.positions),
@@ -425,11 +459,21 @@ class SQLiteReconciliationService:
                 (account_id,),
             ).fetchall()
             local_orders = [dict(row) for row in rows]
-            return {
+            by_broker_id = {
                 row["broker_order_id"]: row
                 for row in local_orders
                 if row["broker_order_id"]
             }
+            by_client_tag = {
+                row["client_tag"]: row
+                for row in local_orders
+                if not row["broker_order_id"]
+                and row["state"] in (
+                    OrderState.PENDING_SUBMIT.value,
+                    OrderState.SUBMIT_UNKNOWN.value,
+                )
+            }
+            return by_broker_id, by_client_tag
         finally:
             connection.close()
 

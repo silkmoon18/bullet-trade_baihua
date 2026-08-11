@@ -47,7 +47,6 @@ __all__ = [
     "get_portfolio",
     "submit_targets",
     "get_intent",
-    "get_events",
     "get_reconciliation",
 ]
 
@@ -56,8 +55,6 @@ STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
-DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS = 30.0
-DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS = 16.0
 
 # 策略 namespace 中的安装记录键；用于识别上一代 helper 遗留状态。
 _RUNTIME_STATE_KEY = "__bt_strategy_runtime_state__"
@@ -79,14 +76,8 @@ _PROFILE_OPTIONAL_FIELDS = frozenset(
     {
         "port",
         "account_key",
-        "sub_account_id",
         "tls_cert",
-        "retries",
-        "retry_interval",
         "rpc_timeout",
-        "place_order_timeout_margin",
-        "default_wait_timeout",
-        "debug",
     }
 )
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
@@ -288,10 +279,6 @@ def get_intent(
     return _strategy_request("strategy.get_intent", payload)
 
 
-def get_events(after_seq: int = 0) -> Dict[str, Any]:
-    return _strategy_request("strategy.get_events", {"after_seq": after_seq})
-
-
 def get_reconciliation() -> Dict[str, Any]:
     return _strategy_request("strategy.get_reconciliation", {})
 
@@ -406,19 +393,8 @@ def _load_runtime_profile(
     if type(port) is not int or not 1 <= port <= 65535:
         raise RuntimeError("profile.port 必须是1到65535之间的整数")
 
-    retries = raw.get("retries", 2)
-    if type(retries) is not int or not 0 <= retries <= 10:
-        raise RuntimeError("profile.retries 必须是0到10之间的整数")
-
     numeric_rules = {
-        "retry_interval": (0.5, 0.1, 30.0),
         "rpc_timeout": (DEFAULT_RPC_TIMEOUT_SECONDS, 5.0, 300.0),
-        "place_order_timeout_margin": (
-            DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
-            0.0,
-            300.0,
-        ),
-        "default_wait_timeout": (DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS, 0.0, 300.0),
     }
     numeric_values = {}  # type: Dict[str, float]
     for field, (default, minimum, maximum) in numeric_rules.items():
@@ -433,12 +409,8 @@ def _load_runtime_profile(
             )
         numeric_values[field] = float(value)
 
-    debug = raw.get("debug", True)
-    if type(debug) is not bool:
-        raise RuntimeError("profile.debug 必须是布尔值")
-
     optional_strings = {}  # type: Dict[str, Optional[str]]
-    for field in ("account_key", "sub_account_id", "tls_cert"):
+    for field in ("account_key", "tls_cert"):
         value = raw.get(field)
         if value is not None and (
             type(value) is not str or not value or value != str.strip(value)
@@ -454,14 +426,8 @@ def _load_runtime_profile(
         "token": token,
         "port": port,
         "account_key": optional_strings["account_key"],
-        "sub_account_id": optional_strings["sub_account_id"],
         "tls_cert": optional_strings["tls_cert"],
-        "retries": retries,
-        "retry_interval": numeric_values["retry_interval"],
         "rpc_timeout": numeric_values["rpc_timeout"],
-        "place_order_timeout_margin": numeric_values["place_order_timeout_margin"],
-        "default_wait_timeout": numeric_values["default_wait_timeout"],
-        "debug": debug,
     }
 
 
@@ -522,8 +488,8 @@ def _build_strategy_runtime_state(
                 "profile_module": profile_module,
                 "enabled": True,
                 "orders_enabled": True,
-                "production_ready": True,
-                "reason": "strategy_ledger_v1",
+                "production_ready": False,
+                "reason": "profile_validated",
                 "mirror_jq_orders": False,
                 "blocked_mutations": blocked_mutations,
             }

@@ -166,6 +166,16 @@ class SQLiteStrategyAPI:
         snapshot, _, marks = await self._refresh(
             account_context, account_key, strategy_id, payload
         )
+        cancel_requested_order_ids = []
+        for broker_order_id in self.planner.stale_broker_order_ids(strategy_id):
+            await cast(Any, self.broker).cancel_order(
+                account_context, broker_order_id
+            )
+            cancel_requested_order_ids.append(broker_order_id)
+        if cancel_requested_order_ids:
+            snapshot, _, marks = await self._refresh(
+                account_context, account_key, strategy_id, payload
+            )
         advance = self.planner.submit_target_weights(
             strategy_id,
             key,
@@ -195,6 +205,7 @@ class SQLiteStrategyAPI:
             "intent": _json_value(self.planner.get_intent(advance.intent.intent_id)),
             "planned_orders": _json_value(advance.orders),
             "dispatched_orders": _json_value(dispatched),
+            "cancel_requested_order_ids": cancel_requested_order_ids,
             "snapshot": self._snapshot_payload(refreshed),
             "reconciliation": _json_value(reconciliation),
         }
@@ -264,17 +275,6 @@ class SQLiteStrategyAPI:
             for security, value in stored.get("weights_ppm", {}).items()
         }
         return result
-
-    def get_events(self, payload: Mapping[str, object]) -> Dict[str, object]:
-        strategy_id = self._strategy_id(payload)
-        raw_after_seq = payload.get("after_seq")
-        after_seq = int(str(raw_after_seq)) if raw_after_seq is not None else 0
-        events = [
-            event
-            for event in self.repository.list_events(strategy_id)
-            if event.event_seq > after_seq
-        ]
-        return {"events": _json_value(events), "last_seq": events[-1].event_seq if events else after_seq}
 
     def get_reconciliation(
         self, account_key: str, payload: Mapping[str, object]

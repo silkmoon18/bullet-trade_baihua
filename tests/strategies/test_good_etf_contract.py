@@ -154,6 +154,48 @@ def test_fallback_backtest_rejects_sim_trade_run_type(monkeypatch):
         strategy._install_runtime(_Context("sim_trade"))
 
 
+def test_live_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    strategy.g.bt_runtime = {"production_ready": False}
+    monkeypatch.setattr(
+        strategy,
+        "bt",
+        types.SimpleNamespace(
+            ensure_account=lambda _capital: {
+                "reconciliation": {"state": "READY"}
+            }
+        ),
+    )
+    monkeypatch.setattr(strategy, "_portfolio", lambda _context: object())
+    monkeypatch.setattr(strategy, "_restore_live_intent", lambda: None)
+
+    strategy._ensure_live_ready(_Context("sim_trade"))
+
+    assert strategy.g.bt_runtime["production_ready"] is True
+
+
+def test_live_readiness_stays_false_when_reconciliation_is_blocked(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    strategy.g.bt_runtime = {"production_ready": False}
+    monkeypatch.setattr(
+        strategy,
+        "bt",
+        types.SimpleNamespace(
+            ensure_account=lambda _capital: {
+                "reconciliation": {
+                    "state": "BLOCKED",
+                    "details": {"blockers": ["fee_fields"]},
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="fee_fields"):
+        strategy._ensure_live_ready(_Context("sim_trade"))
+
+    assert strategy.g.bt_runtime["production_ready"] is False
+
+
 @pytest.mark.parametrize("marker", ["wrong-marker", None])
 def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     install_calls = []
