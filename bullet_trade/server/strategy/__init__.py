@@ -90,6 +90,7 @@ from .planner_executor import (
     SQLiteTargetExecutionService,
     TargetPlanningError,
 )
+from .api import SQLiteStrategyAPI, StrategyAPIConfig
 
 __all__ = [
     "MONEY_SCALE",
@@ -142,6 +143,7 @@ __all__ = [
     "ReconciliationResult",
     "RepositoryError",
     "SQLiteStrategyRepository",
+    "SQLiteStrategyAPI",
     "SQLiteTargetExecutionService",
     "SQLiteOperationRepository",
     "SQLiteReconciliationService",
@@ -151,6 +153,7 @@ __all__ = [
     "StrategyEvent",
     "StrategyAccount",
     "StrategyAccountEnsureResult",
+    "StrategyAPIConfig",
     "StrategyRepository",
     "TargetPlanningError",
     "VersionConflictError",

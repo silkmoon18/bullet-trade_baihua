@@ -9,12 +9,12 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# 状态：L00精简运行契约；尚未完成StrategyLedger实盘改造，禁止直接用于真实资金。
+# LIVE通过StrategyLedger提交组合目标并展示真实账户视图；BACKTEST逻辑保持聚宽原生。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
 from types import ModuleType
-from typing import Dict, List, Optional, TYPE_CHECKING, cast
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, cast
 
 from jqdata import *
 
@@ -36,9 +36,9 @@ except ModuleNotFoundError as exc:
 PROFILE = 'good_etf-prod'
 MODE = 'BACKTEST'
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 1
+_EXPECTED_RUNTIME_API_VERSION = 2
 _EXPECTED_PROFILE_SCHEMA_VERSION = 1
-_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v1'
+_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v2'
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -54,6 +54,7 @@ HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '
 # ===== 执行参数 =====
 BUY_PRICE_FLOAT_PCT = 0.002   # 限价买入浮动比例：限价 = 最新价 × (1 + 0.2%)，上浮提高成交率
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
+INITIAL_CAPITAL = 10000         # 聚宽策略分配给真实专用账户的固定初始资金
 
 
 def _run_type(context: 'Context') -> str:
@@ -109,8 +110,6 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         g.bt_runtime = state
         return state
 
-    if mode == 'LIVE':
-        raise RuntimeError('good_etf LIVE尚未完成StrategyLedger安全改造，禁止真实资金运行')
     if getattr(bt, 'STRATEGY_RUNTIME_HELPER_MARKER', None) != _EXPECTED_RUNTIME_HELPER_MARKER:
         raise RuntimeError('聚宽helper运行时marker不匹配，必须重新上传helper')
     if getattr(bt, 'STRATEGY_RUNTIME_API_VERSION', None) != _EXPECTED_RUNTIME_API_VERSION:
@@ -151,9 +150,96 @@ def _notify(message: str) -> None:
     log.info('[策略通知] {}'.format(message))
 
 
+def _record_real_portfolio(portfolio: Any) -> None:
+    record(  # type: ignore[name-defined]  # 聚宽运行时由jqdata注入
+        real_cash=portfolio.available_cash,
+        real_total=portfolio.total_value,
+        real_positions=portfolio.positions_value,
+        real_nav=portfolio.nav,
+        real_return=portfolio.returns,
+        real_fees=portfolio.fees,
+    )
+
+
+def _portfolio(context: 'Context') -> Any:
+    if _runtime_mode() != 'LIVE':
+        return context.portfolio
+    if bt is None:
+        raise RuntimeError('LIVE缺少聚宽helper')
+    portfolio = bt.get_portfolio(as_of=context.current_dt)
+    if not portfolio.performance_ready:
+        raise RuntimeError('真实组合发生过运行中增减资，简单NAV指标不可用')
+    g.bt_portfolio = portfolio
+    _record_real_portfolio(portfolio)
+    return portfolio
+
+
+def _submit_live_targets(
+    context: 'Context',
+    weights: Dict[str, float],
+    marks: Dict[str, float],
+    key: str,
+) -> Dict[str, Any]:
+    if bt is None:
+        raise RuntimeError('LIVE缺少聚宽helper')
+    existing = bt.get_intent(idempotency_key=key)
+    if existing:
+        weights = cast(Dict[str, float], existing.get('weights', weights))
+    result = bt.submit_targets(weights, key, marks=marks, as_of=context.current_dt)
+    g.bt_target_key = key
+    g.bt_target_weights = dict(weights)
+    g.bt_target_marks = dict(marks)
+    g.bt_intent_id = result['intent']['intent_id']
+    portfolio = bt.PortfolioView(result['snapshot'])
+    g.bt_portfolio = portfolio
+    _record_real_portfolio(portfolio)
+    return cast(Dict[str, Any], result)
+
+
+def _restore_live_intent() -> None:
+    if _runtime_mode() != 'LIVE' or bt is None:
+        return
+    intent = bt.get_intent()
+    if not intent:
+        g.bt_intent_id = None
+        return
+    g.bt_intent_id = intent['intent_id']
+    g.bt_target_key = intent['idempotency_key']
+    g.bt_target_weights = dict(intent.get('weights', {}))
+    g.bt_target_marks = {}
+    log.info('恢复未完成真实组合意图 | intent_id={} state={}'.format(
+        g.bt_intent_id, intent['state']))
+
+
+def _advance_live_intent(context: 'Context') -> bool:
+    """推进未完成的卖后买意图；未完成时本轮不创建新意图。"""
+    if _runtime_mode() != 'LIVE' or not getattr(g, 'bt_intent_id', None):
+        return True
+    if bt is None:
+        raise RuntimeError('LIVE缺少聚宽helper')
+    intent = bt.get_intent(g.bt_intent_id)
+    if intent.get('state') in ('COMPLETED', 'CANCELED', 'FAILED'):
+        g.bt_intent_id = None
+        return True
+    result = _submit_live_targets(
+        context,
+        g.bt_target_weights,
+        g.bt_target_marks,
+        g.bt_target_key,
+    )
+    state = result['intent']['state']
+    if state == 'COMPLETED':
+        g.bt_intent_id = None
+        return True
+    log.info('真实组合意图仍在执行，本轮跳过新目标 | intent_id={} state={}'.format(
+        g.bt_intent_id, state))
+    return False
+
+
 def _cancel_open_orders_for_runtime() -> int:
-    if _runtime_mode() == 'SHADOW':
-        log.info('SHADOW计划 | 跳过撤单')
+    if _runtime_mode() in ('SHADOW', 'LIVE'):
+        log.info('{}计划 | 订单生命周期由StrategyLedger管理，跳过聚宽撤单'.format(
+            _runtime_mode()))
         return 0
     open_orders = get_open_orders() or {}
     cancelled = 0
@@ -211,6 +297,17 @@ def initialize(context: 'Context') -> None:
 
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
+    g.bt_intent_id = None
+    if _runtime_mode() == 'LIVE':
+        if bt is None:
+            raise RuntimeError('LIVE缺少聚宽helper')
+        ensured = bt.ensure_account(INITIAL_CAPITAL)
+        reconciliation = ensured.get('reconciliation', {})
+        if reconciliation.get('state') != 'READY':
+            raise RuntimeError('真实账户对账未就绪: {}'.format(
+                reconciliation.get('details', {}).get('blockers', [])))
+        _portfolio(context)
+        _restore_live_intent()
 
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
@@ -220,8 +317,6 @@ def initialize(context: 'Context') -> None:
     run_daily(before_market_open, '09:20', reference_security='000300.XSHG')
     # 9:30 执行开盘选股+下单
     run_daily(market_open, '09:30', reference_security='000300.XSHG')
-    # 9:30 早盘风控检查（开盘下单后随即检查一次）
-    run_daily(handle_risk_management, time='09:30', reference_security='000300.XSHG')
     # 10:30 / 13:30 盘中风控检查（提高止盈止损响应速度）
     run_daily(handle_risk_management, time='10:30', reference_security='000300.XSHG')
     run_daily(handle_risk_management, time='13:30', reference_security='000300.XSHG')
@@ -229,7 +324,7 @@ def initialize(context: 'Context') -> None:
     run_daily(handle_risk_management, time='14:50', reference_security='000300.XSHG')
     # 14:55 尾盘快照（S01仅记录聚宽组合；真实对账由后续StrategyLedger切片实现）
     run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
-    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 09:30/10:30/13:30/14:50 | 14:55 尾盘快照')
+    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 10:30/13:30/14:50 | 14:55 尾盘快照')
 
 
 def process_initialize(context: 'Context') -> None:
@@ -237,6 +332,12 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
+    if _runtime_mode() == 'LIVE':
+        if bt is None:
+            raise RuntimeError('LIVE缺少聚宽helper')
+        bt.ensure_account(INITIAL_CAPITAL)
+        _portfolio(context)
+        _restore_live_intent()
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 
@@ -319,6 +420,8 @@ def market_open(context: 'Context') -> None:
     """开盘执行：选股+按折价率权重下单"""
     log.info('===== 开盘选股下单开始 =====')
     try:
+        if not _advance_live_intent(context):
+            return
         # 若盘前预处理未执行（聚宽在 09:20~09:30 间重启会错过），现场补跑一次
         if g.fund_list is None:
             log.warn('盘前预处理数据缺失，现场补跑 before_market_open')
@@ -375,11 +478,37 @@ def market_open(context: 'Context') -> None:
 
         # 第一步：对不在选定列表中的持仓提交清仓目标。
         # 注意：迭代持仓列表副本，避免下单过程中持仓变化影响遍历
-        hold_codes = list(context.portfolio.positions.keys())
+        portfolio = _portfolio(context)
+        hold_codes = list(portfolio.positions.keys())
         log.info(f'当前持仓 {len(hold_codes)} 只: {hold_codes}')
+
+        if _runtime_mode() == 'LIVE':
+            raw_weights = selected_funds['premium'].abs().tolist()
+            total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
+            target_weights = {
+                code: float(weight / total_weight * DEPLOY_RATIO)
+                for code, weight in zip(order_fund_codes, raw_weights)
+            }
+            if not target_weights:
+                target_weights = {code: 0.0 for code in hold_codes}
+            if not target_weights:
+                log.info('真实组合无持仓且无新目标，本轮无需提交')
+                return
+            marks = {
+                code: float(selected_funds.loc[code, 'last_price'])
+                for code in order_fund_codes
+            }
+            for code, position in portfolio.positions.items():
+                marks.setdefault(code, float(position.price))
+            key = 'open-{}'.format(context.current_dt.strftime('%Y%m%d'))
+            result = _submit_live_targets(context, target_weights, marks, key)
+            log.info('真实组合目标已提交 | intent_id={} state={} weights={}'.format(
+                result['intent']['intent_id'], result['intent']['state'], target_weights))
+            return
+
         for hold_code in hold_codes:
             if hold_code not in order_fund_codes:
-                pos = context.portfolio.positions[hold_code]
+                pos = portfolio.positions[hold_code]
                 log.info(f'调仓卖出 | {hold_code} 数量={pos.total_amount} 成本={pos.avg_cost:.4f}')
                 order_result = _submit_target_amount(hold_code, 0)
                 log.info('清仓目标已提交 | {} order_id={}'.format(
@@ -393,7 +522,7 @@ def market_open(context: 'Context') -> None:
             weights = selected_funds['premium'].abs().tolist()
             total_weight = sum(weights) if sum(weights) != 0 else 1e-9  # 防除零
 
-            total_value = context.portfolio.total_value
+            total_value = portfolio.total_value
             investable_value = total_value * DEPLOY_RATIO
             log.info(f'组合总资产={total_value:.2f} 目标部署={investable_value:.2f} '
                      f'现金缓冲={total_value - investable_value:.2f}')
@@ -402,7 +531,7 @@ def market_open(context: 'Context') -> None:
             for code, weight in zip(order_fund_codes, weights):
                 normalized_weight = weight / total_weight
                 target_value = investable_value * normalized_weight
-                position = context.portfolio.positions[code] if code in context.portfolio.positions else None
+                position = portfolio.positions[code] if code in portfolio.positions else None
                 current_value = getattr(position, 'value', None) if position is not None else 0.0
                 if current_value is None:
                     current_value = getattr(position, 'total_amount', 0) * selected_funds.loc[code, 'last_price']
@@ -429,17 +558,21 @@ def market_open(context: 'Context') -> None:
 
 
 def handle_risk_management(context: 'Context') -> None:
-    """风控函数：9:30/14:50 双触发，止盈10%/止损5%（实时价格，无未来函数）"""
-    hold_codes = list(context.portfolio.positions.keys())
-    if not hold_codes:
-        log.info('风控检查 | 当前无持仓')
-        return
-    log.info(f'风控检查开始 | 持仓 {len(hold_codes)} 只 | {context.current_dt}')
+    """止盈止损；LIVE一次提交完整组合目标，避免同轮多个intent。"""
     try:
+        if not _advance_live_intent(context):
+            return
+        portfolio = _portfolio(context)
+        hold_codes = list(portfolio.positions.keys())
+        if not hold_codes:
+            log.info('风控检查 | 当前无持仓')
+            return
+        log.info(f'风控检查开始 | 持仓 {len(hold_codes)} 只 | {context.current_dt}')
+        exits: List[str] = []
         # 遍历所有持仓ETF（迭代列表副本）
         for hold_code in hold_codes:
             # 关键修复：用聚宽官方无未来函数的实时价格
-            position = context.portfolio.positions[hold_code]
+            position = portfolio.positions[hold_code]
             current_price = position.price  # 实时最新价（回测/实盘一致）
             cost_basis = position.avg_cost  # 持仓成本价
             pnl = (current_price / cost_basis - 1) if cost_basis else 0.0
@@ -451,9 +584,12 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                order_result = _submit_target_amount(hold_code, 0)
-                log.info('止损清仓目标已提交 | {} order_id={}'.format(
-                    hold_code, getattr(order_result, 'order_id', None)))
+                if _runtime_mode() == 'LIVE':
+                    exits.append(hold_code)
+                else:
+                    order_result = _submit_target_amount(hold_code, 0)
+                    log.info('止损清仓目标已提交 | {} order_id={}'.format(
+                        hold_code, getattr(order_result, 'order_id', None)))
 
             # 止盈逻辑：涨超成本价110%（10%止盈）
             elif current_price > cost_basis * TAKE_PROFIT_RATIO:
@@ -461,22 +597,41 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                order_result = _submit_target_amount(hold_code, 0)
-                log.info('止盈清仓目标已提交 | {} order_id={}'.format(
-                    hold_code, getattr(order_result, 'order_id', None)))
+                if _runtime_mode() == 'LIVE':
+                    exits.append(hold_code)
+                else:
+                    order_result = _submit_target_amount(hold_code, 0)
+                    log.info('止盈清仓目标已提交 | {} order_id={}'.format(
+                        hold_code, getattr(order_result, 'order_id', None)))
+
+        if exits and _runtime_mode() == 'LIVE':
+            total = portfolio.total_value or 1.0
+            target_weights = {
+                code: (0.0 if code in exits else position.value / total)
+                for code, position in portfolio.positions.items()
+            }
+            marks = {
+                code: float(position.price)
+                for code, position in portfolio.positions.items()
+            }
+            key = 'risk-{}'.format(context.current_dt.strftime('%Y%m%d-%H%M'))
+            result = _submit_live_targets(context, target_weights, marks, key)
+            log.info('真实风控目标已提交 | intent_id={} exits={}'.format(
+                result['intent']['intent_id'], exits))
 
     except Exception as e:
         log.error(f"风控执行异常：{e}")
 
 
 def after_market_check(context: 'Context') -> None:
-    """记录聚宽侧组合快照；真实券商对账将在StrategyLedger切片中实现。"""
-    positions = context.portfolio.positions
-    log.info('===== 尾盘聚宽组合快照 =====')
+    """记录BACKTEST原生组合或LIVE真实StrategyLedger组合。"""
+    portfolio = _portfolio(context)
+    positions = portfolio.positions
+    log.info('===== 尾盘组合快照 =====')
     log.info('组合资金 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}'.format(
-        context.portfolio.available_cash,
-        context.portfolio.total_value,
-        context.portfolio.positions_value))
+        portfolio.available_cash,
+        portfolio.total_value,
+        portfolio.positions_value))
     for code in sorted(positions.keys()):
         position = positions[code]
         log.info('组合持仓 | {} 数量={} 可卖={} 成本={:.4f} 现价={:.4f}'.format(
@@ -485,5 +640,6 @@ def after_market_check(context: 'Context') -> None:
             getattr(position, 'closeable_amount', 0),
             position.avg_cost,
             position.price))
-    if _runtime_mode() in ('SHADOW', 'LIVE'):
-        log.warn('S01尚无StrategyLedger真实成交账本；本快照不能视为券商实盘对账结果')
+    if _runtime_mode() == 'LIVE':
+        log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
+            portfolio.nav, portfolio.returns, portfolio.fees))

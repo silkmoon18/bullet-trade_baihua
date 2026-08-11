@@ -28,18 +28,31 @@
   代码、monkey patch 或热重载攻击（docs/live-ledger/02-decisions.md D021）。
 """
 
+import json
 import math
+import socket
+import ssl
+import struct
+import uuid
 from typing import Any, Callable, Dict, Optional, Tuple
 
 __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
     "PROFILE_SCHEMA_VERSION",
+    "PortfolioView",
+    "PositionView",
     "install_strategy_runtime",
+    "ensure_account",
+    "get_portfolio",
+    "submit_targets",
+    "get_intent",
+    "get_events",
+    "get_reconciliation",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 1
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v1"
+STRATEGY_RUNTIME_API_VERSION = 2
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -84,6 +97,203 @@ _MODULE_TOKEN = object()
 # 模块级安装记录：同一进程只允许一种安装签名。
 _active_signature = None  # type: Optional[Tuple[Any, ...]]
 _active_state = None  # type: Optional[Dict[str, Any]]
+_active_profile = None  # type: Optional[Dict[str, Any]]
+
+
+class PositionView(object):
+    """聚宽策略可直接读取的真实持仓只读视图。"""
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        self.security = payload["security"]
+        self.total_amount = int(payload["total_amount"])
+        self.closeable_amount = int(payload["closeable_amount"])
+        self.avg_cost = float(payload["avg_cost"])
+        self.price = float(payload["price"])
+        self.value = float(payload["value"])
+        self.unrealized_pnl = float(payload.get("unrealized_pnl", 0.0))
+
+
+class PortfolioView(object):
+    """由真实成交账本生成，不修改聚宽原生模拟账户。"""
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        self.account_id = payload["account_id"]
+        self.as_of = payload["as_of"]
+        self.snapshot_version = payload["snapshot_version"]
+        self.ledger_version = int(payload["ledger_version"])
+        self.cash = float(payload["cash"])
+        self.reserved_cash = float(payload["reserved_cash"])
+        self.available_cash = float(payload["available_cash"])
+        self.positions_value = float(payload["positions_value"])
+        self.total_value = float(payload["total_value"])
+        self.starting_cash = float(payload["starting_cash"])
+        self.total_pnl = float(payload["total_pnl"])
+        self.realized_pnl = float(payload["realized_pnl"])
+        self.unrealized_pnl = float(payload["unrealized_pnl"])
+        self.fees = float(payload["fees"])
+        self.nav = float(payload["nav"])
+        self.returns = float(payload["returns"])
+        self.performance_ready = bool(payload["performance_ready"])
+        self.positions = {
+            security: PositionView(item)
+            for security, item in payload.get("positions", {}).items()
+        }
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError("unsupported JSON value: {}".format(type(value).__name__))
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise RuntimeError("服务器连接提前关闭")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _send_message(sock: socket.socket, message: Dict[str, Any]) -> None:
+    body = json.dumps(
+        message, ensure_ascii=False, default=_json_default
+    ).encode("utf-8")
+    sock.sendall(struct.pack(">I", len(body)) + body)
+
+
+def _read_message(sock: socket.socket) -> Dict[str, Any]:
+    size = struct.unpack(">I", _recv_exact(sock, 4))[0]
+    if size > 32 * 1024 * 1024:
+        raise RuntimeError("服务器响应过大")
+    result = json.loads(_recv_exact(sock, size).decode("utf-8"))
+    if not isinstance(result, dict):
+        raise RuntimeError("服务器响应格式无效")
+    return result
+
+
+def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if _active_profile is None or _active_state is None:
+        raise RuntimeError("策略运行时尚未安装")
+    profile = _active_profile
+    timeout = float(profile["rpc_timeout"])
+    raw_sock = socket.create_connection(
+        (profile["host"], profile["port"]), timeout=timeout
+    )
+    sock = raw_sock
+    try:
+        tls_cert = profile.get("tls_cert")
+        if tls_cert:
+            context = ssl.create_default_context(cafile=tls_cert)
+            sock = context.wrap_socket(raw_sock, server_hostname=profile["host"])
+        sock.settimeout(timeout)
+        _send_message(
+            sock,
+            {
+                "type": "handshake",
+                "token": profile["token"],
+                "protocol": 1,
+                "features": ["strategy_ledger_v1"],
+                "account_key": profile.get("account_key"),
+            },
+        )
+        handshake = _read_message(sock)
+        if handshake.get("type") != "handshake_ack":
+            raise RuntimeError("服务器握手失败")
+        request_id = uuid.uuid4().hex
+        request_payload = dict(payload)
+        request_payload["strategy_id"] = _active_state["strategy_id"]
+        if profile.get("account_key"):
+            request_payload["account_key"] = profile["account_key"]
+        _send_message(
+            sock,
+            {
+                "type": "request",
+                "id": request_id,
+                "action": action,
+                "payload": request_payload,
+            },
+        )
+        response = _read_message(sock)
+        if response.get("type") == "error":
+            raise RuntimeError(
+                "{}: {}".format(
+                    response.get("code", "REQUEST_FAILED"),
+                    response.get("message", "server error"),
+                )
+            )
+        if response.get("type") != "response" or response.get("id") != request_id:
+            raise RuntimeError("服务器响应与请求不匹配")
+        result = response.get("payload")
+        if not isinstance(result, dict):
+            raise RuntimeError("服务器响应payload无效")
+        return result
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def ensure_account(initial_capital: Any = "10000") -> Dict[str, Any]:
+    """校验真实账户资金并幂等建立策略账户。"""
+
+    return _strategy_request(
+        "strategy.ensure_account", {"initial_capital": initial_capital}
+    )
+
+
+def get_portfolio(
+    marks: Optional[Dict[str, Any]] = None,
+    as_of: Any = None,
+) -> PortfolioView:
+    payload = {}  # type: Dict[str, Any]
+    if marks is not None:
+        payload["marks"] = marks
+    if as_of is not None:
+        payload["as_of"] = as_of
+    return PortfolioView(_strategy_request("strategy.get_snapshot", payload))
+
+
+def submit_targets(
+    weights: Dict[str, Any],
+    idempotency_key: str,
+    marks: Optional[Dict[str, Any]] = None,
+    as_of: Any = None,
+) -> Dict[str, Any]:
+    if _active_state is None or _active_state.get("mode") != "LIVE":
+        raise RuntimeError("只有LIVE模式可以提交真实组合目标")
+    payload = {"weights": weights, "idempotency_key": idempotency_key}
+    if marks is not None:
+        payload["marks"] = marks
+    if as_of is not None:
+        payload["as_of"] = as_of
+    return _strategy_request("strategy.submit_targets", payload)
+
+
+def get_intent(
+    intent_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = {}  # type: Dict[str, Any]
+    if intent_id:
+        payload["intent_id"] = intent_id
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    return _strategy_request("strategy.get_intent", payload)
+
+
+def get_events(after_seq: int = 0) -> Dict[str, Any]:
+    return _strategy_request("strategy.get_events", {"after_seq": after_seq})
+
+
+def get_reconciliation() -> Dict[str, Any]:
+    return _strategy_request("strategy.get_reconciliation", {})
 
 
 def _run_type_from_context(context: Any) -> Optional[str]:
@@ -130,6 +340,8 @@ def _load_runtime_profile(
     """加载并校验聚宽私有运行 profile；错误信息不回显凭据或未知字段名。"""
 
     load_failed = False
+    schema_version = None
+    profiles = None
     try:
         module = __import__(profile_module, fromlist=["*"])
         schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
@@ -308,8 +520,10 @@ def _build_strategy_runtime_state(
         state.update(
             {
                 "profile_module": profile_module,
-                "orders_enabled": False,
-                "reason": "live_blocked_until_strategy_ledger",
+                "enabled": True,
+                "orders_enabled": True,
+                "production_ready": True,
+                "reason": "strategy_ledger_v1",
                 "mirror_jq_orders": False,
                 "blocked_mutations": blocked_mutations,
             }
@@ -333,7 +547,7 @@ def install_strategy_runtime(
     上一代 helper 遗留记录或记录缺失均失败关闭，必须使用干净进程重启。
     """
 
-    global _active_signature, _active_state
+    global _active_signature, _active_state, _active_profile
 
     if type(namespace) is not dict:
         raise RuntimeError("策略namespace必须是普通dict（请传入globals()）")
@@ -369,6 +583,7 @@ def install_strategy_runtime(
         return dict(_active_state)
 
     blocked_mutations = ()  # type: Tuple[str, ...]
+    runtime_profile = None  # type: Optional[Dict[str, Any]]
     if mode == "BACKTEST":
         if run_type not in ("simple_backtest", "full_backtest"):
             raise RuntimeError(
@@ -389,7 +604,7 @@ def install_strategy_runtime(
                     mode, run_type or "<empty>"
                 )
             )
-        _load_runtime_profile(profile_module, profile, strategy_id)
+        runtime_profile = _load_runtime_profile(profile_module, profile, strategy_id)
         blocked_mutations = _install_runtime_guards(namespace, mode)
         state = _build_strategy_runtime_state(
             mode=mode,
@@ -402,5 +617,7 @@ def install_strategy_runtime(
 
     _active_signature = signature
     _active_state = dict(state)
+    if mode != "BACKTEST":
+        _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
     return dict(state)

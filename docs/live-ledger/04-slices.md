@@ -54,8 +54,8 @@
 | S11-S20 | 原机构级剩余计划 | PENDING | 已由D023合并为L00至L04；仅保留历史需求映射 |
 | L00 | Existing Code Pruning | DONE | `cd5ed99`：净删除约1.6万行，334项定向矩阵通过 |
 | L01 | QMT Sync and Reconciliation | DONE | `b077670`：QMT快照同步、真实fill入账与READY/BLOCKED |
-| L02 | Target Planner and Executor | REVIEW | 目标权重、先卖后买、整手/现金缓冲、kill switch |
-| L03 | Strategy API and JoinQuant View | PENDING | ensure/snapshot/targets/intent/events/reconciliation与PortfolioView |
+| L02 | Target Planner and Executor | DONE | `dfeae3f`：目标权重、先卖后买、整手/现金缓冲、kill switch |
+| L03 | Strategy API and JoinQuant View | REVIEW | 六个strategy RPC、helper v2、真实PortfolioView与record指标 |
 | L04 | Local Deployment and Small Live | PENDING | 服务启动、备份、飞书通知、SHADOW/模拟/小额人工验收 |
 
 ## S00：Repository Baseline and Documentation
@@ -544,7 +544,7 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 
 ### 当前状态
 
-- REVIEW：实现、6项定向和92项StrategyLedger联合回归通过，等待提交。
+- DONE：实现提交`dfeae3f`；6项定向和92项StrategyLedger联合回归通过。
 
 ### 最小实现
 
@@ -559,6 +559,25 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 ### 验证
 
 - 1万元50%目标整手数量与资金冻结、相同key不重复、真实broker ID绑定、超时unknown不重发、A卖出后才规划B、T+1等待和全局开关阻断。
+
+## L03：Strategy API and JoinQuant View
+
+### 当前状态
+
+- REVIEW：六个最小RPC、聚宽helper v2、真实PortfolioView、组合提交和重启恢复已实现；等待提交收口。
+
+### 最小实现
+
+- 复用现有TCP握手/token和server action分发，不新增HTTP、多租户或角色系统。
+- `ensure_account/get_snapshot/submit_targets/get_intent/get_events/get_reconciliation`覆盖聚宽首版所需读写。
+- 每次快照/提交前同步QMT，真实fill先入账；提交后再次同步并返回真实现金、持仓、NAV、收益和费用。
+- helper v2提供短连接RPC和只读`PortfolioView/PositionView`；旧v1与新策略版本不匹配并失败关闭。
+- good_etf BACKTEST不变；LIVE只读真实视图、一次提交组合权重，用`record()`展示自定义真实指标。
+- 活跃intent和同日idempotency key可从SQLite恢复，聚宽重启不另建调仓意图。
+
+### 验证
+
+- 4项API定向及StrategyLedger/helper/good_etf/export联合280项通过；flake8、Python语法和diff检查通过。
 
 ## 4. Review记录模板
 

@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
-HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v1"
+HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
 BLOCKED_MUTATIONS = tuple(sorted({
     "order", "order_value", "order_percent", "order_target",
     "order_target_value", "order_target_percent", "cancel_order",
@@ -62,7 +62,7 @@ def _load_strategy(monkeypatch, helper_module=None):
     return module
 
 
-def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=1):
+def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=2):
     module = types.ModuleType("bullet_trade_jq_remote_helper")
     if marker is not None:
         module.STRATEGY_RUNTIME_HELPER_MARKER = marker
@@ -75,7 +75,7 @@ def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=1):
 
 def _runtime_state(mode="SHADOW"):
     return {
-        "api_version": 1,
+        "api_version": 2,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": mode,
@@ -124,7 +124,7 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     strategy = _load_strategy(monkeypatch)
     state = strategy._install_runtime(_Context(run_type))
     assert state == {
-        "api_version": 1,
+        "api_version": 2,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": "BACKTEST",
@@ -166,7 +166,7 @@ def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     assert install_calls == []
 
 
-@pytest.mark.parametrize("api_version", [0, 2])
+@pytest.mark.parametrize("api_version", [0, 1, 3])
 def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
     helper = _fake_helper(
         lambda *args, **kwargs: pytest.fail("版本不匹配不得进入安装"),
@@ -187,14 +187,19 @@ def test_helper_invalid_entry_rejected(monkeypatch, entry):
         strategy._install_runtime(_Context("full_backtest"))
 
 
-def test_live_rejected_before_helper_install(monkeypatch):
-    helper = _fake_helper(
-        lambda *args, **kwargs: pytest.fail("LIVE 不得触达helper安装入口")
-    )
+def test_live_installs_strategy_ledger_runtime(monkeypatch):
+    calls = []
+
+    def install(namespace, **kwargs):
+        calls.append(kwargs)
+        return _runtime_state("LIVE")
+
+    helper = _fake_helper(install)
     strategy = _load_strategy(monkeypatch, helper)
     strategy.MODE = "LIVE"
-    with pytest.raises(RuntimeError, match="禁止真实资金运行"):
-        strategy._install_runtime(_Context("sim_trade"))
+    state = strategy._install_runtime(_Context("sim_trade"))
+    assert state["mode"] == "LIVE"
+    assert calls[0]["expected_api_version"] == 2
 
 
 def test_helper_non_dict_state_rejected(monkeypatch):
@@ -210,7 +215,7 @@ def test_helper_non_dict_state_rejected(monkeypatch):
     [
         {"mode": "BACKTEST"},
         {"strategy_id": "other-strategy"},
-        {"api_version": 2},
+        {"api_version": 1},
     ],
 )
 def test_helper_state_contract_mismatch_rejected(monkeypatch, tamper):
@@ -245,7 +250,7 @@ def test_shadow_install_success_and_call_contract(monkeypatch):
         "profile": "good_etf-prod",
         "mode": "SHADOW",
         "strategy_id": "good_etf",
-        "expected_api_version": 1,
+        "expected_api_version": 2,
     }
     assert state["mode"] == "SHADOW"
     assert strategy.g.bt_runtime == state

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 import secrets
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -9,6 +8,7 @@ from typing import Dict, List, Optional
 from bullet_trade.utils.env_loader import (
     get_env,
     get_env_bool,
+    get_env_float,
     get_env_int,
     get_env_optional_bool,
 )
@@ -60,6 +60,13 @@ class ServerConfig:
     access_log_enabled: bool = True
     order_risk_enabled: bool = False
     idempotency_ttl_seconds: int = 300
+    strategy_database_path: Optional[str] = None
+    strategy_trading_enabled: bool = False
+    strategy_allow_buys: bool = True
+    strategy_max_age_seconds: int = 300
+    strategy_cash_buffer: float = 100.0
+    strategy_minimum_order: float = 0.0
+    strategy_buy_fee_buffer: float = 5.0
 
 
 def _split_items(raw: Optional[str]) -> List[str]:
@@ -182,6 +189,7 @@ def build_server_config(args) -> ServerConfig:
         access_log_enabled = True if flag is None else bool(flag)
     order_risk_enabled = get_env_bool("QMT_SERVER_ORDER_RISK_ENABLED", False)
     idempotency_ttl_seconds = get_env_int("QMT_SERVER_IDEMPOTENCY_TTL_SECONDS", 300)
+    strategy_database_path = get_env("QMT_STRATEGY_LEDGER_DB")
 
     accounts_map = _parse_accounts(getattr(args, "accounts", None) or get_env("QMT_SERVER_ACCOUNTS"))
     default_account_id = get_env("QMT_ACCOUNT_ID")
@@ -235,5 +243,12 @@ def build_server_config(args) -> ServerConfig:
         access_log_enabled=bool(access_log_enabled),
         order_risk_enabled=bool(order_risk_enabled),
         idempotency_ttl_seconds=max(0, int(idempotency_ttl_seconds)),
+        strategy_database_path=strategy_database_path,
+        strategy_trading_enabled=get_env_bool("QMT_STRATEGY_TRADING_ENABLED", False),
+        strategy_allow_buys=get_env_bool("QMT_STRATEGY_ALLOW_BUYS", True),
+        strategy_max_age_seconds=max(1, get_env_int("QMT_STRATEGY_MAX_AGE_SECONDS", 300)),
+        strategy_cash_buffer=max(0.0, get_env_float("QMT_STRATEGY_CASH_BUFFER", 100.0)),
+        strategy_minimum_order=max(0.0, get_env_float("QMT_STRATEGY_MINIMUM_ORDER", 0.0)),
+        strategy_buy_fee_buffer=max(0.0, get_env_float("QMT_STRATEGY_BUY_FEE_BUFFER", 5.0)),
     )
     return cfg

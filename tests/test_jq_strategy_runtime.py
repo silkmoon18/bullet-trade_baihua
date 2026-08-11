@@ -55,15 +55,15 @@ def _install(helper, namespace=None, context=None, *, mode="SHADOW", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 1,
+        "api_version": 2,
         "profile_schema_version": 1,
         "profile": PROFILE,
         "mode": mode,
         "run_type": run_type,
         "strategy_id": STRATEGY_ID,
-        "enabled": mode == "SHADOW",
-        "orders_enabled": mode == "BACKTEST",
-        "production_ready": False,
+        "enabled": mode in ("SHADOW", "LIVE"),
+        "orders_enabled": mode in ("BACKTEST", "LIVE"),
+        "production_ready": mode == "LIVE",
         "reason": "backtest",
     }
     state.update(extra)
@@ -73,13 +73,21 @@ def _state(mode, run_type, **extra):
 def test_public_contract_exports_and_constants(helper):
     assert sorted(helper.__all__) == [
         "PROFILE_SCHEMA_VERSION",
+        "PortfolioView",
+        "PositionView",
         "STRATEGY_RUNTIME_API_VERSION",
         "STRATEGY_RUNTIME_HELPER_MARKER",
+        "ensure_account",
+        "get_events",
+        "get_intent",
+        "get_portfolio",
+        "get_reconciliation",
         "install_strategy_runtime",
+        "submit_targets",
     ]
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 1
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 2
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v1"
+        "bullet-trade-joinquant-runtime-helper-v2"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 1
 
@@ -134,7 +142,7 @@ def test_live_state_exact(helper, monkeypatch):
     _profile_module(monkeypatch)
     assert _install(helper, mode="LIVE") == _state(
         "LIVE", "sim_trade",
-        reason="live_blocked_until_strategy_ledger",
+        reason="strategy_ledger_v1",
         profile_module=PROFILE_MODULE,
         mirror_jq_orders=False,
         blocked_mutations=BLOCKED_MUTATIONS)
@@ -164,8 +172,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [2, "1", True, None])
-def test_expected_api_version_must_equal_one(helper, version):
+@pytest.mark.parametrize("version", [1, 3, "2", True, None])
+def test_expected_api_version_must_equal_two(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 

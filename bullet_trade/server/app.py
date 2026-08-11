@@ -14,11 +14,18 @@ import json
 import ipaddress
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from bullet_trade.core.globals import log
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.utils.portfolio_printer import render_account_overview
+from bullet_trade.server.strategy import (
+    BrokerCapabilityProfile,
+    SQLiteStrategyAPI,
+    StrategyAPIConfig,
+    money_to_units,
+)
 
 from .adapters.base import AccountRouter, AdapterBundle, AccountContext, SubAccountConfig, VirtualAccountManager
 from .config import ServerConfig
@@ -64,6 +71,27 @@ class ServerApplication:
         self._idempotency_lock = asyncio.Lock()
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
+        self.strategy_api: Optional[SQLiteStrategyAPI] = None
+        if self.config.strategy_database_path and self.adapters.broker_adapter:
+            capability_fn = getattr(
+                self.adapters.broker_adapter, "strategy_ledger_capabilities", None
+            )
+            if not callable(capability_fn):
+                raise RuntimeError("broker adapter does not expose StrategyLedger capabilities")
+            self.strategy_api = SQLiteStrategyAPI(
+                StrategyAPIConfig(
+                    database_path=self.config.strategy_database_path,
+                    trading_enabled=self.config.strategy_trading_enabled,
+                    allow_buys=self.config.strategy_allow_buys,
+                    max_age=timedelta(seconds=self.config.strategy_max_age_seconds),
+                    cash_buffer_units=money_to_units(str(self.config.strategy_cash_buffer)),
+                    minimum_order_units=money_to_units(str(self.config.strategy_minimum_order)),
+                    buy_fee_buffer_units=money_to_units(str(self.config.strategy_buy_fee_buffer)),
+                ),
+                self.adapters.broker_adapter,
+                cast(BrokerCapabilityProfile, capability_fn()),
+                self.adapters.data_adapter,
+            )
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
                 account_key = ctx.config.key or "default"
@@ -119,6 +147,8 @@ class ServerApplication:
             features.append("data")
         if self.adapters.broker_adapter:
             features.append("broker")
+        if self.strategy_api:
+            features.append("strategy_ledger_v1")
         return features
 
     def _qmt_status_snapshot(self) -> Optional[Dict[str, Any]]:
@@ -208,7 +238,32 @@ class ServerApplication:
             return await self._dispatch_data(action.split(".", 1)[1], payload)
         if action.startswith("broker."):
             return await self._dispatch_broker(session, action.split(".", 1)[1], payload)
+        if action.startswith("strategy."):
+            return await self._dispatch_strategy(session, action.split(".", 1)[1], payload)
         raise ValueError(f"未知 action: {action}")
+
+    async def _dispatch_strategy(self, session: ClientSession, method: str, payload: Dict) -> Dict:
+        if self.strategy_api is None:
+            raise RuntimeError("StrategyLedger未启用")
+        account_key = payload.get("account_key") or session.account_key
+        sub_account_id = payload.get("sub_account_id") or session.sub_account_id
+        if sub_account_id:
+            raise ValueError("StrategyLedger首版不支持sub_account_id")
+        resolved_key, _ = self.virtual_accounts.resolve(account_key, None)
+        account_context = self.router.get(resolved_key)
+        if method == "ensure_account":
+            return await self.strategy_api.ensure_account(account_context, resolved_key, payload)
+        if method == "get_snapshot":
+            return await self.strategy_api.get_snapshot(account_context, resolved_key, payload)
+        if method == "submit_targets":
+            return await self.strategy_api.submit_targets(account_context, resolved_key, payload)
+        if method == "get_intent":
+            return self.strategy_api.get_intent(payload)
+        if method == "get_events":
+            return self.strategy_api.get_events(payload)
+        if method == "get_reconciliation":
+            return self.strategy_api.get_reconciliation(resolved_key, payload)
+        raise ValueError(f"未知策略接口: {method}")
 
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:
         if not self.adapters.data_adapter:

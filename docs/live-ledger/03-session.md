@@ -41,16 +41,16 @@
 
 ## 最近完成slice
 
-`L01 QMT Sync and Reconciliation`（DONE，`b077670`）
+`L02 Target Planner and Executor`（DONE，`dfeae3f`）
 
 ## 当前slice
 
-`L02 Target Planner and Executor`（REVIEW）
+`L03 Strategy API and JoinQuant View`（REVIEW）
 
-- 新增`SQLiteTargetExecutionService`：真实NAV权重规划、整手、现金/费用缓冲、先卖后买和单进程dispatcher。
-- 聚宽key和operation/outbox双层幂等；真实broker ID回填订单，未知提交不重发。
-- 默认关闭交易，账户/对账/快照任一未就绪均不规划；T+1和working order阻止提前买入。
-- 6项L02定向、92项StrategyLedger联合回归、pyright、flake8和Python 3.8检查通过。
+- 现有TCP server新增六个最小`strategy.*`动作，复用单一token，不建设角色系统。
+- helper升级v2并提供短连接RPC和真实`PortfolioView`；good_etf LIVE改为一次组合目标、真实指标`record()`和活跃intent重启恢复。
+- 聚宽原生模拟账户不被改写；真实组合以StrategyLedger为权威，只通过自定义指标展示。
+- 4项API定向及StrategyLedger/helper/good_etf/export联合280项通过。
 
 ## S03收口
 
@@ -61,7 +61,7 @@
 
 ## 下一步
 
-完成L02提交前审查；通过后进入L03策略API与聚宽真实视图。
+完成L03提交前审查；通过后进入L04本机部署、飞书通知、备份与小额人工验收准备。
 
 ## S04收口
 
