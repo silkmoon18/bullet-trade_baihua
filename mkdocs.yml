@@ -49,6 +49,7 @@ nav:
       - 个人量化精简计划: live-ledger/15-lean-personal-plan.md
       - 飞书交易卡片通知: live-ledger/16-feishu-trade-notifications.md
       - QMT同步与账实对账: live-ledger/17-qmt-reconciliation.md
+      - 目标规划与执行: live-ledger/18-target-planner-executor.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md

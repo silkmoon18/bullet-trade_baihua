@@ -156,30 +156,31 @@ class SQLiteFillBookingService:
                 ),
             )
             connection.commit()
-            self._notify(
-                TradeNotification(
-                    event="ORDER_SUBMITTED",
-                    security=order.security,
-                    side=order.side.value,
-                    status=order.state.value,
-                    quantity=order.requested_qty,
-                    price=(
-                        price_units_to_display(order.limit_price_units)
-                        if order.limit_price_units is not None
-                        else None
-                    ),
-                    amount=(
-                        money_units_to_display(
-                            _trade_value_units(
-                                order.limit_price_units, order.requested_qty
+            if order.state is OrderState.SUBMITTED:
+                self._notify(
+                    TradeNotification(
+                        event="ORDER_SUBMITTED",
+                        security=order.security,
+                        side=order.side.value,
+                        status=order.state.value,
+                        quantity=order.requested_qty,
+                        price=(
+                            price_units_to_display(order.limit_price_units)
+                            if order.limit_price_units is not None
+                            else None
+                        ),
+                        amount=(
+                            money_units_to_display(
+                                _trade_value_units(
+                                    order.limit_price_units, order.requested_qty
+                                )
                             )
-                        )
-                        if order.limit_price_units is not None
-                        else None
-                    ),
-                    order_id=order.order_id,
+                            if order.limit_price_units is not None
+                            else None
+                        ),
+                        order_id=order.order_id,
+                    )
                 )
-            )
             return order
         except (AccountNotFoundError, FillConflictError):
             connection.rollback()
@@ -187,6 +188,132 @@ class SQLiteFillBookingService:
         except sqlite3.DatabaseError as exc:
             connection.rollback()
             raise RepositoryError("failed to register strategy order") from exc
+        finally:
+            connection.close()
+
+    def mark_order_submitted(
+        self,
+        account_id: str,
+        order_id: str,
+        broker_order_id: str,
+    ) -> BrokerOrder:
+        if not broker_order_id:
+            raise ValueError("broker_order_id cannot be empty")
+        connection = connect_database(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._select_order(connection, order_id)
+            if row["strategy_account_id"] != account_id:
+                raise FillConflictError("order belongs to another strategy account")
+            if row["broker_order_id"] not in (None, broker_order_id):
+                raise FillConflictError("order already has another broker order id")
+            if row["state"] in (
+                OrderState.SUBMITTED.value,
+                OrderState.PARTIALLY_FILLED.value,
+                OrderState.FILLED.value,
+            ):
+                current = self._order_from_row(row)
+                if current.broker_order_id != broker_order_id:
+                    raise FillConflictError("submitted order broker id changed")
+                connection.commit()
+                return current
+            if row["state"] not in (
+                OrderState.PENDING_SUBMIT.value,
+                OrderState.SUBMIT_UNKNOWN.value,
+            ):
+                raise FillConflictError("order cannot become submitted")
+            timestamp = _timestamp()
+            connection.execute(
+                """
+                UPDATE strategy_orders
+                SET broker_order_id = ?, state = 'SUBMITTED',
+                    submitted_at = ?, updated_at = ?
+                WHERE order_id = ?
+                """,
+                (broker_order_id, timestamp, timestamp, order_id),
+            )
+            current = self._order_from_row(self._select_order(connection, order_id))
+            connection.commit()
+            self._notify(
+                TradeNotification(
+                    event="ORDER_SUBMITTED",
+                    security=current.security,
+                    side=current.side.value,
+                    status=current.state.value,
+                    quantity=current.requested_qty,
+                    price=(
+                        price_units_to_display(current.limit_price_units)
+                        if current.limit_price_units is not None
+                        else None
+                    ),
+                    amount=(
+                        money_units_to_display(
+                            _trade_value_units(
+                                current.limit_price_units, current.requested_qty
+                            )
+                        )
+                        if current.limit_price_units is not None
+                        else None
+                    ),
+                    order_id=current.order_id,
+                    detail="券商订单号 {}".format(broker_order_id),
+                )
+            )
+            return current
+        except (FillBookingError, FillConflictError):
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise RepositoryError("failed to mark order submitted") from exc
+        finally:
+            connection.close()
+
+    def mark_order_submit_unknown(
+        self,
+        account_id: str,
+        order_id: str,
+        detail: str = "券商提交结果未知",
+    ) -> BrokerOrder:
+        connection = connect_database(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._select_order(connection, order_id)
+            if row["strategy_account_id"] != account_id:
+                raise FillConflictError("order belongs to another strategy account")
+            if row["state"] == OrderState.SUBMIT_UNKNOWN.value:
+                connection.commit()
+                return self._order_from_row(row)
+            if row["state"] != OrderState.PENDING_SUBMIT.value:
+                raise FillConflictError("only pending order can become submit unknown")
+            timestamp = _timestamp()
+            connection.execute(
+                """
+                UPDATE strategy_orders
+                SET state = 'SUBMIT_UNKNOWN', updated_at = ? WHERE order_id = ?
+                """,
+                (timestamp, order_id),
+            )
+            current = self._order_from_row(self._select_order(connection, order_id))
+            connection.commit()
+            self._notify(
+                TradeNotification(
+                    event="ERROR",
+                    security=current.security,
+                    side=current.side.value,
+                    status=current.state.value,
+                    quantity=current.requested_qty,
+                    order_id=current.order_id,
+                    detail=detail,
+                )
+            )
+            return current
+        except (FillBookingError, FillConflictError):
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise RepositoryError("failed to mark submit unknown") from exc
         finally:
             connection.close()
 

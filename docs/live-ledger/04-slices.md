@@ -53,8 +53,8 @@
 | S10 | Valuation and Atomic Snapshot | DONE | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11-S20 | 原机构级剩余计划 | PENDING | 已由D023合并为L00至L04；仅保留历史需求映射 |
 | L00 | Existing Code Pruning | DONE | `cd5ed99`：净删除约1.6万行，334项定向矩阵通过 |
-| L01 | QMT Sync and Reconciliation | REVIEW | 单账户订单/成交/资金/持仓同步与READY/BLOCKED |
-| L02 | Target Planner and Executor | PENDING | 目标权重、先卖后买、整手/现金缓冲、kill switch |
+| L01 | QMT Sync and Reconciliation | DONE | `b077670`：QMT快照同步、真实fill入账与READY/BLOCKED |
+| L02 | Target Planner and Executor | REVIEW | 目标权重、先卖后买、整手/现金缓冲、kill switch |
 | L03 | Strategy API and JoinQuant View | PENDING | ensure/snapshot/targets/intent/events/reconciliation与PortfolioView |
 | L04 | Local Deployment and Small Live | PENDING | 服务启动、备份、飞书通知、SHADOW/模拟/小额人工验收 |
 
@@ -533,6 +533,32 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 ### 验证
 
 - 空账户READY、真实买入fill及重复快照no-op、未知订单、未知成交、现金/持仓差异、撤单释放、kill switch保持、能力未证明BLOCKED、同步/异步采集。
+
+### L01收口
+
+- 实现提交：`b077670`。
+- 9项定向、86项StrategyLedger联合回归、flake8、pyright和Python 3.8检查通过。
+- 决定：DONE。真实MiniQMT/BigQMT能力仍须探针从`PROBE_REQUIRED`升级后才会放行。
+
+## L02：Target Planner and Executor
+
+### 当前状态
+
+- REVIEW：实现、6项定向和92项StrategyLedger联合回归通过，等待提交。
+
+### 最小实现
+
+- 用S10真实总资产、最新mark和目标权重计算整手目标数量；扣除当前真实持仓，不读取聚宽原生模拟持仓。
+- 同一账户只允许一个活跃组合意图；同一聚宽idempotency key重放原意图，不重复建单。
+- 先生成卖单；存在不可卖T+1数量、working order或SUBMIT_UNKNOWN时不生成买单。
+- 卖单完成并由L01同步真实回款后，再按最新可用现金、现金缓冲、每单费用缓冲和最小订单规则生成买单。
+- 买单先冻结StrategyLedger资金；单进程outbox调用server adapter，payload带持久client tag remark和有限确认窗口。
+- 明确响应绑定真实broker order ID；异常或缺order ID进入SUBMIT_UNKNOWN且outbox终止，不自动重发。
+- `trading_enabled=False`默认关闭；`allow_buys=False`支持只卖不买；账户非ACTIVE、对账非READY或快照过期/版本漂移均不规划。
+
+### 验证
+
+- 1万元50%目标整手数量与资金冻结、相同key不重复、真实broker ID绑定、超时unknown不重发、A卖出后才规划B、T+1等待和全局开关阻断。
 
 ## 4. Review记录模板
 

@@ -41,16 +41,16 @@
 
 ## 最近完成slice
 
-`L00 Existing Code Pruning`（DONE，`cd5ed99`）
+`L01 QMT Sync and Reconciliation`（DONE，`b077670`）
 
 ## 当前slice
 
-`L01 QMT Sync and Reconciliation`（REVIEW）
+`L02 Target Planner and Executor`（REVIEW）
 
-- 新增同步/异步QMT快照采集和`SQLiteReconciliationService`。
-- 已知fill复用S09原子入账；未知活动、现金/持仓差异和缺失working order持久化BLOCKED。
-- READY不解除人工kill switch；未完成QMT能力探针时明确BLOCKED。
-- 9项L01定向测试、86项StrategyLedger联合回归通过；pyright、flake8和Python 3.8检查通过。
+- 新增`SQLiteTargetExecutionService`：真实NAV权重规划、整手、现金/费用缓冲、先卖后买和单进程dispatcher。
+- 聚宽key和operation/outbox双层幂等；真实broker ID回填订单，未知提交不重发。
+- 默认关闭交易，账户/对账/快照任一未就绪均不规划；T+1和working order阻止提前买入。
+- 6项L02定向、92项StrategyLedger联合回归、pyright、flake8和Python 3.8检查通过。
 
 ## S03收口
 
@@ -61,7 +61,7 @@
 
 ## 下一步
 
-完成L01提交前审查；通过后进入L02目标规划与执行。
+完成L02提交前审查；通过后进入L03策略API与聚宽真实视图。
 
 ## S04收口
 

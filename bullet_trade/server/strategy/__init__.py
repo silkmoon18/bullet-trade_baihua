@@ -82,6 +82,14 @@ from .reconciliation import (
     collect_broker_snapshot,
     collect_async_broker_snapshot,
 )
+from .planner_executor import (
+    DispatchResult,
+    IntentAdvanceResult,
+    PlannedOrder,
+    PlannerConfig,
+    SQLiteTargetExecutionService,
+    TargetPlanningError,
+)
 
 __all__ = [
     "MONEY_SCALE",
@@ -104,7 +112,9 @@ __all__ = [
     "CapitalAdjustmentResult",
     "CapitalConfigurationError",
     "CapabilityState",
+    "DispatchResult",
     "IntentState",
+    "IntentAdvanceResult",
     "IdempotencyConflictError",
     "FillBookingError",
     "FillBookingResult",
@@ -122,6 +132,8 @@ __all__ = [
     "OperationState",
     "OutboxClaim",
     "PortfolioIntent",
+    "PlannedOrder",
+    "PlannerConfig",
     "PortfolioPositionSnapshot",
     "PortfolioSnapshot",
     "Position",
@@ -130,6 +142,7 @@ __all__ = [
     "ReconciliationResult",
     "RepositoryError",
     "SQLiteStrategyRepository",
+    "SQLiteTargetExecutionService",
     "SQLiteOperationRepository",
     "SQLiteReconciliationService",
     "SQLiteCapitalService",
@@ -139,6 +152,7 @@ __all__ = [
     "StrategyAccount",
     "StrategyAccountEnsureResult",
     "StrategyRepository",
+    "TargetPlanningError",
     "VersionConflictError",
     "ValuationReadinessError",
     "connect_database",
