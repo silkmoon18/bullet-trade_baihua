@@ -45,12 +45,13 @@
 
 ## 当前slice
 
-`L04 Local Deployment and Small Live`（REVIEW，代码完成，等待真实环境人工证据）
+`L04 Local Deployment and Small Live`（代码DONE，`c151a8c`；真实环境人工证据BLOCKED）
 
 - 能力证明文件接入server启动；未验证或启动对账失败时保持只读。
 - 飞书卡片自动接入委托、成交、撤单、拒单和对账阻断。
 - 新增SQLite在线备份/拒绝覆盖式恢复工具，以及登录启动server和每日备份的Windows任务脚本。
 - 真实QMT探针、SHADOW、模拟和小额实盘属于用户机器上的人工证据，代码测试不会自动放行。
+- L04实现提交`c151a8c`；119项server/ledger/probe/backup联合回归及静态检查通过。
 
 ## S03收口
 

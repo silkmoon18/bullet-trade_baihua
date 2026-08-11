@@ -56,7 +56,7 @@
 | L01 | QMT Sync and Reconciliation | DONE | `b077670`：QMT快照同步、真实fill入账与READY/BLOCKED |
 | L02 | Target Planner and Executor | DONE | `dfeae3f`：目标权重、先卖后买、整手/现金缓冲、kill switch |
 | L03 | Strategy API and JoinQuant View | DONE | `04beb3d`：六个strategy RPC、helper v2、真实PortfolioView与record指标 |
-| L04 | Local Deployment and Small Live | REVIEW | 代码完成；真实QMT/SHADOW/模拟/小额人工证据待目标环境执行 |
+| L04 | Local Deployment and Small Live | BLOCKED | `c151a8c`代码DONE；真实QMT/SHADOW/模拟/小额证据待目标环境 |
 
 ## S00：Repository Baseline and Documentation
 
@@ -583,7 +583,7 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 
 ### 当前状态
 
-- REVIEW：本机部署所需代码和runbook已完成；真实柜台和真实交易日证据不能在仓库测试中代替。
+- BLOCKED：实现提交`c151a8c`，119项联合回归通过；真实柜台和真实交易日证据不能在仓库测试中代替。
 
 ### 最小实现
 
