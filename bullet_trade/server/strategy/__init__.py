@@ -43,6 +43,7 @@ from .broker_contract import (
     normalize_trade_evidence,
     require_strategy_ledger_v1,
     strategy_ledger_v1_blockers,
+    load_verified_capabilities,
 )
 from .idempotency import (
     IdempotencyConflictError,
@@ -163,6 +164,7 @@ __all__ = [
     "collect_async_broker_snapshot",
     "migrate_database",
     "money_to_units",
+    "load_verified_capabilities",
     "normalize_trade_batch",
     "normalize_trade_evidence",
     "price_to_units",

@@ -41,16 +41,16 @@
 
 ## 最近完成slice
 
-`L02 Target Planner and Executor`（DONE，`dfeae3f`）
+`L03 Strategy API and JoinQuant View`（DONE，`04beb3d`）
 
 ## 当前slice
 
-`L03 Strategy API and JoinQuant View`（REVIEW）
+`L04 Local Deployment and Small Live`（REVIEW，代码完成，等待真实环境人工证据）
 
-- 现有TCP server新增六个最小`strategy.*`动作，复用单一token，不建设角色系统。
-- helper升级v2并提供短连接RPC和真实`PortfolioView`；good_etf LIVE改为一次组合目标、真实指标`record()`和活跃intent重启恢复。
-- 聚宽原生模拟账户不被改写；真实组合以StrategyLedger为权威，只通过自定义指标展示。
-- 4项API定向及StrategyLedger/helper/good_etf/export联合280项通过。
+- 能力证明文件接入server启动；未验证或启动对账失败时保持只读。
+- 飞书卡片自动接入委托、成交、撤单、拒单和对账阻断。
+- 新增SQLite在线备份/拒绝覆盖式恢复工具，以及登录启动server和每日备份的Windows任务脚本。
+- 真实QMT探针、SHADOW、模拟和小额实盘属于用户机器上的人工证据，代码测试不会自动放行。
 
 ## S03收口
 
@@ -61,7 +61,7 @@
 
 ## 下一步
 
-完成L03提交前审查；通过后进入L04本机部署、飞书通知、备份与小额人工验收准备。
+完成L04代码审查和提交；随后按runbook在目标机器收集真实QMT/聚宽证据。未获用户小额资金批准前保持交易关闭。
 
 ## S04收口
 

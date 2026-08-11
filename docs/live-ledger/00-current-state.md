@@ -62,7 +62,7 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00已将helper重写为403行精简版：公开API只有`STRATEGY_RUNTIME_API_VERSION=1`、`STRATEGY_RUNTIME_HELPER_MARKER`、`PROFILE_SCHEMA_VERSION=1`和`install_strategy_runtime(namespace, *, context, profile, mode, strategy_id, expected_api_version=1, profile_module='jq_runtime_config')`。旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）和全部同进程对抗机制（reload代际、闭包authority、对象投毒检测、lease/socket gate）已删除；按D021，helper运行在用户自有的可信策略进程中，不防御同进程恶意Python代码。
+L00先将helper精简为安装契约；L03将其升级为`STRATEGY_RUNTIME_API_VERSION=2`，只增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
 
 三种模式语义：
 
@@ -97,8 +97,7 @@ S04至S10已具备：
 
 - QMT订单/成交/资金/持仓的持续同步与账实对账（L01）。
 - 目标组合规划与先卖后买执行（L02）。
-- 策略API与聚宽真实组合视图（L03）。
-- 本机部署、备份演练与小额实盘验收（L04）。
+- L01至L04仓库代码已完成；目标QMT能力、聚宽SHADOW/QMT模拟和小额实盘仍需外部人工证据。
 
 ## 4. 依赖现状
 
@@ -171,8 +170,7 @@ L00精简运行契约已经处理：
 仍然存在的问题：
 
 1. 过渡目标仍使用聚宽组合总资产；实盘必须改用StrategyLedger的策略虚拟NAV、working exposure和费用缓冲。
-2. 生产级异步执行、卖后买和部分成交恢复尚未实现（L02）；不能把当前精简运行契约用于真实资金。
-3. 券商硬对账尚未实现（L01）；策略级资金/持仓归属、持久幂等和真实成交入账已在S04至S09完成。
+2. 卖后买、部分成交恢复和券商硬对账已由L01/L02接入；真实柜台能力未经用户目标环境证明时仍保持BLOCKED。
 4. 09:30调仓和09:30风控可能对同一标的产生冲突。
 5. 昨日单位净值与今日开盘价不是严格同时间折价。
 6. 1万元、3只ETF受到100份整手和最低佣金显著影响。
@@ -193,7 +191,7 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-L00精简运行契约只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。导出smoke、L03聚宽真实视图和S18至S20真实门禁均不可省略。
+BACKTEST继续原生运行，SHADOW只生成计划，LIVE软件路径通过helper v2和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SHADOW、模拟和小额资金验收不可由mock替代。
 
 L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
 
@@ -206,4 +204,4 @@ L00后策略只保留普通`getattr`校验helper marker与API版本，不再维�
 
 ## 8. 当前基线结论
 
-当前分支适合作为统一改造起点，但尚不具备真实资金上线条件。P0中的开发体验、策略账本、持久幂等和真实成交入账已完成（S00至S10）；剩余闸门为QMT同步对账（L01）、目标规划执行（L02）、聚宽真实视图（L03）和本机部署与小额验收（L04）。
+当前分支已完成统一仓库和L01至L04代码闭环，但尚不具备自动放行真实资金的条件。剩余事项是runbook中的目标QMT能力证明、聚宽SHADOW/QMT模拟、备份恢复演练及用户明确批准的小额实盘证据。

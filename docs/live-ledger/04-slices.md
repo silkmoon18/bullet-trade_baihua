@@ -55,8 +55,8 @@
 | L00 | Existing Code Pruning | DONE | `cd5ed99`：净删除约1.6万行，334项定向矩阵通过 |
 | L01 | QMT Sync and Reconciliation | DONE | `b077670`：QMT快照同步、真实fill入账与READY/BLOCKED |
 | L02 | Target Planner and Executor | DONE | `dfeae3f`：目标权重、先卖后买、整手/现金缓冲、kill switch |
-| L03 | Strategy API and JoinQuant View | REVIEW | 六个strategy RPC、helper v2、真实PortfolioView与record指标 |
-| L04 | Local Deployment and Small Live | PENDING | 服务启动、备份、飞书通知、SHADOW/模拟/小额人工验收 |
+| L03 | Strategy API and JoinQuant View | DONE | `04beb3d`：六个strategy RPC、helper v2、真实PortfolioView与record指标 |
+| L04 | Local Deployment and Small Live | REVIEW | 代码完成；真实QMT/SHADOW/模拟/小额人工证据待目标环境执行 |
 
 ## S00：Repository Baseline and Documentation
 
@@ -564,7 +564,7 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 
 ### 当前状态
 
-- REVIEW：六个最小RPC、聚宽helper v2、真实PortfolioView、组合提交和重启恢复已实现；等待提交收口。
+- DONE：实现提交`04beb3d`；六个最小RPC、聚宽helper v2、真实PortfolioView、组合提交和重启恢复完成。
 
 ### 最小实现
 
@@ -578,6 +578,27 @@ SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fi
 ### 验证
 
 - 4项API定向及StrategyLedger/helper/good_etf/export联合280项通过；flake8、Python语法和diff检查通过。
+
+## L04：Local Deployment and Small Live
+
+### 当前状态
+
+- REVIEW：本机部署所需代码和runbook已完成；真实柜台和真实交易日证据不能在仓库测试中代替。
+
+### 最小实现
+
+- `QMT_STRATEGY_CAPABILITIES_FILE`加载用户核验的目标QMT能力证据；adapter不匹配、字段未证明或lookback不足时启动失败关闭。
+- 已有账户在server启动后立即同步和对账；未READY时`strategy_ledger_ready=false`，`submit_targets`继续阻断。
+- 复用已有飞书交互卡片及订单/fill钩子，server自动注入；新增对账BLOCKED卡片。
+- 复用已有5MB×3滚动日志；新增SQLite在线backup/restore工具，恢复拒绝覆盖现存库。
+- Windows计划任务在用户登录后启动QMT server，每日18:00备份；不建设额外Windows Service框架。
+- runbook明确能力探针、SHADOW、QMT模拟、备份恢复、飞书和小额真实资金的人工顺序。
+
+### 外部剩余证据
+
+- 目标QMT完成可撤单和小额成交探针并跨进程/跨日核对。
+- 聚宽SHADOW和QMT模拟运行，0重复订单、0未解释账实差异。
+- 用户再次明确批准准确小额金额后，才允许打开交易开关；代码不会自动批准。
 
 ## 4. Review记录模板
 

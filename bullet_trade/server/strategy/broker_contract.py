@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union, cast
 
 from .domain import SHANGHAI_TZ, OrderSide, as_shanghai_time, money_to_units, price_to_units
@@ -77,6 +79,57 @@ BIG_QMT_CAPABILITIES = BrokerCapabilityProfile(
     current_trades_query=CapabilityState.PROBE_REQUIRED,
     working_orders_query=CapabilityState.PROBE_REQUIRED,
 )
+
+
+def load_verified_capabilities(
+    evidence_path: Union[str, Path],
+    expected_adapter_kind: str,
+) -> BrokerCapabilityProfile:
+    """Load a user-reviewed capability probe result for one QMT environment."""
+
+    try:
+        payload = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BrokerContractError("cannot read capability evidence") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise BrokerContractError("capability evidence schema is invalid")
+    if payload.get("adapter_kind") != expected_adapter_kind:
+        raise BrokerContractError("capability evidence adapter does not match server")
+    if not payload.get("verified_at") or not payload.get("probe_report"):
+        raise BrokerContractError("capability evidence has no probe reference")
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise BrokerContractError("capability evidence is incomplete")
+    state_fields = (
+        "client_tag_roundtrip",
+        "stable_order_id",
+        "stable_trade_id",
+        "trade_order_link",
+        "direct_trade_side",
+        "order_side_for_trade",
+        "fee_fields",
+        "order_status",
+        "current_orders_query",
+        "current_trades_query",
+        "working_orders_query",
+    )
+    if any(type(capabilities.get(name)) is not bool for name in state_fields):
+        raise BrokerContractError("capability evidence contains non-boolean results")
+    profile = BrokerCapabilityProfile(
+        adapter_kind=expected_adapter_kind,
+        **{
+            name: (
+                CapabilityState.SUPPORTED
+                if capabilities[name]
+                else CapabilityState.UNSUPPORTED
+            )
+            for name in state_fields
+        },
+        order_lookback_days=payload.get("order_lookback_days"),
+        trade_lookback_days=payload.get("trade_lookback_days"),
+    )
+    require_strategy_ledger_v1(profile)
+    return profile
 
 
 def strategy_ledger_v1_blockers(profile: BrokerCapabilityProfile) -> Tuple[str, ...]:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union, cast
 
 from .broker_contract import BrokerCapabilityProfile
+from ..feishu_notifier import TradeNotification
 from .capital import SQLiteCapitalService
 from .domain import MONEY_SCALE, NAV_SCALE, PRICE_SCALE, SHANGHAI_TZ, money_to_units, price_to_units
 from .planner_executor import PlannerConfig, SQLiteTargetExecutionService
@@ -67,16 +68,19 @@ class SQLiteStrategyAPI:
         broker: object,
         capabilities: BrokerCapabilityProfile,
         data_provider: Optional[object] = None,
+        notification_handler=None,
     ) -> None:
         self.config = config
         self.database_path = Path(config.database_path)
         self.broker = broker
         self.data_provider = data_provider
+        self.notification_handler = notification_handler
+        self.startup_ready = False
         self.repository = SQLiteStrategyRepository(self.database_path)
         self.repository.initialize()
         self.capital = SQLiteCapitalService(self.database_path)
         self.reconciliation = SQLiteReconciliationService(
-            self.database_path, capabilities
+            self.database_path, capabilities, notification_handler
         )
         self.valuation = SQLiteValuationService(self.database_path)
         self.planner = SQLiteTargetExecutionService(
@@ -89,6 +93,7 @@ class SQLiteStrategyAPI:
                 minimum_order_units=config.minimum_order_units,
                 buy_fee_buffer_units=config.buy_fee_buffer_units,
             ),
+            notification_handler,
         )
 
     async def ensure_account(
@@ -116,10 +121,9 @@ class SQLiteStrategyAPI:
                 strategy_id, strategy_id, physical_id, initial_units
             )
             account, created = ensured.account, ensured.created
-        result = self.reconciliation.synchronize(
-            strategy_id, physical_id, broker_snapshot
-        )
+        result = self._synchronize(strategy_id, physical_id, broker_snapshot)
         account = self.repository.get_strategy_account(strategy_id)
+        self.startup_ready = result.state.value == "READY"
         return {
             "account": self._account_payload(account),
             "created": created,
@@ -153,6 +157,8 @@ class SQLiteStrategyAPI:
         payload: Mapping[str, object],
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
+        if not self.startup_ready:
+            raise RuntimeError("StrategyLedger startup reconciliation is not READY")
         key = str(payload.get("idempotency_key") or "").strip()
         weights = payload.get("weights")
         if not key or not isinstance(weights, Mapping):
@@ -192,6 +198,26 @@ class SQLiteStrategyAPI:
             "snapshot": self._snapshot_payload(refreshed),
             "reconciliation": _json_value(reconciliation),
         }
+
+    async def startup_check(self, account_context: object, account_key: str) -> bool:
+        physical_id = self._physical_id(account_key)
+        connection = connect_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT strategy_account_id FROM strategy_accounts WHERE physical_account_id = ?",
+                (physical_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            self.startup_ready = False
+            return False
+        snapshot = await collect_async_broker_snapshot(
+            cast(Any, self.broker), account_context
+        )
+        result = self._synchronize(str(row[0]), physical_id, snapshot)
+        self.startup_ready = result.state.value == "READY"
+        return self.startup_ready
 
     def get_intent(self, payload: Mapping[str, object]) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
@@ -262,9 +288,7 @@ class SQLiteStrategyAPI:
         broker_snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
-        reconciliation = self.reconciliation.synchronize(
-            strategy_id, physical_id, broker_snapshot
-        )
+        reconciliation = self._synchronize(strategy_id, physical_id, broker_snapshot)
         as_of = self._as_of(payload.get("as_of"), broker_snapshot.as_of)
         raw_weights = payload.get("weights")
         target_securities = (
@@ -279,6 +303,35 @@ class SQLiteStrategyAPI:
             strategy_id, marks, as_of, self.config.max_age
         )
         return snapshot, reconciliation, marks
+
+    def _synchronize(self, strategy_id, physical_id, broker_snapshot):
+        previous = self.reconciliation.latest(physical_id)
+        result = self.reconciliation.synchronize(
+            strategy_id, physical_id, broker_snapshot
+        )
+        self.startup_ready = result.state.value == "READY"
+        if (
+            self.notification_handler is not None
+            and result.state.value == "BLOCKED"
+            and (previous is None or previous.state.value != "BLOCKED" or previous.details != result.details)
+        ):
+            try:
+                blockers = result.details.get("blockers", ())
+                if not isinstance(blockers, (list, tuple)):
+                    blockers = (blockers,)
+                self.notification_handler(
+                    TradeNotification(
+                        event="RECONCILIATION_BLOCKED",
+                        security="-",
+                        side="-",
+                        status="BLOCKED",
+                        detail="; ".join(str(item) for item in blockers),
+                        title="实盘账实对账已阻断",
+                    )
+                )
+            except Exception:
+                pass
+        return result
 
     async def _marks(
         self,

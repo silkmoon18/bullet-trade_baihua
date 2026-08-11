@@ -20,11 +20,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple, cast
 from bullet_trade.core.globals import log
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.utils.portfolio_printer import render_account_overview
+from bullet_trade.server.feishu_notifier import FeishuNotifier
 from bullet_trade.server.strategy import (
     BrokerCapabilityProfile,
+    BrokerContractError,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
+    load_verified_capabilities,
 )
 
 from .adapters.base import AccountRouter, AdapterBundle, AccountContext, SubAccountConfig, VirtualAccountManager
@@ -72,12 +75,29 @@ class ServerApplication:
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
         self.strategy_api: Optional[SQLiteStrategyAPI] = None
+        self.feishu_notifier = (
+            FeishuNotifier(
+                self.config.feishu_webhook_url,
+                self.config.feishu_signing_secret,
+            )
+            if self.config.feishu_webhook_url
+            else None
+        )
         if self.config.strategy_database_path and self.adapters.broker_adapter:
             capability_fn = getattr(
                 self.adapters.broker_adapter, "strategy_ledger_capabilities", None
             )
             if not callable(capability_fn):
                 raise RuntimeError("broker adapter does not expose StrategyLedger capabilities")
+            capabilities = cast(BrokerCapabilityProfile, capability_fn())
+            if self.config.strategy_capabilities_path:
+                try:
+                    capabilities = load_verified_capabilities(
+                        self.config.strategy_capabilities_path,
+                        capabilities.adapter_kind,
+                    )
+                except BrokerContractError as exc:
+                    log.error("QMT能力证明无效，StrategyLedger保持只读: %s", exc)
             self.strategy_api = SQLiteStrategyAPI(
                 StrategyAPIConfig(
                     database_path=self.config.strategy_database_path,
@@ -89,8 +109,9 @@ class ServerApplication:
                     buy_fee_buffer_units=money_to_units(str(self.config.strategy_buy_fee_buffer)),
                 ),
                 self.adapters.broker_adapter,
-                cast(BrokerCapabilityProfile, capability_fn()),
+                capabilities,
                 self.adapters.data_adapter,
+                self.feishu_notifier.queue_message if self.feishu_notifier else None,
             )
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
@@ -623,6 +644,21 @@ class ServerApplication:
     async def _start_components(self) -> None:
         if self.adapters.broker_adapter:
             await self.adapters.broker_adapter.start()
+        if self.strategy_api:
+            for account_context in self.router.list_accounts():
+                account_key = account_context.config.key or "default"
+                try:
+                    ready = await self.strategy_api.startup_check(
+                        account_context, account_key
+                    )
+                except Exception as exc:
+                    ready = False
+                    log.error("StrategyLedger启动对账失败，保持只读: %s", exc)
+                if not ready:
+                    log.warning(
+                        "StrategyLedger账户%s启动未就绪，真实组合下单保持阻断",
+                        account_key,
+                    )
         if self.tick_manager:
             await self.tick_manager.start()
 
@@ -643,6 +679,8 @@ class ServerApplication:
             big_qmt_gateway = qmt_status.get("big_qmt_gateway") if isinstance(qmt_status, dict) else None
             if big_qmt_gateway is not None:
                 value["big_qmt_gateway"] = big_qmt_gateway
+        if self.strategy_api is not None:
+            value["strategy_ledger_ready"] = self.strategy_api.startup_ready
         return {
             "dtype": "dict",
             "value": value,

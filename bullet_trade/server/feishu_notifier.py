@@ -78,6 +78,7 @@ class FeishuTradeNotifier:
             "PARTIALLY_FILLED": "turquoise",
             "CANCELED": "grey",
             "REJECTED": "red",
+            "RECONCILIATION_BLOCKED": "red",
             "ERROR": "red",
         }.get(notification.event.upper(), "orange")
         title = notification.title or {

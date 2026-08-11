@@ -25,6 +25,7 @@
 19. [QMT同步与账实对账](17-qmt-reconciliation.md)
 20. [目标规划与执行](18-target-planner-executor.md)
 21. [策略API与聚宽真实组合视图](19-strategy-api-joinquant-view.md)
+22. [本机部署、备份与小额验收](20-local-deployment-runbook.md)
 
 `archive/`：历史审查记录归档（S01逐轮REWORK与S01至S03逐轮冻结明细）；其中各轮候选结论均已失效，仅作历史记录，不作为放行证据。
 

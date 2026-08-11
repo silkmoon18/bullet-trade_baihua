@@ -10,6 +10,7 @@ from bullet_trade.server.strategy import (
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
+    MINI_QMT_CAPABILITIES,
 )
 
 
@@ -80,6 +81,7 @@ class FakeData:
 @pytest.fixture
 def api(tmp_path):
     broker = FakeBroker()
+    notifications = []
     service = SQLiteStrategyAPI(
         StrategyAPIConfig(
             database_path=tmp_path / "strategy.db",
@@ -90,14 +92,15 @@ def api(tmp_path):
         broker,
         _capabilities(),
         FakeData(),
+        notifications.append,
     )
     account = AccountContext(AccountConfig("default", "qmt-account"))
-    return service, broker, account
+    return service, broker, account, notifications
 
 
 @pytest.mark.asyncio
 async def test_ensure_account_and_real_snapshot(api):
-    service, _, account = api
+    service, _, account, _ = api
 
     ensured = await service.ensure_account(
         account,
@@ -114,11 +117,13 @@ async def test_ensure_account_and_real_snapshot(api):
     assert snapshot["total_value"] == 10_000.0
     assert snapshot["nav"] == 1.0
     assert snapshot["reconciliation"]["state"] == "READY"
+    service.startup_ready = False
+    assert await service.startup_check(account, "default") is True
 
 
 @pytest.mark.asyncio
 async def test_submit_targets_is_idempotent_and_exposes_queries(api):
-    service, broker, account = api
+    service, broker, account, notifications = api
     await service.ensure_account(
         account,
         "default",
@@ -138,6 +143,7 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     restored = service.get_intent({"strategy_id": "good_etf"})
 
     assert broker.order_calls == 1
+    assert any(item.event == "ORDER_SUBMITTED" for item in notifications)
     assert first["intent"]["intent_id"] == second["intent"]["intent_id"]
     assert restored["intent_id"] == intent_id
     assert restored["weights"] == {SECURITY: 0.5}
@@ -154,7 +160,7 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
 
 @pytest.mark.asyncio
 async def test_initial_cash_shortage_fails_without_strategy_account(api):
-    service, broker, account = api
+    service, broker, account, _ = api
     broker.cash = 9_999.0
 
     with pytest.raises(Exception, match="insufficient"):
@@ -170,3 +176,25 @@ async def test_initial_cash_shortage_fails_without_strategy_account(api):
 
 def test_money_scale_is_still_exact():
     assert money_to_units("10000") == 100_000_000
+
+
+@pytest.mark.asyncio
+async def test_unverified_capabilities_send_reconciliation_block_card(tmp_path):
+    broker = FakeBroker()
+    notifications = []
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(tmp_path / "blocked.db"),
+        broker,
+        MINI_QMT_CAPABILITIES,
+        FakeData(),
+        notifications.append,
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    result = await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": "10000"},
+    )
+    assert result["reconciliation"]["state"] == "BLOCKED"
+    assert notifications[-1].event == "RECONCILIATION_BLOCKED"
+    assert "capability" in notifications[-1].detail

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "adapter_kind": "MINI_QMT",
+  "verified_at": "replace-after-real-probe",
+  "probe_report": "replace-with-probe-report-path",
+  "order_lookback_days": 0,
+  "trade_lookback_days": 0,
+  "capabilities": {
+    "client_tag_roundtrip": false,
+    "stable_order_id": false,
+    "stable_trade_id": false,
+    "trade_order_link": false,
+    "direct_trade_side": false,
+    "order_side_for_trade": false,
+    "fee_fields": false,
+    "order_status": false,
+    "current_orders_query": false,
+    "current_trades_query": false,
+    "working_orders_query": false
+  }
+}

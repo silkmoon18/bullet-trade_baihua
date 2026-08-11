@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -14,6 +15,7 @@ from bullet_trade.server.strategy.broker_contract import (
     normalize_trade_evidence,
     require_strategy_ledger_v1,
     strategy_ledger_v1_blockers,
+    load_verified_capabilities,
 )
 from bullet_trade.server.strategy.domain import OrderSide
 
@@ -56,6 +58,59 @@ def test_verified_qmt_profile_can_use_order_mapping_for_trade_side(profile):
     assert verified.direct_trade_side is CapabilityState.UNSUPPORTED
     assert strategy_ledger_v1_blockers(verified) == ()
     require_strategy_ledger_v1(verified)
+
+
+def test_verified_capability_evidence_loads_for_matching_adapter(tmp_path):
+    path = tmp_path / "capabilities.json"
+    states = {
+        "client_tag_roundtrip": True,
+        "stable_order_id": True,
+        "stable_trade_id": True,
+        "trade_order_link": True,
+        "direct_trade_side": False,
+        "order_side_for_trade": True,
+        "fee_fields": True,
+        "order_status": True,
+        "current_orders_query": True,
+        "current_trades_query": True,
+        "working_orders_query": True,
+    }
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "adapter_kind": "MINI_QMT",
+                "verified_at": "2026-08-11T20:00:00+08:00",
+                "probe_report": "runtime-probe/probe_report.json",
+                "order_lookback_days": 1,
+                "trade_lookback_days": 1,
+                "capabilities": states,
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile = load_verified_capabilities(path, "MINI_QMT")
+    assert strategy_ledger_v1_blockers(profile) == ()
+    with pytest.raises(BrokerContractError, match="adapter does not match"):
+        load_verified_capabilities(path, "BIG_QMT")
+
+
+def test_incomplete_capability_evidence_is_rejected(tmp_path):
+    path = tmp_path / "capabilities.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "adapter_kind": "MINI_QMT",
+                "verified_at": "2026-08-11",
+                "probe_report": "probe.json",
+                "capabilities": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(BrokerContractError, match="non-boolean"):
+        load_verified_capabilities(path, "MINI_QMT")
 
 
 def test_trade_order_link_without_order_side_does_not_satisfy_side_contract():

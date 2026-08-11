@@ -51,6 +51,7 @@ nav:
       - QMT同步与账实对账: live-ledger/17-qmt-reconciliation.md
       - 目标规划与执行: live-ledger/18-target-planner-executor.md
       - 策略API与聚宽真实组合视图: live-ledger/19-strategy-api-joinquant-view.md
+      - 本机部署、备份与小额验收: live-ledger/20-local-deployment-runbook.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
       - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md
