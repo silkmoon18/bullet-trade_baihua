@@ -1,179 +1,64 @@
+# -*- coding: utf-8 -*-
+# flake8: noqa: F403,F405
+"""BulletTrade 聚宽 SHADOW（只读影子）模式最小示例。
+
+上传步骤：
+1. 将 helpers/bullet_trade_jq_remote_helper.py 上传到聚宽研究根目录。
+2. 参照 jq_runtime/jq_runtime_config.example.py 编写私有 jq_runtime_config.py
+   并上传到聚宽研究根目录；其中 host/token 等字段在本地用占位符
+   （如 <服务器地址>、<访问令牌>）管理，真实凭据只存在于聚宽私有文件中。
+3. 将本文件内容复制到聚宽策略，以“模拟交易”方式运行。
+
+SHADOW 语义：helper 校验 profile 后，把 order/order_value/order_percent/
+order_target/order_target_value/order_target_percent/cancel_order 替换为
+失败关闭的 guard；策略侧只记录日志，不会产生任何真实委托。
 """
-可直接拷贝到聚宽研究环境的示例策略。
 
-准备：
-- 将 `bullet_trade_jq_remote_helper.py` 放到聚宽研究根目录。
-- 将本文件拷贝到同目录，在聚宽里打开后直接运行。
-- 请先在下方填写你的服务器参数。
-
-能力：
-- 启动时自动调用 bt.configure，适配聚宽频繁重启。
-- 查看账户与持仓。
-- 市价单（自动补价转限价）/限价单，下单时可指定 wait_timeout>0 同步等待，否则异步。
-- 撤单、订单状态查询。
-"""
-
-import datetime
-import os
-
-from jqdata import *  # 聚宽内置
+from jqdata import *  # 聚宽内置环境
 
 import bullet_trade_jq_remote_helper as bt
 
-# ===== 配置区域 =====
-BT_REMOTE_HOST = '111.111.111.111'  #远程qmt服务器
-BT_REMOTE_PORT = 58620              #远程qmt服务器端口
-BT_REMOTE_TOKEN = 'my_remote_token_879237283'  #修改为你自己的服务器token秘钥
-ACCOUNT_KEY = None  # 可选
-SUB_ACCOUNT = None  # 可选
-
-
-def _ensure_configured():
-    if not BT_REMOTE_TOKEN:
-        raise RuntimeError("请先在 BT_REMOTE_HOST/BT_REMOTE_PORT/BT_REMOTE_TOKEN/ACCOUNT_KEY/SUB_ACCOUNT 填写远程服务器配置")
-    bt.configure(
-        host=BT_REMOTE_HOST,
-        port=BT_REMOTE_PORT,
-        token=BT_REMOTE_TOKEN,
-        account_key=ACCOUNT_KEY,
-        sub_account_id=SUB_ACCOUNT,
-    )
-    # 让券商端可用数据补价
-    bt.get_broker_client().bind_data_client(bt.get_data_client())
-
-
-def process_initialize(context):
-    """
-    聚宽重启/代码刷新时调用，此处完成所有初始化与任务注册。
-    """
-    log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
-    _ensure_configured()
-
-
+# ===== 部署契约 =====
+PROFILE = 'demo-prod'         # 对应 jq_runtime_config.PROFILES 中的键
+MODE = 'SHADOW'               # 只读影子模式：校验链路但禁止下单
+STRATEGY_ID = 'demo_shadow'   # 必须等于 profile 中的 strategy_id
 
 
 def initialize(context):
-    """
-    占位：聚宽重启后由 process_initialize 完成实际初始化。
-    """
-    set_benchmark("000001.XSHE")
-    set_option("use_real_price", True)
+    # 安全门必须是第一条可执行语句：安装运行模式并阻断交易函数。
+    state = bt.install_strategy_runtime(
+        globals(),
+        context=context,
+        profile=PROFILE,
+        mode=MODE,
+        strategy_id=STRATEGY_ID,
+    )
+    log.info('运行时已安装 | mode={} reason={}'.format(state['mode'], state['reason']))
 
-    run_daily(show_account_and_positions, time="09:35")
-    run_daily(place_limit_buy_and_cancel, time="09:36")
-    run_daily(place_market_buy_async, time="09:37")
-    run_daily(check_open_orders, time="09:38")
-    run_daily(trade_gold_roundtrip, time="09:39")
-
-
-def show_account_and_positions(context):
-    """
-    打印账户与持仓。
-    """
-    try:
-        acct = bt.get_account()
-        positions = bt.get_positions()
-        log.info(
-            f"[账号] 现金={acct.available_cash:.2f} 总资产={acct.total_value:.2f} 持仓数量={len(positions)}"
-        )
-        for pos in positions:
-            log.info(f"[持仓] {pos.security} 数量={pos.amount} 成本={pos.avg_cost:.4f} 市值={pos.market_value:.2f}")
-    except Exception as exc:
-        log.error(f"获取账户/持仓失败: {exc}")
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    # 每交易日 14:50 记录一次组合快照（纯日志，不下单）。
+    run_daily(record_portfolio_snapshot, '14:50', reference_security='000300.XSHG')
 
 
-def place_limit_buy_and_cancel(context):
-    """
-    取当前价打 99 折挂单买入 100 手，wait_timeout=10s 同步等待，然后尝试撤单。
-    """
-    symbol = "000001.XSHE"
-    try:
-        last = bt.get_data_client().get_last_price(symbol)
-        if not last:
-            log.warning(f"[限价单] 无法获取 {symbol} 价格，跳过")
-            return
-        limit_price = round(last * 0.99, 2)
-        log.info(f"[限价单] {symbol} 99折买入尝试，限价={limit_price}")
-        oid = bt.order(symbol, 100, price=limit_price, wait_timeout=10)
-        log.info(f"[限价单] 下单返回 order_id={oid}，准备撤单")
-        if oid:
-            try:
-                bt.cancel_order(oid)
-                log.info(f"[撤单] 已提交撤单 order_id={oid}")
-            except Exception as exc:
-                log.error(f"[撤单] 撤单失败 order_id={oid}, err={exc}")
-    except Exception as exc:
-        log.error(f"[限价单] 下单流程异常: {exc}")
+def process_initialize(context):
+    """聚宽重启/代码刷新时调用；同签名重复安装幂等返回原状态。"""
+    state = bt.install_strategy_runtime(
+        globals(),
+        context=context,
+        profile=PROFILE,
+        mode=MODE,
+        strategy_id=STRATEGY_ID,
+    )
+    log.info('运行时已恢复 | mode={} reason={}'.format(state['mode'], state['reason']))
 
 
-def place_market_buy_async(context):
-    """
-    市价单（自动补价转限价），不等待回报。
-    """
-    symbol = "000002.XSHE"
-    try:
-        log.info(f"[市价单] {symbol} 买入 100，异步模式")
-        oid = bt.order(symbol, 100, price=None, wait_timeout=0)
-        log.info(f"[市价单] 已提交，order_id={oid}")
-    except Exception as exc:
-        log.error(f"[市价单] 下单失败: {exc}")
-
-
-def trade_gold_roundtrip(context):
-    """
-    同步买入黄金 100 份（市价自动补限价），待回报后再卖出同等数量。
-    """
-    symbol = "518880.XSHG"  # 黄金 ETF
-    try:
-        before_acct = bt.get_account()
-        positions = bt.get_positions()
-        pos_map = {p.security: p for p in positions}
-        before_pos = pos_map.get(symbol)
-        log.info(
-            f"[黄金回合][前] 现金={before_acct.available_cash:.2f} "
-            f"持仓={before_pos.amount if before_pos else 0} 可用={before_pos.available if before_pos else 0}"
-        )
-        log.info(f"[黄金回合] 市价买入 {symbol} 100 份，同步等待成交（保护价自动计算）")
-        buy_oid = bt.order(symbol, 100, price=None, wait_timeout=10)
-        log.info(f"[黄金回合] 买单 order_id={buy_oid}")
-        if buy_oid:
-            mid_acct = bt.get_account()
-            positions = bt.get_positions()
-            pos_map = {p.security: p for p in positions}
-            mid_pos = pos_map.get(symbol)
-            log.info(
-                f"[黄金回合][买后] 现金={mid_acct.available_cash:.2f} "
-                f"持仓={mid_pos.amount if mid_pos else 0} 可用={mid_pos.available if mid_pos else 0}"
-            )
-            log.info(f"[黄金回合] 市价卖出 {symbol} 100 份，同步等待成交（保护价自动计算）")
-            sell_oid = bt.order(symbol, -100, price=None, wait_timeout=10)
-            log.info(f"[黄金回合] 卖单 order_id={sell_oid}")
-            after_acct = bt.get_account()
-            positions = bt.get_positions()
-            pos_map = {p.security: p for p in positions}
-            after_pos = pos_map.get(symbol)
-            log.info(
-                f"[黄金回合][卖后] 现金={after_acct.available_cash:.2f} "
-                f"持仓={after_pos.amount if after_pos else 0} 可用={after_pos.available if after_pos else 0}"
-            )
-    except Exception as exc:
-        log.error(f"[黄金回合] 交易失败: {exc}")
-
-
-def check_open_orders(context):
-    """
-    查询开放订单、状态，并演示可卖数量。
-    """
-    try:
-        opens = bt.get_open_orders()
-        log.info(f"[订单查询] 当前未完结订单数={len(opens)}")
-        for it in opens:
-            oid = it.get("order_id")
-            status = bt.get_order_status(oid) if oid else {}
-            log.info(f"[订单查询] order_id={oid}, status={status.get('status')}, raw={status}")
-        # 展示可卖数量
-            positions = bt.get_positions()
-            for pos in positions:
-                log.info(f"[持仓核对] {pos.security} 总量={pos.amount} 可用={pos.available} 冻结={pos.frozen}")
-    except Exception as exc:
-        log.error(f"[订单查询] 失败: {exc}")
+def record_portfolio_snapshot(context):
+    """只记录日志的定时任务；SHADOW 下任何下单调用都会被 guard 阻断。"""
+    portfolio = context.portfolio
+    log.info('组合快照 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}'.format(
+        portfolio.available_cash, portfolio.total_value, portfolio.positions_value))
+    for code in sorted(portfolio.positions.keys()):
+        position = portfolio.positions[code]
+        log.info('持仓 | {} 数量={} 成本={:.4f} 现价={:.4f}'.format(
+            code, position.total_amount, position.avg_cost, position.price))

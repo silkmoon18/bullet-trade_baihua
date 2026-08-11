@@ -1,5 +1,7 @@
 # 方案 B：策略在聚宽侧模拟盘运行
 
+> **当前 fork 提示：** 本页涉及 `bullet_trade_jq_remote_helper.configure(...)` 的步骤属于上游历史方案，L00 后已不可用。聚宽继续负责策略信号，但真实下单将由 L02/L03 的 StrategyLedger API 完成；实施状态见 [个人量化精简计划](live-ledger/15-lean-personal-plan.md)。
+
 [返回新手入门总览](beginner-guide.md)
 
 这一条路的意思是：

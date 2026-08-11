@@ -1,0 +1,24 @@
+# S01逐轮审查历史（L00前归档）
+
+> 归档时间：2026-08-10（Asia/Shanghai）。
+> 来源：`docs/live-ledger/03-session.md`“## 当前状态”小节中，S01自初始实现`655b3c9`至最终候选的逐轮REWORK与冻结叙述。
+> 说明：其中各轮候选与审查结论均已失效，仅为历史记录，不作为放行证据；S01最终收口以`../03-session.md`与`../04-slices.md`为准。
+
+---
+
+- S01初始实现`655b3c9`经多轮修复形成精确候选`354ecf3`；契约和安全审查批准，但对抗审查仍发现旧compat originals/别名、helper reload、并发契约、RPC切换、污染BACKTEST、BaseException凭据脱敏及namespace状态伪造问题，因此该SHA明确REWORK，不能发布。
+- S01 v3精确候选`34944b3`经三方复审仍为REWORK：策略BACKTEST分支可绕过helper污染检查；helper在BACKTEST读取context前尚未建立进程门禁；`raise ... from None`仍通过`__context__`保留profile导入异常；profile导入成功后的属性异常也未脱敏。
+- S01 v4首轮工作树预审继续为REWORK，又发现异常进程状态失败开放、无helper兜底接受旧远程portfolio、helper内部ImportError被误判为缺失、未知profile字段名回显、超大整数逃逸稳定错误、并发双BACKTEST给失败namespace遗留guard等问题。第二轮修复后的预审仍发现孤儿`TRANSITIONING`可恢复成功、超大API版本错误不稳定，以及无helper兜底在已加载其他helper别名时仍有context getter远程窗口。第三轮修复将孤儿态直接转FAILED，要求精确`ModuleNotFoundError`的traceback证明helper本体尚未执行，并在context前拒绝任何已加载helper别名和旧remote portfolio；预审仅余策略期望API和helper实际API两个超大内部版本的稳定错误MINOR。第四轮对API比较两侧统一使用有界安全显示，162项相关测试、阻断级flake8、Python 3.8 AST、基线验证和Git格式检查均通过，契约、安全、对抗预审全部APPROVE。实现提交`aa04303`、记录提交`c336d24`的精确复审为REWORK：任意sys.modules键可隐藏真实helper模块对象；成功runtime的进程和namespace权威被同时清空时会被误判为fresh。v5工作树虽增加marker、模块对象扫描和普通值封套，预审仍复现四项权威全擦恢复、ModuleType子类漏检、等值协同替换/常量poison及无关模块假阳性，因此继续REWORK。v6使用非零generation和commit capsule绑定身份后，预审又发现capsule全局本身可等值替换、两份状态字典可保持identity协同原地改值。v7新增闭包identity锚、进程期FAILED latch和提交时不可变state snapshot，上述情况都在context前失败；183项相关测试及静态/语法/基线/格式验证通过，等待重新三路预提交复审。
+- v7三路预审为2 APPROVE、1 REWORK：RPC lease对poison generation执行自定义比较后可能进入socket，reload初始化对poison旧计数调用`int()`会在FAILED/client清理前中断。v8改为精确整数快照后，三路复审仍全部REWORK：并发/中断reload旧client窗口、commit envelope缺少原helper token/generation、transition owner自定义比较、可替换锁identity和请求登记后inflight污染均可越过预期边界。v9在任何reload generation变化前先发布FAILED，使用闭包锚定模块代际、两把锁和request-token registry，commit capsule绑定原token/generation，所有transition字段先做精确类型校验，并在紧邻每次socket前验证多维lease；198项测试通过，但复审继续发现fake-equal registry、finally漂移、部分reload重复generation和lease到socket的TOCTOU，因此仍REWORK。
+- v10将单向reload latch与socket attempt identity集合移入闭包，加入request隔离、异步清理和完整install reservation lease；213项测试通过。精确复审仍发现三个阻断：新代imports早于reload失败关闭、最终generation检查与实际返回存在并发窗口、BACKTEST隐式`str(profile/profile_module)`可执行回调并掩盖reservation篡改。
+- v11在任何新代import前调用旧代闭包bootstrap，先关闭gate再等待attempt；commit capsule绑定namespace并在reload时即时清理record/安装guard，安装最终以`runtime -> owner -> socket`复核返回。其222项测试和已发生的审查仅保留为历史证据；后续reload/socket线性化REWORK已经修改工作树，因此v11测试结论和审查结论均自动失效，不能用于放行。
+- 当前工作树采用三锁模型（runtime `RLock`、owner `Lock`、socket `RLock`）和`attempt token -> thread id`登记；lease检查与attempt登记在`runtime -> socket`临界区原子完成，connector随后通过独立最终permit进入且不持续持gate锁，reload关闭gate后等待已登记attempt；TLS包装、握手及request/mutation发送effect在socket锁内线性化，mutation在调用effect前发布handoff。同线程递归reload不再等待自身，而以`RuntimeReloadAbort`进入进程终止路径。reload gate仅是误用检测/fail-closed防线，生产禁止raw reload、热补丁及trace/profile/signal catch-and-resume，升级必须停止策略后冷启动全新进程。
+- 首轮冻结预审的契约路发现MAJOR：`good_etf.py`只校验helper API版本、未校验稳定marker，API恰为1的错误同名模块可在runtime门禁前取得`globals/context`并返回伪状态；并发和部署两路结论随冻结失效。修复后策略在调用runtime前按精确内建类型和值校验helper marker，并新增missing/wrong/bool/poison四项fail-fast回归，错误helper的安装入口不会被调用。
+- 第二轮冻结预审为2 APPROVE、1 REWORK：策略在helper门禁前用`str(MODE or '')`执行非普通MODE的`__bool__/__str__`，且在确认期望API为精确`int`前执行`actual != expected`，可触发poison expected的`__ne__`。修复后MODE先做精确`str`检查并仅用内建`str.strip/upper`归一化；API比较先短路验证expected/actual均为精确`int`。boolean/poison MODE与expected API均新增不执行魔术方法、不调用helper的回归。
+- 第三轮冻结预审为1 APPROVE、2 REWORK：策略用普通属性访问调用`bt.install_strategy_runtime`，合法marker/API但缺入口的标准模块可执行PEP 562 `__getattr__`，任意callable入口也可在真正helper门禁前执行`__call__`。修复后只用已取得的模块`__dict__`和`dict.get`捕获入口，要求精确Python函数类型并调用局部引用；missing入口、poison模块`__getattr__`和poison callable均固定失败且不执行回调。runtime state也收紧为精确内建`dict`。
+- 第四轮冻结预审为部署/文档APPROVE、契约REWORK、并发REWORK：helper虽返回精确`dict`，策略未验证完整state，伪state可把SHADOW降级成BACKTEST并触发聚宽原生order；`initialize`/`process_initialize`也在helper gate前调用了jqdata/platform对象。修复后策略逐字段验证state schema、identity、mode、run_type、flags、reason、profile_module和blocked_mutations，`_runtime_mode`拒绝任何篡改；两个生命周期入口的首条可执行语句均为runtime安装。
+- 第5轮冻结前对抗探针又发现MAJOR：`_runtime_mode`先读取`g.bt_runtime`会执行平台属性协议，poison getter可先把SHADOW改成BACKTEST并触发原生order。修复后已验证模式封存在一次性闭包权威中，`g.bt_runtime`仅作展示且三个交易入口完全不读取它；当前MODE与闭包权威漂移固定失败。
+- 第5轮正式冻结审查为1 APPROVE、2 REWORK；代码、并发和部署边界均未发现问题，两路REWORK源于同两项MINOR文档漂移：当前候选摘要仍停在首轮marker阶段，现状文档日期仍为2026-08-08。两处现已更正，前五轮历史均保留，第6轮冻结待执行。
+- 第6轮正式冻结三路均因同一MINOR文档漂移REWORK：`00-current-state.md`正文仍称处于第5轮，与第6轮PENDING记录矛盾；代码与并发路径没有新finding。该句现改为不随轮次失效的S01 IN_PROGRESS/两阶段复审未完成表述，第7轮冻结待执行。
+- 第7轮预提交冻结的契约、并发/对抗、部署/文档三路均APPROVE；候选提交`a94aa12060c5e8cef479224952e302eeac99f37d`随后再次通过三路精确SHA终审，均无BLOCKER/MAJOR/MINOR，起止工作树clean。
+- 当前阶段共新增17个策略回归。最新完整目标测试为295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST（6个变更Python文件）、阻断级flake8、S00 baseline validator和Git格式检查均PASS，`git diff --check`仅有CRLF提示。S01状态为DONE。

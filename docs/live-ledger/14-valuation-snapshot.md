@@ -55,6 +55,6 @@ lot成本不再依赖舍入后的每股成本来做结转，而是使用原始�
 
 ## NAV边界
 
-当前策略正常使用场景是启动时固定分配1万元且运行中不增减资，此时`performance_ready=True`，`nav_units`可作为基础组合净值。
+首版运行场景是启动时固定分配1万元且运行中不增减资（D023），此时`performance_ready=True`，`nav_units`可作为基础组合净值。
 
-如果运行中调用显式`ALLOCATE/WITHDRAW`，资产和盈亏快照仍然正确，但严格的份额申购赎回净值尚未实现，`performance_ready=False`。S16在生成聚宽绩效曲线时必须检查该字段，不能把简单资产/净投入比率伪装成严格份额净值。
+严格的份额申购赎回净值从未实现，L00已明确不再建设该支持；`performance_ready`标记保留：如果管理员修复入口产生初始入金之外的`ALLOCATE/WITHDRAW`资金流动，资产和盈亏快照仍然正确，但`performance_ready=False`。聚宽绩效视图（L03）必须检查该字段，不能把简单资产/净投入比率伪装成严格份额净值。

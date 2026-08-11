@@ -1,6 +1,6 @@
 """Strict static contract probe; this module is never uploaded or executed."""
 
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 import bullet_trade_jq_remote_helper as remote
 from joinquant_typing import Snapshot
@@ -51,16 +51,10 @@ def inspect_strategy_contract(context: Context) -> None:
     blocked_mutations: Optional[Tuple[str, ...]] = runtime_state.get(
         "blocked_mutations"
     )
-    broker: remote.RemoteBrokerClient = remote.get_broker_client()
-    open_orders: Dict[str, remote.RemoteOrder] = broker.get_open_orders()
-    account: remote.RemoteAccount = broker.get_account()
     _ = (
         runtime_api,
         profile_schema,
         orders_enabled,
         production_ready,
         blocked_mutations,
-        open_orders,
-        account.available_cash,
-        account.total_value,
     )

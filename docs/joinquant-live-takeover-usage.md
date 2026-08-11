@@ -1,5 +1,7 @@
 # 聚宽策略修改方案 2：接管聚宽函数
 
+> ⚠️ 已失效：本文描述的旧版 helper 远程接口（`configure`/`order` 系列）已在 L00 从 helper 删除，仅保留为上游 v0.9.2 历史资料；当前 helper 契约见 [live-ledger 当前状态](live-ledger/00-current-state.md)。
+
 这份文档给已经在聚宽模拟盘运行策略、希望尽量少改策略代码的用户使用。
 
 目标是：**回测不使用 BulletTrade；聚宽模拟盘运行时，账户资金、持仓读取和下单函数由 BulletTrade 接管**。策略主体逻辑尽量不用改。

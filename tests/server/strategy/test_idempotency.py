@@ -144,18 +144,17 @@ def test_operation_hash_and_outbox_share_one_request_snapshot(operation_reposito
 
 def test_claim_begin_and_finish_persist_response_for_replay(operation_repository):
     created = _create(operation_repository)
-    claim = operation_repository.claim_next("worker-1")
+    claim = operation_repository.claim_next()
     assert claim is not None
     payload = json.loads(claim.payload_json)
     assert payload["operation_id"] == created.operation.operation_id
     assert payload["client_tag"] == created.operation.client_tag
     assert claim.attempt_count == 1
 
-    submitting = operation_repository.begin_submission(claim.outbox_id, "worker-1")
+    submitting = operation_repository.begin_submission(claim.outbox_id)
     assert submitting.state is OperationState.SUBMITTING
     completed = operation_repository.finish_submission(
         claim.outbox_id,
-        "worker-1",
         {"order_id": "broker-order-1", "status": "submitted"},
     )
     assert completed.state is OperationState.COMPLETED
@@ -166,63 +165,62 @@ def test_claim_begin_and_finish_persist_response_for_replay(operation_repository
     replay = _create(operation_repository)
     assert replay.replayed is True
     assert replay.operation == completed
-    assert operation_repository.claim_next("worker-2") is None
+    assert operation_repository.claim_next() is None
 
 
-def test_two_workers_cannot_claim_the_same_pending_outbox(operation_repository):
+def test_concurrent_claims_have_a_single_winner(operation_repository):
     _create(operation_repository)
     barrier = threading.Barrier(2)
 
-    def claim(worker_id):
+    def claim(_):
         barrier.wait()
-        return operation_repository.claim_next(worker_id)
+        return operation_repository.claim_next()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        claims = list(executor.map(claim, ("worker-1", "worker-2")))
+        claims = list(executor.map(claim, range(2)))
 
     assert sum(item is not None for item in claims) == 1
 
 
 def test_unknown_submission_is_not_requeued(operation_repository):
     _create(operation_repository)
-    claim = operation_repository.claim_next("worker-1")
-    operation_repository.begin_submission(claim.outbox_id, "worker-1")
+    claim = operation_repository.claim_next()
+    operation_repository.begin_submission(claim.outbox_id)
     unknown = operation_repository.finish_submission(
         claim.outbox_id,
-        "worker-1",
         {"error": "response lost"},
         unknown=True,
     )
 
     assert unknown.state is OperationState.SUBMIT_UNKNOWN
-    assert operation_repository.claim_next("worker-2") is None
+    assert operation_repository.claim_next() is None
     assert _create(operation_repository).operation.state is OperationState.SUBMIT_UNKNOWN
 
 
 def test_restart_quarantines_submission_that_crossed_effect_boundary(operation_repository):
     created = _create(operation_repository)
-    claim = operation_repository.claim_next("worker-1")
-    operation_repository.begin_submission(claim.outbox_id, "worker-1")
+    claim = operation_repository.claim_next()
+    operation_repository.begin_submission(claim.outbox_id)
 
     assert operation_repository.quarantine_inflight() == 1
     recovered = operation_repository.get_operation(created.operation.operation_id)
     assert recovered.state is OperationState.SUBMIT_UNKNOWN
-    assert operation_repository.claim_next("worker-2") is None
+    assert operation_repository.claim_next() is None
 
 
-def test_expired_claim_before_submission_can_be_reclaimed(operation_repository):
-    _create(operation_repository)
-    first = operation_repository.claim_next("worker-1")
-    connection = connect_database(operation_repository.database_path)
-    try:
-        connection.execute(
-            "UPDATE outbox SET lease_until = '2000-01-01T00:00:00+08:00'"
-        )
-    finally:
-        connection.close()
+def test_restart_resets_unsubmitted_claim_to_pending(operation_repository):
+    created = _create(operation_repository)
+    first = operation_repository.claim_next()
+    assert first is not None
+    with pytest.raises(RepositoryError, match="not claimed"):
+        operation_repository.begin_submission(first.outbox_id + 999)
 
-    second = operation_repository.claim_next("worker-2")
+    # Simulated restart between claim and begin_submission: the message must
+    # not get stuck in CLAIMED, it returns to PENDING and can be claimed again.
+    assert operation_repository.quarantine_inflight() == 1
+    recovered = operation_repository.get_operation(created.operation.operation_id)
+    assert recovered.state is OperationState.PENDING
+    second = operation_repository.claim_next()
+    assert second is not None
     assert second.outbox_id == first.outbox_id
     assert second.attempt_count == 2
-    with pytest.raises(RepositoryError, match="not claimed"):
-        operation_repository.begin_submission(first.outbox_id, "worker-1")

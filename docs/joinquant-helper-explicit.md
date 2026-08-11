@@ -1,5 +1,7 @@
 # 聚宽策略修改方案 1：显式调用 helper
 
+> **历史文档：** 本页使用的 `configure`、`bt.order*` 等旧远程 helper API 已在个人量化 L00 精简中删除，不能用于当前 fork。当前聚宽接入以 [个人量化精简计划](live-ledger/15-lean-personal-plan.md) 和后续 L03 的 Strategy API 为准。
+
 这份文档适合需要在聚宽策略或聚宽研究里直接调用 `bt.xxx` 的用户。
 
 策略修改方案 1 的核心是：聚宽继续运行策略，真实下单点显式改成 `bullet_trade_jq_remote_helper` 的函数。

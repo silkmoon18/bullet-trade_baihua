@@ -1,5 +1,7 @@
 # 交易支撑：聚宽模拟盘远程实盘
 
+> **历史文档：** 本页描述的旧 `configure`、显式 `bt.order*` 和函数接管方案已从当前 fork 删除，不能直接照此部署。当前权威路径见 [个人量化精简计划](live-ledger/15-lean-personal-plan.md)。
+
 这页只保留最小流程：聚宽策略如何连到远程 `bullet-trade server` 做真实下单。
 
 聚宽侧改策略有两种策略修改方案：

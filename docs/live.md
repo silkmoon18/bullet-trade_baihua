@@ -1,5 +1,7 @@
 # 实盘引擎
 
+> **当前 fork 提示：** 本页本地 QMT/远程服务基础说明仍可参考，但其中聚宽 `bullet_trade_jq_remote_helper.configure(...)` 示例属于已删除的历史接口。聚宽实盘接入以 [个人量化精简计划](live-ledger/15-lean-personal-plan.md) 为准。
+
 这页只讲最常见的两种实盘方式：
 
 - 本地 QMT

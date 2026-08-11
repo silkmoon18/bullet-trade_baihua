@@ -52,6 +52,11 @@
 | S09 | Fill Booking and Position Lots | DONE | 买卖成交、费用、lot、T+1、成本和重复fill no-op |
 | S10 | Valuation and Atomic Snapshot | DONE | mark来源/时间戳、NAV、快照版本和陈旧价规则 |
 | S11-S20 | 原机构级剩余计划 | PENDING | 已由D023合并为L00至L04；仅保留历史需求映射 |
+| L00 | Existing Code Pruning | IN_PROGRESS | 裁剪helper对抗门禁、深层导出扫描、多worker lease和历史审查正文 |
+| L01 | QMT Sync and Reconciliation | PENDING | 单账户订单/成交/资金/持仓同步与READY/BLOCKED |
+| L02 | Target Planner and Executor | PENDING | 目标权重、先卖后买、整手/现金缓冲、kill switch |
+| L03 | Strategy API and JoinQuant View | PENDING | ensure/snapshot/targets/intent/events/reconciliation与PortfolioView |
+| L04 | Local Deployment and Small Live | PENDING | 服务启动、备份、飞书通知、SHADOW/模拟/小额人工验收 |
 
 ## S00：Repository Baseline and Documentation
 
@@ -100,604 +105,30 @@ Decision: DONE
 
 ## S01：JoinQuant Source and Profile Contract
 
-### 交付
-
-- 策略只保留`PROFILE`、`MODE`、稳定`STRATEGY_ID`和业务参数。
-- BACKTEST/SHADOW/LIVE模式定义及非法组合fail-fast。
-- 无密钥profile schema、example和本地私有profile忽略规则。
-- 迁移策略不再调用旧helper扩展参数/函数；统一使用最小版本化runtime facade，S01不启用旧`install_jq_compat`实盘接管。
-- 缺helper、helper版本不匹配、缺profile、空token的明确错误。
-- 策略文件不导入`bullet_trade.*`服务器内部包。
-
-### 验证
-
-- 本地导入策略不会因旧helper API立即报错。
-- BACKTEST不连接远端；SHADOW/LIVE在profile导入前即禁止下单/撤单并清除旧客户端；LIVE只校验配置，不连接服务器、不接管portfolio，仅安装本地fail-closed函数。
-- 策略源码无host、token、Webhook和账户明文。
-
-### 首次审查与修复记录
-
-```text
-Slice: S01
-Implementation commit: 655b3c9
-Reviewers: /root/review_s01_runtime_security；/root/review_s01_strategy_contract
-Reviewed commit/diff: f6a73b0..655b3c9
-Initial result: REWORK
-Findings:
-  - BLOCKER: SHADOW可被晚到configure、namespace重绑和缓存broker绕过，幂等安装不修复postcondition
-  - MAJOR: SHADOW继承旧broker后只做代理，读取账户仍会触达socket
-  - MAJOR: S01 LIVE先安装真实兼容层、替换portfolio/订单函数，再由策略报错
-  - MAJOR: 入选但超配的持仓减仓错误复用买入上浮限价，且日志误报为买入
-  - MINOR: SHADOW docstring与实际无连接语义矛盾；profile等待参数缺少合理上限
-Fix commit: 17f8eb2
-Fixes:
-  - 进程模式、namespace、公开helper、RemoteBrokerClient和ShortLivedClient多层fail-closed
-  - SHADOW清除旧client并在幂等安装时重建保护；远程context要求干净进程重启
-  - LIVE改为无远程连接和portfolio接管的profile校验，仅保留本地fail-closed保护；good_etf在helper调用前直接拒绝LIVE
-  - 目标市值按当前持仓判断增持/减持；仅增持使用买入上浮限价
-  - retries/timeout增加上下限并同步文档和边界测试
-Retest:
-  - $env:PYTHONDONTWRITEBYTECODE='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 104 passed
-  - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
-  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS
-Final code candidate SHA: 335a707
-Final review result: REWORK；详见下一轮记录
-Decision: REWORK
-```
-
-### 最终候选复审与第二次修复记录
-
-```text
-Slice: S01
-Reviewed commit: 335a7077e5e53eebe7eeefe4167fdce9370b3045
-Reviewers: /root/review_s01_final_security；/root/review_s01_final_strategy
-Review result: REWORK
-Findings:
-  - BLOCKER: SHADOW/LIVE在导入Python profile之后才设置进程门禁；导入副作用可调用configure并触达socket
-  - BLOCKER: profile缺失或校验失败时active仍为空、旧client仍可复用，后续configure继续可用
-  - MAJOR: 继承远程兼容context的SHADOW失败路径先恢复原生下单函数再抛错，namespace可继续mutation
-Fix commit: 5bca3702e40dd8751d6df53092fa747115179865
-Fixes:
-  - SHADOW/LIVE在任何run_type、契约或profile校验前先设置进程门禁、清client并保护namespace
-  - profile导入、校验及远程context拒绝的任意异常统一进入FAILED，重新安装保护并删除过期runtime state
-  - LIVE也显式安装本地fail-closed函数；SHADOW/LIVE幂等安装均修复被重绑的namespace
-  - 远程运行安装一旦失败，同一进程不得重试或切回BACKTEST，必须使用干净进程重启
-  - 明确Python profile是可信可执行代码而非沙箱，门禁只覆盖BulletTrade及策略namespace入口
-Retest:
-  - $env:PYTHONDONTWRITEBYTECODE='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 111 passed
-  - python -X utf8 -m flake8 tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py jq_runtime/jq_runtime_config.example.py --max-line-length=120 -> PASS
-  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS
-Exact review candidate: 354ecf3230b28d6569a71fe548c7234847b591bf
-Final review result: REWORK；契约与安全审查APPROVE，对抗审查发现新的BLOCKER/MAJOR，详见下一轮记录
-Decision: REWORK
-```
-
-### 精确候选第三次对抗审查与v3修复记录
-
-```text
-Slice: S01
-Reviewed commit: 354ecf3230b28d6569a71fe548c7234847b591bf
-Reviewers: /root/review_s01_exact_contract_v2；/root/review_s01_exact_security_v2；/root/review_s01_exact_adversarial_v2
-Review result: REWORK（2 APPROVE，1 REWORK；任一REWORK即不得放行）
-Findings:
-  - BLOCKER: legacy compat originals、直接别名和跨reload旧portfolio可绕过SHADOW门禁
-  - MAJOR: namespace缓存被当作权威、helper reload和并发不同契约可发布不一致状态
-  - MAJOR: ShortLivedClient入口检查与建socket之间存在切换TOCTOU
-  - MAJOR: 污染进程切回BACKTEST仍可能保留旧wrapper/context/client却返回orders_enabled=True
-  - MAJOR: profile导入的SystemExit/KeyboardInterrupt可携带敏感文本逃逸
-  - MAJOR: 篡改namespace公开state可伪造LIVE/orders_enabled/production_ready
-Fix commit: f2538270d845da65d0835ae6a2a34b5c406ce390
-Fixes in current candidate:
-  - runtime lock、原子transition owner、在途RPC lease和contract generation共同线性化安装/请求；在途请求使安装FAILED且禁止后续重试
-  - helper instance token、module generation、进程signature/canonical state和严格namespace envelope拒绝reload恢复及公开state篡改
-  - 任何legacy compat痕迹、旧remote portfolio、已发布client或污染BACKTEST均隔离并要求干净进程
-  - legacy originals被清空；标准交易名、直接/import alias、partial、wrapped和直接closure引用被本地guard
-  - profile import BaseException统一脱敏；configure/runtime调用跨reload不能重新发布client或虚假成功状态
-  - runtime只接受普通字符串mode和真实模块globals字典；SHADOW/LIVE在owner登记时即安装TRANSITIONING门禁
-  - poison callable/dict/str/partial子类不能阻断基础FAILED guard；并发/递归不同namespace也会先保护再拒绝
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 137 passed
-  - python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py tests/test_jq_strategy_runtime.py --select=E9,F63,F7,F82 -> PASS
-  - Python 3.8 ast.parse(feature_version=(3, 8)) for helper/runtime tests -> PY38_AST_OK
-  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit reviewer: /root/audit_s01_v3_contract -> APPROVE；helper/test冻结哈希与上述137项验证一致，无BLOCKER/MAJOR/MINOR
-Final candidate SHA: 34944b32692744db0c5d8482508a0fed8d8df5c7
-Final reviewers: /root/review_s01_v3_exact_contract；/root/review_s01_v3_exact_security；/root/review_s01_exact_adversarial_v2
-Final review result: REWORK（1 APPROVE，2 REWORK；任一REWORK即不得放行）
-Final findings:
-  - MAJOR: good_etf的BACKTEST本地分支绕过helper，旧client/remote portfolio污染仍可返回orders_enabled=True
-  - MAJOR: helper在BACKTEST读取context属性前未建立进程门禁，属性副作用可通过缓存client发出远程mutation并返回虚假成功
-  - MAJOR: profile import脱敏错误仍通过__context__保留含凭据的原异常对象
-  - MINOR: import成功后的PROFILE_SCHEMA_VERSION/PROFILES属性异常不在脱敏边界内
-Residual risks/external blockers: 任意其他模块、容器、callable对象或局部变量中预存的原生函数引用无法由Python撤销；profile仍是可信代码而非沙箱；真实聚宽smoke在S18
-Decision: REWORK
-```
-
-### v4边界修复与第四次精确候选记录
-
-```text
-Slice: S01
-Reviewed commit: 34944b32692744db0c5d8482508a0fed8d8df5c7
-Review result: REWORK
-Fix commit: aa043034760e42617be795b318cb70d2b22af70a
-Fixes in current candidate:
-  - 三个合法模式在原子owner登记时先建立进程级TRANSITIONING门禁，再读取任何context属性
-  - good_etf在helper存在时连BACKTEST也统一调用版本化入口；仅helper缺失的纯聚宽BACKTEST走本地兜底
-  - BACKTEST经helper检查旧client、remote portfolio及legacy compat污染，但不替换聚宽原生下单函数、不导入profile、不连接网络
-  - profile导入和导入后属性读取统一安全快照；脱敏错误离开except后抛出，__context__/__cause__不保留秘密异常
-  - PROFILES、单个profile及字段值只接受精确内建类型，拒绝通过魔术方法执行的poison子类
-  - 通用configure/runtime跨reload脱敏错误同样在except外抛出并断开异常链
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 147 passed
-  - python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py strategies/joinquant/good_etf.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py --select=E9,F63,F7,F82 -> PASS
-  - Python 3.8 ast.parse(feature_version=(3, 8)) for changed Python files -> PY38_AST_OK
-  - python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-First pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
-First pre-commit result: REWORK（三方均REWORK）
-First pre-commit findings:
-  - MAJOR: 被篡改为未知值的进程active state未被固定blocked set覆盖，BACKTEST context属性仍可让缓存client触达socket
-  - MAJOR: helper缺失兜底不检查旧remote portfolio，仍可返回orders_enabled=True
-  - MAJOR: helper内部ImportError/依赖缺失被顶层宽泛ImportError误判为helper未安装并静默降级
-  - MAJOR: 未知profile字段名原样进入错误文本，字段名自身含凭据时泄露
-  - MAJOR: 并发两个不同namespace的BACKTEST会给失败方永久安装TRANSITIONING guard，与最终BACKTEST状态冲突
-  - MINOR: 超大精确整数可在schema错误格式化或math.isfinite中逃逸为ValueError/OverflowError
-Second fixes in current worktree:
-  - 任意未知/非普通字符串active state在owner登记时直接转FAILED，固定错误不读取对象文本；remote/mutation gate改为非None一律阻断
-  - 只有目标helper自身的精确ModuleNotFoundError才允许BACKTEST兜底；内部导入错误原样中止，兜底也拒绝稳定marker/旧类特征remote portfolio
-  - 未知字段使用固定错误且不回显键；schema版本仅回显有界整数，数值先做类型、有限性和范围检查再转换
-  - 新增transition mode；只有两个纯BACKTEST竞争时失败方保留原生函数，涉及任一远程模式仍保护失败namespace
-Second retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 155 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Second pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
-Second pre-commit result: REWORK（1 APPROVE，2 REWORK）
-Second pre-commit findings:
-  - MAJOR: owner缺失的孤儿TRANSITIONING被下一次BACKTEST恢复为orders_enabled=True，而非FAILED
-  - MAJOR: 无helper兜底读取context前不检查其他模块名下仍加载的helper，getter可用缓存client触达socket
-  - MINOR: helper本体执行后主动抛同名ModuleNotFoundError仍可能被误判为目标模块缺失
-  - MINOR: helper expected_api_version和策略读取的helper API version为超大整数时，错误格式化逃逸为ValueError
-Third fixes in current worktree:
-  - owner为空时只有BACKTEST/SHADOW/LIVE_BLOCKED/FAILED是稳定状态；孤儿TRANSITIONING和其他值在context前统一转FAILED
-  - helper缺失兜底同时要求精确ModuleNotFoundError、目标name和仅调用点单帧traceback；helper本体开始执行后的同名异常继续抛出
-  - 兜底在任何context getter前扫描sys.modules并拒绝顶层或包别名helper；随后仍检查稳定marker、继承marker和旧类/module特征
-  - helper与策略API版本错误只回显有界精确整数，其他值固定显示<invalid>
-Third retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 160 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Third pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
-Third pre-commit result: REWORK（2 APPROVE，1 REWORK）
-Third pre-commit findings:
-  - MINOR: good_etf内部期望API版本被篡改为超大整数时，expected错误格式化逃逸为ValueError
-  - MINOR: helper自身API版本被篡改为超大整数时，actual错误格式化逃逸为ValueError
-Fourth fixes in current worktree:
-  - 策略与helper的API版本比较对expected和actual两侧都只回显有界精确整数，其他值固定显示<invalid>
-Fourth retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 162 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Fourth pre-commit reviewers: /root/audit_s01_v4_security；/root/audit_s01_v4_contract；/root/audit_s01_v4_adversarial
-Fourth pre-commit result: APPROVE（三方均无BLOCKER/MAJOR/MINOR；安全专项20 passed，对抗专项11 passed，契约版本专项4 passed）
-Final candidate SHA: c336d241d75f0e19c7ab02649b956e2652e5d4a6
-Final reviewers: /root/review_s01_v4_exact_contract；/root/review_s01_v4_exact_security；/root/review_s01_v4_exact_adversarial
-Final review result: REWORK（1 APPROVE，2 REWORK；任一REWORK即不得放行）
-Final findings:
-  - MAJOR: 无helper兜底只按sys.modules键名识别helper；若真实helper模块对象以innocent_runtime_cache等任意键缓存，context getter仍可借其旧client触达socket
-  - MAJOR: 成功runtime的namespace record、进程signature和canonical state被同时清空而active mode仍为稳定值时，下一次安装会被误判为全新进程并发布改变后的契约
-Residual risks/external blockers: helper缺失兜底会拒绝sys.modules中的helper别名和remote portfolio标记，但Python无法发现已从模块表删除后藏在任意局部变量/容器中的旧client；该路径只接受全新可信聚宽context，部署规约禁止卸载helper后同进程降级。profile仍是可信代码而非沙箱；真实聚宽smoke在S18
-Decision: REWORK
-```
-
-### v4精确候选复审与v5补救记录
-
-```text
-Slice: S01
-Reviewed commit: c336d241d75f0e19c7ab02649b956e2652e5d4a6
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - helper导出稳定STRATEGY_RUNTIME_HELPER_MARKER；无helper兜底同时扫描sys.modules键和真实模块对象的__name__、marker、文件名及版本化安装入口，任意缓存键名都不能隐藏已加载helper
-  - owner登记时在读取context前以普通内建值快照校验active mode、进程signature、canonical state和namespace runtime record是否构成同一已提交权威状态；只有四者都处于真实初始状态才允许fresh install
-  - 成功状态的权威组成被全部/部分擦除、结构/值篡改或注入poison值时，统一转FAILED、安装namespace guard并要求干净进程重启，且不执行poison魔术方法
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 169 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit reviewers: /root/review_s01_v5_worktree_contract；/root/review_s01_v5_worktree_security（执行流中断，无有效结论）；/root/review_s01_exact_contract_v2（本轮作为对抗审查）
-Pre-commit result: REWORK（两路REWORK；一路执行流中断不计为批准）
-Pre-commit findings:
-  - BLOCKER: active/signature/canonical/namespace record四项全部擦除后仍被当作fresh，因既有单调generation未参与首次安装判定
-  - BLOCKER: 真实helper模块对象被改为ModuleType子类并只放在任意sys.modules键时会被精确type检查跳过，context getter仍可触达旧client/socket
-  - MAJOR: 等值浅拷贝替换canonical/record、同步替换进程与record signature，或篡改公开版本常量及可变schema集合，仍可能通过封套或执行poison比较
-  - MINOR: 仅具有任意整数API版本和同名可调用入口的无关模块被误判为BulletTrade helper
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: sys.modules对象扫描不能发现已经从模块表删除后仅藏在任意局部变量/容器中的旧client；该边界必须由干净聚宽进程和部署规约保证。profile仍是可信代码而非沙箱；真实聚宽smoke在S18
-Decision: REWORK
-```
-
-### v5工作树审查与v6身份封套补救记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v5
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - fresh install除active/signature/canonical/capsule/namespace record均为空外，还要求单调contract generation精确为0；成功或失败尝试均安全递增，四项权威全擦不能回到fresh
-  - 每次成功提交创建进程内commit capsule，以identity绑定signature、canonical state、namespace record、record state及提交generation；等值浅拷贝、global/record协同替换或正整数generation改写都在context前失败
-  - authority快照使用函数内固定schema字面量；公开API/profile/state版本和helper marker先做精确内建类型与固定值校验，bool/poison/超大版本不触发魔术比较
-  - generation安全递增不对篡改对象执行算术魔术方法；FAILED同时清除signature、canonical与commit capsule，但保留非零单调generation
-  - sys.modules扫描接受ModuleType及其子类，并只依赖项目专属模块名、稳定marker或文件名；移除“任意API整数+同名callable”宽泛启发式，避免无关模块假阳性
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 180 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit reviewers: /root/review_s01_v5_worktree_contract；/root/review_s01_v5_worktree_security（因工作树将修改而中断，无有效结论）；/root/review_s01_v4_exact_security（本轮第三路回归）
-Pre-commit result: REWORK（两路发现有效问题；一路中断不计为批准）
-Pre-commit findings:
-  - MAJOR: commit capsule全局本身缺少独立identity锚，等值浅拷贝胶囊仍可通过内部引用校验并读取context
-  - MAJOR: capsule只保存canonical/record state字典identity，没有封存提交时的不可变值；两份字典保持identity并协同原地修改blocked_mutations后，会在读取context后被静默修复并成功
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: Python同进程中拥有任意代码执行权的可信维护者仍可同时重写全部模块内部状态；本门禁防御部署残留、热重载、并发、状态擦除和常见篡改，不是Python沙箱。sys.modules扫描不能发现已移出模块表后仅藏在局部变量/容器中的旧client；真实聚宽smoke在S18
-Decision: REWORK
-```
-
-### v6工作树审查与v7闭包锚/提交快照补救记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v6
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - helper加载时创建独立闭包anchor；成功提交同时把同一capsule identity写入模块全局和闭包，单独等值浅拷贝或替换全局capsule在context前失败
-  - capsule新增提交时的安全不可变state snapshot；pre-context要求canonical和record state当前快照同时等于提交快照，保持字典identity的协同原地值篡改也失败关闭
-  - FAILED及helper generation漂移清空模块capsule，但把闭包anchor置为进程期失败latch；即使随后手工把active和generation复位，也不能伪装fresh，只有真正新进程的anchor为空
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 183 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit reviewers: /root/review_s01_v5_worktree_contract；/root/review_s01_v5_worktree_security；/root/review_s01_v4_exact_security（本轮第三路合同复核）
-Pre-commit result: REWORK（2 APPROVE，1 REWORK；任一REWORK即不得放行）
-Pre-commit findings:
-  - MAJOR: `_track_runtime_request`捕获和`_assert_runtime_request_lease_current`比较非精确整数generation时会执行poison `__ne__`；伪造相等可让缓存client进入socket边界
-  - MAJOR: importlib.reload初始化直接对旧module/contract/inflight generation执行`int(...)`；poison异常可在ACTIVE_MODE转FAILED和client清理前中断，留下混合代际开放状态
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: 闭包锚提高了常见模块全局篡改门槛，但本门禁仍不是Python沙箱；拥有任意可信代码执行权的维护者可通过反射或替换函数重写内部状态。sys.modules外局部/容器旧client不可发现；真实聚宽smoke在S18
-Decision: REWORK
-```
-
-### v7工作树审查与v8 generation/RPC/reload补救记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v7
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - RPC lease捕获前要求contract generation与inflight count都是精确非负int，且允许远程访问的未安装状态generation必须为0；无效状态立即进入FAILED、清client且不调用poison比较/转换
-  - 每次重试建socket前同时要求lease/current generation为精确非负int，再做内建整数比较；finally对被并发污染的inflight count安全归零，不执行算术魔术方法
-  - module generation所有调用前/异常后校验统一要求精确正整数与instance token identity，安装路径不再直接比较poison对象
-  - reload先用精确类型快照读取旧module/contract/inflight计数；无效旧值采用安全FAILED代际，不调用`int()`/`__index__`，重置transition并清空所有client
-  - reload检测基于旧module generation键是否存在；即使旧generation本身poison，也建立新instance token、非零generation和闭包FAILED latch
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 185 passed
-Pre-commit reviewers: /root/review_s01_v5_worktree_contract；/root/review_s01_v5_worktree_security；/root/review_s01_v4_exact_security
-Pre-commit result: REWORK（三路均REWORK；任一REWORK即不得放行）
-Pre-commit findings:
-  - MAJOR: reload先发布module generation、后发布FAILED/清client；旧client未绑定定义时instance token/module generation，并发或中断reload窗口仍可进入socket
-  - MAJOR: 成功commit capsule未锚定原instance token和module generation；改写generation，或协同替换全局token与runtime record token后，同参数安装仍会读取context并成功
-  - MAJOR: RPC在精确类型检查前比较transition owner，poison `__ne__`可伪装当前线程并进入socket
-  - MAJOR: RPC直接`with`可替换的runtime lock；代理锁会执行上下文协议，同类型不同identity的锁也会破坏线性化
-  - MAJOR: inflight只在入口验证；登记后、建socket前污染为poison值仍可进入socket，且finally会静默归零而不锁存FAILED
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: 可信Python代码仍不是沙箱；sys.modules外局部/容器旧client不可发现。真实聚宽/QMT证据分别在S18-S20，S01仍禁止真实资金
-Decision: REWORK
-```
-
-### v8工作树审查与v9模块原语/多维RPC租约补救记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v8
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - reload在改变任何generation前先发布FAILED、重置transition并清空全部client；配置/runtime/RPC wrapper在装饰时捕获本模块instance token和module generation，旧调用不能在reload后借用新代际
-  - 独立闭包anchor同时绑定runtime RLock、owner Lock、instance token、module generation和请求lease registry；所有锁在进入上下文协议前按identity校验，同类型替换或代理对象均固定失败且不执行魔术方法
-  - transition owner/namespace/mode统一先快照，只接受None或精确内建int/dict/str；任何比较、membership或格式化都发生在类型通过后，失败路径幂等清除transition和全部权威/client状态
-  - commit capsule新增原instance token identity和精确module generation；成功状态协同替换token/record或改写module generation在读取context前失败
-  - 每个RPC使用定义时helper代际、请求时contract generation、精确inflight count和闭包锚定的独立request token registry组成多维lease；入口、每次重试及紧邻socket前均校验own token仍登记且`inflight == len(registry)`
-  - finally只在同module/contract代际移除自己的lease；reload或既有FAILED已清registry时旧finally不得递减新代际计数或重复推进失败generation
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 198 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-Pre-commit reviewers: /root/audit_v10_registry；/root/audit_v10_gate；/root/review_s01_exact_contract_v2
-Pre-commit result: REWORK
-Findings:
-  - fake-equal registry元素可利用set值相等绕过本请求token identity；finally未完整验证active/transition/reload状态
-  - 部分reload后的旧finally可重复推进FAILED generation；最终lease检查与socket建立之间仍有TOCTOU
-  - reload gate若保存在公开可替换结构中可被回调重新打开，异步中断还可能遗留attempt token或锁
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: 可信Python代码仍不是沙箱；反射替换闭包函数本身或sys.modules外局部/容器旧client不在本门禁可证明范围。真实聚宽/QMT证据分别在S18-S20，S01仍禁止真实资金
-Decision: REWORK
-```
-
-### v9工作树审查与v10闭包gate/install lease补救记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v9
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - request registry只用set基类迭代和object identity检查；不可信元素先由闭包永久隔离，再清registry，避免析构器在FAILED锁存期间执行
-  - socket gate把单向reload latch和attempt identity集合封入闭包；公开active/reload镜像不能重新打开，创建socket以runtime→gate顺序原子登记attempt
-  - attempt外层finally在登记前建立，异步中断反复完成identity释放、condition通知和已建socket关闭；reload等待全部已登记attempt收尾
-  - install reservation绑定helper token/module generation、thread、namespace/mode、contract generation、active mode和gate authority identity；每个可执行context/profile边界后及提交前复核
-  - reload与旧request finally幂等复用FAILED anchor，旧代清理不再重复推进contract generation
-Retest:
-  - target suite -> 213 passed
-Pre-commit reviewers: /root/audit_v10_registry；/root/audit_v10_gate；/root/review_s01_exact_contract_v2
-Pre-commit result: REWORK
-Findings:
-  - BLOCKER: 新模块先执行imports、后识别reload；首个import处KeyboardInterrupt仍会保留旧client远程能力
-  - BLOCKER: decorator最终generation检查与真实返回之间仍可并发完成reload，旧安装返回成功且namespace record残留
-  - MAJOR: BACKTEST对profile/profile_module调用str()后才合法切换generation，可执行__str__回调并掩盖reservation篡改
-Decision: REWORK
-```
-
-### v10精确复审与v11 pre-import/返回线性化补救记录（历史，已被后续REWORK取代）
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..worktree-v10
-Review result: REWORK
-Fix commit: PENDING
-Fixes in current worktree:
-  - v11曾以文件末bootstrap尝试在新代import前关闭旧gate并等待attempt；该历史实现已被后续REWORK和D020生产边界取代，不构成进程内reload或任意异步中断的安全保证
-  - commit capsule按identity额外绑定提交namespace；reload会立即删除旧runtime record并安装FAILED guard，不依赖后续安装调用触发清理
-  - 安装最终generation检查后复核权威gate；runtime锁覆盖owner收尾，最终以runtime→owner→gate原子复核helper代际、gate、公开reload镜像和transition identity后才允许成功返回
-  - 最终边界失败显式按namespace撤销已提交record；并发reload不能留下成功结果或可变交易入口
-  - BACKTEST只接受精确内建str的profile/profile_module，并在首次合法postcondition generation切换前复核原install lease，不执行自定义__str__
-  - 新增bootstrap首行/首个import中断、generation检查后reload、reload/install双向线性化、最终化异步中断、确定性无效gate无自旋、提交namespace即时清理及字符串callback回归
-Retest:
-  - $env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider -> 222 passed
-  - fatal flake8 for helper/strategy/runtime tests -> PASS
-  - Python 3.8 AST -> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit reviewers: /root/design_reload_linearization；/root/audit_v11_bootstrap；第三路未形成可放行结论
-Pre-commit result: INVALIDATED；后续工作树已修改，v11审查和222项测试只保留为历史证据
-Final candidate SHA: PENDING
-Final reviewers: PENDING（三方精确SHA复审）
-Final review result: PENDING
-Residual risks/external blockers: 该记录中的绝对reload/BaseException保证已被后续审查否定并收窄；见下一轮记录
-Decision: REWORK（被后续工作树取代）
-```
-
-### v11后续reload/effect边界REWORK与当前候选记录
-
-```text
-Slice: S01
-Reviewed diff: c336d241d75f0e19c7ab02649b956e2652e5d4a6..a94aa12060c5e8cef479224952e302eeac99f37d
-Review result: DONE；逐轮结论与最终精确SHA见本记录下方
-Implementation commit: a94aa12060c5e8cef479224952e302eeac99f37d
-Committed candidate changes:
-  - 三把闭包锚定锁分别为runtime RLock、owner Lock和socket RLock；支持路径采用runtime -> owner -> socket锁序
-  - socket authority用attempt token -> thread id登记在途连接；lease检查与attempt登记在runtime -> socket临界区原子完成，connector随后通过独立最终permit进入且不持续持gate锁，reload关闭gate后等待已登记attempt结束
-  - TLS包装、握手和request/mutation发送effect在socket RLock内线性化；mutation在调用effect前发布handoff，发送结果不确定时禁止自动重试
-  - 在post-connector runtime复核前先结束socket attempt，避免reload持runtime等待attempt与请求持attempt等待runtime的锁循环
-  - 同线程已持socket锁或拥有attempt时递归reload不等待自身，发布FAILED并抛出不属于Exception的RuntimeReloadAbort
-  - reload gate明确降级为误用检测与fail-closed防线，不是热更新API；即使importlib.reload返回成功，该进程也永久FAILED
-  - 生产禁止raw importlib.reload、热补丁、same-thread recursive reload及sys.settrace/sys.setprofile/signal catch-and-resume；任何reload异常、RuntimeReloadAbort或异步中断必须终止进程
-  - helper升级固定为停策略、确认旧进程退出、换文件、全新进程冷启动；首次从raw-Lock/pre-bootstrap旧helper升级亦如此
-  - good_etf在调用helper runtime前精确校验稳定marker；missing/wrong/bool/poison marker固定失败且不触达install入口
-  - good_etf在任何模式归一化/API比较前先校验MODE为精确str、expected/actual API为精确int；boolean/poison值不执行魔术方法且不触达helper
-  - good_etf从模块`__dict__`以`dict.get`捕获runtime入口并要求精确Python函数；缺失入口、模块`__getattr__`和任意callable对象不会在门禁前执行，返回state只接受精确dict
-First pre-review freeze:
-  - runtime + reload deadlock regression -> 204 passed
-  - remote helper + strategy contract -> 63 passed
-  - total -> 267 passed
-Pre-commit round 1 reviewers: /root/precommit_s01_contract_frozen -> REWORK；并发/部署两路因工作树解冻标记INVALIDATED
-Pre-commit round 1 result: REWORK
-Pre-commit round 1 finding:
-  - MAJOR: good_etf只校验STRATEGY_RUNTIME_API_VERSION，未校验STRATEGY_RUNTIME_HELPER_MARKER；API碰巧为1的错误同名helper可在门禁前获得globals/context并返回伪状态
-Retest after marker remediation:
-  - 完整目标测试 -> 271 passed（runtime+deadlock 204；remote helper+strategy contract 67）
-  - fatal flake8（helper/strategy/相关tests）-> PASS
-  - Python 3.8 AST（6个变更Python文件）-> PY38_AST_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit round 2 reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/update_s01_docs_boundary -> APPROVE；/root/audit_rlock_reload_v13 -> REWORK
-Pre-commit round 2 result: REWORK（2 APPROVE，1 REWORK；任一REWORK即不得放行）
-Pre-commit round 2 findings:
-  - MAJOR: `str(MODE or '')`会在helper门禁前执行非普通MODE的`__bool__/__str__`
-  - MAJOR: 在确认`_EXPECTED_RUNTIME_API_VERSION`为精确int前执行`actual != expected`，可调用poison expected的`__ne__`
-Retest after pre-gate poison remediation:
-  - 完整目标测试 -> 275 passed（runtime+deadlock 204；remote helper+strategy contract 71）
-  - fatal flake8（helper/strategy/相关tests）-> PASS
-  - Python 3.8 AST（6个变更Python文件）-> PY38_AST_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit round 3 reviewers: /root/precommit_s01_contract_frozen -> REWORK；/root/audit_rlock_reload_v13 -> REWORK；/root/update_s01_docs_boundary -> APPROVE
-Pre-commit round 3 result: REWORK（1 APPROVE，2 REWORK；任一REWORK即不得放行）
-Pre-commit round 3 finding:
-  - MAJOR: 普通属性访问/调用`bt.install_strategy_runtime`可在入口缺失时触发模块`__getattr__`，或对任意callable入口执行`__call__`，均早于真正runtime gate
-Retest after exact runtime-entry remediation:
-  - 完整目标测试 -> 278 passed（runtime+deadlock 204；remote helper+strategy contract 74）
-  - fatal flake8（helper/strategy/相关tests）-> PASS
-  - Python 3.8 AST（6个变更Python文件）-> PY38_AST_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit round 4 reviewers: /root/update_s01_docs_boundary -> APPROVE；契约路 -> REWORK；并发路 -> REWORK
-Pre-commit round 4 result: REWORK（1 APPROVE，2 REWORK；任一REWORK即不得放行）
-Pre-commit round 4 findings:
-  - MAJOR: helper返回值只校验精确dict、未验证完整state；伪state可把SHADOW降级为BACKTEST，随后触发聚宽原生order
-  - MAJOR: initialize/process_initialize在helper gate前调用jqdata/platform对象，平台回调可先产生副作用
-Fixes after round 4:
-  - 对runtime state完整校验schema、strategy identity、mode、run_type、enabled/orders_enabled/production_ready、reason、profile_module及blocked_mutations；_runtime_mode拒绝提交后篡改
-  - initialize与process_initialize的首条可执行语句均安装runtime，任何jqdata/platform调用只能发生在gate之后
-  - 新增15个策略回归，覆盖伪state、字段篡改、SHADOW降级和生命周期首语句顺序
-Retest after state/lifecycle remediation:
-  - 完整目标测试 -> 293 passed（runtime+deadlock 204；remote helper 35；strategy contract 54）
-  - fatal flake8（helper/strategy/相关tests）-> PASS
-  - Python 3.8 AST（6个变更Python文件）-> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-round-5 adversarial advisory: REWORK（非正式冻结前咨询，不构成正式第5轮结论）
-Pre-round-5 finding:
-  - MAJOR: `_runtime_mode`先读取`g.bt_runtime`会执行平台属性协议；poison getter可先把SHADOW改为BACKTEST、返回伪BACKTEST state并触发原生order
-Additional fixes before round 5:
-  - 完整state校验成功后把请求模式写入一次性闭包权威；`g.bt_runtime`降为聚宽侧展示副本，交易入口完全不读取g属性协议
-  - `_runtime_mode`只比较精确当前MODE与闭包权威；MODE漂移、未安装或权威损坏均在原生交易函数前固定失败
-  - poison g getter、g/MODE协同降级及cancel/order_target/order_target_value三条SHADOW wrapper均有回归覆盖
-Final retest before round 5:
-  - 完整目标测试 -> 295 passed（runtime+deadlock 204；remote helper 35；strategy contract 56）
-  - fatal flake8（helper/strategy/相关tests）-> PASS
-  - Python 3.8 AST（6个变更Python文件）-> PY38_AST_OK
-  - baseline validator -> S00_BASELINE_CHECK_OK
-  - git diff --check -> PASS（仅工作树CRLF转换提示）
-Pre-commit round 5 reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/update_s01_docs_boundary -> REWORK；/root/audit_rlock_reload_v13 -> REWORK
-Pre-commit round 5 result: REWORK（1 APPROVE，2 REWORK；代码/并发无finding，任一文档finding仍不得放行）
-Pre-commit round 5 findings:
-  - MINOR: 本记录顶部Review result仍停在首轮marker修复阶段，与同段已记录round 2-5矛盾
-  - MINOR: `00-current-state.md`更新时间仍为2026-08-08，与2026-08-09的当前session/冻结状态不一致
-Fixes after round 5:
-  - 当前候选摘要改为概括前五轮REWORK并明确等待round 6；保留逐轮历史证据
-  - 当前状态文档更新时间同步为2026-08-09（Asia/Shanghai）
-Pre-commit round 6 reviewers: /root/precommit_s01_contract_frozen -> REWORK；/root/update_s01_docs_boundary -> REWORK；/root/audit_rlock_reload_v13 -> REWORK
-Pre-commit round 6 result: REWORK（三路均命中同一MINOR；代码/并发无新finding）
-Pre-commit round 6 finding:
-  - MINOR: `00-current-state.md`正文仍称处于第5轮预提交审查，与round 5已REWORK、round 6 PENDING的session/slice记录矛盾
-Fix after round 6:
-  - 现状正文改为不随审查轮次失效的“S01仍为IN_PROGRESS，预提交审查与精确SHA复审尚未全部完成”
-Pre-commit round 7 reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/audit_rlock_reload_v13 -> APPROVE；/root/update_s01_docs_boundary -> APPROVE
-Pre-commit round 7 result: APPROVE（三路均无BLOCKER/MAJOR/MINOR；冻结tracked指纹0c97824c8fdc5861ec8f2bd5427759b353e82e38，deadlock test SHA256=ACE880F2434643ABC73593D8E42DAC28131B9780E26B3436BD41C179C4FD2874）
-Final candidate SHA: a94aa12060c5e8cef479224952e302eeac99f37d
-Final reviewers: /root/precommit_s01_contract_frozen -> APPROVE；/root/audit_rlock_reload_v13 -> APPROVE；/root/update_s01_docs_boundary -> APPROVE
-Final review result: APPROVE（三路均无BLOCKER/MAJOR/MINOR；起止HEAD精确匹配且工作树clean；完整目标测试295 passed，并发/死锁定向矩阵20 passed）
-Final verification commands:
-  - root提交前实跑：`$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:DEFAULT_DATA_PROVIDER='easy_tdx'; $env:EASY_TDX_USE_STUB='1'; python -X utf8 -m pytest -p no:cacheprovider tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py tests/test_jq_remote_helper.py tests/strategies/test_good_etf_contract.py -q` -> 295 passed, 3 warnings
-  - 契约路精确SHA终审实跑：`$env:DEFAULT_DATA_PROVIDER='qmt'; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_remote_helper.py tests/test_jq_strategy_runtime.py tests/strategies/test_good_etf_contract.py tests/test_jq_runtime_reload_deadlock_regression.py -q -o addopts='' -p no:cacheprovider` -> 295 passed, 3 warnings
-  - 部署/文档路精确SHA终审实跑：`$env:PYTHONUTF8='1'; $env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; $env:PYTHONDONTWRITEBYTECODE='1'; pytest tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py tests/test_jq_remote_helper.py tests/strategies/test_good_etf_contract.py -q -o addopts='' -p no:cacheprovider` -> 295 passed, 3 warnings
-  - 并发/对抗路精确SHA终审实跑：`$env:DEFAULT_DATA_PROVIDER='tushare'; $env:DATA_CACHE_DIR=''; $env:PYTHONDONTWRITEBYTECODE='1'; python -X utf8 -m pytest tests/test_jq_strategy_runtime.py tests/test_jq_runtime_reload_deadlock_regression.py -q -o addopts='' -p no:cacheprovider -k "reload_from_own_socket_attempt or recursive_reload_while_holding_socket_gate_lock or mutation_send_base_exception or mutation_response_base_exception or recursive_reload_after_socket_attempt_registration or recursive_reload_during_final_socket_validation or recursive_reload_after_phase_lease_check or reload_waits_for_linearized_mutation_effect or reload_waiting_for_completed_connector or reload_ownership_probe_interrupt"` -> 20 passed, 184 deselected
-  - `python -X utf8 -m flake8 helpers/bullet_trade_jq_remote_helper.py strategies/joinquant/good_etf.py tests/test_jq_strategy_runtime.py tests/test_jq_remote_helper.py tests/test_jq_runtime_reload_deadlock_regression.py tests/strategies/test_good_etf_contract.py --select=E9,F63,F7,F82` -> PASS
-  - `python -X utf8 scripts/validate_live_ledger_baseline.py --bt-quant E:\dev\pycharm\bt_quant` -> S00_BASELINE_CHECK_OK
-  - `git diff --check c336d241d75f0e19c7ab02649b956e2652e5d4a6 a94aa12060c5e8cef479224952e302eeac99f37d` -> PASS
-Residual risks/external blockers: 纯Python无法对任意opcode/C返回点的恶意catch-and-resume、最终许可读取后的旧栈恢复、connector返回资源到共享holder之间的极短handoff窗口提供不可绕过的原子保证。生产以禁止这些机制并在任何异常时终止进程作为边界；进程退出负责最终释放残余OS资源。活动authority frame的f_locals物化/同步还可能把旧closure cell值写回并回滚已关闭latch，因此trace/debugger/frame introspection具有活动帧改写权，不在可防御契约内。若未来LIVE需抵抗同进程任意代码执行，须引入带epoch的独立IO worker/子进程或原生原子gate。真实聚宽/QMT证据仍分别在S18-S20，S01禁止真实资金
-Decision: DONE
-```
+- 新增能力：脱敏同源策略只保留`PROFILE`、`MODE`和稳定`STRATEGY_ID`；BACKTEST/SHADOW/LIVE模式与非法组合fail-fast；无密钥profile schema v1、example和本地私有profile忽略规则；统一版本化runtime入口`install_strategy_runtime`，缺helper、API版本不匹配、缺profile均有明确错误；策略不导入`bullet_trade.*`服务器内部包。
+- 最终测试：完整目标矩阵295 passed（runtime+deadlock 204、remote helper 35、strategy contract 56），并发/死锁定向矩阵20 passed；Python 3.8 AST、阻断级flake8、S00 baseline与`git diff --check`均PASS。
+- 审查结论：第七轮预提交冻结与精确SHA终审的契约、并发/对抗、部署/文档三路均APPROVE，无BLOCKER/MAJOR/MINOR，起止HEAD一致且工作树clean。
+- 实现提交：`a94aa12060c5e8cef479224952e302eeac99f37d`。
+- 决定：DONE。S01只证明源码/profile边界可测试：BACKTEST可运行、SHADOW只生成计划、LIVE明确阻断；不授权真实资金。
+- 逐轮冻结与审查明细见[S01-S03审查明细归档](archive/04-slices-s01-s03-review-detail-pre-l00.md)；归档内容均已失效，仅作历史记录。
 
 ## S02：JoinQuant Typings and IDE
 
-### 交付
-
-- `jqdata.pyi`、helper `.pyi`和typing-only Context/Portfolio/Position/Snapshot模型。
-- pyi与runtime API同步测试，导出符号、参数名称/种类和必填/可选形状漂移即失败。
-- 独立严格类型配置，不受项目全局`ignore_missing_imports`掩盖。
-- 记录聚宽目标Python、pandas/numpy及使用API兼容矩阵；未知版本明确为待平台核验。
-- fresh venv/PyCharm源码路径配置说明和自动化setup。
-
-### 验证
-
-- 全新venv中editable install后，策略范围严格mypy/pyright通过。
-- 常用`context.portfolio`、Position和helper返回值具有补全。
-- Python目标版本语法编译通过。
-
-### S02审查记录
-
-```text
-Slice: S02
-Implementation commit: 3b54a4a7178fb36ab9f85de22a648bb08bd0448b
-Pre-commit reviewers: /root/precommit_s01_contract_frozen；/root/audit_rlock_reload_v13；/root/update_s01_docs_boundary
-Initial result: REWORK
-Initial findings:
-  - helper runtime-state TypedDict字段/blocked_mutations类型错误，六个交易入口退化为**kwargs: Any，漂移测试覆盖不足
-  - 严格检查只覆盖合成probe而未覆盖真实good_etf.py；setup未验证venv/prefix/purelib，文档夸大--full和轻量环境pytest能力
-  - Windows site.getsitepackages()[0]实际指向venv根；类型收窄引入的runtime cast可被篡改后把SHADOW伪装为BACKTEST
-  - Python 3.8没有ast.unparse，旧pip可能不支持PEP 660 editable安装
-Fixes:
-  - 对齐全部导出函数、类构造器/公共方法的参数名称、种类和必填性；TypedDict按真实builder分为必填和模式可选字段
-  - 真实策略与契约probe同时进入strict mypy/pyright；策略安全路径清除全部runtime cast并增加poisoned-cast fail-close回归
-  - setup校验sys.prefix/base_prefix和目标目录，先确保pip>=21.3，只向sysconfig purelib写.pth并拒绝越界
-  - AST测试移除3.9专属API；文档明确轻量/full、版本范围、editable/wheel和S17/S18边界
-Final pre-commit result: APPROVE（三路均无BLOCKER/MAJOR/MINOR）
-Final exact-SHA reviewers: 同上三路
-Final exact-SHA result: APPROVE；三路起止HEAD均为3b54a4a7178fb36ab9f85de22a648bb08bd0448b且工作树clean
-Verification:
-  - S01+S02目标矩阵 -> 320 passed, 3 warnings
-  - strict mypy -> 2 source files PASS；strict pyright -> 0 errors/0 warnings
-  - Python 3.8 AST、阻断级flake8、S00 baseline、commit diff --check -> PASS
-  - 最新脚本在第三个全新空venv完成pip引导、editable install、严格检查和两模块find_spec；.pth仅位于Lib/site-packages
-Residual risks:
-  - 聚宽托管Python/pandas/numpy和私有API行为仍须S18平台探针确认；普通wheel顶层类型文件布局仍由S17门禁处理
-  - 全仓测试仍受既有jqdatasdk/外部策略路径及若干非S02历史失败影响，本slice不宣称全仓套件已全绿
-Decision: DONE
-```
+- 新增能力：`jqdata.pyi`、helper `.pyi`与typing-only Context/Portfolio/Position/Snapshot模型；pyi与runtime API同步漂移测试；独立严格mypy/pyright配置；聚宽目标Python、pandas/numpy与API兼容矩阵；fresh venv/PyCharm自动化setup（pip>=21.3引导、`.pth`只写purelib）。
+- 最终测试：S01+S02目标矩阵320 passed；strict mypy两个源文件PASS、strict pyright 0 errors/0 warnings；Python 3.8 AST、阻断级flake8、S00 baseline与commit diff --check均PASS；第三个全新空venv完成editable install与严格检查。
+- 审查结论：首轮REWORK修复后预提交三路APPROVE，精确SHA终审三路APPROVE，起止HEAD一致且工作树clean。
+- 实现提交：`3b54a4a7178fb36ab9f85de22a648bb08bd0448b`。
+- 决定：DONE。聚宽托管Python/pandas/numpy与私有API行为仍由S18平台探针确认。
+- 逐轮审查明细见[S01-S03审查明细归档](archive/04-slices-s01-s03-review-detail-pre-l00.md)。
 
 ## S03：JoinQuant Validation and Export
 
-### 交付
-
-- AST校验：禁止服务器内部导入、危险文件/进程/网络用法和不支持语法。
-- 敏感信息扫描和配置引用检查。
-- 导出工具输出原样策略、helper、example profile和manifest。
-- 非bundle模式源策略和导出策略hash一致。
-- 校验、契约、hash、写出和manifest来自同一次不可变源码快照；部署声明在源码中先确定，导出/上传后禁止编辑。
-- 可选私有profile只读校验不执行、不复制且不输出秘密；最终私有文件未显式传入时不得宣称已校验。
-- 目标目录必须不存在且不经过symlink/junction/reparse point，失败保持调用前状态。
-- clean-room目录导入测试以及helper/profile缺失、版本不匹配fail-fast测试。
-- 明确：自动化通过只表示“可上传候选”，真实聚宽运行证据在S18。
-
-### 验证
-
-- 全新临时目录只使用导出物完成语法、导入和mock runtime smoke。
-- 导出包不含token、Webhook、日志、缓存、数据库或服务器内部模块。
-
-### 最终实现与审查
-
-- 固定白名单三文件按一次不可变源码快照原样导出，manifest确定性记录契约、字节数和SHA256；目标必须不存在且路径不得经过symlink/junction/reparse point。
-- 私有profile只按Python 3.8 AST读取字面量，校验schema、字段、精确类型、范围和strategy/profile契约；不执行、不复制、不hash、不输出秘密。
-- 127项S03回归覆盖确定性、失败原子性、契约漂移、危险能力、敏感信息、clean-room、私有profile和namespace改写；与S01/S02联合矩阵为447 passed、3个既有warning。
-- 冻结前REWORK已修复不可变快照、契约重绑定、动态/相对导入、`TYPE_CHECKING`污染、危险builtin别名、组合秘密、路径reparse/断链以及通过`globals/locals/vars/sys.modules/__dict__`改写契约等问题。最新修复拒绝保存或修改`getattr`/`object.__getattribute__`取得的原始namespace；策略与helper的合法只读模块查询改为单键读取而不保存namespace对象。
-- 首次10文件正式冻结为REWORK：未绑定`dict.__setitem__/update/pop`可把`globals()`或原始`__dict__`作为首参数并配合computed key改写契约。mutator现统一解析真实修改目标，`dict.*`与`builtins.dict.*`以首参数为目标，新增5个拒绝回归。
-- 第二次10文件正式冻结为REWORK：`object.__setattr__`/模块`.__setattr__`computed field可改运行时契约；`type({})`、`globals().__class__`等派生dict未绑定mutator仍可绕过；helper静态`__import__`未复用角色白名单。修复后mutator对其接收者和全部参数中的动态/raw namespace失败关闭，四种属性mutator形态统一验证静态字段，静态动态导入复用角色白名单且仅helper受控`profile_module`变量可动态解析。
-- 第三次10文件正式冻结为REWORK：静态getter取得`__setattr__/__delattr__`后可绕过字段验证，关键字或`**kwargs`形式的`__import__`可绕过导入目标检查。被调函数名/owner现统一解析直接、属性和getter形式；导入目标统一规范化首位置参数或唯一`name=`，歧义/缺失/`**kwargs`失败关闭。
-- 第四次10文件正式冻结为REWORK：helper的`__builtins__`下标可绕过动态导入白名单，嵌套/条件`TYPE_CHECKING`导入可通过校验但让策略加载NameError。所有角色现禁止直接`__builtins__`访问，并拒绝动态namespace直接下标和敏感内建键读取；`TYPE_CHECKING`只接受无条件模块顶层单次显式导入，typing通配符也被拒绝。
-- 第五次10文件正式冻结为REWORK：bound/unbound/getter形式`__getitem__`可从动态namespace读取`__builtins__`并绕过角色导入白名单。现复用静态callable解析统一检查三种形式的目标、参数和敏感键。
-- 该REWORK之后S03定向127 passed、联合矩阵447 passed；strict mypy/pyright、完整/阻断级flake8、Python 3.8 AST、S00 baseline、`git diff --check`、validate-only和全新目录真实导出均PASS。
-- AST/特征扫描明确只是防误提交门禁，不是Python沙箱、完备别名/数据流证明或完备秘密检测器；真实聚宽行为仍由S18验证。
-- 第六次冻结的部署/文档与独立功能审查均APPROVE；第三个审查代理因平台误判未产出结论，主审使用相同冻结指纹和验证结果补足合同核对。
-- 实现提交：`224a68195eeff11a542885344957132a294c5399`。两路独立精确SHA终审均APPROVE，确认只包含冻结10文件，127项S03测试与447项联合矩阵通过，确定性导出与manifest逐项匹配。
-- 残余边界：该扫描器不是Python沙箱、完备别名/数据流证明或完备秘密检测器；聚宽真实平台、QMT模拟和小额实盘仍分别受S18至S20门禁约束。
-- Decision: DONE
+- 新增能力：固定白名单三文件按单次不可变源码快照原样导出；确定性manifest记录角色、相对路径、字节数、SHA256与部署mode契约；目标目录reparse防护与原子导出；明显凭据扫描；私有profile只读校验（不执行、不复制、不hash、不输出秘密）；clean-room导入与缺helper/profile/版本不匹配的失败关闭smoke。
+- 最终测试：S03定向127 passed、与S01/S02联合矩阵447 passed（3个既有warning）；strict mypy/pyright、完整/阻断级flake8、Python 3.8 AST、S00 baseline、`git diff --check`、validate-only与全新目录真实导出均PASS。
+- 审查结论：第六次10文件冻结的部署/文档与独立功能审查APPROVE，两路独立精确SHA终审APPROVE；提交只含冻结10文件，双份全新导出字节一致，工作树clean。
+- 实现提交：`224a68195eeff11a542885344957132a294c5399`。
+- 决定：DONE。只放行“可上传候选”的生成与验证，不放行真实资金；L00已按D021/D023将导出器精简，当前边界见[聚宽校验与导出](06-joinquant-export.md)。
+- 逐轮冻结明细见[S01-S03审查明细归档](archive/04-slices-s01-s03-review-detail-pre-l00.md)。
 
 ## S04：Strategy Domain and Schema
 
@@ -1046,6 +477,43 @@ Decision: DONE
 - 需要用户明确审批真实资金和准确额度。
 - 专用账户先使用极小资金，完成预定义场景和日终对账。
 - 通过独立运行审查后才允许提高到1万元；共享账户仍不在范围内。
+
+## L00：Existing Code Pruning
+
+### 当前状态
+
+- 裁剪实施完成，两路独立审查APPROVE且findings已修复复测；待实现提交后标记DONE。
+
+### 实施计划
+
+1. helper精简：`helpers/bullet_trade_jq_remote_helper.py`重写为只含`STRATEGY_RUNTIME_API_VERSION`/`STRATEGY_RUNTIME_HELPER_MARKER`/`PROFILE_SCHEMA_VERSION`/`install_strategy_runtime`的单文件；删除旧版远程交易API（configure/install_jq_compat/RemoteBrokerClient/order系列）和全部同进程对抗机制（reload代际、闭包authority、对象投毒检测、lease/socket gate）。保留：普通类型/版本/模式校验、SHADOW交易函数门禁、profile schema v1校验、幂等重装（不同签名拒绝）、LIVE阻断状态。`.pyi`同步瘦身；删除`tests/test_jq_remote_helper.py`、`tests/helpers/test_jq_remote_helper_warning.py`、`tests/test_jq_runtime_reload_deadlock_regression.py`；`tests/test_jq_strategy_runtime.py`重写为精简套件。
+2. 策略适配：`strategies/joinquant/good_etf.py`删除远程portfolio检测、helper别名扫描、运行时模式authority闭包和深度state校验；保留普通marker/版本/mode校验与无helper BACKTEST兜底。`tests/strategies/test_good_etf_contract.py`同步收缩。
+3. 导出器精简：`scripts/export_joinquant.py`删除AST角色门禁、别名/namespace对抗扫描、动态导入分析、TYPE_CHECKING绑定检查和跨文件契约重绑扫描；保留固定白名单、Python 3.8语法检查、明显凭据扫描（字面量+文本模式）、profile形状校验、确定性manifest、reparse防护、原子导出和clean-room smoke。`tests/test_joinquant_export.py`同步收缩。
+4. 单进程idempotency：`bullet_trade/server/strategy/idempotency.py`删除worker_id/lease归属与过期重领，claim退化为单进程原子认领，`quarantine_inflight`增加启动时CLAIMED→PENDING重置；outbox lease列保留为弃用占位（不破坏既有迁移哈希纪律）。不新增删除表的破坏性迁移，暂不用的`corporate_actions`表只保留兼容。多租户授权与复杂角色系统不建设（原S14范围），上游v0.9.2 server的sub-account功能保持原样。
+5. adjust_capital定位固化：估值与资金代码保持现状（严格份额NAV从未实现，现有`performance_ready`标记保留），文档明确`adjust_capital`仅为管理员修复入口，不接入日常流程。
+6. 文档归档：`03-session.md`与`04-slices.md`的多轮审查明细归档至`docs/live-ledger/archive/`，正文只保留架构、使用、恢复、部署和当前测试证据；`00-current-state.md`第3节改写为精简runtime描述；`06-joinquant-export.md`、`11-persistent-idempotency-outbox.md`同步更新。
+
+### 保留底线（不得裁剪）
+
+SQLite事务和CAS、资金冻结、请求幂等、未知提交隔离、真实fill去重、精确费用/lot成本、T+1、账实对账、原子估值、启动阻断、kill switch（地基）和数据库备份（地基）。
+
+### 出口条件
+
+- 核心BACKTEST/SHADOW、资金、成交、估值测试继续通过；L00定向矩阵全绿。
+- 生产代码与测试数量明显下降；helper与导出器恢复到个人可维护规模。
+- 独立审查APPROVE后收口。
+
+### L00收口
+
+- helper：6001→403行，公开API仅marker/API版本/profile schema/`install_strategy_runtime`；旧远程交易API与同进程对抗机制删除；`.pyi`与`typecheck/joinquant_contract.py`同步。`good_etf.py` 826→489行，业务逻辑零改动（diff确认hunk止于`_runtime_mode`）。
+- 导出器：1500→615行；深层AST/别名/namespace对抗扫描与跨契约重绑扫描删除；manifest删除contracts字段；127→36用例。凭据扫描收窄为文本正则+字面量（拼接构造不再拦截），已在`06-joinquant-export.md`如实声明。
+- idempotency：单进程原子认领；`quarantine_inflight`增加CLAIMED→PENDING崩溃恢复；SUBMIT_UNKNOWN不再投递保留。outbox lease列弃用保留，`corporate_actions`表只作兼容、不进入首版业务。已知取舍：CLAIMED搁浅仅随进程重启恢复，L02接线dispatcher时须记住此前提。
+- 测试删除：`tests/test_jq_remote_helper.py`、`tests/helpers/test_jq_remote_helper_warning.py`、`tests/test_jq_runtime_reload_deadlock_regression.py`（均为已删除能力的测试）。
+- 文档：S01/S03逐轮审查历史归档至`docs/live-ledger/archive/`（结论失效仅作记录）；00/03/04/06/08/11/12/14与两份README对齐现状；三篇上游接管文档与notebook 04添加失效标注。
+- 测试证据：L00定向矩阵334 passed（runtime 121、策略契约25、helpers 31、typings 12、export 36、server 97、scheduler 12；PYTHONUTF8=1、DEFAULT_DATA_PROVIDER=easy_tdx）；全量724 passed、8个既有环境失败（pre-L00基线worktree复跑同样8失败，与L00无关）；strict mypy/pyright 0 issues；阻断级flake8、py3.8 AST、S00 baseline、`git diff --check`均PASS。
+- 审查：helper/策略路APPROVE（MAJOR“profile校验零覆盖”已补64用例；MINOR幂等重装重装guard、签名含run_type已修复）；导出器/server/文档路APPROVE（无BLOCKER/MAJOR；两条MINOR为已声明的能力收窄）。
+- 实现提交：（待用户确认git提交后补录SHA）。
+- L00决定：DONE（提交后生效）。
 
 ## 4. Review记录模板
 

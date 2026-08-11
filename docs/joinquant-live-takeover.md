@@ -1,5 +1,7 @@
 # 聚宽模拟盘完全接管设计说明
 
+> ⚠️ 已失效：本文描述的兼容层接管 API（`install_jq_compat`/`configure` 等旧版 helper 远程接口）已在 L00 从 helper 删除，仅保留为上游 v0.9.2 历史资料；当前 helper 契约见 [live-ledger 当前状态](live-ledger/00-current-state.md)。
+
 > 用户接入流程见 [聚宽策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。当前文档用于说明兼容层实现边界、账户代理、下单映射和验收清单。
 
 ## 目标

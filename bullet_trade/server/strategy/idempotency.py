@@ -1,4 +1,12 @@
-"""Persistent request idempotency and a small SQLite outbox."""
+"""Persistent request idempotency and a small single-process SQLite outbox.
+
+The outbox is claimed by one embedded dispatcher thread inside the server
+process; there are no external workers and no leases. Crash recovery is
+handled by :meth:`SQLiteOperationRepository.quarantine_inflight` at startup:
+operations that crossed the broker effect boundary (SUBMITTING) become
+SUBMIT_UNKNOWN and are never requeued, while outbox rows that were only
+CLAIMED return to PENDING so they can be claimed again.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +14,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Union, cast
@@ -58,8 +66,6 @@ class OutboxClaim:
     topic: str
     payload_json: str
     attempt_count: int
-    lease_owner: str
-    lease_until: datetime
 
 
 def _now() -> datetime:
@@ -119,7 +125,11 @@ def _operation_from_row(row: sqlite3.Row) -> OperationRecord:
 
 
 class SQLiteOperationRepository:
-    """Own idempotent operations and their one-to-one submission outbox rows."""
+    """Own idempotent operations and their one-to-one submission outbox rows.
+
+    All claim/submission transitions run inside ``BEGIN IMMEDIATE``
+    transactions; the outbox is designed for a single claiming process.
+    """
 
     def __init__(self, database_path: DatabasePath):
         self.database_path = Path(database_path)
@@ -206,9 +216,9 @@ class SQLiteOperationRepository:
                 """
                 INSERT INTO outbox(
                     strategy_account_id, topic, aggregate_id, payload_json,
-                    state, attempt_count, available_at, lease_owner,
-                    lease_until, created_at, updated_at, operation_id
-                ) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, NULL, NULL, ?, ?, ?)
+                    state, attempt_count, available_at, created_at, updated_at,
+                    operation_id
+                ) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?, ?, ?)
                 """,
                 (
                     strategy_account_id,
@@ -248,47 +258,49 @@ class SQLiteOperationRepository:
         finally:
             connection.close()
 
-    def claim_next(self, worker_id: str, lease_seconds: int = 30) -> Optional[OutboxClaim]:
-        if not worker_id or type(lease_seconds) is not int or lease_seconds <= 0:
-            raise ValueError("worker_id and a positive lease_seconds are required")
+    def claim_next(self) -> Optional[OutboxClaim]:
+        """Atomically claim the oldest dispatchable outbox row.
+
+        Single-process claim: the ``BEGIN IMMEDIATE`` transaction holds the
+        write lock for the whole select-then-update, so concurrent in-process
+        callers cannot both claim the same row.
+        """
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            now = _now()
-            now_text = now.isoformat()
+            now_text = _now_text()
             row = connection.execute(
                 """
                 SELECT o.outbox_id
                 FROM outbox AS o
                 JOIN strategy_operations AS op ON op.operation_id = o.operation_id
                 WHERE op.state = 'PENDING'
-                  AND (
-                    (o.state = 'PENDING' AND o.available_at <= ?)
-                    OR (o.state = 'CLAIMED' AND o.lease_until <= ?)
-                  )
+                  AND o.state = 'PENDING'
+                  AND o.available_at <= ?
                 ORDER BY o.outbox_id
                 LIMIT 1
                 """,
-                (now_text, now_text),
+                (now_text,),
             ).fetchone()
             if row is None:
                 connection.commit()
                 return None
             outbox_id = int(row["outbox_id"])
-            lease_until = now + timedelta(seconds=lease_seconds)
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE outbox
                 SET state = 'CLAIMED', attempt_count = attempt_count + 1,
-                    lease_owner = ?, lease_until = ?, updated_at = ?
-                WHERE outbox_id = ?
+                    updated_at = ?
+                WHERE outbox_id = ? AND state = 'PENDING'
                 """,
-                (worker_id, lease_until.isoformat(), now_text, outbox_id),
+                (now_text, outbox_id),
             )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return None
             claim_row = connection.execute(
                 """
-                SELECT outbox_id, operation_id, topic, payload_json,
-                       attempt_count, lease_owner, lease_until
+                SELECT outbox_id, operation_id, topic, payload_json, attempt_count
                 FROM outbox WHERE outbox_id = ?
                 """,
                 (outbox_id,),
@@ -301,8 +313,6 @@ class SQLiteOperationRepository:
                 topic=claim_row["topic"],
                 payload_json=claim_row["payload_json"],
                 attempt_count=claim_row["attempt_count"],
-                lease_owner=claim_row["lease_owner"],
-                lease_until=datetime.fromisoformat(claim_row["lease_until"]),
             )
         except sqlite3.DatabaseError as exc:
             connection.rollback()
@@ -313,16 +323,11 @@ class SQLiteOperationRepository:
         finally:
             connection.close()
 
-    def begin_submission(self, outbox_id: int, worker_id: str) -> OperationRecord:
+    def begin_submission(self, outbox_id: int) -> OperationRecord:
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._select_claimed_operation(
-                connection,
-                outbox_id,
-                worker_id,
-                require_active_lease=True,
-            )
+            row = self._select_claimed_operation(connection, outbox_id)
             cursor = connection.execute(
                 """
                 UPDATE strategy_operations
@@ -351,7 +356,6 @@ class SQLiteOperationRepository:
     def finish_submission(
         self,
         outbox_id: int,
-        worker_id: str,
         response: Mapping[str, object],
         unknown: bool = False,
     ) -> OperationRecord:
@@ -359,11 +363,13 @@ class SQLiteOperationRepository:
         operation_state = (
             OperationState.SUBMIT_UNKNOWN if unknown else OperationState.COMPLETED
         )
+        # An unknown submission is never requeued: the broker may already
+        # have accepted the order, so the outbox row is terminally FAILED.
         outbox_state = "FAILED" if unknown else "DONE"
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._select_claimed_operation(connection, outbox_id, worker_id)
+            row = self._select_claimed_operation(connection, outbox_id)
             timestamp = _now_text()
             cursor = connection.execute(
                 """
@@ -383,7 +389,7 @@ class SQLiteOperationRepository:
             connection.execute(
                 """
                 UPDATE outbox
-                SET state = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
+                SET state = ?, updated_at = ?
                 WHERE outbox_id = ?
                 """,
                 (outbox_state, timestamp, outbox_id),
@@ -404,6 +410,14 @@ class SQLiteOperationRepository:
             connection.close()
 
     def quarantine_inflight(self) -> int:
+        """Recover outbox/operation state after a process restart.
+
+        Operations stuck in SUBMITTING crossed the broker effect boundary, so
+        they become SUBMIT_UNKNOWN (never requeued) and their outbox rows are
+        terminally FAILED. Outbox rows that were CLAIMED but never began
+        submission return to PENDING so they can be claimed again. Returns the
+        total number of rows recovered.
+        """
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -421,8 +435,7 @@ class SQLiteOperationRepository:
                 connection.execute(
                     """
                     UPDATE outbox
-                    SET state = 'FAILED', lease_owner = NULL, lease_until = NULL,
-                        updated_at = ?
+                    SET state = 'FAILED', updated_at = ?
                     WHERE operation_id = ? AND state != 'DONE'
                     """,
                     (timestamp, operation_id),
@@ -435,8 +448,21 @@ class SQLiteOperationRepository:
                     """,
                     (timestamp, operation_id),
                 )
+            cursor = connection.execute(
+                """
+                UPDATE outbox
+                SET state = 'PENDING', updated_at = ?
+                WHERE state = 'CLAIMED'
+                  AND operation_id IN (
+                      SELECT operation_id FROM strategy_operations
+                      WHERE state = 'PENDING'
+                  )
+                """,
+                (timestamp,),
+            )
+            recovered = len(operation_ids) + cursor.rowcount
             connection.commit()
-            return len(operation_ids)
+            return recovered
         except sqlite3.DatabaseError as exc:
             connection.rollback()
             raise RepositoryError("failed to quarantine inflight submissions") from exc
@@ -467,26 +493,14 @@ class SQLiteOperationRepository:
     def _select_claimed_operation(
         connection: sqlite3.Connection,
         outbox_id: int,
-        worker_id: str,
-        require_active_lease: bool = False,
     ) -> sqlite3.Row:
-        if require_active_lease:
-            row = connection.execute(
-                """
-                SELECT operation_id FROM outbox
-                WHERE outbox_id = ? AND state = 'CLAIMED' AND lease_owner = ?
-                  AND lease_until > ?
-                """,
-                (outbox_id, worker_id, _now_text()),
-            ).fetchone()
-        else:
-            row = connection.execute(
-                """
-                SELECT operation_id FROM outbox
-                WHERE outbox_id = ? AND state = 'CLAIMED' AND lease_owner = ?
-                """,
-                (outbox_id, worker_id),
-            ).fetchone()
+        row = connection.execute(
+            """
+            SELECT operation_id FROM outbox
+            WHERE outbox_id = ? AND state = 'CLAIMED'
+            """,
+            (outbox_id,),
+        ).fetchone()
         if row is None:
-            raise RepositoryError("outbox message is not claimed by this worker")
+            raise RepositoryError("outbox message is not claimed")
         return cast(sqlite3.Row, row)

@@ -38,11 +38,15 @@ S04交付领域数据结构和可迁移SQLite schema；S05在其上增加事务r
 - `strategy_events`：按策略单调递增的事件流。
 - `outbox`：后续S07用于事务内创建外部提交任务。
 - `reconciliation_runs`：对账时间、状态和差异摘要。
-- `capital_flows`、`corporate_actions`：显式资金流和公司行动扩展钩子。
+- `capital_flows`：显式资金流扩展钩子。`corporate_actions`是旧schema兼容表，首版业务不读写。
 
 迁移v3为`ledger_entries`和`strategy_events`增加禁止UPDATE/DELETE的触发器，业务修复只能追加新事件。
 
 迁移v4新增`strategy_operations`，并为`outbox`增加一对一`operation_id`：同一策略、endpoint和幂等键只能创建一个operation；请求hash、client tag、状态和最终响应持久保存。
+
+公司行动业务不在首版范围，但不为裁剪空表增加破坏性迁移。当前`LATEST_SCHEMA_VERSION=4`。
+
+`outbox`的`lease_owner`/`lease_until`列已弃用：outbox改为单进程认领后不再有lease概念，两列恒为NULL；保留列只是为了避免对既有数据库做破坏性表重建，新代码不得再读写它们。
 
 S04只保证schema和静态约束；事件追加、CAS、资金划拨、成交入账和对账业务不在本slice中伪实现。
 

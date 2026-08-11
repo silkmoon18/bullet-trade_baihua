@@ -1,6 +1,6 @@
 # 当前架构、依赖与状态
 
-更新时间：2026-08-09（Asia/Shanghai）
+更新时间：2026-08-10（Asia/Shanghai）
 
 ## 1. 仓库与版本状态
 
@@ -62,25 +62,17 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-`v0.9.2` 已提供 `install_jq_compat(...)`：回测保持聚宽行为；模拟盘可接管常用下单函数和策略可见的 `context.portfolio`。该接管是Python代理，不会修改聚宽内部撮合账本。
+L00已将helper重写为403行精简版：公开API只有`STRATEGY_RUNTIME_API_VERSION=1`、`STRATEGY_RUNTIME_HELPER_MARKER`、`PROFILE_SCHEMA_VERSION=1`和`install_strategy_runtime(namespace, *, context, profile, mode, strategy_id, expected_api_version=1, profile_module='jq_runtime_config')`。旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）和全部同进程对抗机制（reload代际、闭包authority、对象投毒检测、lease/socket gate）已删除；按D021，helper运行在用户自有的可信策略进程中，不防御同进程恶意Python代码。
 
-S01候选在同一helper上增加了`install_strategy_runtime(...)`、稳定helper marker和profile schema v1：三个合法模式都在原子登记安装owner时先建立进程级`TRANSITIONING`门禁，再读取context；owner/namespace/mode只接受精确内建类型，未知、被篡改或owner缺失的孤儿状态会在context前固定失败，且poison对象不会进入比较、membership或错误格式化。已经成功安装时，active mode、进程signature、canonical state、commit capsule、独立闭包anchor与namespace runtime record必须在context读取前构成同一identity封套；capsule还封存提交时的原helper instance token、module generation和不可变安全state snapshot。runtime、owner、socket三把锁及socket condition、helper token/generation、请求lease registry由另一闭包anchor绑定，模块全局锁即使替换为同类型对象也不能被使用。fresh install要求权威状态为空且单调generation精确为0；全部/部分擦除、等值浅拷贝、协同替换、module token/generation改写或保持字典identity的原地值篡改均失败关闭。公开版本/marker先做精确类型与固定值校验，poison不会进入比较。SHADOW/LIVE还会同时保护namespace并在读取可信profile前清除旧远程客户端。BACKTEST不读取profile或连接网络，也不替换聚宽原生下单函数；helper已上传时，`good_etf.py`必须经版本化入口检查旧client/remote portfolio等污染，只有精确`ModuleNotFoundError`及其traceback证明目标helper本体尚未执行时才允许纯聚宽回测本地兜底。helper内部导入失败、进程中仍加载任何helper模块对象或兜底context仍带旧远程portfolio都会在读取context前中止；模块对象识别接受ModuleType子类，并使用项目专属模块名、稳定marker或文件名，不能通过任意sys.modules缓存键隐藏，也不会仅因无关模块具有相似API入口而误判。并发BACKTEST的失败方保留原生下单函数；涉及任一远程模式的并发失败namespace仍安装本地门禁。进程模式、namespace、公开helper、缓存broker和短连接client共同阻断交易或远程访问；并发/递归安装、在途RPC、旧兼容状态、旧远程portfolio、检测到helper重载或公开状态篡改都失败关闭。profile导入和导入后属性读取的意外异常使用固定消息并断开异常链，profile容器和值只接受精确内建类型；未知字段名不回显，异常大的schema、数值或API版本也只产生稳定契约错误。S01的LIVE只校验profile，不安装旧兼容层、不替换portfolio且保持连接和交易关闭；其namespace替换仅是本地fail-closed保护。合法runtime安装失败后必须使用干净进程重启，污染进程也不能切回BACKTEST。`good_etf.py`在调用helper前就会拒绝LIVE启动。
+三种模式语义：
 
-FAILED会把独立闭包anchor保留为进程期失败latch；即使随后复位active mode、generation及其他模块全局，也不能伪装成fresh install。只有真正新进程的anchor为空。
+- `BACKTEST`：只校验聚宽回测run_type（`simple_backtest`/`full_backtest`），不读取profile、不联网、不接管下单函数。
+- `SHADOW`：校验`sim_trade`run_type，加载并校验私有profile schema v1，把`order`、`order_value`、`order_percent`、`order_target`、`order_target_value`、`order_target_percent`、`cancel_order`七个聚宽交易函数替换为抛错guard，只生成计划。
+- `LIVE`：同样校验profile并安装guard，且state保持`enabled=False`、`reason='live_blocked_until_strategy_ledger'`，StrategyLedger实盘闭环完成前禁止交易。
 
-远程RPC wrapper在定义时捕获helper instance token/module generation，请求时再登记独立object token；入口、每次重试和紧邻`socket.create_connection`前都要求精确generation/count、当前token仍在闭包锚定registry且`inflight == len(registry)`。类型/identity污染会在socket前固定失败且不执行对象比较或锁上下文协议；同代际finally只移除自己的token，reload后的旧finally不能改写新代际计数。helper reload先于任何generation变化发布FAILED并清client，随后只读取旧状态中的精确内建计数；poison旧值或初始化中断都不能留下可远程访问的混合代际。
+同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-该边界要求直接传普通模块`globals()`字典和普通字符串mode。它会保护标准交易名、直接别名及可安全识别的函数名、partial、wrapped和直接闭包引用，但无法撤销已经藏在其他模块、容器、任意callable对象或局部变量中的原生函数引用；因此策略初始化必须单线程、先安装runtime再启动任何回调，profile仍属于可信代码而非沙箱。namespace runtime record不是权威恢复源，进程内signature/canonical state、commit capsule、单调generation与当前helper实例必须同时匹配。
-
-### S01当前并发模型与生产边界（取代上述v11重载表述）
-
-当前候选使用三把闭包锚定锁：runtime `RLock`保护权威状态，owner `Lock`保护安装所有权，socket `RLock`保护gate和远程effect；支持路径遵循`runtime -> owner -> socket`锁序。socket authority以`attempt token -> thread id`登记在途连接。lease检查与attempt登记在`runtime -> socket`临界区原子完成；随后connector通过独立的最终latch/token permit进入，且不持续持有socket锁，所以跨线程reload可以关闭gate，但必须等待该attempt结束。TLS包装、握手及request/mutation发送等远程effect在socket `RLock`内线性化；mutation在调用effect前发布handoff，发送已开始或结果不确定时不得自动重试。post-connector的runtime复核发生前先结束attempt，以避免reload持runtime等待attempt、请求持attempt等待runtime的锁循环。同线程持有socket锁或拥有attempt时发起递归reload不会等待自身，而是进入进程终止型失败。
-
-reload gate只是误用检测和fail-closed防线，不是热更新API。生产禁止直接调用`importlib.reload()`、热补丁、same-thread recursive reload，以及用`sys.settrace`、`sys.setprofile`或signal handler在任意字节码/C返回点触发reload后捕获异常并恢复旧栈。即使普通`importlib.reload()`自身返回成功，旧代bootstrap也已经把该进程永久置为`FAILED`；这不代表热升级成功，后续不得重新安装runtime、发起请求或切回BACKTEST。
-
-`RuntimeReloadAbort`、任何reload异常和在runtime/网络effect期间发生的任意异步中断都按进程终止事件处理：不得捕获后继续旧调用栈，不得在同一进程重试，不得用BACKTEST“恢复”。支持的保证限定为正常控制流和受测的跨线程并发；上文关于reload或`BaseException`失败关闭的描述也只在这个边界内成立。纯Python无法对恶意catch-and-resume、任意opcode/C返回点的中断，以及connector返回资源到共享holder之间的极短handoff窗口给出不可绕过的原子保证。尤其是trace/debugger读取活动authority frame的`frame.f_locals`会物化旧closure cell值；递归reload关闭latch后，CPython的trace locals同步可能把旧`False`写回同一cell并回滚gate，所以具有活动帧改写权的调试/跟踪代码不在可防御契约内。进程退出是释放这类残余OS资源和清除旧闭包状态的最终边界。未来若LIVE要求抵抗这类同进程任意代码执行，应把网络IO移到带epoch的独立worker/子进程，或使用原生原子gate。
-
-helper升级必须冷升级：停止聚宽策略并确认旧进程退出，替换helper/config/策略文件，再由平台启动全新进程并重新校验marker、profile和模式。首次从缺少当前primitive anchor的旧helper升级，尤其raw `Lock`/pre-bootstrap版本，也只能走此流程，绝不能在旧进程内reload。
+`good_etf.py`默认`MODE='BACKTEST'`，只用普通`getattr`校验helper marker与API版本；安装后的模式保存在模块级`_active_mode`，三个交易入口只读它。无helper时仅BACKTEST可本地兜底；LIVE由策略侧直接拒绝和helper阻断态双重保险。
 
 ### BulletTrade服务器侧
 
@@ -93,15 +85,20 @@ helper升级必须冷升级：停止聚宽策略并确认旧进程退出，替�
 - `submit_unknown`等基础不确定状态表达。
 - `sub_account_id`路由和单笔限额。
 
+S04至S10已具备：
+
+- SQLite策略账本：策略级现金、冻结、持仓/lot归属和append-only资金流水。
+- 1万元策略资金的真实校准、原子分配与按订单冻结/释放。
+- 持久幂等operation/outbox（单进程认领）、成交去重和`SUBMIT_UNKNOWN`不重发底线。
+- 真实买卖成交入账：费用、FIFO lot、T+1可卖和已实现盈亏。
+- 原子估值快照：现金、持仓市值、总资产、NAV、费用和盈亏来自同一读事务。
+
 当前不具备：
 
-- 持久化的策略级现金和持仓账本。
-- 1万元策略资金的原子分配与冻结。
-- 策略持仓归属和共享账户隔离。
-- 持久幂等、成交去重、事务outbox。
-- 组合目标执行器和卖后买状态机。
-- 策略级真实NAV/TWR/回撤。
-- 可阻断交易的账实对账系统。
+- QMT订单/成交/资金/持仓的持续同步与账实对账（L01）。
+- 目标组合规划与先卖后买执行（L02）。
+- 策略API与聚宽真实组合视图（L03）。
+- 本机部署、备份演练与小额实盘验收（L04）。
 
 ## 4. 依赖现状
 
@@ -164,7 +161,7 @@ from jqdata import *
 - 折价排序、前N只和折价绝对值权重。
 - 停牌/涨停过滤、多时点风控和日终对账思想。
 
-S01候选已经处理：
+L00精简运行契约已经处理：
 
 - 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、`MODE`、`STRATEGY_ID`。
 - 移除旧定制helper的同步追单、账户查询、全账户撤单和通知调用。
@@ -174,8 +171,8 @@ S01候选已经处理：
 仍然存在的问题：
 
 1. 过渡目标仍使用聚宽组合总资产；实盘必须改用StrategyLedger的策略虚拟NAV、working exposure和费用缓冲。
-2. 生产级异步执行、卖后买和部分成交恢复尚未实现；不能把S01兼容路径用于真实资金。
-3. 策略级资金/持仓归属、持久幂等和券商硬对账尚未实现。
+2. 生产级异步执行、卖后买和部分成交恢复尚未实现（L02）；不能把当前精简运行契约用于真实资金。
+3. 券商硬对账尚未实现（L01）；策略级资金/持仓归属、持久幂等和真实成交入账已在S04至S09完成。
 4. 09:30调仓和09:30风控可能对同一标的产生冲突。
 5. 昨日单位净值与今日开盘价不是严格同时间折价。
 6. 1万元、3只ETF受到100份整手和最低佣金显著影响。
@@ -183,7 +180,7 @@ S01候选已经处理：
 
 ### 6.1 与 v0.9.2 helper 的已知API差异
 
-迁移策略来自 `bt_quant@e6462dd` 的定制helper调用。下表保留迁移差异及S01候选的处理结果：
+迁移策略来自 `bt_quant@e6462dd` 的定制helper调用。下表保留迁移差异及L00精简运行契约的处理结果：
 
 | 迁移策略调用 | v0.9.2状态 | 处理决策 |
 |---|---|---|
@@ -196,9 +193,9 @@ S01候选已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-S01候选只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。S03导出smoke、S15 StrategyLedger runtime和S18至S20真实门禁均不可省略。
+L00精简运行契约只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只生成计划；LIVE仍被明确阻断。导出smoke、L03聚宽真实视图和S18至S20真实门禁均不可省略。
 
-第四轮冻结后，策略还收紧了helper返回契约与生命周期入口：runtime state必须是完整、精确且自洽的schema/identity/mode/run_type/flags/reason/profile_module/blocked_mutations组合；`initialize`和`process_initialize`的首条可执行语句都是runtime安装，jqdata/platform调用不得先于helper gate。随后冻结前对抗探针证明读取`g.bt_runtime`本身可执行平台属性协议并协同降级MODE，因此执行模式现封存在安装后的一次性闭包权威中，`g.bt_runtime`只保留为聚宽侧展示副本，交易入口完全不读取它；当前MODE与闭包权威漂移会固定失败。该阶段共增加17个策略回归；S01的预提交审查与精确SHA复审均已通过，状态为DONE。
+L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
 
 ## 7. 安全现状
 
@@ -209,4 +206,4 @@ S01候选只证明源码/profile边界可测试：BACKTEST可运行，SHADOW只�
 
 ## 8. 当前基线结论
 
-当前分支适合作为统一改造起点，但尚不具备真实资金上线条件。P0条件是完成开发体验、协议契约、策略账本、持久幂等、真实成交入账和硬对账闸门。
+当前分支适合作为统一改造起点，但尚不具备真实资金上线条件。P0中的开发体验、策略账本、持久幂等和真实成交入账已完成（S00至S10）；剩余闸门为QMT同步对账（L01）、目标规划执行（L02）、聚宽真实视图（L03）和本机部署与小额验收（L04）。

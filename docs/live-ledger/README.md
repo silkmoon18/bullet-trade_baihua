@@ -23,6 +23,8 @@
 17. [个人量化精简计划](15-lean-personal-plan.md)
 18. [飞书交易卡片通知](16-feishu-trade-notifications.md)
 
+`archive/`：历史审查记录归档（S01逐轮REWORK与S01至S03逐轮冻结明细）；其中各轮候选结论均已失效，仅作历史记录，不作为放行证据。
+
 ## 权威边界
 
 - QMT/券商：物理账户、委托和成交事实来源。

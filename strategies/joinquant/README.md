@@ -21,13 +21,13 @@
 
 当前三种模式的边界是：
 
-- `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时先经版本化入口检查旧远程client/portfolio污染，只有traceback证明目标helper本体尚未执行且确实不存在时才使用纯聚宽本地兜底；helper内部导入失败、任意`sys.modules`键下仍缓存带项目名称/marker/文件特征的helper模块对象（含ModuleType子类），或无helper但context仍是旧远程portfolio都会中止；仅有相似API入口的无关模块不会被误判；
-- `SHADOW`：需要版本匹配的helper和私有profile，只记录计划，所有交易变更均被阻断；
-- `LIVE`：S01尚未切换到StrategyLedger，策略会明确拒绝启动。
+- `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时经版本化入口校验marker/API版本与回测run_type；helper缺失（仅目标模块本身的`ModuleNotFoundError`）时只允许纯聚宽回测本地兜底，helper内部导入失败直接中止；
+- `SHADOW`：需要版本匹配的helper和私有profile，只记录计划；helper把`order`等七个聚宽交易函数替换为抛错guard，所有交易变更均被阻断；
+- `LIVE`：StrategyLedger实盘闭环尚未完成；策略侧在调用helper前直接拒绝，helper也保持`enabled=False`阻断态（`reason='live_blocked_until_strategy_ledger'`）。
 
-因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。S15接入StrategyLedger runtime；S18至S20依次完成真实聚宽、QMT模拟和用户批准的小额实盘门禁。
+因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。聚宽真实组合视图属L03；真实聚宽、QMT模拟和用户批准的小额实盘门禁在L04按人工验收执行。
 
-helper的reload gate仅用于误用检测和fail-closed，不是热更新API。生产禁止raw `importlib.reload()`、热补丁、same-thread recursive reload，以及`sys.settrace`/`sys.setprofile`/signal catch-and-resume。即使reload调用返回成功，该进程也已经永久`FAILED`；`RuntimeReloadAbort`、reload异常或runtime/网络effect期间的任意异步中断都必须终止进程，不能继续旧栈、同进程重试或切回BACKTEST。
+helper按D021不防御同进程恶意Python代码；旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）与全部同进程对抗机制已在L00删除。同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留记录即失败关闭，必须使用干净进程重启，禁止reload或热补丁。
 
 ## 直接复制语义
 
@@ -38,14 +38,14 @@ helper的reload gate仅用于误用检测和fail-closed，不是热更新API。�
    不维护本地专用分支。
 3. 在仓库源码中先确定并审查顶部的`PROFILE`、`MODE`和`STRATEGY_ID`部署声明；默认BACKTEST源码不能在
    上传后手工改成SHADOW/LIVE。
-4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、导入能力、契约、
-   敏感信息和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
+4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
+   profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。
-5. 核对manifest中的mode/profile/strategy_id和各文件SHA256，停止旧进程后上传统一helper与已校验的私有
+5. 核对manifest中各文件SHA256与受控源码的部署声明（`PROFILE`/`MODE`/`STRATEGY_ID`），停止旧进程后上传统一helper与已校验的私有
    `jq_runtime_config.py`，最后把导出的策略原样复制到聚宽编辑器。
 6. 导出后和聚宽侧均禁止再次编辑部署声明或helper；任何变更都回到受控源码重新校验、导出并冷升级。
 
-更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/MODE校验。首次从旧raw `Lock`/pre-bootstrap helper升级也必须如此；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
+更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/MODE校验；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
 
 “代码一致”指同一份策略源码和已验证API契约，不代表本地兼容引擎与聚宽私有撮合实现绝对相同。
 
