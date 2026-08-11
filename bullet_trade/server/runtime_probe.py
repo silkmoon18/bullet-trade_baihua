@@ -911,3 +911,7 @@ __all__ = [
     "load_probe_config",
     "main",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
