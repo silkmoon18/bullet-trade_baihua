@@ -33,6 +33,7 @@ import math
 import socket
 import ssl
 import struct
+import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -55,6 +56,8 @@ STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
+_RPC_ATTEMPTS = 3
+_RPC_RETRY_INTERVAL_SECONDS = 0.5
 
 # 策略 namespace 中的安装记录键；用于识别上一代 helper 遗留状态。
 _RUNTIME_STATE_KEY = "__bt_strategy_runtime_state__"
@@ -89,6 +92,14 @@ _MODULE_TOKEN = object()
 _active_signature = None  # type: Optional[Tuple[Any, ...]]
 _active_state = None  # type: Optional[Dict[str, Any]]
 _active_profile = None  # type: Optional[Dict[str, Any]]
+
+
+class _AmbiguousRequestError(RuntimeError):
+    """请求可能已执行但响应丢失，禁止在当前调用中盲目重发。"""
+
+
+class _ServerResponseError(RuntimeError):
+    """服务端明确拒绝请求，结果是确定的。"""
 
 
 class PositionView(object):
@@ -173,62 +184,111 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("策略运行时尚未安装")
     profile = _active_profile
     timeout = float(profile["rpc_timeout"])
-    raw_sock = socket.create_connection(
-        (profile["host"], profile["port"]), timeout=timeout
-    )
-    sock = raw_sock
-    try:
-        tls_cert = profile.get("tls_cert")
-        if tls_cert:
-            context = ssl.create_default_context(cafile=tls_cert)
-            sock = context.wrap_socket(raw_sock, server_hostname=profile["host"])
-        sock.settimeout(timeout)
-        _send_message(
-            sock,
-            {
-                "type": "handshake",
-                "token": profile["token"],
-                "protocol": 1,
-                "features": ["strategy_ledger_v1"],
-                "account_key": profile.get("account_key"),
-            },
-        )
-        handshake = _read_message(sock)
-        if handshake.get("type") != "handshake_ack":
-            raise RuntimeError("服务器握手失败")
-        request_id = uuid.uuid4().hex
-        request_payload = dict(payload)
-        request_payload["strategy_id"] = _active_state["strategy_id"]
-        if profile.get("account_key"):
-            request_payload["account_key"] = profile["account_key"]
-        _send_message(
-            sock,
-            {
-                "type": "request",
-                "id": request_id,
-                "action": action,
-                "payload": request_payload,
-            },
-        )
-        response = _read_message(sock)
-        if response.get("type") == "error":
-            raise RuntimeError(
-                "{}: {}".format(
-                    response.get("code", "REQUEST_FAILED"),
-                    response.get("message", "server error"),
-                )
-            )
-        if response.get("type") != "response" or response.get("id") != request_id:
-            raise RuntimeError("服务器响应与请求不匹配")
-        result = response.get("payload")
-        if not isinstance(result, dict):
-            raise RuntimeError("服务器响应payload无效")
-        return result
-    finally:
+    connect_timeout = min(timeout, 10.0)
+    safe_retry = action != "strategy.submit_targets"
+    last_error = None  # type: Optional[Exception]
+
+    for attempt in range(1, _RPC_ATTEMPTS + 1):
+        raw_sock = None
+        sock = None
+        phase = "连接"
+        request_may_have_been_sent = False
         try:
-            sock.close()
-        except Exception:
-            pass
+            raw_sock = socket.create_connection(
+                (profile["host"], profile["port"]), timeout=connect_timeout
+            )
+            sock = raw_sock
+            tls_cert = profile.get("tls_cert")
+            if tls_cert:
+                phase = "TLS握手"
+                context = ssl.create_default_context(cafile=tls_cert)
+                sock = context.wrap_socket(
+                    raw_sock, server_hostname=profile["host"]
+                )
+            sock.settimeout(timeout)
+
+            phase = "应用握手"
+            _send_message(
+                sock,
+                {
+                    "type": "handshake",
+                    "token": profile["token"],
+                    "protocol": 1,
+                    "features": ["strategy_ledger_v1"],
+                    "account_key": profile.get("account_key"),
+                },
+            )
+            handshake = _read_message(sock)
+            if handshake.get("type") != "handshake_ack":
+                raise RuntimeError("服务器握手失败")
+
+            request_id = uuid.uuid4().hex
+            request_payload = dict(payload)
+            request_payload["strategy_id"] = _active_state["strategy_id"]
+            if profile.get("account_key"):
+                request_payload["account_key"] = profile["account_key"]
+
+            phase = "发送请求"
+            # sendall 失败时也可能已经发送了部分数据；有副作用的请求必须按未知结果处理。
+            request_may_have_been_sent = True
+            _send_message(
+                sock,
+                {
+                    "type": "request",
+                    "id": request_id,
+                    "action": action,
+                    "payload": request_payload,
+                },
+            )
+            phase = "接收响应"
+            response = _read_message(sock)
+            if response.get("type") == "error":
+                raise _ServerResponseError(
+                    "{}: {}".format(
+                        response.get("code", "REQUEST_FAILED"),
+                        response.get("message", "server error"),
+                    )
+                )
+            if (
+                response.get("type") != "response"
+                or response.get("id") != request_id
+            ):
+                raise RuntimeError("服务器响应与请求不匹配")
+            result = response.get("payload")
+            if not isinstance(result, dict):
+                raise RuntimeError("服务器响应payload无效")
+            return result
+        except _ServerResponseError as exc:
+            raise RuntimeError(str(exc)) from None
+        except Exception as exc:
+            if not safe_retry and request_may_have_been_sent:
+                raise _AmbiguousRequestError(
+                    "{}在{}阶段失败：请求可能已执行，已停止自动重发；"
+                    "请使用原idempotency_key查询意图和对账结果".format(
+                        action, phase
+                    )
+                ) from None
+            last_error = exc
+            if attempt < _RPC_ATTEMPTS:
+                print(
+                    "[BulletTrade RPC] {}阶段失败（第{}/{}次），0.5秒后重试: {}".format(
+                        phase, attempt, _RPC_ATTEMPTS, type(exc).__name__
+                    )
+                )
+                time.sleep(_RPC_RETRY_INTERVAL_SECONDS)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        "{}请求失败：{}阶段连续尝试{}次仍未成功（{}）".format(
+            action, phase, _RPC_ATTEMPTS,
+            type(last_error).__name__ if last_error is not None else "unknown",
+        )
+    ) from None
 
 
 def ensure_account(initial_capital: Any = "10000") -> Dict[str, Any]:

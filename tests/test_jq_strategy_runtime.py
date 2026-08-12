@@ -5,6 +5,7 @@
 """
 
 import importlib
+import socket
 import sys
 import types
 
@@ -412,3 +413,99 @@ def test_reinstall_with_changed_run_type_rejected(helper, monkeypatch):
     _install(helper, namespace)
     with pytest.raises(RuntimeError, match="签名漂移"):
         _install(helper, namespace, context=_context("full_backtest"))
+
+
+class _FakeSocket(object):
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def close(self):
+        self.closed = True
+
+
+def test_read_only_rpc_retries_connection_then_succeeds(helper, monkeypatch):
+    _profile_module(monkeypatch)
+    _install(helper)
+    attempts = []
+    sent = []
+    sleeps = []
+
+    def connect(address, timeout):
+        attempts.append((address, timeout))
+        if len(attempts) < 3:
+            raise OSError("temporary network failure")
+        return _FakeSocket()
+
+    def read_message(sock):
+        if not sent or sent[-1]["type"] == "handshake":
+            return {"type": "handshake_ack"}
+        return {"type": "response", "id": sent[-1]["id"], "payload": {"ok": True}}
+
+    monkeypatch.setattr(helper.socket, "create_connection", connect)
+    monkeypatch.setattr(helper, "_send_message", lambda sock, message: sent.append(message))
+    monkeypatch.setattr(helper, "_read_message", read_message)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+
+    assert helper._strategy_request("strategy.get_snapshot", {}) == {"ok": True}
+    assert len(attempts) == 3
+    assert sleeps == [0.5, 0.5]
+
+
+def test_submit_targets_does_not_retry_after_request_may_be_sent(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    _install(helper, mode="LIVE")
+    attempts = []
+    reads = []
+
+    def connect(address, timeout):
+        attempts.append((address, timeout))
+        return _FakeSocket()
+
+    def read_message(sock):
+        reads.append(True)
+        if len(reads) == 1:
+            return {"type": "handshake_ack"}
+        raise socket.timeout("response lost")
+
+    monkeypatch.setattr(helper.socket, "create_connection", connect)
+    monkeypatch.setattr(helper, "_send_message", lambda sock, message: None)
+    monkeypatch.setattr(helper, "_read_message", read_message)
+    monkeypatch.setattr(
+        helper.time, "sleep", lambda seconds: pytest.fail("must not retry")
+    )
+
+    with pytest.raises(RuntimeError, match="请求可能已执行.*停止自动重发"):
+        helper.submit_targets({"510300.XSHG": 1}, "same-key")
+    assert len(attempts) == 1
+
+
+def test_server_error_is_not_retried_or_echoes_request_payload(helper, monkeypatch):
+    _profile_module(monkeypatch)
+    _install(helper)
+    attempts = []
+    reads = []
+
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda address, timeout: attempts.append(address) or _FakeSocket(),
+    )
+
+    def read_message(sock):
+        reads.append(True)
+        if len(reads) == 1:
+            return {"type": "handshake_ack"}
+        return {"type": "error", "code": "ACCOUNT_NOT_READY", "message": "rejected"}
+
+    monkeypatch.setattr(helper, "_send_message", lambda sock, message: None)
+    monkeypatch.setattr(helper, "_read_message", read_message)
+    monkeypatch.setattr(
+        helper.time, "sleep", lambda seconds: pytest.fail("must not retry")
+    )
+
+    with pytest.raises(RuntimeError, match="ACCOUNT_NOT_READY: rejected") as excinfo:
+        helper._strategy_request("strategy.ensure_account", {"secret": "do-not-echo"})
+    assert "do-not-echo" not in str(excinfo.value)
+    assert len(attempts) == 1
