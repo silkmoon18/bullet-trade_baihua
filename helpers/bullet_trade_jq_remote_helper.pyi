@@ -61,6 +61,7 @@ class _StrategyRuntimeOptionalState(TypedDict, total=False):
     profile_module: Optional[str]
     blocked_mutations: Tuple[str, ...]
     mirror_jq_orders: bool
+    remote_validation_enabled: bool
 
 
 class _StrategyRuntimeState(_StrategyRuntimeRequiredState, _StrategyRuntimeOptionalState):
@@ -76,6 +77,7 @@ def install_strategy_runtime(
     strategy_id: str,
     expected_api_version: int = ...,
     profile_module: str = ...,
+    validate_remote: bool = ...,
 ) -> _StrategyRuntimeState: ...
 
 

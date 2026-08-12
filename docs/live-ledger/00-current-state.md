@@ -62,17 +62,17 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00先将helper精简为安装契约；L03将其升级为`STRATEGY_RUNTIME_API_VERSION=2`，只增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
+L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装；当前API v3进一步支持回测阶段的远程预检。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
 
-三种模式语义：
+三种有效执行语义：
 
-- `BACKTEST`：只校验聚宽回测run_type（`simple_backtest`/`full_backtest`），不读取profile、不联网、不接管下单函数。
-- `SHADOW`：校验`sim_trade`run_type，加载并校验私有profile schema v1，把`order`、`order_value`、`order_percent`、`order_target`、`order_target_value`、`order_target_percent`、`cancel_order`七个聚宽交易函数替换为抛错guard，只生成计划。
-- `LIVE`：同样校验profile并安装guard，且state保持`enabled=False`、`reason='live_blocked_until_strategy_ledger'`，StrategyLedger实盘闭环完成前禁止交易。
+- `ExecutionMode.NATIVE`：由回测run_type自动选择，始终使用聚宽原生账户和订单；可选执行一次远程预检，但真实快照不参与历史决策且不提交远程目标。
+- `ExecutionMode.SHADOW`：只允许`sim_trade`，加载并校验私有profile，把七个聚宽交易函数替换为抛错guard，只生成实时计划。
+- `ExecutionMode.REMOTE`：只允许`sim_trade`，同样安装guard，真实组合读写和目标提交仅经过StrategyLedger；是否下QMT订单由服务器交易开关决定。
 
 同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-`good_etf.py`默认`MODE='BACKTEST'`，只用普通`getattr`校验helper marker与API版本；安装后的模式保存在模块级`_active_mode`，三个交易入口只读它。无helper时仅BACKTEST可本地兜底；LIVE由策略侧直接拒绝和helper阻断态双重保险。
+`good_etf.py`默认`SIM_EXECUTION_MODE=ExecutionMode.SHADOW`、`VALIDATE_REMOTE_DURING_BACKTEST=True`。回测自动NATIVE并做一次远程预检；模拟交易读取枚举配置。安装后的模式保存在模块级`_active_mode`，交易入口只读它。关闭回测预检时允许无helper进行纯离线回测。
 
 ### BulletTrade服务器侧
 
@@ -162,7 +162,7 @@ from jqdata import *
 
 L00精简运行契约已经处理：
 
-- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、`MODE`、`STRATEGY_ID`。
+- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、`SIM_EXECUTION_MODE`、回测远程预检开关和`STRATEGY_ID`。
 - 移除旧定制helper的同步追单、账户查询、全账户撤单和通知调用。
 - 过渡期组合目标改为`context.portfolio.total_value × DEPLOY_RATIO × normalized_weight`，不再用可用现金直接计算最终目标。
 - 尾盘仅记录聚宽组合快照，不再把旧helper返回的整个物理账户误报为策略级对账。
@@ -183,7 +183,7 @@ L00精简运行契约已经处理：
 | 迁移策略调用 | v0.9.2状态 | 处理决策 |
 |---|---|---|
 | `configure(jq_order=..., jq_order_value=..., jq_order_target=..., jq_order_target_value=...)` | 4个参数均不受支持 | 已移除；统一调用版本化runtime入口 |
-| `configure(send_signals=...)` | 不支持该参数 | 已移除；由BACKTEST/SHADOW/LIVE模式控制 |
+| `configure(send_signals=...)` | 不支持该参数 | 已移除；由NATIVE/SHADOW/REMOTE执行语义控制 |
 | `configure(feishu_webhook_url=...)` | 不支持该参数 | 已移除；通知后续移到服务器事件 |
 | `configure(strategy_name=...)` | 不支持该参数 | 已改为稳定`STRATEGY_ID`；S14由strategy-scoped API承载 |
 | `bt.notify(...)` | 上游helper无此函数 | 已移除；S01只写聚宽日志 |
@@ -191,14 +191,14 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-BACKTEST继续原生运行，SHADOW只生成计划，LIVE软件路径通过helper v2和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SHADOW、模拟和小额资金验收不可由mock替代。
+回测继续NATIVE原生运行，SHADOW只生成计划，REMOTE软件路径通过helper v3和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SHADOW、模拟和小额资金验收不可由mock替代。
 
 L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
 
 ## 7. 安全现状
 
 - 原策略曾硬编码远程token、服务器地址和飞书Webhook；这些值应视为已经暴露，必须在外部系统轮换。
-- 新仓库策略已移除这些值；默认`MODE='BACKTEST'`，且S01的LIVE明确失败关闭。
+- 新仓库策略已移除这些值；默认模拟执行模式为SHADOW，服务器交易开关仍默认关闭。
 - 官方公共仓库已配置为只读 `upstream` 并禁用push；在用户提供私有fork URL后再添加可写 `origin`。
 - 生产配置不得提交到Git，日志不得打印token、Webhook或完整账户信息。
 

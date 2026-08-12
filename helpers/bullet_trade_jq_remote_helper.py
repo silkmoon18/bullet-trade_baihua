@@ -9,18 +9,19 @@
         globals(),
         context=context,
         profile=PROFILE,
-        mode=MODE,
+        mode="BACKTEST",  # 策略内部枚举在此边界映射为协议字符串
         strategy_id=STRATEGY_ID,
+        validate_remote=True,
     )
 
 职责边界：
 
 - 版本校验：helper marker、运行时 API 版本和 profile schema 版本固定校验，
   不匹配即失败关闭。
-- 模式校验：BACKTEST 只校验聚宽回测 run_type，不读取 profile、不联网、
-  不接管下单函数；SHADOW 校验 sim_trade run_type、加载并校验私有 profile，
-  并把聚宽交易函数替换为失败关闭的 guard；LIVE 在 StrategyLedger 实盘
-  闭环完成前保持阻断（enabled=False，交易函数同样被 guard）。
+- 模式校验：BACKTEST 始终保留聚宽原生下单；可选加载私有 profile 供策略做
+  一次远程预检。SHADOW 校验 sim_trade、加载 profile 并安装交易 guard；
+  LIVE 是模拟交易的远程执行协议值，同样阻断聚宽原生交易函数，真实目标只
+  能通过 StrategyLedger 提交。
 - 冷启动升级：helper/config/策略文件变更必须先停止聚宽策略、确认旧进程
   退出，再由平台启动全新进程。同一进程内重复安装仅在签名完全一致时幂等
   返回；签名漂移或检测到上一代 helper 遗留记录即失败关闭。
@@ -51,8 +52,8 @@ __all__ = [
     "get_reconciliation",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 2
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
+STRATEGY_RUNTIME_API_VERSION = 3
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v3"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -519,6 +520,7 @@ def _build_strategy_runtime_state(
     profile: str,
     profile_module: Optional[str] = None,
     blocked_mutations: Tuple[str, ...] = (),
+    validate_remote: bool = False,
 ) -> Dict[str, Any]:
     state = {
         "api_version": STRATEGY_RUNTIME_API_VERSION,
@@ -532,7 +534,15 @@ def _build_strategy_runtime_state(
         "production_ready": False,
         "reason": "backtest",
     }
-    if mode == "SHADOW":
+    if mode == "BACKTEST" and validate_remote:
+        state.update(
+            {
+                "profile_module": profile_module,
+                "remote_validation_enabled": True,
+                "reason": "backtest_remote_validation",
+            }
+        )
+    elif mode == "SHADOW":
         state.update(
             {
                 "profile_module": profile_module,
@@ -566,6 +576,7 @@ def install_strategy_runtime(
     strategy_id: str,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
     profile_module: str = "jq_runtime_config",
+    validate_remote: bool = False,
 ) -> Dict[str, Any]:
     """安装策略运行模式并返回运行时状态；任何校验失败都抛出异常。
 
@@ -585,6 +596,10 @@ def install_strategy_runtime(
             "helper运行时API版本不匹配: expected={}".format(STRATEGY_RUNTIME_API_VERSION)
         )
     mode = _normalise_runtime_mode(mode)
+    if type(validate_remote) is not bool:
+        raise RuntimeError("validate_remote必须是bool")
+    if validate_remote and mode != "BACKTEST":
+        raise RuntimeError("validate_remote仅用于BACKTEST远程预检")
     profile = _validate_runtime_identifier(profile, "profile")
     strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
@@ -599,7 +614,15 @@ def install_strategy_runtime(
         raise RuntimeError("策略namespace运行记录缺失；必须使用干净运行进程重启")
 
     run_type = str(_run_type_from_context(context) or "").strip().lower()
-    signature = (mode, profile, strategy_id, profile_module, expected_api_version, run_type)
+    signature = (
+        mode,
+        profile,
+        strategy_id,
+        profile_module,
+        expected_api_version,
+        run_type,
+        validate_remote,
+    )
     if _active_state is not None:
         if _active_signature != signature:
             raise RuntimeError("策略运行安装签名漂移；必须使用干净运行进程重启")
@@ -617,11 +640,17 @@ def install_strategy_runtime(
                     run_type or "<empty>"
                 )
             )
+        if validate_remote:
+            runtime_profile = _load_runtime_profile(
+                profile_module, profile, strategy_id
+            )
         state = _build_strategy_runtime_state(
             mode=mode,
             run_type=run_type,
             strategy_id=strategy_id,
             profile=profile,
+            profile_module=(profile_module if validate_remote else None),
+            validate_remote=validate_remote,
         )
     else:
         if run_type != "sim_trade":
@@ -643,7 +672,7 @@ def install_strategy_runtime(
 
     _active_signature = signature
     _active_state = dict(state)
-    if mode != "BACKTEST":
+    if mode != "BACKTEST" or validate_remote:
         _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
     return dict(state)

@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
-HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v2"
+HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v3"
 BLOCKED_MUTATIONS = tuple(sorted({
     "order", "order_value", "order_percent", "order_target",
     "order_target_value", "order_target_percent", "cancel_order",
@@ -62,7 +62,7 @@ def _load_strategy(monkeypatch, helper_module=None):
     return module
 
 
-def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=2):
+def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=3):
     module = types.ModuleType("bullet_trade_jq_remote_helper")
     if marker is not None:
         module.STRATEGY_RUNTIME_HELPER_MARKER = marker
@@ -75,7 +75,7 @@ def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=2):
 
 def _runtime_state(mode="SHADOW"):
     return {
-        "api_version": 2,
+        "api_version": 3,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": mode,
@@ -122,9 +122,10 @@ def test_lifecycle_gate_is_first_executable_statement(lifecycle):
 @pytest.mark.parametrize("run_type", ["simple_backtest", "full_backtest"])
 def test_backtest_fallback_without_helper(monkeypatch, run_type):
     strategy = _load_strategy(monkeypatch)
+    strategy.VALIDATE_REMOTE_DURING_BACKTEST = False
     state = strategy._install_runtime(_Context(run_type))
     assert state == {
-        "api_version": 2,
+        "api_version": 3,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": "BACKTEST",
@@ -136,13 +137,17 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
         "reason": "backtest",
     }
     assert strategy.g.bt_runtime == state
-    assert strategy._runtime_mode() == "BACKTEST"
+    assert strategy._runtime_mode() is strategy.ExecutionMode.NATIVE
 
 
 @pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
 def test_fallback_without_helper_rejects_remote_modes(monkeypatch, mode):
     strategy = _load_strategy(monkeypatch)
-    strategy.MODE = mode
+    strategy.SIM_EXECUTION_MODE = (
+        strategy.ExecutionMode.SHADOW
+        if mode == "SHADOW"
+        else strategy.ExecutionMode.REMOTE
+    )
     run_type = "sim_trade"
     with pytest.raises(RuntimeError, match="需要bullet_trade_jq_remote_helper"):
         strategy._install_runtime(_Context(run_type))
@@ -150,11 +155,12 @@ def test_fallback_without_helper_rejects_remote_modes(monkeypatch, mode):
 
 def test_fallback_backtest_rejects_sim_trade_run_type(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    with pytest.raises(RuntimeError, match="仅允许聚宽回测"):
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.NATIVE
+    with pytest.raises(RuntimeError, match="必须是ExecutionMode.SHADOW或REMOTE"):
         strategy._install_runtime(_Context("sim_trade"))
 
 
-def test_live_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
+def test_remote_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     strategy.g.bt_runtime = {"production_ready": False}
     monkeypatch.setattr(
@@ -167,14 +173,14 @@ def test_live_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
         ),
     )
     monkeypatch.setattr(strategy, "_portfolio", lambda _context: object())
-    monkeypatch.setattr(strategy, "_restore_live_intent", lambda: None)
+    monkeypatch.setattr(strategy, "_restore_remote_intent", lambda: None)
 
-    strategy._ensure_live_ready(_Context("sim_trade"))
+    strategy._ensure_remote_ready(_Context("sim_trade"))
 
     assert strategy.g.bt_runtime["production_ready"] is True
 
 
-def test_live_readiness_stays_false_when_reconciliation_is_blocked(monkeypatch):
+def test_remote_readiness_stays_false_when_reconciliation_is_blocked(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     strategy.g.bt_runtime = {"production_ready": False}
     monkeypatch.setattr(
@@ -191,7 +197,7 @@ def test_live_readiness_stays_false_when_reconciliation_is_blocked(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="fee_fields"):
-        strategy._ensure_live_ready(_Context("sim_trade"))
+        strategy._ensure_remote_ready(_Context("sim_trade"))
 
     assert strategy.g.bt_runtime["production_ready"] is False
 
@@ -208,7 +214,7 @@ def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     assert install_calls == []
 
 
-@pytest.mark.parametrize("api_version", [0, 1, 3])
+@pytest.mark.parametrize("api_version", [0, 1, 2, 4])
 def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
     helper = _fake_helper(
         lambda *args, **kwargs: pytest.fail("版本不匹配不得进入安装"),
@@ -229,7 +235,7 @@ def test_helper_invalid_entry_rejected(monkeypatch, entry):
         strategy._install_runtime(_Context("full_backtest"))
 
 
-def test_live_installs_strategy_ledger_runtime(monkeypatch):
+def test_remote_installs_strategy_ledger_runtime(monkeypatch):
     calls = []
 
     def install(namespace, **kwargs):
@@ -238,16 +244,16 @@ def test_live_installs_strategy_ledger_runtime(monkeypatch):
 
     helper = _fake_helper(install)
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.MODE = "LIVE"
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.REMOTE
     state = strategy._install_runtime(_Context("sim_trade"))
     assert state["mode"] == "LIVE"
-    assert calls[0]["expected_api_version"] == 2
+    assert calls[0]["expected_api_version"] == 3
 
 
 def test_helper_non_dict_state_rejected(monkeypatch):
     helper = _fake_helper(lambda namespace, **kwargs: None)
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.MODE = "SHADOW"
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
@@ -267,7 +273,7 @@ def test_helper_state_contract_mismatch_rejected(monkeypatch, tamper):
         return state
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.MODE = "SHADOW"
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
@@ -280,7 +286,7 @@ def test_shadow_install_success_and_call_contract(monkeypatch):
         return _runtime_state("SHADOW")
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.MODE = "SHADOW"
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
     context = _Context("sim_trade")
     state = strategy._install_runtime(context)
 
@@ -292,11 +298,13 @@ def test_shadow_install_success_and_call_contract(monkeypatch):
         "profile": "good_etf-prod",
         "mode": "SHADOW",
         "strategy_id": "good_etf",
-        "expected_api_version": 2,
+        "expected_api_version": 3,
+        "profile_module": "jq_runtime_config",
+        "validate_remote": False,
     }
     assert state["mode"] == "SHADOW"
     assert strategy.g.bt_runtime == state
-    assert strategy._runtime_mode() == "SHADOW"
+    assert strategy._runtime_mode() is strategy.ExecutionMode.SHADOW
 
 
 def test_backtest_install_with_helper(monkeypatch):
@@ -307,18 +315,105 @@ def test_backtest_install_with_helper(monkeypatch):
         return _runtime_state("BACKTEST")
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
+    strategy.VALIDATE_REMOTE_DURING_BACKTEST = False
     state = strategy._install_runtime(_Context("full_backtest"))
 
     assert [call["mode"] for call in calls] == ["BACKTEST"]
     assert state["mode"] == "BACKTEST"
-    assert strategy._runtime_mode() == "BACKTEST"
+    assert strategy._runtime_mode() is strategy.ExecutionMode.NATIVE
+
+
+def test_backtest_remote_validation_uses_real_snapshot_without_submitting(
+    monkeypatch
+):
+    calls = []
+    portfolio = types.SimpleNamespace(
+        available_cash=8000.0,
+        positions_value=2000.0,
+        total_value=10000.0,
+        positions={"510300.XSHG": object()},
+    )
+
+    def install(namespace, **kwargs):
+        calls.append(kwargs)
+        state = _runtime_state("BACKTEST")
+        state.update(
+            remote_validation_enabled=True,
+            reason="backtest_remote_validation",
+            profile_module="jq_runtime_config",
+        )
+        return state
+
+    helper = _fake_helper(install)
+    helper.ensure_account = lambda capital: {
+        "capital": capital,
+        "reconciliation": {"state": "READY"},
+    }
+    helper.get_portfolio = lambda: portfolio
+    helper.get_reconciliation = lambda: {
+        "reconciliation": {"state": "READY"}
+    }
+    helper.submit_targets = lambda *args, **kwargs: pytest.fail(
+        "回测远程预检不得提交组合目标"
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.REMOTE
+
+    state = strategy._install_runtime(_Context("simple_backtest"))
+
+    assert state["mode"] == "BACKTEST"
+    assert calls[0]["mode"] == "BACKTEST"
+    assert calls[0]["validate_remote"] is True
+    assert strategy._runtime_mode() is strategy.ExecutionMode.NATIVE
+    assert strategy.g.bt_remote_validation == {
+        "cash": 8000.0,
+        "positions_value": 2000.0,
+        "total_value": 10000.0,
+        "position_count": 1,
+        "reconciliation": "READY",
+    }
+
+
+@pytest.mark.parametrize("mode_name", ["SHADOW", "REMOTE"])
+def test_backtest_validation_flag_has_no_effect_in_sim_trade(
+    monkeypatch, mode_name
+):
+    calls = []
+
+    def install(namespace, **kwargs):
+        calls.append(kwargs)
+        protocol_mode = "SHADOW" if mode_name == "SHADOW" else "LIVE"
+        return _runtime_state(protocol_mode)
+
+    strategy = _load_strategy(monkeypatch, _fake_helper(install))
+    strategy.SIM_EXECUTION_MODE = getattr(strategy.ExecutionMode, mode_name)
+    # 即使模拟交易时该名字被设置为无效值，也必须完全不参与执行路径。
+    strategy.VALIDATE_REMOTE_DURING_BACKTEST = "ignored-in-sim-trade"
+
+    strategy._install_runtime(_Context("sim_trade"))
+
+    assert calls[0]["validate_remote"] is False
+
+
+def test_invalid_backtest_validation_flag_rejected(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    strategy.VALIDATE_REMOTE_DURING_BACKTEST = "true"
+    with pytest.raises(RuntimeError, match="必须是bool"):
+        strategy._install_runtime(_Context("simple_backtest"))
+
+
+def test_sim_execution_mode_rejects_plain_string(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    strategy.SIM_EXECUTION_MODE = "SHADOW"
+    with pytest.raises(RuntimeError, match="必须是ExecutionMode.SHADOW或REMOTE"):
+        strategy._install_runtime(_Context("sim_trade"))
 
 
 def _shadow_strategy(monkeypatch):
     strategy = _load_strategy(
         monkeypatch, _fake_helper(lambda namespace, **kwargs: _runtime_state("SHADOW"))
     )
-    strategy.MODE = "SHADOW"
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
     strategy._install_runtime(_Context("sim_trade"))
     return strategy
 

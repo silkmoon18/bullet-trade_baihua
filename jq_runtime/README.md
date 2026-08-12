@@ -31,15 +31,26 @@
 
 ## 模式边界
 
-| MODE | 允许的聚宽运行类型 | helper/profile | 交易行为 |
+策略不再要求用户填写字符串`MODE`。它根据聚宽`run_type`自动决定：
+
+| 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
-| `BACKTEST` | `simple_backtest`、`full_backtest` | helper可缺省；存在时校验marker/API版本与回测run_type，仍不导入私有profile或连接网络 | 使用聚宽原生回测订单，不替换下单函数 |
-| `SHADOW` | `sim_trade` | 必须通过profile schema v1校验；不建远程连接 | 只生成计划和日志；所有下单、撤单入口均被替换为抛错guard |
-| `LIVE` | `sim_trade` | 必须通过profile schema v1校验；实际RPC在策略调用时建立短连接 | 聚宽原生交易函数保持guard；`good_etf.py`通过StrategyLedger下单，并仅在真实账户对账READY后标记`production_ready` |
+| `simple_backtest`、`full_backtest` | `ExecutionMode.NATIVE` | 固定使用聚宽原生回测；`VALIDATE_REMOTE_DURING_BACKTEST=True`时额外校验helper/profile并读取一次StrategyLedger真实快照 | 远程快照只写日志，不参与历史决策；绝不提交远程组合目标 |
+| `sim_trade` + `ExecutionMode.SHADOW` | `SHADOW` | 校验profile；不主动连接服务器 | 实时计算并记录计划；聚宽下单、撤单入口由guard阻断 |
+| `sim_trade` + `ExecutionMode.REMOTE` | helper协议`LIVE` | 校验profile并在调用时建立短连接 | 读取StrategyLedger组合并提交远程目标；是否下QMT订单仍取决于服务器交易开关 |
 
-只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失并仅在BACKTEST本地兜底；helper文件已上传但其内部导入失败会直接中止，不能静默降级为BACKTEST。helper导出稳定`STRATEGY_RUNTIME_HELPER_MARKER`和`STRATEGY_RUNTIME_API_VERSION`，策略用普通`getattr`校验二者。
+用户只配置：
 
-`install_strategy_runtime`的第一个参数必须直接传模块的普通`globals()`字典，`mode`必须是普通字符串。SHADOW和LIVE都会把namespace中的七个聚宽原生交易函数替换为抛错guard；LIVE订单只允许经StrategyLedger目标接口提交。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
+```python
+SIM_EXECUTION_MODE = ExecutionMode.SHADOW
+VALIDATE_REMOTE_DURING_BACKTEST = True
+```
+
+`VALIDATE_REMOTE_DURING_BACKTEST`在模拟交易中完全无作用。设为`True`时，回测初始化会幂等执行`ensure_account`和`get_portfolio`，验证公网连接、认证、资金覆盖、账实对账及真实快照，但不会调用`submit_targets`，因此不能替代QMT下单/成交能力探针。设为`False`时允许不上传helper/profile做纯离线回测。
+
+只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失；且仅在回测并关闭远程预检时允许本地兜底。helper文件已上传但其内部导入失败会直接中止。helper导出稳定marker和API版本，策略用普通`getattr`校验二者。
+
+策略内部使用`ExecutionMode`枚举；为兼容独立helper和网络协议，只在helper边界映射为普通字符串`BACKTEST/SHADOW/LIVE`。SHADOW和LIVE都会把namespace中的七个聚宽原生交易函数替换为抛错guard；LIVE订单只允许经StrategyLedger目标接口提交。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 
@@ -53,7 +64,7 @@ helper不支持热重载：生产禁止`importlib.reload()`和热补丁，任何
 
 1. 停止聚宽策略，并确认承载旧helper的进程已经退出。
 2. 替换helper、私有`jq_runtime_config.py`和需要更新的策略文件；不要在旧进程中reload。
-3. 由聚宽启动全新进程，重新校验helper marker/API、profile schema、`strategy_id`和MODE。
+3. 由聚宽启动全新进程，重新校验helper marker/API、profile schema、`strategy_id`和执行模式。
 4. 任一校验或初始化失败时停止该进程；修正文件后再次从全新进程启动，不在原进程重试。
 
 从任何旧版helper升级都只能执行上述冷升级，绝不能在旧进程内reload。

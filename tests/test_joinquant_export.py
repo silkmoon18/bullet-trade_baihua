@@ -416,7 +416,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 2
+assert helper.STRATEGY_RUNTIME_API_VERSION == 3
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 1
 assert profile['PROFILES']['good_etf-prod']['host'] == ''
@@ -444,7 +444,7 @@ sys.modules['jqdata'] = jqdata
 spec = importlib.util.spec_from_file_location('missing_helper_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.MODE = 'SHADOW'
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)
@@ -475,14 +475,14 @@ jqdata.__all__ = []
 sys.modules['jqdata'] = jqdata
 called = []
 helper = types.ModuleType('bullet_trade_jq_remote_helper')
-helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v2'
-helper.STRATEGY_RUNTIME_API_VERSION = 1
+helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v3'
+helper.STRATEGY_RUNTIME_API_VERSION = 2
 helper.install_strategy_runtime = lambda *args, **kwargs: called.append(True)
 sys.modules['bullet_trade_jq_remote_helper'] = helper
 spec = importlib.util.spec_from_file_location('bad_version_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.MODE = 'SHADOW'
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)
@@ -518,7 +518,7 @@ sys.modules.pop('jq_runtime_config', None)
 spec = importlib.util.spec_from_file_location('missing_profile_strategy', root / 'good_etf.py')
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.MODE = 'SHADOW'
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)

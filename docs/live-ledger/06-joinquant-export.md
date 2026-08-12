@@ -63,8 +63,9 @@ python -X utf8 scripts/export_joinquant.py --validate-only `
 
 标准部署顺序是：
 
-1. 在仓库内先确定并审查策略顶部的`PROFILE`、`MODE`和`STRATEGY_ID`；默认`MODE='BACKTEST'`不代表
-   SHADOW/LIVE部署声明。不得在导出后或聚宽编辑器内再次修改这些值。
+1. 在仓库内先确定并审查策略顶部的`PROFILE`、`SIM_EXECUTION_MODE`、
+   `VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`。回测始终自动使用NATIVE，模拟交易才读取
+   `SIM_EXECUTION_MODE`。不得在导出后或聚宽编辑器内再次修改这些值。
 2. 在仓库外复制`jq_runtime_config.example.py`为`jq_runtime_config.py`，填写真实host/token及可选账户/TLS字段，
    使用`--private-profile`通过只读校验。
 3. 以同一受控源码执行最终导出，核对`manifest.json`中的文件SHA256和三个Python文件；上传后禁止手工编辑。

@@ -9,10 +9,11 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# LIVE通过StrategyLedger提交组合目标并展示真实账户视图；BACKTEST逻辑保持聚宽原生。
+# REMOTE通过StrategyLedger提交组合目标并展示真实账户视图；回测保持聚宽原生。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
+from enum import Enum
 from types import ModuleType
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, cast
 
@@ -32,13 +33,21 @@ except ModuleNotFoundError as exc:
     bt = None
 
 # ===== 部署契约 =====
-# 安全默认值为BACKTEST。SHADOW/LIVE需要上传独立的helper和私有jq_runtime_config.py。
+class ExecutionMode(str, Enum):
+    """策略执行方式；历史回测固定为NATIVE。"""
+
+    NATIVE = 'NATIVE'
+    SHADOW = 'SHADOW'
+    REMOTE = 'REMOTE'
+
+
 PROFILE = 'good_etf-prod'
-MODE = 'BACKTEST'
+SIM_EXECUTION_MODE = ExecutionMode.SHADOW
+VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 2
+_EXPECTED_RUNTIME_API_VERSION = 3
 _EXPECTED_PROFILE_SCHEMA_VERSION = 1
-_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v2'
+_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v3'
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -62,17 +71,82 @@ def _run_type(context: 'Context') -> str:
     return str(getattr(run_params, 'type', '') or '').strip().lower()
 
 
-# 运行时模式在安装时写入该模块级变量；交易入口只读取它，不读取平台侧展示副本。
-_active_mode: Optional[str] = None
+# 执行模式在安装时写入；协议字符串仅在helper边界使用。
+_active_mode: Optional[ExecutionMode] = None
+_backtest_remote_validated = False
+
+
+def _execution_mode(context: 'Context') -> ExecutionMode:
+    run_type = _run_type(context)
+    if run_type in ('simple_backtest', 'full_backtest'):
+        return ExecutionMode.NATIVE
+    if run_type == 'sim_trade':
+        if (
+            type(SIM_EXECUTION_MODE) is not ExecutionMode
+            or SIM_EXECUTION_MODE is ExecutionMode.NATIVE
+        ):
+            raise RuntimeError(
+                'SIM_EXECUTION_MODE必须是ExecutionMode.SHADOW或REMOTE')
+        return SIM_EXECUTION_MODE
+    raise RuntimeError('不支持的聚宽run_type: {}'.format(run_type or '<empty>'))
+
+
+def _protocol_mode(mode: ExecutionMode) -> str:
+    if mode is ExecutionMode.NATIVE:
+        return 'BACKTEST'
+    if mode is ExecutionMode.SHADOW:
+        return 'SHADOW'
+    if mode is ExecutionMode.REMOTE:
+        return 'LIVE'
+    raise RuntimeError('无效的策略执行模式')
+
+
+def _validate_backtest_remote(context: 'Context') -> None:
+    """回测只做远程预检；真实快照不参与历史决策，也不提交组合目标。"""
+    global _backtest_remote_validated
+    if _backtest_remote_validated:
+        return
+    if bt is None:
+        raise RuntimeError('回测远程预检缺少聚宽helper')
+    ensured = bt.ensure_account(INITIAL_CAPITAL)
+    reconciliation = ensured.get('reconciliation', {})
+    if reconciliation.get('state') != 'READY':
+        raise RuntimeError('回测远程预检对账未就绪: {}'.format(
+            reconciliation.get('details', {}).get('blockers', [])))
+    portfolio = bt.get_portfolio()
+    latest_reconciliation = bt.get_reconciliation().get('reconciliation', {})
+    if latest_reconciliation.get('state') != 'READY':
+        raise RuntimeError('回测远程预检快照对账未就绪: {}'.format(
+            latest_reconciliation.get('details', {}).get('blockers', [])))
+    _backtest_remote_validated = True
+    g.bt_remote_validation = {
+        'cash': portfolio.available_cash,
+        'positions_value': portfolio.positions_value,
+        'total_value': portfolio.total_value,
+        'position_count': len(portfolio.positions),
+        'reconciliation': 'READY',
+    }
+    log.info(
+        '回测远程预检通过 | 可用资金={:.2f} 持仓市值={:.2f} '
+        '总资产={:.2f} 持仓数={}'.format(
+            portfolio.available_cash,
+            portfolio.positions_value,
+            portfolio.total_value,
+            len(portfolio.positions),
+        ))
 
 
 def _install_runtime(context: 'Context') -> Dict[str, object]:
     """安装运行模式；此异常不得被策略业务层吞掉。"""
-    if type(MODE) is not str:
-        raise RuntimeError('good_etf MODE必须是普通字符串')
-    mode = str.upper(str.strip(MODE))
-    if mode not in ('BACKTEST', 'SHADOW', 'LIVE'):
-        raise RuntimeError('good_etf MODE必须是BACKTEST、SHADOW或LIVE')
+    execution_mode = _execution_mode(context)
+    mode = _protocol_mode(execution_mode)
+    if execution_mode is ExecutionMode.NATIVE:
+        if type(VALIDATE_REMOTE_DURING_BACKTEST) is not bool:
+            raise RuntimeError('VALIDATE_REMOTE_DURING_BACKTEST必须是bool')
+        validate_remote = VALIDATE_REMOTE_DURING_BACKTEST
+    else:
+        # 该开关在模拟交易中不参与校验、连接或执行授权。
+        validate_remote = False
     if type(PROFILE) is not str or not PROFILE:
         raise RuntimeError('good_etf PROFILE必须是非空普通字符串')
     if type(STRATEGY_ID) is not str or not STRATEGY_ID:
@@ -84,16 +158,12 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         raise RuntimeError('good_etf profile schema版本无效')
 
     global _active_mode
-    # helper未上传时只允许聚宽原生回测兜底；此路径不导入profile、不访问网络。
+    # 关闭远程预检时，回测允许没有helper并直接使用聚宽原生执行。
     if bt is None:
-        if mode != 'BACKTEST':
+        if mode != 'BACKTEST' or validate_remote:
             raise RuntimeError(
                 '当前模式需要bullet_trade_jq_remote_helper.py，请先上传到聚宽研究根目录')
         run_type = _run_type(context)
-        if run_type not in ('simple_backtest', 'full_backtest'):
-            raise RuntimeError(
-                'good_etf运行模式不匹配: MODE=BACKTEST 仅允许聚宽回测，当前run_type={}'.format(
-                    run_type or '<empty>'))
         state: Dict[str, object] = {
             'api_version': _EXPECTED_RUNTIME_API_VERSION,
             'profile_schema_version': _EXPECTED_PROFILE_SCHEMA_VERSION,
@@ -106,7 +176,7 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
             'production_ready': False,
             'reason': 'backtest',
         }
-        _active_mode = mode
+        _active_mode = execution_mode
         g.bt_runtime = state
         return state
 
@@ -124,6 +194,8 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         mode=mode,
         strategy_id=STRATEGY_ID,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
+        profile_module=_EXPECTED_RUNTIME_PROFILE_MODULE,
+        validate_remote=validate_remote,
     )
     if not isinstance(remote_state, dict):
         raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
@@ -132,15 +204,21 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         checked_state.get('mode') != mode
         or checked_state.get('strategy_id') != STRATEGY_ID
         or checked_state.get('api_version') != _EXPECTED_RUNTIME_API_VERSION
+        or (
+            validate_remote
+            and checked_state.get('remote_validation_enabled') is not True
+        )
     ):
         raise RuntimeError('聚宽helper返回了无效的运行时状态，拒绝继续运行')
-    _active_mode = mode
+    _active_mode = execution_mode
     g.bt_runtime = checked_state
+    if validate_remote:
+        _validate_backtest_remote(context)
     return checked_state
 
 
-def _runtime_mode() -> str:
-    if _active_mode is None:
+def _runtime_mode() -> ExecutionMode:
+    if _active_mode is None or not hasattr(g, 'bt_runtime'):
         raise RuntimeError('good_etf运行时模式尚未安装，拒绝执行交易动作')
     return _active_mode
 
@@ -162,10 +240,10 @@ def _record_real_portfolio(portfolio: Any) -> None:
 
 
 def _portfolio(context: 'Context') -> Any:
-    if _runtime_mode() != 'LIVE':
+    if _runtime_mode() is not ExecutionMode.REMOTE:
         return context.portfolio
     if bt is None:
-        raise RuntimeError('LIVE缺少聚宽helper')
+        raise RuntimeError('REMOTE缺少聚宽helper')
     portfolio = bt.get_portfolio(as_of=context.current_dt)
     if not portfolio.performance_ready:
         raise RuntimeError('真实组合发生过运行中增减资，简单NAV指标不可用')
@@ -174,27 +252,27 @@ def _portfolio(context: 'Context') -> Any:
     return portfolio
 
 
-def _ensure_live_ready(context: 'Context') -> None:
+def _ensure_remote_ready(context: 'Context') -> None:
     if bt is None:
-        raise RuntimeError('LIVE缺少聚宽helper')
+        raise RuntimeError('REMOTE缺少聚宽helper')
     ensured = bt.ensure_account(INITIAL_CAPITAL)
     reconciliation = ensured.get('reconciliation', {})
     if reconciliation.get('state') != 'READY':
         raise RuntimeError('真实账户对账未就绪: {}'.format(
             reconciliation.get('details', {}).get('blockers', [])))
     _portfolio(context)
-    _restore_live_intent()
+    _restore_remote_intent()
     g.bt_runtime['production_ready'] = True
 
 
-def _submit_live_targets(
+def _submit_remote_targets(
     context: 'Context',
     weights: Dict[str, float],
     marks: Dict[str, float],
     key: str,
 ) -> Dict[str, Any]:
     if bt is None:
-        raise RuntimeError('LIVE缺少聚宽helper')
+        raise RuntimeError('REMOTE缺少聚宽helper')
     existing = bt.get_intent(idempotency_key=key)
     if existing:
         weights = cast(Dict[str, float], existing.get('weights', weights))
@@ -209,8 +287,8 @@ def _submit_live_targets(
     return cast(Dict[str, Any], result)
 
 
-def _restore_live_intent() -> None:
-    if _runtime_mode() != 'LIVE' or bt is None:
+def _restore_remote_intent() -> None:
+    if _runtime_mode() is not ExecutionMode.REMOTE or bt is None:
         return
     intent = bt.get_intent()
     if not intent:
@@ -224,17 +302,20 @@ def _restore_live_intent() -> None:
         g.bt_intent_id, intent['state']))
 
 
-def _advance_live_intent(context: 'Context') -> bool:
+def _advance_remote_intent(context: 'Context') -> bool:
     """推进未完成的卖后买意图；未完成时本轮不创建新意图。"""
-    if _runtime_mode() != 'LIVE' or not getattr(g, 'bt_intent_id', None):
+    if (
+        _runtime_mode() is not ExecutionMode.REMOTE
+        or not getattr(g, 'bt_intent_id', None)
+    ):
         return True
     if bt is None:
-        raise RuntimeError('LIVE缺少聚宽helper')
+        raise RuntimeError('REMOTE缺少聚宽helper')
     intent = bt.get_intent(g.bt_intent_id)
     if intent.get('state') in ('COMPLETED', 'CANCELED', 'FAILED'):
         g.bt_intent_id = None
         return True
-    result = _submit_live_targets(
+    result = _submit_remote_targets(
         context,
         g.bt_target_weights,
         g.bt_target_marks,
@@ -250,9 +331,9 @@ def _advance_live_intent(context: 'Context') -> bool:
 
 
 def _cancel_open_orders_for_runtime() -> int:
-    if _runtime_mode() in ('SHADOW', 'LIVE'):
+    if _runtime_mode() in (ExecutionMode.SHADOW, ExecutionMode.REMOTE):
         log.info('{}计划 | 订单生命周期由StrategyLedger管理，跳过聚宽撤单'.format(
-            _runtime_mode()))
+            _runtime_mode().value))
         return 0
     open_orders = get_open_orders() or {}
     cancelled = 0
@@ -266,7 +347,7 @@ def _submit_target_amount(
     security: str,
     target_amount: int,
 ) -> Optional[object]:
-    if _runtime_mode() == 'SHADOW':
+    if _runtime_mode() is ExecutionMode.SHADOW:
         log.info('SHADOW目标数量 | {} -> {}'.format(security, target_amount))
         return None
     return order_target(security, target_amount)
@@ -278,7 +359,7 @@ def _submit_target_value(
     last_price: Optional[float] = None,
     current_value: float = 0.0,
 ) -> Optional[object]:
-    if _runtime_mode() == 'SHADOW':
+    if _runtime_mode() is ExecutionMode.SHADOW:
         log.info('SHADOW目标市值 | {} -> {:.2f}'.format(security, target_value))
         return None
     style = None
@@ -311,8 +392,8 @@ def initialize(context: 'Context') -> None:
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
     g.bt_intent_id = None
-    if _runtime_mode() == 'LIVE':
-        _ensure_live_ready(context)
+    if _runtime_mode() is ExecutionMode.REMOTE:
+        _ensure_remote_ready(context)
 
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
@@ -337,8 +418,8 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
-    if _runtime_mode() == 'LIVE':
-        _ensure_live_ready(context)
+    if _runtime_mode() is ExecutionMode.REMOTE:
+        _ensure_remote_ready(context)
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 
@@ -421,7 +502,7 @@ def market_open(context: 'Context') -> None:
     """开盘执行：选股+按折价率权重下单"""
     log.info('===== 开盘选股下单开始 =====')
     try:
-        if not _advance_live_intent(context):
+        if not _advance_remote_intent(context):
             return
         # 若盘前预处理未执行（聚宽在 09:20~09:30 间重启会错过），现场补跑一次
         if g.fund_list is None:
@@ -483,7 +564,7 @@ def market_open(context: 'Context') -> None:
         hold_codes = list(portfolio.positions.keys())
         log.info(f'当前持仓 {len(hold_codes)} 只: {hold_codes}')
 
-        if _runtime_mode() == 'LIVE':
+        if _runtime_mode() is ExecutionMode.REMOTE:
             raw_weights = selected_funds['premium'].abs().tolist()
             total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
             target_weights = {
@@ -502,7 +583,7 @@ def market_open(context: 'Context') -> None:
             for code, position in portfolio.positions.items():
                 marks.setdefault(code, float(position.price))
             key = 'open-{}'.format(context.current_dt.strftime('%Y%m%d'))
-            result = _submit_live_targets(context, target_weights, marks, key)
+            result = _submit_remote_targets(context, target_weights, marks, key)
             log.info('真实组合目标已提交 | intent_id={} state={} weights={}'.format(
                 result['intent']['intent_id'], result['intent']['state'], target_weights))
             return
@@ -559,9 +640,9 @@ def market_open(context: 'Context') -> None:
 
 
 def handle_risk_management(context: 'Context') -> None:
-    """止盈止损；LIVE一次提交完整组合目标，避免同轮多个intent。"""
+    """止盈止损；REMOTE一次提交完整组合目标，避免同轮多个intent。"""
     try:
-        if not _advance_live_intent(context):
+        if not _advance_remote_intent(context):
             return
         portfolio = _portfolio(context)
         hold_codes = list(portfolio.positions.keys())
@@ -585,7 +666,7 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                if _runtime_mode() == 'LIVE':
+                if _runtime_mode() is ExecutionMode.REMOTE:
                     exits.append(hold_code)
                 else:
                     order_result = _submit_target_amount(hold_code, 0)
@@ -598,14 +679,14 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                if _runtime_mode() == 'LIVE':
+                if _runtime_mode() is ExecutionMode.REMOTE:
                     exits.append(hold_code)
                 else:
                     order_result = _submit_target_amount(hold_code, 0)
                     log.info('止盈清仓目标已提交 | {} order_id={}'.format(
                         hold_code, getattr(order_result, 'order_id', None)))
 
-        if exits and _runtime_mode() == 'LIVE':
+        if exits and _runtime_mode() is ExecutionMode.REMOTE:
             total = portfolio.total_value or 1.0
             target_weights = {
                 code: (0.0 if code in exits else position.value / total)
@@ -616,7 +697,7 @@ def handle_risk_management(context: 'Context') -> None:
                 for code, position in portfolio.positions.items()
             }
             key = 'risk-{}'.format(context.current_dt.strftime('%Y%m%d-%H%M'))
-            result = _submit_live_targets(context, target_weights, marks, key)
+            result = _submit_remote_targets(context, target_weights, marks, key)
             log.info('真实风控目标已提交 | intent_id={} exits={}'.format(
                 result['intent']['intent_id'], exits))
 
@@ -625,7 +706,7 @@ def handle_risk_management(context: 'Context') -> None:
 
 
 def after_market_check(context: 'Context') -> None:
-    """记录BACKTEST原生组合或LIVE真实StrategyLedger组合。"""
+    """记录NATIVE原生组合或REMOTE真实StrategyLedger组合。"""
     portfolio = _portfolio(context)
     positions = portfolio.positions
     log.info('===== 尾盘组合快照 =====')
@@ -641,6 +722,6 @@ def after_market_check(context: 'Context') -> None:
             getattr(position, 'closeable_amount', 0),
             position.avg_cost,
             position.price))
-    if _runtime_mode() == 'LIVE':
+    if _runtime_mode() is ExecutionMode.REMOTE:
         log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
             portfolio.nav, portfolio.returns, portfolio.fees))

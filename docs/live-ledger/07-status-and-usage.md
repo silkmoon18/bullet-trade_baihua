@@ -38,13 +38,16 @@ strategies/joinquant/good_etf.py
 
 ### 聚宽回测
 
-保持策略顶部：
+同一份策略自动识别回测，不再切换字符串MODE：
 
 ```python
 PROFILE = 'good_etf-prod'
-MODE = 'BACKTEST'
+SIM_EXECUTION_MODE = ExecutionMode.SHADOW
+VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
+
+远程预检为`True`时必须已上传v3 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
 
 先运行校验：
 
@@ -64,9 +67,9 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 SHADOW只用于验证profile合同和观察信号，不会提交真实订单。私有`jq_runtime_config.py`必须仅保存在本地/聚宽私有文件区，并显式传给导出器做只读校验；示例profile不能用于连接服务器。
 
-### LIVE
+### REMOTE
 
-代码路径已存在，但人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v2 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把`SIM_EXECUTION_MODE`改为`ExecutionMode.REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定NATIVE。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v3 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 ## 4. good_etf与原策略的关系
 
@@ -74,11 +77,11 @@ SHADOW只用于验证profile合同和观察信号，不会提交真实订单。�
 
 执行与配置并非原样保留，修改是有意的：
 
-- 删除策略内硬编码host、token、Webhook和账户定位，改为`PROFILE/MODE/STRATEGY_ID`合同。
+- 删除策略内硬编码host、token、Webhook和账户定位，改为`PROFILE/SIM_EXECUTION_MODE/STRATEGY_ID`合同。
 - 删除旧同步追单扩展；持久幂等已在S07完成，异步执行状态机由L02实现。
-- SHADOW改为只记录，不下单；LIVE通过StrategyLedger执行，人工验收前服务端交易开关保持关闭。
+- SHADOW只记录不下单；REMOTE通过StrategyLedger执行，人工验收前服务端交易开关保持关闭。
 - 组合目标由`available_cash * weight`改为`total_value * DEPLOY_RATIO * normalized_weight`，避免把目标仓位误当成本轮新增买入额并在每轮缩小已有持仓。
-- LIVE尾盘读取真实PortfolioView并通过自定义`record()`指标展示；聚宽内置模拟账户和内置收益曲线仍不代表真实券商账户。
+- REMOTE尾盘读取真实PortfolioView并通过自定义`record()`指标展示；聚宽内置模拟账户和内置收益曲线仍不代表真实券商账户。
 
 因此可以说“策略思想和选股规则基本一致”，不能说“执行、资金和持仓语义与原版完全一样”。
 

@@ -56,7 +56,7 @@ def _install(helper, namespace=None, context=None, *, mode="SHADOW", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 2,
+        "api_version": 3,
         "profile_schema_version": 1,
         "profile": PROFILE,
         "mode": mode,
@@ -85,9 +85,9 @@ def test_public_contract_exports_and_constants(helper):
         "install_strategy_runtime",
         "submit_targets",
     ]
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 2
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 3
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v2"
+        "bullet-trade-joinquant-runtime-helper-v3"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 1
 
@@ -172,10 +172,36 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 3, "2", True, None])
-def test_expected_api_version_must_equal_two(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 4, "3", True, None])
+def test_expected_api_version_must_equal_three(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
+
+
+def test_backtest_remote_validation_loads_profile_without_installing_guards(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    namespace = {"order": lambda *args: "native"}
+
+    state = _install(
+        helper,
+        namespace,
+        context=_context("simple_backtest"),
+        mode="BACKTEST",
+        validate_remote=True,
+    )
+
+    assert state["remote_validation_enabled"] is True
+    assert state["reason"] == "backtest_remote_validation"
+    assert namespace["order"]("510300.XSHG", 100) == "native"
+    assert helper._active_profile["host"] == "127.0.0.1"
+
+
+@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+def test_validate_remote_is_rejected_outside_backtest(helper, mode):
+    with pytest.raises(RuntimeError, match="仅用于BACKTEST"):
+        _install(helper, mode=mode, validate_remote=True)
 
 
 def test_mode_is_normalised(helper, monkeypatch):

@@ -36,16 +36,16 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
 2. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
-3. 在仓库源码中先确定并审查顶部的`PROFILE`、`MODE`和`STRATEGY_ID`部署声明；默认BACKTEST源码不能在
-   上传后手工改成SHADOW/LIVE。
+3. 在仓库源码中先确定并审查顶部的`PROFILE`、`SIM_EXECUTION_MODE`、`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`部署声明；回测自动使用NATIVE，不能在
+   上传后手工改成SHADOW/REMOTE。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
    profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。
-5. 核对manifest中各文件SHA256与受控源码的部署声明（`PROFILE`/`MODE`/`STRATEGY_ID`），停止旧进程后上传统一helper与已校验的私有
+5. 核对manifest中各文件SHA256与受控源码的部署声明（`PROFILE`/`SIM_EXECUTION_MODE`/`VALIDATE_REMOTE_DURING_BACKTEST`/`STRATEGY_ID`），停止旧进程后上传统一helper与已校验的私有
    `jq_runtime_config.py`，最后把导出的策略原样复制到聚宽编辑器。
 6. 导出后和聚宽侧均禁止再次编辑部署声明或helper；任何变更都回到受控源码重新校验、导出并冷升级。
 
-更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/MODE校验；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
+更新helper/config/策略时必须冷升级：先停止策略并确认旧进程退出，再替换文件，最后让聚宽启动全新进程并重新完成marker/profile/执行模式校验；禁止在旧进程内reload或热补丁。任何启动失败都应丢弃该进程，修正后再次以全新进程启动。
 
 “代码一致”指同一份策略源码和已验证API契约，不代表本地兼容引擎与聚宽私有撮合实现绝对相同。
 
