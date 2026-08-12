@@ -73,6 +73,13 @@ def _display(value: Optional[Number], digits: int = 2) -> str:
     return "{:.{}f}".format(number, digits)
 
 
+def _markdown_div(lines: list[str]) -> Dict[str, Any]:
+    return {
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": "\n".join(lines)},
+    }
+
+
 class FeishuTradeNotifier:
     def __init__(
         self,
@@ -115,17 +122,16 @@ class FeishuTradeNotifier:
             occurred_at = occurred_at.astimezone(SHANGHAI_TZ)
         lines = [
             "**标的：** `{}`".format(notification.security or "-"),
-            "**方向：** {}　　**状态：** {}".format(
-                notification.side or "-", notification.status or "-"
+            "**方向：** {}".format(notification.side or "-"),
+            "**状态：** {}".format(notification.status or "-"),
+            "**数量：** {}".format(
+                notification.quantity
+                if notification.quantity is not None
+                else "-"
             ),
-            "**金额：** ¥{}　　**数量：** {}".format(
-                _display(notification.amount, 2),
-                notification.quantity if notification.quantity is not None else "-",
-            ),
-            "**单价：** ¥{}　　**时间：** {}".format(
-                _display(notification.price, 4),
-                occurred_at.strftime("%Y-%m-%d %H:%M:%S"),
-            ),
+            "**金额：** ¥{}".format(_display(notification.amount, 2)),
+            "**单价：** ¥{}".format(_display(notification.price, 4)),
+            "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
         ]
         if notification.order_id:
             lines.append("**订单号：** `{}`".format(notification.order_id))
@@ -141,12 +147,7 @@ class FeishuTradeNotifier:
                     "template": color,
                     "title": {"tag": "plain_text", "content": title},
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {"tag": "lark_md", "content": "\n".join(lines)},
-                    }
-                ],
+                "elements": [_markdown_div(lines)],
             },
         }
         if self.secret:
@@ -165,28 +166,30 @@ class FeishuTradeNotifier:
             (Decimal(str(item.amount)) for item in notification.items),
             Decimal("0"),
         )
-        lines = [
-            "**策略：** `{}`　　**模式：** `{}`".format(
-                notification.strategy_id, notification.mode
-            ),
+        summary_lines = [
+            "**策略：** `{}`".format(notification.strategy_id),
+            "**模式：** `{}`".format(notification.mode),
             "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
         ]
+        elements = [_markdown_div(summary_lines), {"tag": "hr"}]
         for item in notification.items:
-            detail = "- `{}`　**{}股**　¥{}".format(
-                item.security,
-                item.quantity,
-                _display(item.amount, 2),
-            )
+            item_lines = [
+                "**标的：** `{}`".format(item.security),
+                "**目标数量：** {} 股".format(item.quantity),
+                "**目标金额：** ¥{}".format(_display(item.amount, 2)),
+            ]
             if item.reference_price is not None:
-                detail += "　参考价 ¥{}".format(
-                    _display(item.reference_price, 4)
+                item_lines.append(
+                    "**参考价格：** ¥{}".format(
+                        _display(item.reference_price, 4)
+                    )
                 )
-            lines.append(detail)
-        lines.extend(
-            [
+            elements.extend([_markdown_div(item_lines), {"tag": "hr"}])
+        elements.append(
+            _markdown_div([
                 "**计划买入总金额：** ¥{}".format(_display(total_amount, 2)),
                 "**说明：** 策略目标计划，不代表已提交委托或已经成交。",
-            ]
+            ])
         )
         payload: Dict[str, Any] = {
             "msg_type": "interactive",
@@ -201,15 +204,7 @@ class FeishuTradeNotifier:
                         ),
                     },
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": "\n".join(lines),
-                        },
-                    }
-                ],
+                "elements": elements,
             },
         }
         if self.secret:

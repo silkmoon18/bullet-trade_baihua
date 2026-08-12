@@ -30,6 +30,16 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["template"] == "green"
     content = payload["card"]["elements"][0]["text"]["content"]
+    lines = content.splitlines()
+    assert lines[:7] == [
+        "**标的：** `510050.XSHG`",
+        "**方向：** BUY",
+        "**状态：** FILLED",
+        "**数量：** 1000",
+        "**金额：** ¥2505.00",
+        "**单价：** ¥2.5000",
+        "**时间：** 2026-08-10 10:00:00",
+    ]
     assert "510050.XSHG" in content
     assert "¥2505.00" in content
     assert "1000" in content
@@ -75,13 +85,30 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
     assert payload["card"]["header"]["title"]["content"] == (
         "策略目标买入计划 · SHADOW"
     )
-    content = payload["card"]["elements"][0]["text"]["content"]
-    assert "510050.XSHG" in content
-    assert "1000股" in content
-    assert "159915.XSHE" in content
-    assert "500股" in content
-    assert "¥3250.00" in content
-    assert "不代表已提交委托或已经成交" in content
+    elements = payload["card"]["elements"]
+    assert [element["tag"] for element in elements] == [
+        "div", "hr", "div", "hr", "div", "hr", "div"
+    ]
+    assert elements[0]["text"]["content"].splitlines() == [
+        "**策略：** `good_etf`",
+        "**模式：** `SHADOW`",
+        "**时间：** 2026-08-13 09:30:00",
+    ]
+    assert elements[2]["text"]["content"].splitlines() == [
+        "**标的：** `510050.XSHG`",
+        "**目标数量：** 1000 股",
+        "**目标金额：** ¥2500.00",
+        "**参考价格：** ¥2.5000",
+    ]
+    assert elements[4]["text"]["content"].splitlines() == [
+        "**标的：** `159915.XSHE`",
+        "**目标数量：** 500 股",
+        "**目标金额：** ¥750.00",
+        "**参考价格：** ¥1.5000",
+    ]
+    footer = elements[6]["text"]["content"]
+    assert "¥3250.00" in footer
+    assert "不代表已提交委托或已经成交" in footer
 
 
 def test_legacy_notifier_is_drop_in_compatible(monkeypatch):
