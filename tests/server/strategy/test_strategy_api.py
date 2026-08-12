@@ -242,7 +242,7 @@ def test_money_scale_is_still_exact():
 
 
 @pytest.mark.asyncio
-async def test_unverified_capabilities_send_reconciliation_block_card(tmp_path):
+async def test_unverified_capabilities_are_deferred_while_trading_is_disabled(tmp_path):
     broker = FakeBroker()
     notifications = []
     service = SQLiteStrategyAPI(
@@ -258,6 +258,32 @@ async def test_unverified_capabilities_send_reconciliation_block_card(tmp_path):
         "default",
         {"strategy_id": "good_etf", "initial_capital": "10000"},
     )
+    assert result["reconciliation"]["state"] == "READY"
+    assert result["reconciliation"]["details"][
+        "capability_verification_required"
+    ] is False
+    assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_unverified_capabilities_block_when_trading_is_enabled(tmp_path):
+    broker = FakeBroker()
+    notifications = []
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(tmp_path / "blocked-live.db", trading_enabled=True),
+        broker,
+        MINI_QMT_CAPABILITIES,
+        FakeData(),
+        notifications.append,
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+
+    result = await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": "10000"},
+    )
+
     assert result["reconciliation"]["state"] == "BLOCKED"
     assert notifications[-1].event == "RECONCILIATION_BLOCKED"
     assert "capability" in notifications[-1].detail

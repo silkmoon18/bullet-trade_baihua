@@ -80,7 +80,10 @@ class SQLiteStrategyAPI:
         self.repository.initialize()
         self.capital = SQLiteCapitalService(self.database_path)
         self.reconciliation = SQLiteReconciliationService(
-            self.database_path, capabilities, notification_handler
+            self.database_path,
+            capabilities,
+            notification_handler,
+            require_verified_capabilities=config.trading_enabled,
         )
         self.valuation = SQLiteValuationService(self.database_path)
         self.planner = SQLiteTargetExecutionService(

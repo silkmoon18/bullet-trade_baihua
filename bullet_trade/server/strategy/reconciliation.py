@@ -267,9 +267,11 @@ class SQLiteReconciliationService:
         database_path: DatabasePath,
         capabilities: BrokerCapabilityProfile,
         notification_handler=None,
+        require_verified_capabilities: bool = True,
     ) -> None:
         self.database_path = Path(database_path)
         self.capabilities = capabilities
+        self.require_verified_capabilities = bool(require_verified_capabilities)
         self._ledger = SQLiteStrategyRepository(database_path)
         self._booking = SQLiteFillBookingService(
             database_path,
@@ -282,16 +284,20 @@ class SQLiteReconciliationService:
         physical_account_id: str,
         snapshot: BrokerAccountSnapshot,
     ) -> ReconciliationResult:
-        try:
-            require_strategy_ledger_v1(self.capabilities)
-        except BrokerContractError as exc:
-            return self._persist_result(
-                account_id,
-                physical_account_id,
-                ReconciliationState.BLOCKED,
-                {"blockers": ["capability:{}".format(str(exc))]},
-                snapshot.as_of,
-            )
+        if self.require_verified_capabilities:
+            try:
+                require_strategy_ledger_v1(self.capabilities)
+            except BrokerContractError as exc:
+                return self._persist_result(
+                    account_id,
+                    physical_account_id,
+                    ReconciliationState.BLOCKED,
+                    {
+                        "blockers": ["capability:{}".format(str(exc))],
+                        "capability_verification_required": True,
+                    },
+                    snapshot.as_of,
+                )
         blockers = []
         booked_trade_ids = []
         ignored_broker_order_count = 0
@@ -462,6 +468,7 @@ class SQLiteReconciliationService:
             "ignored_broker_trade_count": ignored_broker_trade_count,
             "strategy_required_cash_units": required_cash,
             "strategy_owned_position_count": len(owned_positions),
+            "capability_verification_required": self.require_verified_capabilities,
         }
         state = ReconciliationState.BLOCKED if blockers else ReconciliationState.READY
         return self._persist_result(
