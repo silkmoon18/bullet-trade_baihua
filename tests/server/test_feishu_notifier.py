@@ -98,13 +98,13 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
         "**标的：** `510050.XSHG`",
         "**目标数量：** 1000 股",
         "**目标金额：** ¥2500.00",
-        "**参考价格：** ¥2.5000",
+        "**单价：** ¥2.5000",
     ]
     assert elements[4]["text"]["content"].splitlines() == [
         "**标的：** `159915.XSHE`",
         "**目标数量：** 500 股",
         "**目标金额：** ¥750.00",
-        "**参考价格：** ¥1.5000",
+        "**单价：** ¥1.5000",
     ]
     footer = elements[6]["text"]["content"]
     assert "¥3250.00" in footer

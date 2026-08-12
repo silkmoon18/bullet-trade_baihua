@@ -180,7 +180,7 @@ class FeishuTradeNotifier:
             ]
             if item.reference_price is not None:
                 item_lines.append(
-                    "**参考价格：** ¥{}".format(
+                    "**单价：** ¥{}".format(
                         _display(item.reference_price, 4)
                     )
                 )
