@@ -41,7 +41,9 @@ def _capabilities():
 class FakeBroker:
     def __init__(self):
         self.cash = 20_000.0
+        self.positions = []
         self.orders = []
+        self.trades = []
         self.order_calls = 0
         self.cancel_calls = []
 
@@ -49,13 +51,13 @@ class FakeBroker:
         return {"available_cash": self.cash}
 
     async def get_positions(self, account):
-        return []
+        return list(self.positions)
 
     async def list_orders(self, account, filters=None):
         return list(self.orders)
 
     async def list_trades(self, account, filters=None):
-        return []
+        return list(self.trades)
 
     async def place_order(self, account, payload):
         self.order_calls += 1
@@ -125,6 +127,52 @@ async def test_ensure_account_and_real_snapshot(api):
     assert snapshot["reconciliation"]["state"] == "READY"
     service.startup_ready = False
     assert await service.startup_check(account, "default") is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_account_ignores_unrelated_shared_account_activity(api):
+    service, broker, account, _ = api
+    broker.positions = [
+        {
+            "security": "159208.SZ",
+            "amount": -21949,
+            "closeable_amount": -21949,
+        },
+        {
+            "security": "510300.SH",
+            "amount": 1000,
+            "closeable_amount": 1000,
+        },
+    ]
+    broker.orders = [
+        {
+            "order_id": "manual-order",
+            "security": "510300.XSHG",
+            "status": "filled",
+            "order_remark": "another-strategy",
+        }
+    ]
+    broker.trades = [
+        {
+            "trade_id": "manual-trade",
+            "order_id": "manual-order",
+            "security": "510300.XSHG",
+            "amount": 1000,
+            "price": 4.0,
+        }
+    ]
+
+    result = await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": "10000"},
+    )
+
+    assert result["created"] is True
+    assert result["reconciliation"]["state"] == "READY"
+    details = result["reconciliation"]["details"]
+    assert details["ignored_broker_order_count"] == 1
+    assert details["ignored_broker_trade_count"] == 1
 
 
 @pytest.mark.asyncio

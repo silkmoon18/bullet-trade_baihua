@@ -1,4 +1,4 @@
-"""Single-account QMT snapshot synchronization and reconciliation."""
+"""Strategy-owned QMT synchronization for a shared physical account."""
 
 from __future__ import annotations
 
@@ -91,9 +91,12 @@ class BrokerPositionSnapshot:
     def __post_init__(self) -> None:
         if not self.security:
             raise ValueError("broker position security cannot be empty")
-        if type(self.total_qty) is not int or self.total_qty < 0:
-            raise ValueError("broker position quantity must be non-negative")
-        if type(self.sellable_qty) is not int or not 0 <= self.sellable_qty <= self.total_qty:
+        # QMT can expose signed rows for assets that do not belong to this
+        # strategy.  Keep the raw quantities here and apply non-negative
+        # capacity checks only to strategy-owned securities during reconcile.
+        if type(self.total_qty) is not int:
+            raise ValueError("broker position quantity is invalid")
+        if type(self.sellable_qty) is not int:
             raise ValueError("broker sellable quantity is invalid")
 
 
@@ -188,7 +191,9 @@ def _build_broker_snapshot(
     if cash is None:
         raise BrokerContractError("broker account snapshot has no available cash")
     try:
-        cash_units = money_to_units(str(cash) if type(cash) is float else cash)  # type: ignore[arg-type]
+        cash_units = money_to_units(  # type: ignore[arg-type]
+            str(cash) if type(cash) is float else cash
+        )
     except (ArithmeticError, TypeError, ValueError) as exc:
         raise BrokerContractError("broker available cash is invalid") from exc
 
@@ -255,7 +260,7 @@ def _fingerprint(evidence: object) -> str:
 
 
 class SQLiteReconciliationService:
-    """Synchronize known fills and block trading on any broker/ledger drift."""
+    """Synchronize strategy-owned fills inside a shared broker account."""
 
     def __init__(
         self,
@@ -289,18 +294,28 @@ class SQLiteReconciliationService:
             )
         blockers = []
         booked_trade_ids = []
-        orders_by_broker_id, orders_by_client_tag = self._local_orders(account_id)
+        ignored_broker_order_count = 0
+        ignored_broker_trade_count = 0
+        (
+            orders_by_broker_id,
+            orders_by_client_tag,
+            all_orders_by_client_tag,
+        ) = self._local_orders(account_id)
         broker_orders = {}
         adopted_order_ids = []
         for row in snapshot.orders:
             broker_order_id = _text(row.get("order_id"))
+            remark = _text(row.get("order_remark") or row.get("remark"))
+            remark_matches = self._remark_matches(remark, all_orders_by_client_tag)
             if not broker_order_id:
-                blockers.append("broker_order_missing_id")
+                if remark_matches:
+                    blockers.append("owned_broker_order_missing_id")
+                else:
+                    ignored_broker_order_count += 1
                 continue
             broker_orders[broker_order_id] = row
             local = orders_by_broker_id.get(broker_order_id)
             if local is None:
-                remark = _text(row.get("order_remark") or row.get("remark"))
                 matches = {
                     orders_by_client_tag[token]["order_id"]: orders_by_client_tag[token]
                     for token in (item.strip() for item in remark.split("|"))
@@ -328,13 +343,27 @@ class SQLiteReconciliationService:
                 elif len(matches) > 1:
                     blockers.append("ambiguous_order_remark:{}".format(broker_order_id))
             if local is None:
-                blockers.append("unknown_order:{}".format(broker_order_id))
+                if remark_matches:
+                    blockers.append(
+                        "owned_order_broker_id_mismatch:{}".format(broker_order_id)
+                    )
+                else:
+                    ignored_broker_order_count += 1
 
-        for trade in sorted(snapshot.trades, key=lambda row: _text(row.get("time") or row.get("trade_time"))):
+        for trade in sorted(
+            snapshot.trades,
+            key=lambda row: _text(row.get("time") or row.get("trade_time")),
+        ):
             broker_order_id = _text(trade.get("order_id"))
             local = orders_by_broker_id.get(broker_order_id)
             if local is None:
-                blockers.append("unknown_trade_order:{}".format(broker_order_id or "<empty>"))
+                remark = _text(trade.get("order_remark") or trade.get("remark"))
+                if self._remark_matches(remark, all_orders_by_client_tag):
+                    blockers.append(
+                        "owned_trade_order_missing:{}".format(broker_order_id or "<empty>")
+                    )
+                else:
+                    ignored_broker_trade_count += 1
                 continue
             try:
                 evidence = normalize_trade_evidence(trade, broker_orders)
@@ -365,7 +394,11 @@ class SQLiteReconciliationService:
                 if not result.duplicate:
                     booked_trade_ids.append(evidence.broker_trade_id)
             except (BrokerContractError, RepositoryError, ValueError) as exc:
-                blockers.append("trade_error:{}:{}".format(_text(trade.get("trade_id")) or "<empty>", str(exc)))
+                blockers.append(
+                    "trade_error:{}:{}".format(
+                        _text(trade.get("trade_id")) or "<empty>", str(exc)
+                    )
+                )
 
         for broker_order_id, row in broker_orders.items():
             local = orders_by_broker_id.get(broker_order_id)
@@ -392,24 +425,31 @@ class SQLiteReconciliationService:
             ) and broker_order_id not in broker_ids:
                 blockers.append("missing_working_order:{}".format(broker_order_id))
 
-        expected_cash, local_positions = self._ledger_view(account_id, physical_account_id, snapshot.as_of)
-        if expected_cash != snapshot.available_cash_units:
+        required_cash, owned_positions = self._ledger_view(
+            account_id, physical_account_id, snapshot.as_of
+        )
+        if snapshot.available_cash_units < required_cash:
             blockers.append(
-                "cash_mismatch:ledger={}:broker={}".format(
-                    expected_cash, snapshot.available_cash_units
+                "broker_cash_insufficient:strategy_required={}:broker={}".format(
+                    required_cash, snapshot.available_cash_units
                 )
             )
         broker_positions = {
-            item.security: (item.total_qty, item.sellable_qty)
+            item.security: (max(item.total_qty, 0), max(item.sellable_qty, 0))
             for item in snapshot.positions
-            if item.total_qty or item.sellable_qty
         }
-        if local_positions != broker_positions:
-            blockers.append(
-                "position_mismatch:ledger={}:broker={}".format(
-                    sorted(local_positions.items()), sorted(broker_positions.items())
+        for security, (owned_total, owned_sellable) in sorted(owned_positions.items()):
+            broker_total, broker_sellable = broker_positions.get(security, (0, 0))
+            if broker_total < owned_total or broker_sellable < owned_sellable:
+                blockers.append(
+                    "broker_position_insufficient:{}:strategy=({},{}):broker=({},{})".format(
+                        security,
+                        owned_total,
+                        owned_sellable,
+                        broker_total,
+                        broker_sellable,
+                    )
                 )
-            )
 
         details = {
             "blockers": sorted(set(blockers)),
@@ -418,6 +458,10 @@ class SQLiteReconciliationService:
             "broker_order_count": len(snapshot.orders),
             "broker_trade_count": len(snapshot.trades),
             "broker_position_count": len(snapshot.positions),
+            "ignored_broker_order_count": ignored_broker_order_count,
+            "ignored_broker_trade_count": ignored_broker_trade_count,
+            "strategy_required_cash_units": required_cash,
+            "strategy_owned_position_count": len(owned_positions),
         }
         state = ReconciliationState.BLOCKED if blockers else ReconciliationState.READY
         return self._persist_result(
@@ -473,9 +517,22 @@ class SQLiteReconciliationService:
                     OrderState.SUBMIT_UNKNOWN.value,
                 )
             }
-            return by_broker_id, by_client_tag
+            all_by_client_tag = {
+                row["client_tag"]: row
+                for row in local_orders
+                if row["client_tag"]
+            }
+            return by_broker_id, by_client_tag, all_by_client_tag
         finally:
             connection.close()
+
+    @staticmethod
+    def _remark_matches(remark: str, orders_by_client_tag) -> bool:
+        return any(
+            token in orders_by_client_tag
+            for token in (item.strip() for item in remark.split("|"))
+            if token
+        )
 
     def _ledger_view(
         self,
@@ -498,13 +555,18 @@ class SQLiteReconciliationService:
             ).fetchall()
             if not any(row["strategy_account_id"] == account_id for row in accounts):
                 raise RepositoryError("strategy account does not use physical account")
-            available = pool["unallocated_cash_units"] - pool["reserved_cash_units"]
-            available += sum(
+            required_cash = sum(
                 row["cash_units"] - row["reserved_cash_units"] for row in accounts
             )
             position_rows = connection.execute(
-                "SELECT security, total_qty FROM positions WHERE strategy_account_id = ?",
-                (account_id,),
+                """
+                SELECT p.strategy_account_id, p.security, p.total_qty
+                FROM positions p
+                JOIN strategy_accounts a
+                  ON a.strategy_account_id = p.strategy_account_id
+                WHERE a.physical_account_id = ?
+                """,
+                (physical_account_id,),
             ).fetchall()
             positions = {}
             for row in position_rows:
@@ -514,12 +576,20 @@ class SQLiteReconciliationService:
                     WHERE strategy_account_id = ? AND security = ?
                       AND sellable_from_trade_date <= ?
                     """,
-                    (account_id, row["security"], as_of.date().isoformat()),
+                    (
+                        row["strategy_account_id"],
+                        row["security"],
+                        as_of.date().isoformat(),
+                    ),
                 ).fetchone()[0]
                 if row["total_qty"] or sellable:
-                    positions[row["security"]] = (row["total_qty"], sellable)
+                    current_total, current_sellable = positions.get(row["security"], (0, 0))
+                    positions[row["security"]] = (
+                        current_total + row["total_qty"],
+                        current_sellable + sellable,
+                    )
             connection.commit()
-            return cast(int, available), positions
+            return cast(int, required_cash), positions
         except BaseException:
             connection.rollback()
             raise

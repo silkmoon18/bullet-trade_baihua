@@ -156,7 +156,7 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert account.cash_units == money_to_units("7995")
 
 
-def test_unknown_broker_order_blocks_new_trading(tmp_path):
+def test_unrelated_broker_order_is_ignored_in_shared_account(tmp_path):
     _, repository, _, reconciliation = _services(tmp_path)
     snapshot = _snapshot(
         "20000",
@@ -172,15 +172,41 @@ def test_unknown_broker_order_blocks_new_trading(tmp_path):
 
     result = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
 
+    assert result.state is ReconciliationState.READY
+    assert result.details["blockers"] == ()
+    assert result.details["ignored_broker_order_count"] == 1
+    assert repository.get_strategy_account(ACCOUNT_ID).status is AccountStatus.ACTIVE
+
+
+def test_strategy_tag_with_conflicting_broker_id_still_blocks(tmp_path):
+    database, _, _, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    local = _order()
+    booking.register_order(local)
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "20000",
+            orders=(
+                {
+                    "order_id": "unexpected-broker-id",
+                    "security": SECURITY,
+                    "status": "open",
+                    "order_remark": local.client_tag,
+                },
+            ),
+        ),
+    )
+
     assert result.state is ReconciliationState.BLOCKED
-    assert "unknown_order:manual-order" in result.details["blockers"]
     assert (
-        repository.get_strategy_account(ACCOUNT_ID).status
-        is AccountStatus.RECONCILIATION_BLOCKED
+        "owned_order_broker_id_mismatch:unexpected-broker-id"
+        in result.details["blockers"]
     )
 
 
-def test_cash_or_position_drift_blocks(tmp_path):
+def test_unrelated_cash_and_positions_do_not_block_shared_account(tmp_path):
     _, _, _, reconciliation = _services(tmp_path)
 
     result = reconciliation.synchronize(
@@ -192,10 +218,42 @@ def test_cash_or_position_drift_blocks(tmp_path):
         ),
     )
 
+    assert result.state is ReconciliationState.READY
+    assert result.details["blockers"] == ()
+    assert result.details["strategy_required_cash_units"] == money_to_units("10000")
+    assert result.details["strategy_owned_position_count"] == 0
+
+
+def test_strategy_owned_cash_and_position_shortage_blocks(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    filled = _snapshot(
+        "17995",
+        positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),),
+        trades=(_broker_trade(),),
+    )
+    assert reconciliation.synchronize(
+        ACCOUNT_ID, PHYSICAL_ID, filled
+    ).state is ReconciliationState.READY
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "7000",
+            positions=(BrokerPositionSnapshot(SECURITY, 500, 0),),
+            orders=(_broker_order(),),
+            trades=(_broker_trade(),),
+        ),
+    )
+
     assert result.state is ReconciliationState.BLOCKED
     blockers = result.details["blockers"]
-    assert any(item.startswith("cash_mismatch:") for item in blockers)
-    assert any(item.startswith("position_mismatch:") for item in blockers)
+    assert any(item.startswith("broker_cash_insufficient:") for item in blockers)
+    assert any(item.startswith("broker_position_insufficient:") for item in blockers)
 
 
 def test_canceled_buy_releases_reservation_before_cash_compare(tmp_path):
@@ -213,7 +271,7 @@ def test_canceled_buy_releases_reservation_before_cash_compare(tmp_path):
     assert result.state is ReconciliationState.READY
 
 
-def test_unknown_trade_is_not_guessed_or_booked(tmp_path):
+def test_unrelated_trade_is_not_guessed_or_booked(tmp_path):
     _, _, _, reconciliation = _services(tmp_path)
     trade = dict(_broker_trade())
     trade["order_id"] = "manual-order"
@@ -224,8 +282,9 @@ def test_unknown_trade_is_not_guessed_or_booked(tmp_path):
         _snapshot("20000", trades=(trade,)),
     )
 
-    assert result.state is ReconciliationState.BLOCKED
-    assert "unknown_trade_order:manual-order" in result.details["blockers"]
+    assert result.state is ReconciliationState.READY
+    assert result.details["blockers"] == ()
+    assert result.details["ignored_broker_trade_count"] == 1
 
 
 def test_ready_reconciliation_does_not_clear_manual_kill_switch(tmp_path):
@@ -296,6 +355,33 @@ def test_async_server_adapter_snapshot_is_supported():
 
     assert snapshot.available_cash_units == money_to_units("10000")
     assert snapshot.positions == (BrokerPositionSnapshot(SECURITY, 100, 50),)
+
+
+def test_async_snapshot_keeps_unrelated_signed_qmt_position():
+    class Adapter:
+        async def get_account_info(self, account):
+            return {"available_cash": 10000.0}
+
+        async def get_positions(self, account):
+            return [
+                {
+                    "security": "159208.SZ",
+                    "amount": -21949,
+                    "closeable_amount": -21949,
+                }
+            ]
+
+        async def list_orders(self, account, filters=None):
+            return []
+
+        async def list_trades(self, account, filters=None):
+            return []
+
+    snapshot = asyncio.run(collect_async_broker_snapshot(Adapter(), object()))
+
+    assert snapshot.positions == (
+        BrokerPositionSnapshot("159208.XSHE", -21949, -21949),
+    )
 
 
 def test_async_server_adapter_wrapped_account_snapshot_is_supported():

@@ -22,7 +22,7 @@ QMT_STRATEGY_MINIMUM_ORDER=0
 QMT_STRATEGY_BUY_FEE_BUFFER=5
 ```
 
-交易开关默认`false`。L04完成目标QMT能力探针、备份和人工验收前不得改为`true`。首版只服务一个用户、一个专用QMT账户、一个策略，`sub_account_id`明确不支持。
+交易开关默认`false`。L04完成目标QMT能力探针、备份和人工验收前不得改为`true`。当前按`client_tag/order_remark`和broker order ID识别本策略委托与成交，因此允许QMT物理账户同时存在人工交易或其他策略资产；`sub_account_id`仍明确不支持。
 
 ## 每次调用的真实流程
 
@@ -32,7 +32,7 @@ QMT_STRATEGY_BUY_FEE_BUFFER=5
 
 1. 重新轮询QMT订单、成交、现金和持仓；
 2. 将已知真实fill幂等入账；
-3. 遇到未知活动或账实差异时持久化`BLOCKED`；
+3. 忽略不能归属于本策略的外部订单、成交和额外持仓；只有券商现金/持仓不足以覆盖策略归属资产，或本策略订单证据不完整时才持久化`BLOCKED`；
 4. 使用聚宽传入的mark，并用QMT行情补齐重启后缺失的持仓/目标mark；
 5. 从同一SQLite读事务生成真实组合快照。
 
