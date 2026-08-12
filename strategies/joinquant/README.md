@@ -22,7 +22,7 @@
 当前三种模式的边界是：
 
 - `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时经版本化入口校验marker/API版本与回测run_type；helper缺失（仅目标模块本身的`ModuleNotFoundError`）时只允许纯聚宽回测本地兜底，helper内部导入失败直接中止；
-- `SHADOW`：需要版本匹配的helper和私有profile，只记录计划；helper把`order`等七个聚宽交易函数替换为抛错guard，所有交易变更均被阻断；
+- `SHADOW`：需要版本匹配的helper和私有profile，记录计划并通过服务器发送目标买入卡片；helper把`order`等七个聚宽交易函数替换为抛错guard，所有交易变更均被阻断；
 - `LIVE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。服务端交易总开关默认仍为关闭。
 
 因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。聚宽真实组合视图属L03；真实聚宽、QMT模拟和用户批准的小额实盘门禁在L04按人工验收执行。

@@ -45,9 +45,9 @@ PROFILE = 'good_etf-prod'
 SIM_EXECUTION_MODE = ExecutionMode.SHADOW
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 3
+_EXPECTED_RUNTIME_API_VERSION = 4
 _EXPECTED_PROFILE_SCHEMA_VERSION = 1
-_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v3'
+_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v4'
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -226,6 +226,48 @@ def _runtime_mode() -> ExecutionMode:
 def _notify(message: str) -> None:
     # S01不在聚宽策略中保存Webhook；后续由服务器状态事件统一通知。
     log.info('[策略通知] {}'.format(message))
+
+
+def _target_buy_plan_item(
+    security: str,
+    target_value: float,
+    current_value: float,
+    reference_price: float,
+) -> Optional[Dict[str, object]]:
+    """把组合目标增量换算为整手买入计划；非买入目标返回None。"""
+    if reference_price <= 0:
+        return None
+    target_delta = target_value - current_value
+    quantity = int(target_delta / reference_price) // 100 * 100
+    if quantity <= 0:
+        return None
+    return {
+        'security': security,
+        'quantity': quantity,
+        'amount': round(quantity * reference_price, 2),
+        'reference_price': reference_price,
+    }
+
+
+def _send_target_buy_plan(
+    context: 'Context', items: List[Dict[str, object]]
+) -> None:
+    if not items or _runtime_mode() is ExecutionMode.NATIVE:
+        return
+    if bt is None:
+        log.warn('策略目标买入计划通知跳过：缺少聚宽helper')
+        return
+    try:
+        result = bt.notify_target_buy_plan(items, occurred_at=context.current_dt)
+        if result.get('accepted'):
+            log.info('策略目标买入计划卡片已提交 | 标的数={} 总金额={:.2f}'.format(
+                result.get('item_count', len(items)),
+                float(result.get('total_amount', 0.0))))
+        else:
+            log.warn('策略目标买入计划卡片未启用或发送队列未接受')
+    except Exception as exc:
+        # 通知失败不能影响SHADOW计划计算或REMOTE目标提交。
+        log.warn('策略目标买入计划通知失败：{}'.format(type(exc).__name__))
 
 
 def _record_real_portfolio(portfolio: Any) -> None:
@@ -564,9 +606,31 @@ def market_open(context: 'Context') -> None:
         hold_codes = list(portfolio.positions.keys())
         log.info(f'当前持仓 {len(hold_codes)} 只: {hold_codes}')
 
+        raw_weights = selected_funds['premium'].abs().tolist()
+        total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
+        investable_value = portfolio.total_value * DEPLOY_RATIO
+        target_values = {
+            code: float(investable_value * weight / total_weight)
+            for code, weight in zip(order_fund_codes, raw_weights)
+        }
+        buy_plan_items: List[Dict[str, object]] = []
+        for code in order_fund_codes:
+            position = portfolio.positions[code] if code in portfolio.positions else None
+            current_value = getattr(position, 'value', None) if position is not None else 0.0
+            if current_value is None:
+                current_value = (
+                    getattr(position, 'total_amount', 0)
+                    * selected_funds.loc[code, 'last_price']
+                )
+            item = _target_buy_plan_item(
+                code,
+                target_values[code],
+                float(current_value),
+                float(selected_funds.loc[code, 'last_price']),
+            )
+            if item is not None:
+                buy_plan_items.append(item)
         if _runtime_mode() is ExecutionMode.REMOTE:
-            raw_weights = selected_funds['premium'].abs().tolist()
-            total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
             target_weights = {
                 code: float(weight / total_weight * DEPLOY_RATIO)
                 for code, weight in zip(order_fund_codes, raw_weights)
@@ -586,7 +650,11 @@ def market_open(context: 'Context') -> None:
             result = _submit_remote_targets(context, target_weights, marks, key)
             log.info('真实组合目标已提交 | intent_id={} state={} weights={}'.format(
                 result['intent']['intent_id'], result['intent']['state'], target_weights))
+            # 通知是旁路能力，必须排在真实目标提交之后，不能延迟QMT执行。
+            _send_target_buy_plan(context, buy_plan_items)
             return
+
+        _send_target_buy_plan(context, buy_plan_items)
 
         for hold_code in hold_codes:
             if hold_code not in order_fund_codes:
@@ -601,18 +669,14 @@ def market_open(context: 'Context') -> None:
         # 且卖单尚未成交时可用现金也不能代表本轮可部署资金。
         if not selected_funds.empty:
             # 计算权重（折价率绝对值占比）
-            weights = selected_funds['premium'].abs().tolist()
-            total_weight = sum(weights) if sum(weights) != 0 else 1e-9  # 防除零
-
             total_value = portfolio.total_value
-            investable_value = total_value * DEPLOY_RATIO
             log.info(f'组合总资产={total_value:.2f} 目标部署={investable_value:.2f} '
                      f'现金缓冲={total_value - investable_value:.2f}')
 
             # 按权重提交目标市值；实际成交与资金入账由后续StrategyLedger切片接管。
-            for code, weight in zip(order_fund_codes, weights):
+            for code, weight in zip(order_fund_codes, raw_weights):
                 normalized_weight = weight / total_weight
-                target_value = investable_value * normalized_weight
+                target_value = target_values[code]
                 position = portfolio.positions[code] if code in portfolio.positions else None
                 current_value = getattr(position, 'value', None) if position is not None else 0.0
                 if current_value is None:

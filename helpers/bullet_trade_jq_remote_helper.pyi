@@ -92,6 +92,10 @@ def submit_targets(
     marks: Optional[Dict[str, Any]] = ...,
     as_of: Any = ...,
 ) -> Dict[str, Any]: ...
+def notify_target_buy_plan(
+    items: Any,
+    occurred_at: Any = ...,
+) -> Dict[str, Any]: ...
 def get_intent(
     intent_id: Optional[str] = ...,
     idempotency_key: Optional[str] = ...,

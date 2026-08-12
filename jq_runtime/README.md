@@ -36,7 +36,7 @@
 | 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
 | `simple_backtest`、`full_backtest` | `ExecutionMode.NATIVE` | 固定使用聚宽原生回测；`VALIDATE_REMOTE_DURING_BACKTEST=True`时额外校验helper/profile并读取一次StrategyLedger真实快照 | 远程快照只写日志，不参与历史决策；绝不提交远程组合目标 |
-| `sim_trade` + `ExecutionMode.SHADOW` | `SHADOW` | 校验profile；不主动连接服务器 | 实时计算并记录计划；聚宽下单、撤单入口由guard阻断 |
+| `sim_trade` + `ExecutionMode.SHADOW` | `SHADOW` | 安装时只校验profile；产生新增买入目标时连接服务器发送计划卡片 | 实时计算并记录计划；聚宽下单、撤单入口由guard阻断，通知接口不下单、不写账本 |
 | `sim_trade` + `ExecutionMode.REMOTE` | helper协议`LIVE` | 校验profile并在调用时建立短连接 | 读取StrategyLedger组合并提交远程目标；是否下QMT订单仍取决于服务器交易开关 |
 
 用户只配置：

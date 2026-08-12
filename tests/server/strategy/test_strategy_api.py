@@ -13,6 +13,7 @@ from bullet_trade.server.strategy import (
     MINI_QMT_CAPABILITIES,
 )
 from bullet_trade.server.strategy.schema import connect_database
+from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
 
 
 SECURITY = "510050.XSHG"
@@ -219,6 +220,46 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     assert service.get_reconciliation(
         "default", {"strategy_id": "good_etf"}
     )["reconciliation"]["state"] == "READY"
+
+
+def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
+    service, broker, _, notifications = api
+
+    result = service.notify_target_buy_plan(
+        {
+            "strategy_id": "good_etf",
+            "mode": "SHADOW",
+            "occurred_at": "2026-08-13T09:30:00+08:00",
+            "items": [
+                {
+                    "security": "510050.XSHG",
+                    "quantity": 1000,
+                    "amount": "2500.00",
+                    "reference_price": "2.5000",
+                },
+                {
+                    "security": "159915.XSHE",
+                    "quantity": 500,
+                    "amount": "750.00",
+                    "reference_price": "1.5000",
+                },
+            ],
+        }
+    )
+
+    assert result == {
+        "accepted": True,
+        "item_count": 2,
+        "total_amount": 3250.0,
+    }
+    assert broker.order_calls == 0
+    assert len(notifications) == 1
+    notification = notifications[0]
+    assert isinstance(notification, TargetBuyPlanNotification)
+    assert notification.mode == "SHADOW"
+    assert notification.items[0].quantity == 1000
+    with pytest.raises(Exception, match="not found"):
+        service.repository.get_strategy_account("good_etf")
 
 
 @pytest.mark.asyncio

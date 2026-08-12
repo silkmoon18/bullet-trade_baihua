@@ -47,7 +47,7 @@ VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
 
-远程预检为`True`时必须已上传v3 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
+远程预检为`True`时必须已上传v4 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
 
 先运行校验：
 
@@ -65,11 +65,11 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### SHADOW
 
-SHADOW只用于验证profile合同和观察信号，不会提交真实订单。私有`jq_runtime_config.py`必须仅保存在本地/聚宽私有文件区，并显式传给导出器做只读校验；示例profile不能用于连接服务器。
+SHADOW用于验证profile合同和观察信号，不会提交真实订单。产生新增买入目标时会通过服务器发送橙色计划卡片；该接口不写StrategyLedger，也不受交易开关影响。私有`jq_runtime_config.py`必须仅保存在本地/聚宽私有文件区，并显式传给导出器做只读校验；示例profile不能用于连接服务器。
 
 ### REMOTE
 
-把`SIM_EXECUTION_MODE`改为`ExecutionMode.REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定NATIVE。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v3 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把`SIM_EXECUTION_MODE`改为`ExecutionMode.REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定NATIVE。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v4 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 ## 4. good_etf与原策略的关系
 

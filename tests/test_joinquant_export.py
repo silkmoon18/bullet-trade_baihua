@@ -416,7 +416,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 3
+assert helper.STRATEGY_RUNTIME_API_VERSION == 4
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 1
 assert profile['PROFILES']['good_etf-prod']['host'] == ''
@@ -475,7 +475,7 @@ jqdata.__all__ = []
 sys.modules['jqdata'] = jqdata
 called = []
 helper = types.ModuleType('bullet_trade_jq_remote_helper')
-helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v3'
+helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v4'
 helper.STRATEGY_RUNTIME_API_VERSION = 2
 helper.install_strategy_runtime = lambda *args, **kwargs: called.append(True)
 sys.modules['bullet_trade_jq_remote_helper'] = helper

@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union, cast
 
 from .broker_contract import BrokerCapabilityProfile
-from ..feishu_notifier import TradeNotification
+from ..feishu_notifier import (
+    TargetBuyPlanItem,
+    TargetBuyPlanNotification,
+    TradeNotification,
+)
 from .capital import SQLiteCapitalService
 from .domain import MONEY_SCALE, NAV_SCALE, PRICE_SCALE, SHANGHAI_TZ, money_to_units, price_to_units
 from .planner_executor import PlannerConfig, SQLiteTargetExecutionService
@@ -286,6 +291,63 @@ class SQLiteStrategyAPI:
         result = self.reconciliation.latest(self._physical_id(account_key))
         return {"reconciliation": _json_value(result)}
 
+    def notify_target_buy_plan(
+        self, payload: Mapping[str, object]
+    ) -> Dict[str, object]:
+        strategy_id = self._strategy_id(payload)
+        mode = str(payload.get("mode") or "").strip().upper()
+        if mode not in ("SHADOW", "REMOTE"):
+            raise ValueError("mode must be SHADOW or REMOTE")
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, (list, tuple)) or not raw_items:
+            raise ValueError("items must be a non-empty list")
+        items = []
+        total = Decimal("0")
+        for raw in raw_items:
+            if not isinstance(raw, Mapping):
+                raise ValueError("target buy plan item must be a mapping")
+            security = str(raw.get("security") or "").strip()
+            quantity = raw.get("quantity")
+            if not security or type(quantity) is not int or quantity <= 0:
+                raise ValueError("security and positive integer quantity are required")
+            amount = self._positive_decimal(raw.get("amount"), "amount")
+            reference_price = raw.get("reference_price")
+            if reference_price is not None:
+                reference_price = self._positive_decimal(
+                    reference_price, "reference_price"
+                )
+            items.append(
+                TargetBuyPlanItem(
+                    security=security,
+                    quantity=quantity,
+                    amount=amount,
+                    reference_price=reference_price,
+                )
+            )
+            total += amount
+        occurred_at = self._as_of(
+            payload.get("occurred_at"), datetime.now(SHANGHAI_TZ)
+        )
+        accepted = False
+        if self.notification_handler is not None:
+            try:
+                self.notification_handler(
+                    TargetBuyPlanNotification(
+                        strategy_id=strategy_id,
+                        mode=mode,
+                        items=tuple(items),
+                        occurred_at=occurred_at,
+                    )
+                )
+                accepted = True
+            except Exception:
+                accepted = False
+        return {
+            "accepted": accepted,
+            "item_count": len(items),
+            "total_amount": float(total),
+        }
+
     async def _refresh(self, account_context, account_key, strategy_id, payload):
         physical_id = self._physical_id(account_key)
         broker_snapshot = await collect_async_broker_snapshot(
@@ -429,6 +491,18 @@ class SQLiteStrategyAPI:
         if not strategy_id:
             raise ValueError("strategy_id is required")
         return strategy_id
+
+    @staticmethod
+    def _positive_decimal(value: object, field: str) -> Decimal:
+        if isinstance(value, bool):
+            raise ValueError("{} must be a positive number".format(field))
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("{} must be a positive number".format(field)) from exc
+        if not number.is_finite() or number <= 0:
+            raise ValueError("{} must be a positive number".format(field))
+        return number
 
     @staticmethod
     def _physical_id(account_key: str) -> str:

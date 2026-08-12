@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
-HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v3"
+HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v4"
 BLOCKED_MUTATIONS = tuple(sorted({
     "order", "order_value", "order_percent", "order_target",
     "order_target_value", "order_target_percent", "cancel_order",
@@ -62,7 +62,7 @@ def _load_strategy(monkeypatch, helper_module=None):
     return module
 
 
-def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=3):
+def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=4):
     module = types.ModuleType("bullet_trade_jq_remote_helper")
     if marker is not None:
         module.STRATEGY_RUNTIME_HELPER_MARKER = marker
@@ -75,7 +75,7 @@ def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=3):
 
 def _runtime_state(mode="SHADOW"):
     return {
-        "api_version": 3,
+        "api_version": 4,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": mode,
@@ -125,7 +125,7 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     strategy.VALIDATE_REMOTE_DURING_BACKTEST = False
     state = strategy._install_runtime(_Context(run_type))
     assert state == {
-        "api_version": 3,
+        "api_version": 4,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": "BACKTEST",
@@ -214,7 +214,7 @@ def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     assert install_calls == []
 
 
-@pytest.mark.parametrize("api_version", [0, 1, 2, 4])
+@pytest.mark.parametrize("api_version", [0, 1, 2, 3, 5])
 def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
     helper = _fake_helper(
         lambda *args, **kwargs: pytest.fail("版本不匹配不得进入安装"),
@@ -247,7 +247,7 @@ def test_remote_installs_strategy_ledger_runtime(monkeypatch):
     strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.REMOTE
     state = strategy._install_runtime(_Context("sim_trade"))
     assert state["mode"] == "LIVE"
-    assert calls[0]["expected_api_version"] == 3
+    assert calls[0]["expected_api_version"] == 4
 
 
 def test_helper_non_dict_state_rejected(monkeypatch):
@@ -298,7 +298,7 @@ def test_shadow_install_success_and_call_contract(monkeypatch):
         "profile": "good_etf-prod",
         "mode": "SHADOW",
         "strategy_id": "good_etf",
-        "expected_api_version": 3,
+        "expected_api_version": 4,
         "profile_module": "jq_runtime_config",
         "validate_remote": False,
     }
@@ -448,6 +448,43 @@ def test_shadow_cancel_open_orders_only_logs(monkeypatch):
 
     assert strategy._cancel_open_orders_for_runtime() == 0
     assert any("SHADOW计划" in message for message in strategy.log.messages)
+
+
+def test_target_buy_plan_item_uses_increment_and_round_lot(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+
+    assert strategy._target_buy_plan_item(
+        "510001.XSHG", 3000.0, 1000.0, 2.0
+    ) == {
+        "security": "510001.XSHG",
+        "quantity": 1000,
+        "amount": 2000.0,
+        "reference_price": 2.0,
+    }
+    assert strategy._target_buy_plan_item(
+        "510001.XSHG", 1100.0, 1000.0, 2.0
+    ) is None
+
+
+def test_shadow_target_buy_plan_calls_helper_without_order(monkeypatch):
+    notifications = []
+    helper = _fake_helper(
+        lambda namespace, **kwargs: _runtime_state("SHADOW")
+    )
+    helper.notify_target_buy_plan = lambda items, occurred_at=None: (
+        notifications.append((items, occurred_at))
+        or {"accepted": True, "item_count": len(items), "total_amount": 2000.0}
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SHADOW
+    strategy._install_runtime(_Context("sim_trade"))
+    context = types.SimpleNamespace(current_dt="2026-08-13 09:30:00")
+    items = [{"security": "510001.XSHG", "quantity": 1000, "amount": 2000.0}]
+
+    strategy._send_target_buy_plan(context, items)
+
+    assert notifications == [(items, context.current_dt)]
+    assert any("计划卡片已提交" in message for message in strategy.log.messages)
 
 
 def test_runtime_mode_raises_before_install(monkeypatch):

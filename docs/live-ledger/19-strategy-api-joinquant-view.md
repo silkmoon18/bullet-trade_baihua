@@ -2,7 +2,7 @@
 
 ## 结论
 
-L03复用BulletTrade现有TCP协议和token，提供五个动作：`strategy.ensure_account`、`strategy.get_snapshot`、`strategy.submit_targets`、`strategy.get_intent`和`strategy.get_reconciliation`。没有新增HTTP服务、角色系统或第二套鉴权。账本事件保留在服务器SQLite中用于审计，不再暴露当前策略未使用的远程事件接口。
+L03复用BulletTrade现有TCP协议和token，提供六个动作：`strategy.ensure_account`、`strategy.get_snapshot`、`strategy.submit_targets`、`strategy.get_intent`、`strategy.get_reconciliation`和`strategy.notify_target_buy_plan`。最后一个动作只把SHADOW/REMOTE目标买入计划送入飞书队列，不访问券商、不提交订单也不写账本。没有新增HTTP服务、角色系统或第二套鉴权。账本事件保留在服务器SQLite中用于审计，不再暴露当前策略未使用的远程事件接口。
 
 聚宽`BACKTEST`仍使用原生`context.portfolio`和原生下单接口。`LIVE`不改写聚宽模拟账户，而是读取服务器`PortfolioView`、一次提交完整目标权重，并用`record()`记录真实现金、总资产、持仓市值、NAV、收益和费用。
 

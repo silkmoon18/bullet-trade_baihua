@@ -56,7 +56,7 @@ def _install(helper, namespace=None, context=None, *, mode="SHADOW", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 3,
+        "api_version": 4,
         "profile_schema_version": 1,
         "profile": PROFILE,
         "mode": mode,
@@ -83,11 +83,12 @@ def test_public_contract_exports_and_constants(helper):
         "get_portfolio",
         "get_reconciliation",
         "install_strategy_runtime",
+        "notify_target_buy_plan",
         "submit_targets",
     ]
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 3
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 4
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v3"
+        "bullet-trade-joinquant-runtime-helper-v4"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 1
 
@@ -172,8 +173,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 4, "3", True, None])
-def test_expected_api_version_must_equal_three(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 3, 5, "4", True, None])
+def test_expected_api_version_must_equal_four(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -505,6 +506,44 @@ def test_submit_targets_does_not_retry_after_request_may_be_sent(
     with pytest.raises(RuntimeError, match="请求可能已执行.*停止自动重发"):
         helper.submit_targets({"510300.XSHG": 1}, "same-key")
     assert len(attempts) == 1
+
+
+def test_notify_target_buy_plan_uses_shadow_mode_and_no_retry_after_send(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    _install(helper, mode="SHADOW")
+    sent = []
+    reads = []
+
+    monkeypatch.setattr(
+        helper.socket,
+        "create_connection",
+        lambda address, timeout: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        helper, "_send_message", lambda sock, message: sent.append(message)
+    )
+
+    def read_message(sock):
+        reads.append(True)
+        if len(reads) == 1:
+            return {"type": "handshake_ack"}
+        raise socket.timeout("response lost")
+
+    monkeypatch.setattr(helper, "_read_message", read_message)
+    monkeypatch.setattr(
+        helper.time, "sleep", lambda seconds: pytest.fail("must not retry")
+    )
+
+    with pytest.raises(RuntimeError, match="请求可能已执行.*停止自动重发"):
+        helper.notify_target_buy_plan(
+            [{"security": "510300.XSHG", "quantity": 1000, "amount": 2500}]
+        )
+    requests = [item for item in sent if item.get("type") == "request"]
+    assert len(requests) == 1
+    assert requests[0]["action"] == "strategy.notify_target_buy_plan"
+    assert requests[0]["payload"]["mode"] == "SHADOW"
 
 
 def test_server_error_is_not_retried_or_echoes_request_payload(helper, monkeypatch):

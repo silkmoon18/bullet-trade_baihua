@@ -191,7 +191,7 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-回测继续NATIVE原生运行，SHADOW只生成计划，REMOTE软件路径通过helper v3和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SHADOW、模拟和小额资金验收不可由mock替代。
+回测继续NATIVE原生运行，SHADOW生成计划并可发送目标买入卡片，REMOTE软件路径通过helper v4和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SHADOW、模拟和小额资金验收不可由mock替代。
 
 L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
 

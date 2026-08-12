@@ -282,6 +282,8 @@ class ServerApplication:
             return self.strategy_api.get_intent(payload)
         if method == "get_reconciliation":
             return self.strategy_api.get_reconciliation(resolved_key, payload)
+        if method == "notify_target_buy_plan":
+            return self.strategy_api.notify_target_buy_plan(payload)
         raise ValueError(f"未知策略接口: {method}")
 
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:

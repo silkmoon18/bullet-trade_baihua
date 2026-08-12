@@ -3,6 +3,8 @@ from datetime import datetime
 from bullet_trade.server.feishu_notifier import (
     FeishuNotifier,
     FeishuTradeNotifier,
+    TargetBuyPlanItem,
+    TargetBuyPlanNotification,
     TradeNotification,
 )
 from bullet_trade.server.strategy.domain import SHANGHAI_TZ
@@ -53,6 +55,33 @@ def test_rejected_order_card_keeps_empty_trade_values_visible():
     content = payload["card"]["elements"][0]["text"]["content"]
     assert "**金额：** ¥-" in content
     assert "**单价：** ¥-" in content
+
+
+def test_target_buy_plan_card_lists_items_and_total_amount():
+    notifier = FeishuTradeNotifier("https://example.invalid/hook/test")
+    payload = notifier.build_payload(
+        TargetBuyPlanNotification(
+            strategy_id="good_etf",
+            mode="SHADOW",
+            items=(
+                TargetBuyPlanItem("510050.XSHG", 1000, "2500.00", "2.5000"),
+                TargetBuyPlanItem("159915.XSHE", 500, "750.00", "1.5000"),
+            ),
+            occurred_at=datetime(2026, 8, 13, 9, 30, tzinfo=SHANGHAI_TZ),
+        )
+    )
+
+    assert payload["card"]["header"]["template"] == "orange"
+    assert payload["card"]["header"]["title"]["content"] == (
+        "策略目标买入计划 · SHADOW"
+    )
+    content = payload["card"]["elements"][0]["text"]["content"]
+    assert "510050.XSHG" in content
+    assert "1000股" in content
+    assert "159915.XSHE" in content
+    assert "500股" in content
+    assert "¥3250.00" in content
+    assert "不代表已提交委托或已经成交" in content
 
 
 def test_legacy_notifier_is_drop_in_compatible(monkeypatch):

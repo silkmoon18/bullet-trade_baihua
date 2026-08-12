@@ -48,12 +48,13 @@ __all__ = [
     "ensure_account",
     "get_portfolio",
     "submit_targets",
+    "notify_target_buy_plan",
     "get_intent",
     "get_reconciliation",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 3
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v3"
+STRATEGY_RUNTIME_API_VERSION = 4
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v4"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -186,7 +187,10 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     profile = _active_profile
     timeout = float(profile["rpc_timeout"])
     connect_timeout = min(timeout, 10.0)
-    safe_retry = action != "strategy.submit_targets"
+    safe_retry = action not in (
+        "strategy.submit_targets",
+        "strategy.notify_target_buy_plan",
+    )
     last_error = None  # type: Optional[Exception]
 
     for attempt in range(1, _RPC_ATTEMPTS + 1):
@@ -326,6 +330,27 @@ def submit_targets(
     if as_of is not None:
         payload["as_of"] = as_of
     return _strategy_request("strategy.submit_targets", payload)
+
+
+def notify_target_buy_plan(
+    items: Any,
+    occurred_at: Any = None,
+) -> Dict[str, Any]:
+    """发送策略目标买入计划；只通知，不提交订单或修改账本。"""
+
+    if _active_state is None or _active_state.get("mode") not in (
+        "SHADOW", "LIVE"
+    ):
+        raise RuntimeError("只有SHADOW或LIVE模式可以发送策略目标计划")
+    payload = {
+        "mode": (
+            "REMOTE" if _active_state.get("mode") == "LIVE" else "SHADOW"
+        ),
+        "items": items,
+    }
+    if occurred_at is not None:
+        payload["occurred_at"] = occurred_at
+    return _strategy_request("strategy.notify_target_buy_plan", payload)
 
 
 def get_intent(

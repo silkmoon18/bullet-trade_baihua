@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from queue import Queue
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import requests  # type: ignore[import-untyped]
 
@@ -37,6 +37,22 @@ class TradeNotification:
     detail: str = ""
     occurred_at: Optional[datetime] = None
     title: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TargetBuyPlanItem:
+    security: str
+    quantity: int
+    amount: Number
+    reference_price: Optional[Number] = None
+
+
+@dataclass(frozen=True)
+class TargetBuyPlanNotification:
+    strategy_id: str
+    mode: str
+    items: Tuple[TargetBuyPlanItem, ...]
+    occurred_at: Optional[datetime] = None
 
 
 def _signature(timestamp: int, secret: str) -> str:
@@ -70,7 +86,12 @@ class FeishuTradeNotifier:
         self.secret = secret
         self.timeout_seconds = timeout_seconds
 
-    def build_payload(self, notification: TradeNotification) -> Dict[str, Any]:
+    def build_payload(
+        self,
+        notification: Union[TradeNotification, TargetBuyPlanNotification],
+    ) -> Dict[str, Any]:
+        if isinstance(notification, TargetBuyPlanNotification):
+            return self._build_target_buy_plan_payload(notification)
         color = {
             "ORDER_SUBMITTED": "blue",
             "FILL": "green",
@@ -134,7 +155,73 @@ class FeishuTradeNotifier:
             payload["sign"] = _signature(timestamp, self.secret)
         return payload
 
-    def send(self, notification: TradeNotification) -> bool:
+    def _build_target_buy_plan_payload(
+        self, notification: TargetBuyPlanNotification
+    ) -> Dict[str, Any]:
+        occurred_at = notification.occurred_at or datetime.now(SHANGHAI_TZ)
+        if occurred_at.tzinfo is not None:
+            occurred_at = occurred_at.astimezone(SHANGHAI_TZ)
+        total_amount = sum(
+            (Decimal(str(item.amount)) for item in notification.items),
+            Decimal("0"),
+        )
+        lines = [
+            "**策略：** `{}`　　**模式：** `{}`".format(
+                notification.strategy_id, notification.mode
+            ),
+            "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
+        ]
+        for item in notification.items:
+            detail = "- `{}`　**{}股**　¥{}".format(
+                item.security,
+                item.quantity,
+                _display(item.amount, 2),
+            )
+            if item.reference_price is not None:
+                detail += "　参考价 ¥{}".format(
+                    _display(item.reference_price, 4)
+                )
+            lines.append(detail)
+        lines.extend(
+            [
+                "**计划买入总金额：** ¥{}".format(_display(total_amount, 2)),
+                "**说明：** 策略目标计划，不代表已提交委托或已经成交。",
+            ]
+        )
+        payload: Dict[str, Any] = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": "orange",
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "策略目标买入计划 · {}".format(
+                            notification.mode
+                        ),
+                    },
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": "\n".join(lines),
+                        },
+                    }
+                ],
+            },
+        }
+        if self.secret:
+            timestamp = int(time.time())
+            payload["timestamp"] = str(timestamp)
+            payload["sign"] = _signature(timestamp, self.secret)
+        return payload
+
+    def send(
+        self,
+        notification: Union[TradeNotification, TargetBuyPlanNotification],
+    ) -> bool:
         try:
             response = requests.post(
                 self.webhook_url,
@@ -214,11 +301,14 @@ class FeishuNotifier:
         )
 
     def _build_payload(
-        self, content: Union[str, TradeNotification], msg_type: str = "interactive"
+        self,
+        content: Union[str, TradeNotification, TargetBuyPlanNotification],
+        msg_type: str = "interactive",
     ) -> Dict[str, Any]:
         del msg_type
         notification = (
-            content if isinstance(content, TradeNotification)
+            content
+            if isinstance(content, (TradeNotification, TargetBuyPlanNotification))
             else self._text_notification(content)
         )
         return self._builder().build_payload(notification)
@@ -238,7 +328,10 @@ class FeishuNotifier:
         except Exception:
             return False
 
-    def send_trade(self, notification: TradeNotification) -> bool:
+    def send_trade(
+        self,
+        notification: Union[TradeNotification, TargetBuyPlanNotification],
+    ) -> bool:
         return bool(self._sender and self._sender.send(notification))
 
     def send_text(
@@ -256,7 +349,10 @@ class FeishuNotifier:
         notification = self._text_notification(content, title=title)
         return self._send_request(self._build_payload(notification))
 
-    def queue_message(self, content: Union[str, TradeNotification]) -> None:
+    def queue_message(
+        self,
+        content: Union[str, TradeNotification, TargetBuyPlanNotification],
+    ) -> None:
         self._message_queue.put(content)
 
     def _split_message(self, content: str) -> list:
@@ -276,7 +372,7 @@ class FeishuNotifier:
                 and self._sent_this_minute < self.MAX_MSG_PER_MINUTE
             ):
                 item = self._message_queue.get()
-                if isinstance(item, TradeNotification):
+                if isinstance(item, (TradeNotification, TargetBuyPlanNotification)):
                     self.send_trade(item)
                     self._sent_this_minute += 1
                     continue
