@@ -19,11 +19,12 @@
 
 `good_etf.py`已经不再保存host、token、Webhook或账户配置，也不再调用旧定制helper的同步追单/通知接口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
 
-当前三种模式的边界是：
+当前四种模式的边界是：
 
 - `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时经版本化入口校验marker/API版本与回测run_type；helper缺失（仅目标模块本身的`ModuleNotFoundError`）时只允许纯聚宽回测本地兜底，helper内部导入失败直接中止；
-- `SHADOW`：需要版本匹配的helper和私有profile，记录计划并通过服务器发送目标买入卡片；helper把`order`等七个聚宽交易函数替换为抛错guard，所有交易变更均被阻断；
-- `LIVE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。服务端交易总开关默认仍为关闭。
+- `JQ_PAPER`：只允许聚宽模拟交易，正常调用聚宽原生下单、撤单和模拟撮合，不需要helper、私有profile或QMT；
+- `SIGNAL_ONLY`：需要版本匹配的helper和私有profile，记录计划并通过服务器发送目标买入卡片；helper把`order`等七个聚宽交易函数替换为抛错guard；
+- `QMT_REMOTE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。服务端交易总开关默认仍为关闭。
 
 因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。聚宽真实组合视图属L03；真实聚宽、QMT模拟和用户批准的小额实盘门禁在L04按人工验收执行。
 
@@ -36,8 +37,7 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
 2. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
-3. 在仓库源码中先确定并审查顶部的`PROFILE`、`SIM_EXECUTION_MODE`、`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`部署声明；回测自动使用NATIVE，不能在
-   上传后手工改成SHADOW/REMOTE。
+3. 在仓库源码中先确定并审查顶部的`PROFILE`、`SIM_EXECUTION_MODE`、`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`部署声明；回测自动使用`BACKTEST`，模拟交易按需选择`JQ_PAPER`、`SIGNAL_ONLY`或`QMT_REMOTE`，不能在上传后手工修改。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
    profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。

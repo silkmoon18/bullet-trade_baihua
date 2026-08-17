@@ -1,12 +1,14 @@
 """Type contract for the standalone JoinQuant strategy runtime helper."""
 
-from typing import Any, Dict, Optional, Tuple, TypedDict
+from typing import Any, Dict, Literal, Optional, Tuple, TypedDict
 
 from joinquant_typing import Context
 
 STRATEGY_RUNTIME_API_VERSION: int
 STRATEGY_RUNTIME_HELPER_MARKER: str
 PROFILE_SCHEMA_VERSION: int
+
+RuntimeMode = Literal["BACKTEST", "JQ_PAPER", "SIGNAL_ONLY", "QMT_REMOTE"]
 
 
 class PositionView:
@@ -48,7 +50,7 @@ class _StrategyRuntimeRequiredState(TypedDict):
     api_version: int
     profile_schema_version: int
     profile: str
-    mode: str
+    mode: RuntimeMode
     run_type: str
     strategy_id: str
     enabled: bool
@@ -73,7 +75,7 @@ def install_strategy_runtime(
     *,
     context: Context,
     profile: str,
-    mode: str,
+    mode: RuntimeMode,
     strategy_id: str,
     expected_api_version: int = ...,
     profile_module: str = ...,

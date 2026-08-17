@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # flake8: noqa: F403,F405
-"""BulletTrade 聚宽 SHADOW（只读影子）模式最小示例。
+"""BulletTrade 聚宽 SIGNAL_ONLY（只生成信号）模式最小示例。
 
 上传步骤：
 1. 将 helpers/bullet_trade_jq_remote_helper.py 上传到聚宽研究根目录。
@@ -9,7 +9,7 @@
    （如 <服务器地址>、<访问令牌>）管理，真实凭据只存在于聚宽私有文件中。
 3. 将本文件内容复制到聚宽策略，以“模拟交易”方式运行。
 
-SHADOW 语义：helper 校验 profile 后，把 order/order_value/order_percent/
+SIGNAL_ONLY 语义：helper 校验 profile 后，把 order/order_value/order_percent/
 order_target/order_target_value/order_target_percent/cancel_order 替换为
 失败关闭的 guard；策略侧只记录日志，不会产生任何真实委托。
 """
@@ -20,7 +20,7 @@ import bullet_trade_jq_remote_helper as bt
 
 # ===== 部署契约 =====
 PROFILE = 'demo-prod'         # 对应 jq_runtime_config.PROFILES 中的键
-MODE = 'SHADOW'               # 只读影子模式：校验链路但禁止下单
+MODE = 'SIGNAL_ONLY'          # 只生成计划和通知：校验链路但禁止下单
 STRATEGY_ID = 'demo_shadow'   # 必须等于 profile 中的 strategy_id
 
 
@@ -54,7 +54,7 @@ def process_initialize(context):
 
 
 def record_portfolio_snapshot(context):
-    """只记录日志的定时任务；SHADOW 下任何下单调用都会被 guard 阻断。"""
+    """只记录日志的定时任务；SIGNAL_ONLY下任何下单调用都会被guard阻断。"""
     portfolio = context.portfolio
     log.info('组合快照 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}'.format(
         portfolio.available_cash, portfolio.total_value, portfolio.positions_value))

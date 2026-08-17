@@ -44,7 +44,7 @@ def _profile_module(monkeypatch, *, version=1, profiles=None):
     monkeypatch.setitem(sys.modules, PROFILE_MODULE, module)
 
 
-def _install(helper, namespace=None, context=None, *, mode="SHADOW", **kwargs):
+def _install(helper, namespace=None, context=None, *, mode="SIGNAL_ONLY", **kwargs):
     kwargs.setdefault("profile", PROFILE)
     kwargs.setdefault("strategy_id", STRATEGY_ID)
     kwargs.setdefault("profile_module", PROFILE_MODULE)
@@ -56,14 +56,14 @@ def _install(helper, namespace=None, context=None, *, mode="SHADOW", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 4,
+        "api_version": 5,
         "profile_schema_version": 1,
         "profile": PROFILE,
         "mode": mode,
         "run_type": run_type,
         "strategy_id": STRATEGY_ID,
-        "enabled": mode in ("SHADOW", "LIVE"),
-        "orders_enabled": mode in ("BACKTEST", "LIVE"),
+        "enabled": mode in ("SIGNAL_ONLY", "QMT_REMOTE"),
+        "orders_enabled": mode in ("BACKTEST", "JQ_PAPER", "QMT_REMOTE"),
         "production_ready": False,
         "reason": "backtest",
     }
@@ -86,9 +86,9 @@ def test_public_contract_exports_and_constants(helper):
         "notify_target_buy_plan",
         "submit_targets",
     ]
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 4
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 5
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v4"
+        "bullet-trade-joinquant-runtime-helper-v5"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 1
 
@@ -123,33 +123,56 @@ def test_backtest_rejects_sim_trade_run_type(helper):
         _install(helper, mode="BACKTEST")
 
 
-@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+def test_jq_paper_keeps_native_orders_and_does_not_load_profile(helper):
+    original_order = lambda *args: "native"  # noqa: E731
+    namespace = {"order": original_order}
+
+    state = _install(
+        helper,
+        namespace,
+        mode="JQ_PAPER",
+        profile_module="module_that_must_not_be_imported",
+    )
+
+    assert state == _state("JQ_PAPER", "sim_trade", reason="jq_paper")
+    assert namespace["order"] is original_order
+    assert namespace["order"]("510300.XSHG", 100) == "native"
+    assert namespace["__bt_strategy_runtime_state__"]["mode"] == "JQ_PAPER"
+    assert helper._active_profile is None
+
+
+def test_jq_paper_rejects_backtest_run_type(helper):
+    with pytest.raises(RuntimeError, match="JQ_PAPER仅允许聚宽模拟交易"):
+        _install(helper, context=_context("full_backtest"), mode="JQ_PAPER")
+
+
+@pytest.mark.parametrize("mode", ["SIGNAL_ONLY", "QMT_REMOTE"])
 def test_remote_modes_reject_backtest_run_type(helper, monkeypatch, mode):
     _profile_module(monkeypatch)
     with pytest.raises(RuntimeError, match="仅允许聚宽模拟交易"):
         _install(helper, context=_context("full_backtest"), mode=mode)
 
 
-def test_shadow_state_exact(helper, monkeypatch):
+def test_signal_only_state_exact(helper, monkeypatch):
     _profile_module(monkeypatch)
     assert _install(helper) == _state(
-        "SHADOW", "sim_trade",
-        reason="shadow_read_only",
+        "SIGNAL_ONLY", "sim_trade",
+        reason="signal_only",
         profile_module=PROFILE_MODULE,
         blocked_mutations=BLOCKED_MUTATIONS)
 
 
-def test_live_state_exact(helper, monkeypatch):
+def test_qmt_remote_state_exact(helper, monkeypatch):
     _profile_module(monkeypatch)
-    assert _install(helper, mode="LIVE") == _state(
-        "LIVE", "sim_trade",
-        reason="profile_validated",
+    assert _install(helper, mode="QMT_REMOTE") == _state(
+        "QMT_REMOTE", "sim_trade",
+        reason="qmt_remote_profile_validated",
         profile_module=PROFILE_MODULE,
         mirror_jq_orders=False,
         blocked_mutations=BLOCKED_MUTATIONS)
 
 
-@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+@pytest.mark.parametrize("mode", ["SIGNAL_ONLY", "QMT_REMOTE"])
 def test_remote_modes_replace_seven_mutations_with_guards(helper, monkeypatch, mode):
     _profile_module(monkeypatch)
     sentinel = object()
@@ -173,8 +196,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 5, "4", True, None])
-def test_expected_api_version_must_equal_four(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 6, "5", True, None])
+def test_expected_api_version_must_equal_five(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -199,7 +222,7 @@ def test_backtest_remote_validation_loads_profile_without_installing_guards(
     assert helper._active_profile["host"] == "127.0.0.1"
 
 
-@pytest.mark.parametrize("mode", ["SHADOW", "LIVE"])
+@pytest.mark.parametrize("mode", ["JQ_PAPER", "SIGNAL_ONLY", "QMT_REMOTE"])
 def test_validate_remote_is_rejected_outside_backtest(helper, mode):
     with pytest.raises(RuntimeError, match="仅用于BACKTEST"):
         _install(helper, mode=mode, validate_remote=True)
@@ -207,7 +230,7 @@ def test_validate_remote_is_rejected_outside_backtest(helper, mode):
 
 def test_mode_is_normalised(helper, monkeypatch):
     _profile_module(monkeypatch)
-    assert _install(helper, mode=" shadow ")["mode"] == "SHADOW"
+    assert _install(helper, mode=" signal_only ")["mode"] == "SIGNAL_ONLY"
 
 
 @pytest.mark.parametrize("mode", ["paper", "", None, 1])
@@ -338,7 +361,7 @@ def test_profile_numeric_fields_reject_out_of_range(helper, monkeypatch, field, 
 )
 def test_profile_numeric_fields_accept_boundaries(helper, monkeypatch, field, value):
     _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(**{field: value})})
-    assert _install(helper)["mode"] == "SHADOW"
+    assert _install(helper)["mode"] == "SIGNAL_ONLY"
 
 
 @pytest.mark.parametrize("field", _OPTIONAL_STRING_FIELDS)
@@ -347,7 +370,7 @@ def test_profile_optional_strings_accept_none_and_strings(
     helper, monkeypatch, field, value
 ):
     _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(**{field: value})})
-    assert _install(helper)["mode"] == "SHADOW"
+    assert _install(helper)["mode"] == "SIGNAL_ONLY"
 
 
 @pytest.mark.parametrize("field", _OPTIONAL_STRING_FIELDS)
@@ -364,7 +387,7 @@ def test_profile_optional_strings_reject_invalid(helper, monkeypatch, field, val
 )
 def test_profile_port_accepts_boundaries(helper, monkeypatch, field, value):
     _profile_module(monkeypatch, profiles={PROFILE: _valid_profile(**{field: value})})
-    assert _install(helper)["mode"] == "SHADOW"
+    assert _install(helper)["mode"] == "SIGNAL_ONLY"
 
 
 def test_profile_entry_must_be_plain_dict(helper, monkeypatch):
@@ -406,7 +429,7 @@ def test_signature_drift_rejected(helper, monkeypatch):
 
 def test_previous_generation_record_rejected(helper, monkeypatch):
     _profile_module(monkeypatch)
-    namespace = {"__bt_strategy_runtime_state__": {"token": object(), "mode": "SHADOW"}}
+    namespace = {"__bt_strategy_runtime_state__": {"token": object(), "mode": "SIGNAL_ONLY"}}
     with pytest.raises(RuntimeError, match="上一代helper"):
         _install(helper, namespace)
 
@@ -430,7 +453,7 @@ def test_idempotent_reinstall_restores_guards(helper, monkeypatch):
     second = _install(helper, namespace)
 
     assert second == first
-    with pytest.raises(RuntimeError, match="SHADOW模式禁止交易变更"):
+    with pytest.raises(RuntimeError, match="SIGNAL_ONLY模式禁止交易变更"):
         namespace["order"]("510001.XSHG", 100)
 
 
@@ -482,7 +505,7 @@ def test_submit_targets_does_not_retry_after_request_may_be_sent(
     helper, monkeypatch
 ):
     _profile_module(monkeypatch)
-    _install(helper, mode="LIVE")
+    _install(helper, mode="QMT_REMOTE")
     attempts = []
     reads = []
 
@@ -508,11 +531,11 @@ def test_submit_targets_does_not_retry_after_request_may_be_sent(
     assert len(attempts) == 1
 
 
-def test_notify_target_buy_plan_uses_shadow_mode_and_no_retry_after_send(
+def test_notify_target_buy_plan_uses_signal_only_mode_and_no_retry_after_send(
     helper, monkeypatch
 ):
     _profile_module(monkeypatch)
-    _install(helper, mode="SHADOW")
+    _install(helper, mode="SIGNAL_ONLY")
     sent = []
     reads = []
 
@@ -543,7 +566,7 @@ def test_notify_target_buy_plan_uses_shadow_mode_and_no_retry_after_send(
     requests = [item for item in sent if item.get("type") == "request"]
     assert len(requests) == 1
     assert requests[0]["action"] == "strategy.notify_target_buy_plan"
-    assert requests[0]["payload"]["mode"] == "SHADOW"
+    assert requests[0]["payload"]["mode"] == "SIGNAL_ONLY"
 
 
 def test_server_error_is_not_retried_or_echoes_request_payload(helper, monkeypatch):

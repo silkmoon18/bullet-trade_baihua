@@ -41,7 +41,7 @@ def inspect_strategy_contract(context: Context) -> None:
         {},
         context=context,
         profile="good_etf-prod",
-        mode="SHADOW",
+        mode="SIGNAL_ONLY",
         strategy_id="good_etf",
     )
     runtime_api: int = runtime_state["api_version"]

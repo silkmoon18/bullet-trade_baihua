@@ -296,8 +296,13 @@ class SQLiteStrategyAPI:
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
         mode = str(payload.get("mode") or "").strip().upper()
-        if mode not in ("SHADOW", "REMOTE"):
-            raise ValueError("mode must be SHADOW or REMOTE")
+        mode = {
+            "SHADOW": "SIGNAL_ONLY",
+            "REMOTE": "QMT_REMOTE",
+            "LIVE": "QMT_REMOTE",
+        }.get(mode, mode)
+        if mode not in ("SIGNAL_ONLY", "QMT_REMOTE"):
+            raise ValueError("mode must be SIGNAL_ONLY or QMT_REMOTE")
         raw_items = payload.get("items")
         if not isinstance(raw_items, (list, tuple)) or not raw_items:
             raise ValueError("items must be a non-empty list")

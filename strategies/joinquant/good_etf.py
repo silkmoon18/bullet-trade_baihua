@@ -9,7 +9,7 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# REMOTE通过StrategyLedger提交组合目标并展示真实账户视图；回测保持聚宽原生。
+# QMT_REMOTE通过StrategyLedger提交组合目标并展示真实账户视图；回测保持聚宽原生。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
@@ -34,20 +34,21 @@ except ModuleNotFoundError as exc:
 
 # ===== 部署契约 =====
 class ExecutionMode(str, Enum):
-    """策略执行方式；历史回测固定为NATIVE。"""
+    """策略执行方式；历史回测固定为BACKTEST。"""
 
-    NATIVE = 'NATIVE'
-    SHADOW = 'SHADOW'
-    REMOTE = 'REMOTE'
+    BACKTEST = 'BACKTEST'
+    JQ_PAPER = 'JQ_PAPER'
+    SIGNAL_ONLY = 'SIGNAL_ONLY'
+    QMT_REMOTE = 'QMT_REMOTE'
 
 
 PROFILE = 'good_etf-prod'
-SIM_EXECUTION_MODE = ExecutionMode.SHADOW
+SIM_EXECUTION_MODE = ExecutionMode.SIGNAL_ONLY
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 4
+_EXPECTED_RUNTIME_API_VERSION = 5
 _EXPECTED_PROFILE_SCHEMA_VERSION = 1
-_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v4'
+_EXPECTED_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v5'
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -79,26 +80,21 @@ _backtest_remote_validated = False
 def _execution_mode(context: 'Context') -> ExecutionMode:
     run_type = _run_type(context)
     if run_type in ('simple_backtest', 'full_backtest'):
-        return ExecutionMode.NATIVE
+        return ExecutionMode.BACKTEST
     if run_type == 'sim_trade':
         if (
             type(SIM_EXECUTION_MODE) is not ExecutionMode
-            or SIM_EXECUTION_MODE is ExecutionMode.NATIVE
+            or SIM_EXECUTION_MODE is ExecutionMode.BACKTEST
         ):
             raise RuntimeError(
-                'SIM_EXECUTION_MODE必须是ExecutionMode.SHADOW或REMOTE')
+                'SIM_EXECUTION_MODE必须是ExecutionMode.JQ_PAPER、'
+                'SIGNAL_ONLY或QMT_REMOTE')
         return SIM_EXECUTION_MODE
     raise RuntimeError('不支持的聚宽run_type: {}'.format(run_type or '<empty>'))
 
 
 def _protocol_mode(mode: ExecutionMode) -> str:
-    if mode is ExecutionMode.NATIVE:
-        return 'BACKTEST'
-    if mode is ExecutionMode.SHADOW:
-        return 'SHADOW'
-    if mode is ExecutionMode.REMOTE:
-        return 'LIVE'
-    raise RuntimeError('无效的策略执行模式')
+    return mode.value
 
 
 def _validate_backtest_remote(context: 'Context') -> None:
@@ -140,7 +136,7 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
     """安装运行模式；此异常不得被策略业务层吞掉。"""
     execution_mode = _execution_mode(context)
     mode = _protocol_mode(execution_mode)
-    if execution_mode is ExecutionMode.NATIVE:
+    if execution_mode is ExecutionMode.BACKTEST:
         if type(VALIDATE_REMOTE_DURING_BACKTEST) is not bool:
             raise RuntimeError('VALIDATE_REMOTE_DURING_BACKTEST必须是bool')
         validate_remote = VALIDATE_REMOTE_DURING_BACKTEST
@@ -158,9 +154,9 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         raise RuntimeError('good_etf profile schema版本无效')
 
     global _active_mode
-    # 关闭远程预检时，回测允许没有helper并直接使用聚宽原生执行。
+    # 回测关闭远程预检，或JQ_PAPER运行时，允许没有helper。
     if bt is None:
-        if mode != 'BACKTEST' or validate_remote:
+        if mode not in ('BACKTEST', 'JQ_PAPER') or validate_remote:
             raise RuntimeError(
                 '当前模式需要bullet_trade_jq_remote_helper.py，请先上传到聚宽研究根目录')
         run_type = _run_type(context)
@@ -174,7 +170,7 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
             'enabled': False,
             'orders_enabled': True,
             'production_ready': False,
-            'reason': 'backtest',
+            'reason': 'backtest' if mode == 'BACKTEST' else 'jq_paper',
         }
         _active_mode = execution_mode
         g.bt_runtime = state
@@ -252,7 +248,10 @@ def _target_buy_plan_item(
 def _send_target_buy_plan(
     context: 'Context', items: List[Dict[str, object]]
 ) -> None:
-    if not items or _runtime_mode() is ExecutionMode.NATIVE:
+    if not items or _runtime_mode() in (
+        ExecutionMode.BACKTEST,
+        ExecutionMode.JQ_PAPER,
+    ):
         return
     if bt is None:
         log.warn('策略目标买入计划通知跳过：缺少聚宽helper')
@@ -266,7 +265,7 @@ def _send_target_buy_plan(
         else:
             log.warn('策略目标买入计划卡片未启用或发送队列未接受')
     except Exception as exc:
-        # 通知失败不能影响SHADOW计划计算或REMOTE目标提交。
+        # 通知失败不能影响SIGNAL_ONLY计划计算或QMT_REMOTE目标提交。
         log.warn('策略目标买入计划通知失败：{}'.format(type(exc).__name__))
 
 
@@ -282,10 +281,10 @@ def _record_real_portfolio(portfolio: Any) -> None:
 
 
 def _portfolio(context: 'Context') -> Any:
-    if _runtime_mode() is not ExecutionMode.REMOTE:
+    if _runtime_mode() is not ExecutionMode.QMT_REMOTE:
         return context.portfolio
     if bt is None:
-        raise RuntimeError('REMOTE缺少聚宽helper')
+        raise RuntimeError('QMT_REMOTE缺少聚宽helper')
     portfolio = bt.get_portfolio(as_of=context.current_dt)
     if not portfolio.performance_ready:
         raise RuntimeError('真实组合发生过运行中增减资，简单NAV指标不可用')
@@ -296,7 +295,7 @@ def _portfolio(context: 'Context') -> Any:
 
 def _ensure_remote_ready(context: 'Context') -> None:
     if bt is None:
-        raise RuntimeError('REMOTE缺少聚宽helper')
+        raise RuntimeError('QMT_REMOTE缺少聚宽helper')
     ensured = bt.ensure_account(INITIAL_CAPITAL)
     reconciliation = ensured.get('reconciliation', {})
     if reconciliation.get('state') != 'READY':
@@ -314,7 +313,7 @@ def _submit_remote_targets(
     key: str,
 ) -> Dict[str, Any]:
     if bt is None:
-        raise RuntimeError('REMOTE缺少聚宽helper')
+        raise RuntimeError('QMT_REMOTE缺少聚宽helper')
     existing = bt.get_intent(idempotency_key=key)
     if existing:
         weights = cast(Dict[str, float], existing.get('weights', weights))
@@ -330,7 +329,7 @@ def _submit_remote_targets(
 
 
 def _restore_remote_intent() -> None:
-    if _runtime_mode() is not ExecutionMode.REMOTE or bt is None:
+    if _runtime_mode() is not ExecutionMode.QMT_REMOTE or bt is None:
         return
     intent = bt.get_intent()
     if not intent:
@@ -347,12 +346,12 @@ def _restore_remote_intent() -> None:
 def _advance_remote_intent(context: 'Context') -> bool:
     """推进未完成的卖后买意图；未完成时本轮不创建新意图。"""
     if (
-        _runtime_mode() is not ExecutionMode.REMOTE
+        _runtime_mode() is not ExecutionMode.QMT_REMOTE
         or not getattr(g, 'bt_intent_id', None)
     ):
         return True
     if bt is None:
-        raise RuntimeError('REMOTE缺少聚宽helper')
+        raise RuntimeError('QMT_REMOTE缺少聚宽helper')
     intent = bt.get_intent(g.bt_intent_id)
     if intent.get('state') in ('COMPLETED', 'CANCELED', 'FAILED'):
         g.bt_intent_id = None
@@ -373,9 +372,11 @@ def _advance_remote_intent(context: 'Context') -> bool:
 
 
 def _cancel_open_orders_for_runtime() -> int:
-    if _runtime_mode() in (ExecutionMode.SHADOW, ExecutionMode.REMOTE):
-        log.info('{}计划 | 订单生命周期由StrategyLedger管理，跳过聚宽撤单'.format(
-            _runtime_mode().value))
+    if _runtime_mode() is ExecutionMode.SIGNAL_ONLY:
+        log.info('SIGNAL_ONLY不创建订单，跳过聚宽撤单')
+        return 0
+    if _runtime_mode() is ExecutionMode.QMT_REMOTE:
+        log.info('QMT_REMOTE订单生命周期由StrategyLedger管理，跳过聚宽撤单')
         return 0
     open_orders = get_open_orders() or {}
     cancelled = 0
@@ -389,8 +390,9 @@ def _submit_target_amount(
     security: str,
     target_amount: int,
 ) -> Optional[object]:
-    if _runtime_mode() is ExecutionMode.SHADOW:
-        log.info('SHADOW目标数量 | {} -> {}'.format(security, target_amount))
+    if _runtime_mode() is ExecutionMode.SIGNAL_ONLY:
+        log.info('SIGNAL_ONLY目标数量已记录 | {} -> {}'.format(
+            security, target_amount))
         return None
     return order_target(security, target_amount)
 
@@ -401,8 +403,9 @@ def _submit_target_value(
     last_price: Optional[float] = None,
     current_value: float = 0.0,
 ) -> Optional[object]:
-    if _runtime_mode() is ExecutionMode.SHADOW:
-        log.info('SHADOW目标市值 | {} -> {:.2f}'.format(security, target_value))
+    if _runtime_mode() is ExecutionMode.SIGNAL_ONLY:
+        log.info('SIGNAL_ONLY目标市值已记录 | {} -> {:.2f}'.format(
+            security, target_value))
         return None
     style = None
     is_increase = target_value > current_value
@@ -434,10 +437,10 @@ def initialize(context: 'Context') -> None:
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
     g.bt_intent_id = None
-    if _runtime_mode() is ExecutionMode.REMOTE:
+    if _runtime_mode() is ExecutionMode.QMT_REMOTE:
         _ensure_remote_ready(context)
 
-    log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
+    log.info(f'策略初始化完成 | 模式={_runtime_mode().value} 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
 
     # 每日运行函数调度
@@ -452,7 +455,13 @@ def initialize(context: 'Context') -> None:
     run_daily(handle_risk_management, time='14:50', reference_security='000300.XSHG')
     # 14:55 尾盘快照（S01仅记录聚宽组合；真实对账由后续StrategyLedger切片实现）
     run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
-    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | 风控: 10:30/13:30/14:50 | 14:55 尾盘快照')
+    open_action = (
+        '开盘计划计算'
+        if _runtime_mode() is ExecutionMode.SIGNAL_ONLY
+        else '开盘下单'
+    )
+    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 {} | '
+             '风控: 10:30/13:30/14:50 | 14:55 尾盘快照'.format(open_action))
 
 
 def process_initialize(context: 'Context') -> None:
@@ -460,7 +469,7 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
-    if _runtime_mode() is ExecutionMode.REMOTE:
+    if _runtime_mode() is ExecutionMode.QMT_REMOTE:
         _ensure_remote_ready(context)
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
@@ -541,8 +550,12 @@ def before_market_open(context: 'Context') -> None:
 
 
 def market_open(context: 'Context') -> None:
-    """开盘执行：选股+按折价率权重下单"""
-    log.info('===== 开盘选股下单开始 =====')
+    """开盘执行：选股并按当前执行模式处理目标权重。"""
+    signal_only = _runtime_mode() is ExecutionMode.SIGNAL_ONLY
+    if signal_only:
+        log.info('===== 开盘选股计划计算开始 =====')
+    else:
+        log.info('===== 开盘选股下单开始 =====')
     try:
         if not _advance_remote_intent(context):
             return
@@ -552,7 +565,7 @@ def market_open(context: 'Context') -> None:
             before_market_open(context)
         # 若预处理失败，直接返回
         if g.fund_list is None or g.fund_list.empty:
-            log.warn("无符合条件的ETF标的，跳过下单")
+            log.warn("无符合条件的ETF标的，跳过本轮执行")
             return
 
         df = g.fund_list.copy()
@@ -630,7 +643,7 @@ def market_open(context: 'Context') -> None:
             )
             if item is not None:
                 buy_plan_items.append(item)
-        if _runtime_mode() is ExecutionMode.REMOTE:
+        if _runtime_mode() is ExecutionMode.QMT_REMOTE:
             target_weights = {
                 code: float(weight / total_weight * DEPLOY_RATIO)
                 for code, weight in zip(order_fund_codes, raw_weights)
@@ -661,8 +674,9 @@ def market_open(context: 'Context') -> None:
                 pos = portfolio.positions[hold_code]
                 log.info(f'调仓卖出 | {hold_code} 数量={pos.total_amount} 成本={pos.avg_cost:.4f}')
                 order_result = _submit_target_amount(hold_code, 0)
-                log.info('清仓目标已提交 | {} order_id={}'.format(
-                    hold_code, getattr(order_result, 'order_id', None)))
+                if not signal_only:
+                    log.info('清仓目标已提交 | {} order_id={}'.format(
+                        hold_code, getattr(order_result, 'order_id', None)))
 
         # 第二步：按折价率绝对值权重分配“组合目标市值”。
         # 目标金额必须基于组合总资产，而不是可用现金；否则已有持仓会被重复缩小，
@@ -673,7 +687,7 @@ def market_open(context: 'Context') -> None:
             log.info(f'组合总资产={total_value:.2f} 目标部署={investable_value:.2f} '
                      f'现金缓冲={total_value - investable_value:.2f}')
 
-            # 按权重提交目标市值；实际成交与资金入账由后续StrategyLedger切片接管。
+            # 按权重处理目标市值；成交归属聚宽撮合或StrategyLedger。
             for code, weight in zip(order_fund_codes, raw_weights):
                 normalized_weight = weight / total_weight
                 target_value = target_values[code]
@@ -692,19 +706,27 @@ def market_open(context: 'Context') -> None:
                          f'当前市值={current_value:.2f} 目标市值={target_value:.2f}')
                 order_result = _submit_target_value(
                     code, target_value, selected_funds.loc[code, 'last_price'], current_value)
-                log.info('目标市值已提交 | {} order_id={}'.format(
-                    code, getattr(order_result, 'order_id', None)))
-            log.info('===== 开盘选股下单完成 =====')
+                if not signal_only:
+                    log.info('目标市值已提交 | {} order_id={}'.format(
+                        code, getattr(order_result, 'order_id', None)))
+            if signal_only:
+                log.info('===== 开盘选股计划计算完成 =====')
+            else:
+                log.info('===== 开盘选股下单完成 =====')
         else:
-            log.warn('无折价ETF可选，已执行全部卖出，今日不再买入')
-            _notify('无折价ETF可选，已提交全部卖出目标，今日不再买入')
+            if signal_only:
+                message = '无折价ETF可选，已记录全部卖出目标，今日不再买入'
+            else:
+                message = '无折价ETF可选，已提交全部卖出目标，今日不再买入'
+            log.warn(message)
+            _notify(message)
 
     except Exception as e:
-        log.error(f"开盘下单异常：{e}")
+        log.error(f"开盘执行异常：{e}")
 
 
 def handle_risk_management(context: 'Context') -> None:
-    """止盈止损；REMOTE一次提交完整组合目标，避免同轮多个intent。"""
+    """止盈止损；QMT_REMOTE一次提交完整组合目标，避免同轮多个intent。"""
     try:
         if not _advance_remote_intent(context):
             return
@@ -730,7 +752,7 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                if _runtime_mode() is ExecutionMode.REMOTE:
+                if _runtime_mode() is ExecutionMode.QMT_REMOTE:
                     exits.append(hold_code)
                 else:
                     order_result = _submit_target_amount(hold_code, 0)
@@ -743,14 +765,14 @@ def handle_risk_management(context: 'Context') -> None:
                        f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
                 log.info(msg)
                 _notify(msg)
-                if _runtime_mode() is ExecutionMode.REMOTE:
+                if _runtime_mode() is ExecutionMode.QMT_REMOTE:
                     exits.append(hold_code)
                 else:
                     order_result = _submit_target_amount(hold_code, 0)
                     log.info('止盈清仓目标已提交 | {} order_id={}'.format(
                         hold_code, getattr(order_result, 'order_id', None)))
 
-        if exits and _runtime_mode() is ExecutionMode.REMOTE:
+        if exits and _runtime_mode() is ExecutionMode.QMT_REMOTE:
             total = portfolio.total_value or 1.0
             target_weights = {
                 code: (0.0 if code in exits else position.value / total)
@@ -770,7 +792,7 @@ def handle_risk_management(context: 'Context') -> None:
 
 
 def after_market_check(context: 'Context') -> None:
-    """记录NATIVE原生组合或REMOTE真实StrategyLedger组合。"""
+    """记录聚宽组合或QMT_REMOTE真实StrategyLedger组合。"""
     portfolio = _portfolio(context)
     positions = portfolio.positions
     log.info('===== 尾盘组合快照 =====')
@@ -786,6 +808,6 @@ def after_market_check(context: 'Context') -> None:
             getattr(position, 'closeable_amount', 0),
             position.avg_cost,
             position.price))
-    if _runtime_mode() is ExecutionMode.REMOTE:
+    if _runtime_mode() is ExecutionMode.QMT_REMOTE:
         log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
             portfolio.nav, portfolio.returns, portfolio.fees))

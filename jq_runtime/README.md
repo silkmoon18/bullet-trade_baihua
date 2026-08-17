@@ -35,22 +35,23 @@
 
 | 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
-| `simple_backtest`、`full_backtest` | `ExecutionMode.NATIVE` | 固定使用聚宽原生回测；`VALIDATE_REMOTE_DURING_BACKTEST=True`时额外校验helper/profile并读取一次StrategyLedger真实快照 | 远程快照只写日志，不参与历史决策；绝不提交远程组合目标 |
-| `sim_trade` + `ExecutionMode.SHADOW` | `SHADOW` | 安装时只校验profile；产生新增买入目标时连接服务器发送计划卡片 | 实时计算并记录计划；聚宽下单、撤单入口由guard阻断，通知接口不下单、不写账本 |
-| `sim_trade` + `ExecutionMode.REMOTE` | helper协议`LIVE` | 校验profile并在调用时建立短连接 | 读取StrategyLedger组合并提交远程目标；是否下QMT订单仍取决于服务器交易开关 |
+| `simple_backtest`、`full_backtest` | `ExecutionMode.BACKTEST` | 默认不需要helper/profile；远程预检开启时需要 | 聚宽历史撮合；远程快照只写日志，不参与历史决策，也不提交远程目标 |
+| `sim_trade` + `ExecutionMode.JQ_PAPER` | `JQ_PAPER` | 不需要helper/profile | 正常调用聚宽原生下单、撤单和模拟撮合；不连接QMT |
+| `sim_trade` + `ExecutionMode.SIGNAL_ONLY` | `SIGNAL_ONLY` | 需要helper/profile | 计算并记录目标、发送计划卡片；聚宽交易函数由guard阻断 |
+| `sim_trade` + `ExecutionMode.QMT_REMOTE` | `QMT_REMOTE` | 需要helper/profile | 读取StrategyLedger组合并提交远程目标；是否下QMT订单取决于服务器交易开关 |
 
 用户只配置：
 
 ```python
-SIM_EXECUTION_MODE = ExecutionMode.SHADOW
+SIM_EXECUTION_MODE = ExecutionMode.SIGNAL_ONLY
 VALIDATE_REMOTE_DURING_BACKTEST = True
 ```
 
 `VALIDATE_REMOTE_DURING_BACKTEST`在模拟交易中完全无作用。设为`True`时，回测初始化会幂等执行`ensure_account`和`get_portfolio`，验证公网连接、认证、资金覆盖、账实对账及真实快照，但不会调用`submit_targets`，因此不能替代QMT下单/成交能力探针。设为`False`时允许不上传helper/profile做纯离线回测。
 
-只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失；且仅在回测并关闭远程预检时允许本地兜底。helper文件已上传但其内部导入失败会直接中止。helper导出稳定marker和API版本，策略用普通`getattr`校验二者。
+只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失；仅`BACKTEST`关闭远程预检或`JQ_PAPER`时允许无helper运行。helper文件已上传但其内部导入失败会直接中止。helper导出稳定marker和API版本，策略用普通`getattr`校验二者。
 
-策略内部使用`ExecutionMode`枚举；为兼容独立helper和网络协议，只在helper边界映射为普通字符串`BACKTEST/SHADOW/LIVE`。SHADOW和LIVE都会把namespace中的七个聚宽原生交易函数替换为抛错guard；LIVE订单只允许经StrategyLedger目标接口提交。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
+策略内部使用`ExecutionMode`枚举；只在独立helper和网络协议边界传递`BACKTEST/JQ_PAPER/SIGNAL_ONLY/QMT_REMOTE`字符串。`SIGNAL_ONLY`和`QMT_REMOTE`会把namespace中的七个聚宽原生交易函数替换为抛错guard；`JQ_PAPER`保持这些函数原样。`QMT_REMOTE`订单只允许经StrategyLedger目标接口提交。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 
