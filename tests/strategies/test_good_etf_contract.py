@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
-HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v5"
+HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v6"
 BLOCKED_MUTATIONS = tuple(sorted({
     "order", "order_value", "order_percent", "order_target",
     "order_target_value", "order_target_percent", "cancel_order",
@@ -62,7 +62,7 @@ def _load_strategy(monkeypatch, helper_module=None):
     return module
 
 
-def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=5):
+def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=6):
     module = types.ModuleType("bullet_trade_jq_remote_helper")
     if marker is not None:
         module.STRATEGY_RUNTIME_HELPER_MARKER = marker
@@ -73,30 +73,27 @@ def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=5):
     return module
 
 
-def _runtime_state(mode="SIGNAL_ONLY"):
+def _runtime_state(mode="JQ"):
     state = {
-        "api_version": 5,
+        "api_version": 6,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": mode,
         "run_type": "sim_trade" if mode != "BACKTEST" else "full_backtest",
         "strategy_id": "good_etf",
-        "enabled": mode in ("SIGNAL_ONLY", "QMT_REMOTE"),
-        "orders_enabled": mode in ("BACKTEST", "JQ_PAPER", "QMT_REMOTE"),
+        "enabled": mode in ("JQ", "QMT_REMOTE"),
+        "orders_enabled": mode in ("BACKTEST", "JQ", "QMT_REMOTE"),
         "production_ready": False,
         "reason": {
             "BACKTEST": "backtest",
-            "JQ_PAPER": "jq_paper",
-            "SIGNAL_ONLY": "signal_only",
+            "JQ": "jq",
             "QMT_REMOTE": "qmt_remote_profile_validated",
         }[mode],
     }
-    if mode in ("SIGNAL_ONLY", "QMT_REMOTE"):
-        state.update(
-            profile_module="jq_runtime_config",
-            blocked_mutations=BLOCKED_MUTATIONS,
-        )
+    if mode in ("JQ", "QMT_REMOTE"):
+        state["profile_module"] = "jq_runtime_config"
     if mode == "QMT_REMOTE":
+        state["blocked_mutations"] = BLOCKED_MUTATIONS
         state["mirror_jq_orders"] = False
     return state
 
@@ -136,7 +133,7 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     strategy.VALIDATE_REMOTE_DURING_BACKTEST = False
     state = strategy._install_runtime(_Context(run_type))
     assert state == {
-        "api_version": 5,
+        "api_version": 6,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": "BACKTEST",
@@ -151,24 +148,12 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     assert strategy._runtime_mode() is strategy.ExecutionMode.BACKTEST
 
 
-def test_jq_paper_fallback_without_helper(monkeypatch):
-    strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ_PAPER
-
-    state = strategy._install_runtime(_Context("sim_trade"))
-
-    assert state["mode"] == "JQ_PAPER"
-    assert state["orders_enabled"] is True
-    assert state["reason"] == "jq_paper"
-    assert strategy._runtime_mode() is strategy.ExecutionMode.JQ_PAPER
-
-
-@pytest.mark.parametrize("mode", ["SIGNAL_ONLY", "QMT_REMOTE"])
+@pytest.mark.parametrize("mode", ["JQ", "QMT_REMOTE"])
 def test_fallback_without_helper_rejects_remote_modes(monkeypatch, mode):
     strategy = _load_strategy(monkeypatch)
     strategy.SIM_EXECUTION_MODE = (
-        strategy.ExecutionMode.SIGNAL_ONLY
-        if mode == "SIGNAL_ONLY"
+        strategy.ExecutionMode.JQ
+        if mode == "JQ"
         else strategy.ExecutionMode.QMT_REMOTE
     )
     run_type = "sim_trade"
@@ -179,7 +164,7 @@ def test_fallback_without_helper_rejects_remote_modes(monkeypatch, mode):
 def test_fallback_backtest_rejects_sim_trade_run_type(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.BACKTEST
-    with pytest.raises(RuntimeError, match="ExecutionMode.JQ_PAPER"):
+    with pytest.raises(RuntimeError, match="ExecutionMode.JQ或QMT_REMOTE"):
         strategy._install_runtime(_Context("sim_trade"))
 
 
@@ -237,7 +222,7 @@ def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     assert install_calls == []
 
 
-@pytest.mark.parametrize("api_version", [0, 1, 2, 3, 4, 6])
+@pytest.mark.parametrize("api_version", [0, 1, 2, 3, 4, 5, 7])
 def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
     helper = _fake_helper(
         lambda *args, **kwargs: pytest.fail("版本不匹配不得进入安装"),
@@ -270,13 +255,13 @@ def test_remote_installs_strategy_ledger_runtime(monkeypatch):
     strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.QMT_REMOTE
     state = strategy._install_runtime(_Context("sim_trade"))
     assert state["mode"] == "QMT_REMOTE"
-    assert calls[0]["expected_api_version"] == 5
+    assert calls[0]["expected_api_version"] == 6
 
 
 def test_helper_non_dict_state_rejected(monkeypatch):
     helper = _fake_helper(lambda namespace, **kwargs: None)
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
@@ -291,25 +276,25 @@ def test_helper_non_dict_state_rejected(monkeypatch):
 )
 def test_helper_state_contract_mismatch_rejected(monkeypatch, tamper):
     def install(namespace, **kwargs):
-        state = _runtime_state("SIGNAL_ONLY")
+        state = _runtime_state("JQ")
         state.update(tamper)
         return state
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
 
-def test_signal_only_install_success_and_call_contract(monkeypatch):
+def test_jq_install_success_and_call_contract(monkeypatch):
     calls = []
 
     def install(namespace, **kwargs):
         calls.append((namespace, kwargs))
-        return _runtime_state("SIGNAL_ONLY")
+        return _runtime_state("JQ")
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     context = _Context("sim_trade")
     state = strategy._install_runtime(context)
 
@@ -319,15 +304,15 @@ def test_signal_only_install_success_and_call_contract(monkeypatch):
     assert kwargs == {
         "context": context,
         "profile": "good_etf-prod",
-        "mode": "SIGNAL_ONLY",
+        "mode": "JQ",
         "strategy_id": "good_etf",
-        "expected_api_version": 5,
+        "expected_api_version": 6,
         "profile_module": "jq_runtime_config",
         "validate_remote": False,
     }
-    assert state["mode"] == "SIGNAL_ONLY"
+    assert state["mode"] == "JQ"
     assert strategy.g.bt_runtime == state
-    assert strategy._runtime_mode() is strategy.ExecutionMode.SIGNAL_ONLY
+    assert strategy._runtime_mode() is strategy.ExecutionMode.JQ
 
 
 def test_backtest_install_with_helper(monkeypatch):
@@ -397,7 +382,7 @@ def test_backtest_remote_validation_uses_real_snapshot_without_submitting(
     }
 
 
-@pytest.mark.parametrize("mode_name", ["JQ_PAPER", "SIGNAL_ONLY", "QMT_REMOTE"])
+@pytest.mark.parametrize("mode_name", ["JQ", "QMT_REMOTE"])
 def test_backtest_validation_flag_has_no_effect_in_sim_trade(
     monkeypatch, mode_name
 ):
@@ -426,50 +411,9 @@ def test_invalid_backtest_validation_flag_rejected(monkeypatch):
 
 def test_sim_execution_mode_rejects_plain_string(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = "SIGNAL_ONLY"
-    with pytest.raises(RuntimeError, match="ExecutionMode.JQ_PAPER"):
+    strategy.SIM_EXECUTION_MODE = "JQ"
+    with pytest.raises(RuntimeError, match="ExecutionMode.JQ或QMT_REMOTE"):
         strategy._install_runtime(_Context("sim_trade"))
-
-
-def _signal_only_strategy(monkeypatch):
-    strategy = _load_strategy(
-        monkeypatch, _fake_helper(lambda namespace, **kwargs: _runtime_state("SIGNAL_ONLY"))
-    )
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
-    strategy._install_runtime(_Context("sim_trade"))
-    return strategy
-
-
-def test_signal_only_submit_target_amount_only_logs(monkeypatch):
-    strategy = _signal_only_strategy(monkeypatch)
-    orders = []
-    strategy.order_target = lambda *args: orders.append(args)
-
-    assert strategy._submit_target_amount("510001.XSHG", 100) is None
-    assert orders == []
-    assert any("SIGNAL_ONLY目标数量" in message for message in strategy.log.messages)
-
-
-def test_signal_only_submit_target_value_only_logs(monkeypatch):
-    strategy = _signal_only_strategy(monkeypatch)
-    orders = []
-    strategy.order_target_value = lambda *args, **kwargs: orders.append(args)
-
-    result = strategy._submit_target_value(
-        "510001.XSHG", 1000.0, last_price=10.0, current_value=0.0
-    )
-    assert result is None
-    assert orders == []
-    assert any("SIGNAL_ONLY目标市值" in message for message in strategy.log.messages)
-
-
-def test_signal_only_cancel_open_orders_only_logs(monkeypatch):
-    strategy = _signal_only_strategy(monkeypatch)
-    strategy.get_open_orders = lambda: pytest.fail("SIGNAL_ONLY不得查询/撤销挂单")
-    strategy.cancel_order = lambda order: pytest.fail("SIGNAL_ONLY不得撤单")
-
-    assert strategy._cancel_open_orders_for_runtime() == 0
-    assert any("SIGNAL_ONLY不创建订单" in message for message in strategy.log.messages)
 
 
 def test_target_buy_plan_item_uses_increment_and_round_lot(monkeypatch):
@@ -488,17 +432,17 @@ def test_target_buy_plan_item_uses_increment_and_round_lot(monkeypatch):
     ) is None
 
 
-def test_signal_only_target_buy_plan_calls_helper_without_order(monkeypatch):
+def test_jq_target_buy_plan_calls_helper(monkeypatch):
     notifications = []
     helper = _fake_helper(
-        lambda namespace, **kwargs: _runtime_state("SIGNAL_ONLY")
+        lambda namespace, **kwargs: _runtime_state("JQ")
     )
     helper.notify_target_buy_plan = lambda items, occurred_at=None: (
         notifications.append((items, occurred_at))
         or {"accepted": True, "item_count": len(items), "total_amount": 2000.0}
     )
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     strategy._install_runtime(_Context("sim_trade"))
     context = types.SimpleNamespace(current_dt="2026-08-13 09:30:00")
     items = [{"security": "510001.XSHG", "quantity": 1000, "amount": 2000.0}]
@@ -509,9 +453,15 @@ def test_signal_only_target_buy_plan_calls_helper_without_order(monkeypatch):
     assert any("计划卡片已提交" in message for message in strategy.log.messages)
 
 
-def test_jq_paper_uses_native_order_cancel_and_skips_remote_plan(monkeypatch):
-    strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ_PAPER
+def test_jq_uses_native_order_and_cancel(monkeypatch):
+    helper = _fake_helper(lambda namespace, **kwargs: _runtime_state("JQ"))
+    helper.notify_target_buy_plan = lambda items, occurred_at=None: {
+        "accepted": True,
+        "item_count": len(items),
+        "total_amount": sum(float(item["amount"]) for item in items),
+    }
+    strategy = _load_strategy(monkeypatch, helper)
+    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     strategy._install_runtime(_Context("sim_trade"))
     calls = []
     open_order = types.SimpleNamespace(order_id="jq-open-1")

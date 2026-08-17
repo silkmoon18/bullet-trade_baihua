@@ -81,7 +81,7 @@ pyright只关闭`reportMissingModuleSource`：这是因为`joinquant_typing`有�
 | `Portfolio.positions/available_cash/total_value/positions_value` | 结构化 | 调仓和展示 | S15前仍是聚宽回测组合 |
 | `Position.total_amount/avg_cost/price/value` | 结构化 | 目标仓位与风控 | S15后由真实账本视图提供 |
 | `get_all_securities/history/get_extras/get_current_data` | 有声明 | 选池、历史数据、快照 | 行为差异需平台smoke |
-| `order_target/order_target_value/cancel_order/get_open_orders` | 有声明 | 交易入口 | BACKTEST/JQ_PAPER原生可用；SIGNAL_ONLY/QMT_REMOTE由runtime接管 |
+| `order_target/order_target_value/cancel_order/get_open_orders` | 有声明 | 交易入口 | BACKTEST/JQ原生可用；QMT_REMOTE由runtime阻断并改走StrategyLedger |
 | `install_strategy_runtime` | TypedDict状态 | 模式/profile门禁 | 不等于已启用真实资金 |
 | helper账户/订单/成交/持仓 | 结构化返回 | 后续账本和对账 | 业务接入在S04-S15 |
 

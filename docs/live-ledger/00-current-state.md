@@ -62,18 +62,17 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装；当前API v5增加明确的聚宽原生模拟交易模式。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
+L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装；当前API v6将聚宽模拟撮合与目标计划通知统一为`JQ`。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
 
-四种有效执行语义：
+三种有效执行语义：
 
 - `ExecutionMode.BACKTEST`：由回测run_type自动选择，使用聚宽历史账户和订单；可选执行一次远程预检，但真实快照不参与历史决策且不提交远程目标。
-- `ExecutionMode.JQ_PAPER`：只允许`sim_trade`，保留聚宽原生下单、撤单和模拟撮合，不连接BulletTrade/QMT。
-- `ExecutionMode.SIGNAL_ONLY`：只允许`sim_trade`，加载并校验私有profile，把七个聚宽交易函数替换为抛错guard，只生成实时计划。
+- `ExecutionMode.JQ`：只允许`sim_trade`，保留聚宽原生下单、撤单、模拟撮合和平台指标；加载私有profile并通过BulletTrade发送目标计划卡片，但绝不提交QMT目标。
 - `ExecutionMode.QMT_REMOTE`：只允许`sim_trade`，同样安装guard，真实组合读写和目标提交仅经过StrategyLedger；是否下QMT订单由服务器交易开关决定。
 
 同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-`good_etf.py`默认`SIM_EXECUTION_MODE=ExecutionMode.SIGNAL_ONLY`、`VALIDATE_REMOTE_DURING_BACKTEST=True`。回测自动选择BACKTEST并做一次远程预检；模拟交易读取枚举配置。安装后的模式保存在模块级`_active_mode`，交易入口只读它。关闭回测预检时的BACKTEST和JQ_PAPER允许无helper运行。
+`good_etf.py`默认`SIM_EXECUTION_MODE=ExecutionMode.JQ`、`VALIDATE_REMOTE_DURING_BACKTEST=True`。回测自动选择BACKTEST并做一次远程预检；模拟交易读取枚举配置。安装后的模式保存在模块级`_active_mode`，交易入口只读它。只有关闭远程预检时的BACKTEST允许无helper运行。
 
 ### BulletTrade服务器侧
 
@@ -98,7 +97,7 @@ S04至S10已具备：
 
 - QMT订单/成交/资金/持仓的持续同步与账实对账（L01）。
 - 目标组合规划与先卖后买执行（L02）。
-- L01至L04仓库代码已完成；目标QMT能力、聚宽SIGNAL_ONLY/QMT模拟和小额实盘仍需外部人工证据。
+- L01至L04仓库代码已完成；目标QMT能力、聚宽JQ/QMT模拟和小额实盘仍需外部人工证据。
 
 ## 4. 依赖现状
 
@@ -192,17 +191,17 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-回测继续BACKTEST原生运行，JQ_PAPER走聚宽原生模拟订单，SIGNAL_ONLY生成计划并可发送目标买入卡片，QMT_REMOTE通过helper v5和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、SIGNAL_ONLY、模拟和小额资金验收不可由mock替代。
+回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v6和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
 
 L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
 
 ## 7. 安全现状
 
 - 原策略曾硬编码远程token、服务器地址和飞书Webhook；这些值应视为已经暴露，必须在外部系统轮换。
-- 新仓库策略已移除这些值；默认模拟执行模式为SIGNAL_ONLY，服务器交易开关仍默认关闭。
+- 新仓库策略已移除这些值；默认模拟执行模式为JQ，服务器交易开关仍默认关闭。
 - 官方公共仓库已配置为只读 `upstream` 并禁用push；在用户提供私有fork URL后再添加可写 `origin`。
 - 生产配置不得提交到Git，日志不得打印token、Webhook或完整账户信息。
 
 ## 8. 当前基线结论
 
-当前分支已完成统一仓库和L01至L04代码闭环，但尚不具备自动放行真实资金的条件。剩余事项是runbook中的目标QMT能力证明、聚宽SIGNAL_ONLY/QMT模拟、备份恢复演练及用户明确批准的小额实盘证据。
+当前分支已完成统一仓库和L01至L04代码闭环，但尚不具备自动放行真实资金的条件。剩余事项是runbook中的目标QMT能力证明、聚宽JQ/QMT模拟、备份恢复演练及用户明确批准的小额实盘证据。

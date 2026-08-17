@@ -72,7 +72,7 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
     payload = notifier.build_payload(
         TargetBuyPlanNotification(
             strategy_id="good_etf",
-            mode="SIGNAL_ONLY",
+            mode="JQ",
             items=(
                 TargetBuyPlanItem("510050.XSHG", 1000, "2500.00", "2.5000"),
                 TargetBuyPlanItem("159915.XSHE", 500, "750.00", "1.5000"),
@@ -83,7 +83,7 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
 
     assert payload["card"]["header"]["template"] == "orange"
     assert payload["card"]["header"]["title"]["content"] == (
-        "策略目标买入计划 · SIGNAL_ONLY"
+        "策略目标买入计划 · JQ"
     )
     elements = payload["card"]["elements"]
     assert [element["tag"] for element in elements] == [
@@ -91,7 +91,7 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
     ]
     assert elements[0]["text"]["content"].splitlines() == [
         "**策略：** `good_etf`",
-        "**模式：** `SIGNAL_ONLY`",
+        "**模式：** `JQ`",
         "**时间：** 2026-08-13 09:30:00",
     ]
     assert elements[2]["text"]["content"].splitlines() == [

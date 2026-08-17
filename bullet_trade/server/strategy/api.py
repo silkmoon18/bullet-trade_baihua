@@ -297,12 +297,14 @@ class SQLiteStrategyAPI:
         strategy_id = self._strategy_id(payload)
         mode = str(payload.get("mode") or "").strip().upper()
         mode = {
-            "SHADOW": "SIGNAL_ONLY",
+            "SHADOW": "JQ",
+            "SIGNAL_ONLY": "JQ",
+            "JQ_PAPER": "JQ",
             "REMOTE": "QMT_REMOTE",
             "LIVE": "QMT_REMOTE",
         }.get(mode, mode)
-        if mode not in ("SIGNAL_ONLY", "QMT_REMOTE"):
-            raise ValueError("mode must be SIGNAL_ONLY or QMT_REMOTE")
+        if mode not in ("JQ", "QMT_REMOTE"):
+            raise ValueError("mode must be JQ or QMT_REMOTE")
         raw_items = payload.get("items")
         if not isinstance(raw_items, (list, tuple)) or not raw_items:
             raise ValueError("items must be a non-empty list")

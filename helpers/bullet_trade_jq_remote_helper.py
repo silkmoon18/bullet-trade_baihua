@@ -18,9 +18,9 @@
 
 - 版本校验：helper marker、运行时 API 版本和 profile schema 版本固定校验，
   不匹配即失败关闭。
-- 模式校验：BACKTEST保留聚宽历史回测；JQ_PAPER在聚宽模拟盘调用原生下单；
-  SIGNAL_ONLY只计算计划并安装交易guard；QMT_REMOTE阻断聚宽原生交易函数，
-  真实目标只允许经StrategyLedger接口提交。
+- 模式校验：BACKTEST保留聚宽历史回测；JQ在聚宽模拟盘调用原生下单
+  并通过服务器发送计划通知；QMT_REMOTE阻断聚宽原生交易函数，真实目标只
+  允许经StrategyLedger接口提交。
 - 冷启动升级：helper/config/策略文件变更必须先停止聚宽策略、确认旧进程
   退出，再由平台启动全新进程。同一进程内重复安装仅在签名完全一致时幂等
   返回；签名漂移或检测到上一代 helper 遗留记录即失败关闭。
@@ -52,8 +52,8 @@ __all__ = [
     "get_reconciliation",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 5
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v5"
+STRATEGY_RUNTIME_API_VERSION = 6
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v6"
 PROFILE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -338,10 +338,10 @@ def notify_target_buy_plan(
     """发送策略目标买入计划；只通知，不提交订单或修改账本。"""
 
     if _active_state is None or _active_state.get("mode") not in (
-        "SIGNAL_ONLY", "QMT_REMOTE"
+        "JQ", "QMT_REMOTE"
     ):
         raise RuntimeError(
-            "只有SIGNAL_ONLY或QMT_REMOTE模式可以发送策略目标计划"
+            "只有JQ或QMT_REMOTE模式可以发送策略目标计划"
         )
     payload = {
         "mode": _active_state.get("mode"),
@@ -378,13 +378,12 @@ def _run_type_from_context(context: Any) -> Optional[str]:
 def _normalise_runtime_mode(mode: Any) -> str:
     if type(mode) is not str:
         raise RuntimeError(
-            "运行模式必须是普通字符串BACKTEST、JQ_PAPER、"
-            "SIGNAL_ONLY或QMT_REMOTE"
+            "运行模式必须是普通字符串BACKTEST、JQ或QMT_REMOTE"
         )
     value = str.upper(str.strip(mode))
-    if value not in ("BACKTEST", "JQ_PAPER", "SIGNAL_ONLY", "QMT_REMOTE"):
+    if value not in ("BACKTEST", "JQ", "QMT_REMOTE"):
         raise RuntimeError(
-            "运行模式必须是BACKTEST、JQ_PAPER、SIGNAL_ONLY或QMT_REMOTE"
+            "运行模式必须是BACKTEST、JQ或QMT_REMOTE"
         )
     return value
 
@@ -559,7 +558,7 @@ def _build_strategy_runtime_state(
         "run_type": run_type,
         "strategy_id": strategy_id,
         "enabled": False,
-        "orders_enabled": mode in ("BACKTEST", "JQ_PAPER"),
+        "orders_enabled": mode in ("BACKTEST", "JQ"),
         "production_ready": False,
         "reason": "backtest",
     }
@@ -571,21 +570,13 @@ def _build_strategy_runtime_state(
                 "reason": "backtest_remote_validation",
             }
         )
-    elif mode == "JQ_PAPER":
-        state.update(
-            {
-                "orders_enabled": True,
-                "reason": "jq_paper",
-            }
-        )
-    elif mode == "SIGNAL_ONLY":
+    elif mode == "JQ":
         state.update(
             {
                 "profile_module": profile_module,
                 "enabled": True,
-                "orders_enabled": False,
-                "reason": "signal_only",
-                "blocked_mutations": blocked_mutations,
+                "orders_enabled": True,
+                "reason": "jq",
             }
         )
     elif mode == "QMT_REMOTE":
@@ -662,15 +653,15 @@ def install_strategy_runtime(
     if _active_state is not None:
         if _active_signature != signature:
             raise RuntimeError("策略运行安装签名漂移；必须使用干净运行进程重启")
-        if mode in ("SIGNAL_ONLY", "QMT_REMOTE"):
+        if mode == "QMT_REMOTE":
             # 幂等重装仍补齐交易 guard，防止平台重建 namespace 后 guard 丢失
             _install_runtime_guards(namespace, mode)
         return dict(_active_state)
 
     blocked_mutations = ()  # type: Tuple[str, ...]
     runtime_profile = None  # type: Optional[Dict[str, Any]]
-    if mode in ("BACKTEST", "JQ_PAPER"):
-        if mode == "BACKTEST" and run_type not in (
+    if mode == "BACKTEST":
+        if run_type not in (
             "simple_backtest", "full_backtest"
         ):
             raise RuntimeError(
@@ -678,13 +669,7 @@ def install_strategy_runtime(
                     run_type or "<empty>"
                 )
             )
-        if mode == "JQ_PAPER" and run_type != "sim_trade":
-            raise RuntimeError(
-                "MODE=JQ_PAPER仅允许聚宽模拟交易，当前run_type={}".format(
-                    run_type or "<empty>"
-                )
-            )
-        if mode == "BACKTEST" and validate_remote:
+        if validate_remote:
             runtime_profile = _load_runtime_profile(
                 profile_module, profile, strategy_id
             )
@@ -693,12 +678,23 @@ def install_strategy_runtime(
             run_type=run_type,
             strategy_id=strategy_id,
             profile=profile,
-            profile_module=(
-                profile_module
-                if mode == "BACKTEST" and validate_remote
-                else None
-            ),
-            validate_remote=(mode == "BACKTEST" and validate_remote),
+            profile_module=(profile_module if validate_remote else None),
+            validate_remote=validate_remote,
+        )
+    elif mode == "JQ":
+        if run_type != "sim_trade":
+            raise RuntimeError(
+                "MODE=JQ仅允许聚宽模拟交易，当前run_type={}".format(
+                    run_type or "<empty>"
+                )
+            )
+        runtime_profile = _load_runtime_profile(profile_module, profile, strategy_id)
+        state = _build_strategy_runtime_state(
+            mode=mode,
+            run_type=run_type,
+            strategy_id=strategy_id,
+            profile=profile,
+            profile_module=profile_module,
         )
     else:
         if run_type != "sim_trade":
@@ -720,7 +716,7 @@ def install_strategy_runtime(
 
     _active_signature = signature
     _active_state = dict(state)
-    if mode in ("SIGNAL_ONLY", "QMT_REMOTE") or validate_remote:
+    if mode in ("JQ", "QMT_REMOTE") or validate_remote:
         _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
     return dict(state)

@@ -1,6 +1,6 @@
 # 当前状态与使用指南
 
-> **结论：L01至L05的仓库代码已实现，但当前分支仍不能直接用于真实资金。** 真实QMT能力证明、聚宽SIGNAL_ONLY/QMT模拟和小额人工验收只能在用户目标环境完成；服务端交易开关默认关闭。
+> **结论：L01至L05的仓库代码已实现，但当前分支仍不能直接用于真实资金。** 真实QMT能力证明、聚宽JQ/QMT模拟和小额人工验收只能在用户目标环境完成；服务端交易开关默认关闭。
 
 ## 1. 现在已经具备什么
 
@@ -8,7 +8,7 @@
 - 本地可通过`jqdata.pyi`、helper类型声明和严格mypy/pyright配置获得代码提示及静态检查。
 - `good_etf.py`是仓库内唯一受控策略源码；导出器原样复制策略、helper和示例profile，并生成确定性manifest。
 - 私有profile只读校验不会执行、复制、hash或输出其中的host/token等值。
-- BACKTEST使用聚宽历史撮合；JQ_PAPER使用聚宽模拟账户和原生订单；SIGNAL_ONLY只记录计划；QMT_REMOTE使用服务器真实PortfolioView和一次组合目标。
+- BACKTEST使用聚宽历史撮合；JQ使用聚宽模拟账户和原生订单，同时发送目标计划通知；QMT_REMOTE使用服务器真实PortfolioView和一次组合目标。
 - 已具备真实券商可用现金校准、初始1万元单次分配、按订单冻结/释放和显式增减资的事务服务。
 - 已具备按真实买卖成交更新现金、订单冻结、持仓lot、费用和已实现盈亏的事务服务，重复fill不会重复入账。
 - 已具备基于新鲜行情的现金、持仓市值、总资产、NAV、费用和盈亏原子快照，可作为后续聚宽组合视图数据源。
@@ -20,7 +20,7 @@
 下列外部验证与部署能力尚未完成，因此不能宣称满足实盘要求：
 
 1. 在用户实际MiniQMT/BigQMT上完成订单备注、稳定order/trade ID、费用、状态和跨日查询能力探针。
-2. 聚宽SIGNAL_ONLY、QMT模拟和小额实盘的人工运行证据；真实资金必须再次明确批准。
+2. 聚宽JQ、QMT模拟和小额实盘的人工运行证据；真实资金必须再次明确批准。
 
 完整依赖顺序见[实施 slices](04-slices.md)。只有仓库修复完成且真实交易日人工验收逐级通过，才能启用真实资金。
 
@@ -42,12 +42,12 @@ strategies/joinquant/good_etf.py
 
 ```python
 PROFILE = 'good_etf-prod'
-SIM_EXECUTION_MODE = ExecutionMode.SIGNAL_ONLY
+SIM_EXECUTION_MODE = ExecutionMode.JQ
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
 
-远程预检为`True`时必须已上传v5 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
+远程预检为`True`时必须已上传v6 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
 
 先运行校验：
 
@@ -63,17 +63,13 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 按[聚宽校验与导出](06-joinquant-export.md)上传产物。上传后不得手工修改；否则聚宽文件已不再对应manifest和已审查源码。
 
-### JQ_PAPER
+### JQ
 
-把`SIM_EXECUTION_MODE`设为`ExecutionMode.JQ_PAPER`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合。它不连接BulletTrade/QMT、不需要私有profile，也不会发送服务器目标计划卡片；适合先确认策略在聚宽模拟账户中的订单、持仓、资金和指标。
-
-### SIGNAL_ONLY
-
-SIGNAL_ONLY用于验证profile、服务器连接和观察实时信号，不会提交聚宽或QMT订单。产生新增买入目标时会通过服务器发送橙色计划卡片；该接口不写StrategyLedger，也不受交易开关影响。必须上传v5 helper和私有`jq_runtime_config.py`。
+把`SIM_EXECUTION_MODE`设为`ExecutionMode.JQ`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送橙色计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。必须上传v6 helper和私有`jq_runtime_config.py`。
 
 ### QMT_REMOTE
 
-把`SIM_EXECUTION_MODE`设为`ExecutionMode.QMT_REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v5 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把`SIM_EXECUTION_MODE`设为`ExecutionMode.QMT_REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v6 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 ## 4. good_etf与原策略的关系
 
@@ -83,7 +79,7 @@ SIGNAL_ONLY用于验证profile、服务器连接和观察实时信号，不会�
 
 - 删除策略内硬编码host、token、Webhook和账户定位，改为`PROFILE/SIM_EXECUTION_MODE/STRATEGY_ID`合同。
 - 删除旧同步追单扩展；持久幂等已在S07完成，异步执行状态机由L02实现。
-- JQ_PAPER只走聚宽模拟账户；SIGNAL_ONLY只记录不下单；QMT_REMOTE通过StrategyLedger执行，人工验收前服务端交易开关保持关闭。
+- JQ走聚宽模拟账户并发送目标计划通知，但不碰QMT；QMT_REMOTE通过StrategyLedger执行，人工验收前服务端交易开关保持关闭。
 - 组合目标由`available_cash * weight`改为`total_value * DEPLOY_RATIO * normalized_weight`，避免把目标仓位误当成本轮新增买入额并在每轮缩小已有持仓。
 - QMT_REMOTE尾盘读取真实PortfolioView并通过自定义`record()`指标展示；聚宽内置模拟账户和内置收益曲线仍不代表真实券商账户。
 

@@ -416,7 +416,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 5
+assert helper.STRATEGY_RUNTIME_API_VERSION == 6
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 1
 assert profile['PROFILES']['good_etf-prod']['host'] == ''
@@ -428,7 +428,7 @@ print('CLEANROOM_IMPORT_OK')
     assert "CLEANROOM_IMPORT_OK" in result.stdout
 
 
-def test_cleanroom_missing_helper_fails_signal_only_closed(tmp_path):
+def test_cleanroom_missing_helper_fails_jq_closed(tmp_path):
     exporter = _load_export_module()
     destination = tmp_path / "export"
     exporter.export_joinquant(ROOT, destination)
@@ -444,14 +444,14 @@ sys.modules['jqdata'] = jqdata
 spec = importlib.util.spec_from_file_location('missing_helper_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)
 except RuntimeError as exc:
     assert 'bullet_trade_jq_remote_helper.py' in str(exc)
 else:
-    raise AssertionError('SIGNAL_ONLY accepted missing helper')
+    raise AssertionError('JQ accepted missing helper')
 print('MISSING_HELPER_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 
@@ -475,14 +475,14 @@ jqdata.__all__ = []
 sys.modules['jqdata'] = jqdata
 called = []
 helper = types.ModuleType('bullet_trade_jq_remote_helper')
-helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v5'
+helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v6'
 helper.STRATEGY_RUNTIME_API_VERSION = 2
 helper.install_strategy_runtime = lambda *args, **kwargs: called.append(True)
 sys.modules['bullet_trade_jq_remote_helper'] = helper
 spec = importlib.util.spec_from_file_location('bad_version_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)
@@ -499,7 +499,7 @@ print('VERSION_MISMATCH_FAIL_CLOSED_OK')
     assert "VERSION_MISMATCH_FAIL_CLOSED_OK" in result.stdout
 
 
-def test_cleanroom_missing_private_profile_fails_signal_only_closed(tmp_path):
+def test_cleanroom_missing_private_profile_fails_jq_closed(tmp_path):
     exporter = _load_export_module()
     destination = tmp_path / "export"
     exporter.export_joinquant(ROOT, destination)
@@ -518,14 +518,14 @@ sys.modules.pop('jq_runtime_config', None)
 spec = importlib.util.spec_from_file_location('missing_profile_strategy', root / 'good_etf.py')
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
-strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.SIGNAL_ONLY
+strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
 context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
     strategy._install_runtime(context)
 except RuntimeError as exc:
     assert '运行配置模块' in str(exc)
 else:
-    raise AssertionError('SIGNAL_ONLY accepted missing private profile')
+    raise AssertionError('JQ accepted missing private profile')
 print('MISSING_PROFILE_FAIL_CLOSED_OK')
 """.format(root=str(destination))
 

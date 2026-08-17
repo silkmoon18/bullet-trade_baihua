@@ -8,7 +8,7 @@ STRATEGY_RUNTIME_API_VERSION: int
 STRATEGY_RUNTIME_HELPER_MARKER: str
 PROFILE_SCHEMA_VERSION: int
 
-RuntimeMode = Literal["BACKTEST", "JQ_PAPER", "SIGNAL_ONLY", "QMT_REMOTE"]
+RuntimeMode = Literal["BACKTEST", "JQ", "QMT_REMOTE"]
 
 
 class PositionView:

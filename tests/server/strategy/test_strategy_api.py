@@ -228,7 +228,7 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     result = service.notify_target_buy_plan(
         {
             "strategy_id": "good_etf",
-            "mode": "SIGNAL_ONLY",
+            "mode": "JQ",
             "occurred_at": "2026-08-13T09:30:00+08:00",
             "items": [
                 {
@@ -256,7 +256,7 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     assert len(notifications) == 1
     notification = notifications[0]
     assert isinstance(notification, TargetBuyPlanNotification)
-    assert notification.mode == "SIGNAL_ONLY"
+    assert notification.mode == "JQ"
     assert notification.items[0].quantity == 1000
     with pytest.raises(Exception, match="not found"):
         service.repository.get_strategy_account("good_etf")
@@ -264,7 +264,13 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
 
 @pytest.mark.parametrize(
     ("legacy_mode", "normalised_mode"),
-    [("SHADOW", "SIGNAL_ONLY"), ("REMOTE", "QMT_REMOTE"), ("LIVE", "QMT_REMOTE")],
+    [
+        ("SHADOW", "JQ"),
+        ("SIGNAL_ONLY", "JQ"),
+        ("JQ_PAPER", "JQ"),
+        ("REMOTE", "QMT_REMOTE"),
+        ("LIVE", "QMT_REMOTE"),
+    ],
 )
 def test_target_buy_plan_accepts_legacy_mode_aliases(
     api, legacy_mode, normalised_mode
