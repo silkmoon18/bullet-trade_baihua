@@ -90,6 +90,35 @@ def test_qmt_broker_get_trades_prefers_traded_price_and_preserves_zero_commissio
 
 
 @pytest.mark.unit
+def test_qmt_broker_maps_native_xttrade_id_and_used_commission(monkeypatch):
+    broker = QmtBroker(account_id="demo")
+    broker._connected = True
+
+    class DummyTrade:
+        traded_id = "xt-trade-1"
+        order_id = "xt-order-1"
+        stock_code = "510050.SH"
+        traded_volume = 100
+        traded_price = 2.5
+        traded_time = "2026-08-19 09:31:00"
+        used_commission = 5.25
+
+    class DummyTrader:
+        def query_stock_trades(self, account):
+            return [DummyTrade()]
+
+    broker._xt_trader = DummyTrader()
+    broker._xt_account = object()
+
+    trade = broker.get_trades(order_id="xt-order-1")[0]
+    assert trade["trade_id"] == "xt-trade-1"
+    assert trade["trade_id_source"] == "broker"
+    assert trade["commission_fee"] == pytest.approx(5.25)
+    assert trade["commission_known"] is True
+    assert trade["tax_known"] is False
+
+
+@pytest.mark.unit
 def test_qmt_broker_marks_synthetic_trade_id_and_unknown_fees(monkeypatch):
     broker = QmtBroker(account_id="demo")
     broker._connected = True

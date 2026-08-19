@@ -1083,7 +1083,12 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         security = _security_from_qmt_fields(item)
         if security:
             item["security"] = security
-    trade_id = item.get("trade_id") or item.get("m_strTradeID") or item.get("deal_id")
+    trade_id = (
+        item.get("trade_id")
+        or item.get("traded_id")
+        or item.get("m_strTradeID")
+        or item.get("deal_id")
+    )
     item["trade_id"] = trade_id
     item.setdefault("trade_id_source", "broker" if trade_id else "missing")
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
@@ -1093,6 +1098,8 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     commission = item.get("commission_fee")
     if commission is None:
         commission = item.get("commission")
+    if commission is None:
+        commission = item.get("used_commission")
     if commission is None:
         commission = item.get("m_dCommission")
     tax = item.get("tax")

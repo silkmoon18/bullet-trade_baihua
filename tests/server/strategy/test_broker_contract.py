@@ -268,6 +268,18 @@ def test_big_qmt_normalization_marks_native_ids_and_fee_presence():
     assert normalized["commission_known"] is True
     assert normalized["tax_known"] is True
 
+    xttrade = _normalize_trade(
+        {
+            "traded_id": "XT-T-1",
+            "order_id": "XT-O-1",
+            "used_commission": 5.25,
+        }
+    )
+    assert xttrade["trade_id"] == "XT-T-1"
+    assert xttrade["trade_id_source"] == "broker"
+    assert xttrade["commission_fee"] == 5.25
+    assert xttrade["commission_known"] is True
+
     native_time = _normalize_trade(
         {
             "m_strTradeID": "T-time",

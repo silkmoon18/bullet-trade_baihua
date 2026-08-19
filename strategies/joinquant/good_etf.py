@@ -412,7 +412,7 @@ def initialize(context: 'Context') -> None:
     set_benchmark('000300.XSHG')
     # 开启动态复权模式（真实价格）
     set_option('use_real_price', True)
-    # 设置交易成本（针对基金/ETF）
+    # 设置聚宽BACKTEST/JQ的模拟交易成本；QMT_REMOTE实际费用来自券商成交回报。
     set_order_cost(
         OrderCost(close_tax=0.000, open_commission=0.00025, close_commission=0.00025, min_commission=5),
         type='fund'
@@ -598,7 +598,11 @@ def market_open(context: 'Context') -> None:
 
         raw_weights = selected_funds['premium'].abs().tolist()
         total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
-        investable_value = portfolio.total_value * DEPLOY_RATIO
+        # 固定计划生成时的组合快照。聚宽会在后续卖单成交后原地更新
+        # context.portfolio；若再次读取 total_value，日志会把卖出后的资产
+        # 与卖出前计算的目标部署金额混在一起。
+        planning_total_value = float(portfolio.total_value)
+        investable_value = planning_total_value * DEPLOY_RATIO
         target_values = {
             code: float(investable_value * weight / total_weight)
             for code, weight in zip(order_fund_codes, raw_weights)
@@ -659,9 +663,9 @@ def market_open(context: 'Context') -> None:
         # 且卖单尚未成交时可用现金也不能代表本轮可部署资金。
         if not selected_funds.empty:
             # 计算权重（折价率绝对值占比）
-            total_value = portfolio.total_value
-            log.info(f'组合总资产={total_value:.2f} 目标部署={investable_value:.2f} '
-                     f'现金缓冲={total_value - investable_value:.2f}')
+            log.info(f'计划时组合总资产={planning_total_value:.2f} '
+                     f'目标部署={investable_value:.2f} '
+                     f'计划现金缓冲={planning_total_value - investable_value:.2f}')
 
             # 按权重处理目标市值；成交归属聚宽撮合或StrategyLedger。
             for code, weight in zip(order_fund_codes, raw_weights):

@@ -12,6 +12,7 @@ import types
 import uuid
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -430,6 +431,53 @@ def test_target_buy_plan_item_uses_increment_and_round_lot(monkeypatch):
     assert strategy._target_buy_plan_item(
         "510001.XSHG", 1100.0, 1000.0, 2.0
     ) is None
+
+
+def test_market_open_logs_the_same_pre_trade_asset_snapshot_used_for_targets(
+    monkeypatch,
+):
+    strategy = _load_strategy(monkeypatch)
+    strategy.g.fund_list = pd.DataFrame(
+        {"unit_net_value": [2.0]}, index=["510001.XSHG"]
+    )
+    current_data = {
+        "510001.XSHG": types.SimpleNamespace(
+            last_price=1.0, paused=False, high_limit=1.1
+        )
+    }
+    old_position = types.SimpleNamespace(total_amount=100, avg_cost=1.0)
+    portfolio = types.SimpleNamespace(
+        total_value=10000.0,
+        positions={"510002.XSHG": old_position},
+    )
+    monkeypatch.setattr(strategy, "get_current_data", lambda: current_data, raising=False)
+    monkeypatch.setattr(strategy, "_advance_remote_intent", lambda context: True)
+    monkeypatch.setattr(strategy, "_cancel_open_orders_for_runtime", lambda: 0)
+    monkeypatch.setattr(strategy, "_portfolio", lambda context: portfolio)
+    monkeypatch.setattr(strategy, "_notify", lambda message: None)
+    monkeypatch.setattr(strategy, "_send_target_buy_plan", lambda context, items: None)
+    monkeypatch.setattr(
+        strategy, "_runtime_mode", lambda: strategy.ExecutionMode.JQ
+    )
+
+    def sell_old_position(security, amount):
+        portfolio.total_value = 9800.0
+        return types.SimpleNamespace(order_id="sell-1")
+
+    monkeypatch.setattr(strategy, "_submit_target_amount", sell_old_position)
+    monkeypatch.setattr(
+        strategy,
+        "_submit_target_value",
+        lambda *args, **kwargs: types.SimpleNamespace(order_id="buy-1"),
+    )
+
+    strategy.market_open(types.SimpleNamespace(current_dt="2026-08-19 09:30:00"))
+
+    assert any(
+        "计划时组合总资产=10000.00 目标部署=9500.00 计划现金缓冲=500.00"
+        in message
+        for message in strategy.log.messages
+    )
 
 
 def test_jq_target_buy_plan_calls_helper(monkeypatch):

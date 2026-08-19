@@ -71,6 +71,8 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 把`SIM_EXECUTION_MODE`设为`ExecutionMode.QMT_REMOTE`后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v6 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
+`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前仅按服务器的保守费用缓冲预留现金，成交后以QMT/券商`XtTrade`回报的实际手续费入账，并通过StrategyLedger的`fees`和聚宽`real_fees`指标展示；不得用聚宽模拟佣金覆盖真实费用。目标QMT版本必须由只读/小额探针证明成交回报包含可用的实际费用字段。
+
 ## 4. good_etf与原策略的关系
 
 选股和风控主逻辑保持：ETF池、港股关键词过滤、前一日成交额区间、单位净值、停牌/涨停过滤、折价排序、前三名、按折价绝对值分配，以及5%止损/10%止盈。

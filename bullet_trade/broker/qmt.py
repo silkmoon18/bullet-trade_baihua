@@ -468,7 +468,7 @@ class QmtBroker(BrokerBase):
             jq_code = self._map_to_jq_symbol(raw_code) if raw_code else None
             if security and jq_code != security:
                 continue
-            trade_id = _pick(item, "trade_id", "deal_no", "trade_no")
+            trade_id = _pick(item, "trade_id", "traded_id", "deal_no", "trade_no")
             trade_id_source = "broker"
             price = _first_present(
                 _pick(item, "traded_price"),
@@ -490,6 +490,7 @@ class QmtBroker(BrokerBase):
             commission = _first_present(
                 _pick(item, "commission_fee"),
                 _pick(item, "commission"),
+                _pick(item, "used_commission"),
                 _pick(item, "comm"),
             )
             tax = _first_present(_pick(item, "tax"), _pick(item, "stamp_tax"))
