@@ -62,7 +62,7 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真实组合视图；当前API v7进一步提供`JoinQuantRuntime`统一门面和不可变执行请求。策略不再包含连接、协议、重启恢复或QMT回调代码；按D021，helper运行在用户自有可信策略进程中。
+L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真实组合视图；当前API v8进一步提供`JoinQuantRuntime`统一门面、不可变执行请求和多策略配置v2。策略不再包含连接、协议、重启恢复或QMT回调代码；按D021，helper运行在用户自有可信策略进程中。
 
 三种有效执行语义：
 
@@ -72,7 +72,7 @@ L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真
 
 同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-`good_etf.py`保留`VALIDATE_REMOTE_DURING_BACKTEST=True`；回测自动选择BACKTEST并做一次只读远程预检，模拟交易从私有`EXECUTION_MODES[strategy_id]`读取JQ或QMT_REMOTE，缺少键时默认JQ。helper在所有模式均为必需；关闭回测远程预检时只是不读取profile和不连接服务器。
+`good_etf.py`只声明`STRATEGY_ID`和`VALIDATE_REMOTE_DURING_BACKTEST=True`；回测自动选择BACKTEST并做一次只读远程预检，模拟交易从私有`STRATEGIES[strategy_id]`读取profile和JQ/QMT_REMOTE。缺少策略键时使用`DEFAULT_PROFILE`并默认JQ。helper在所有模式均为必需；关闭回测远程预检时不读取配置、不连接服务器。
 
 ### BulletTrade服务器侧
 
@@ -158,7 +158,7 @@ from jqdata import *
 
 L00精简运行契约已经处理：
 
-- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、回测远程预检开关和`STRATEGY_ID`；模拟交易模式由私有配置按策略选择。
+- 删除host、token、profile、Webhook和账户定位等策略内连接配置，只保留回测远程预检开关和唯一`STRATEGY_ID`；连接和模拟交易模式由私有配置按策略选择。
 - 移除旧定制helper的同步追单、账户查询、全账户撤单和通知调用。
 - 过渡期组合目标改为`context.portfolio.total_value × DEPLOY_RATIO × normalized_weight`，不再用可用现金直接计算最终目标。
 - 尾盘仅记录聚宽组合快照，不再把旧helper返回的整个物理账户误报为策略级对账。
@@ -186,9 +186,9 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v7和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
+回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v8和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
 
-当前策略只保留一次`install_joinquant_runtime`调用；模式解析、API版本校验、状态发布、远程预检、通知容错和聚宽/QMT订单门面均由helper v7负责。策略交易入口只调用`JoinQuantRuntime`，`initialize`与`process_initialize`的首条可执行语句均为runtime安装。历史逐轮审查见`archive/`归档。
+当前策略只保留一次`install_joinquant_runtime`调用；模式解析、API版本校验、状态发布、远程预检、通知容错和聚宽/QMT订单门面均由helper v8负责。策略交易入口只调用`JoinQuantRuntime`，`initialize`与`process_initialize`的首条可执行语句均为runtime安装。历史逐轮审查见`archive/`归档。
 
 ## 7. 安全现状
 

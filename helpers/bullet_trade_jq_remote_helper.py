@@ -8,7 +8,6 @@
     state = bt.install_strategy_runtime(
         globals(),
         context=context,
-        profile=PROFILE,
         mode="BACKTEST",
         strategy_id=STRATEGY_ID,
         validate_remote=True,
@@ -75,9 +74,9 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 7
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v7"
-PROFILE_SCHEMA_VERSION = 1
+STRATEGY_RUNTIME_API_VERSION = 8
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v8"
+PROFILE_SCHEMA_VERSION = 2
 EXECUTION_WIRE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -99,7 +98,7 @@ _RUNTIME_MUTATION_NAMES = frozenset(
     }
 )
 
-_PROFILE_REQUIRED_FIELDS = frozenset({"strategy_id", "host", "token"})
+_PROFILE_REQUIRED_FIELDS = frozenset({"host", "token"})
 _PROFILE_OPTIONAL_FIELDS = frozenset(
     {
         "port",
@@ -109,6 +108,7 @@ _PROFILE_OPTIONAL_FIELDS = frozenset(
     }
 )
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
+_STRATEGY_ALLOWED_FIELDS = frozenset({"profile", "mode"})
 
 # 本代 helper 实例标记；namespace 记录中的 token 不同即为上一代遗留。
 _MODULE_TOKEN = object()
@@ -836,58 +836,22 @@ def _validate_profile_module_name(value: Any) -> str:
     return value
 
 
-def get_configured_execution_mode(
+def _load_runtime_configuration(
+    profile_module: str,
     strategy_id: str,
-    profile_module: str = "jq_runtime_config",
-) -> str:
-    """Read the per-strategy mode; a missing key deliberately defaults to JQ."""
+) -> Dict[str, Any]:
+    """Resolve one strategy to its mode and reusable connection profile."""
 
     strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
-    try:
-        module = __import__(profile_module, fromlist=["*"])
-        schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
-        configured = getattr(module, "EXECUTION_MODES", {})
-    except BaseException:
-        raise RuntimeError(
-            "无法加载运行配置模块 {}；请确认文件已上传且配置可读取".format(
-                profile_module
-            )
-        ) from None
-    if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
-        raise RuntimeError(
-            "运行配置schema版本不匹配: expected={}".format(
-                PROFILE_SCHEMA_VERSION
-            )
-        )
-    if type(configured) is not dict:
-        raise RuntimeError("运行配置EXECUTION_MODES必须是字典")
-    if any(type(key) is not str or type(value) is not str for key, value in configured.items()):
-        raise RuntimeError("运行配置EXECUTION_MODES的键和值必须是普通字符串")
-    mode = configured.get(strategy_id, "JQ").strip().upper()
-    if mode not in ("JQ", "QMT_REMOTE"):
-        raise RuntimeError(
-            "策略{}的执行模式必须是JQ或QMT_REMOTE".format(strategy_id)
-        )
-    return mode
-
-
-def _load_runtime_profile(
-    profile_module: str,
-    profile: str,
-    strategy_id: str,
-) -> Dict[str, Any]:
-    """加载并校验聚宽私有运行 profile；错误信息不回显凭据或未知字段名。"""
-
     load_failed = False
-    schema_version = None
-    profiles = None
     try:
         module = __import__(profile_module, fromlist=["*"])
         schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
+        default_profile = getattr(module, "DEFAULT_PROFILE", None)
+        strategies = getattr(module, "STRATEGIES", None)
         profiles = getattr(module, "PROFILES", None)
     except BaseException:
-        # 配置模块导入或属性读取异常可能包含密钥；断开异常链后抛出固定错误。
         load_failed = True
     if load_failed:
         raise RuntimeError(
@@ -898,19 +862,49 @@ def _load_runtime_profile(
 
     if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
         raise RuntimeError(
-            "运行配置schema版本不匹配: expected={}".format(PROFILE_SCHEMA_VERSION)
+            "运行配置schema版本不匹配: expected={}".format(
+                PROFILE_SCHEMA_VERSION
+            )
         )
-
+    default_profile = _validate_runtime_identifier(
+        default_profile, "DEFAULT_PROFILE"
+    )
+    if type(strategies) is not dict:
+        raise RuntimeError("运行配置模块必须定义字典 STRATEGIES")
     if type(profiles) is not dict:
         raise RuntimeError("运行配置模块必须定义字典 PROFILES")
     if any(type(name) is not str for name in profiles):
         raise RuntimeError("运行配置 PROFILES 的profile名称必须是普通字符串")
-    if profile not in profiles:
-        raise RuntimeError("运行配置中不存在profile: {}".format(profile))
+    if default_profile not in profiles:
+        raise RuntimeError("DEFAULT_PROFILE在PROFILES中不存在")
+
+    for configured_id, settings in strategies.items():
+        _validate_runtime_identifier(configured_id, "STRATEGIES策略ID")
+        if type(settings) is not dict:
+            raise RuntimeError("STRATEGIES中的策略配置必须是字典")
+        if any(type(key) is not str for key in settings):
+            raise RuntimeError("STRATEGIES中的字段名必须是普通字符串")
+        if any(key not in _STRATEGY_ALLOWED_FIELDS for key in settings):
+            raise RuntimeError("STRATEGIES包含未知字段；字段名不予回显")
+        configured_profile = settings.get("profile", default_profile)
+        configured_profile = _validate_runtime_identifier(
+            configured_profile, "STRATEGIES.profile"
+        )
+        if configured_profile not in profiles:
+            raise RuntimeError("STRATEGIES引用的profile在PROFILES中不存在")
+        configured_mode = settings.get("mode", "JQ")
+        if type(configured_mode) is not str:
+            raise RuntimeError("STRATEGIES.mode必须是普通字符串")
+        configured_mode = configured_mode.strip().upper()
+        if configured_mode not in ("JQ", "QMT_REMOTE"):
+            raise RuntimeError("STRATEGIES.mode必须是JQ或QMT_REMOTE")
+
+    selected = strategies.get(strategy_id, {})
+    profile = selected.get("profile", default_profile)
+    mode = selected.get("mode", "JQ").strip().upper()
     raw = profiles[profile]
     if type(raw) is not dict:
         raise RuntimeError("profile {} 必须是字典".format(profile))
-
     if any(type(key) is not str for key in raw):
         raise RuntimeError("profile {} 包含非普通字符串字段".format(profile))
     if any(key not in _PROFILE_ALLOWED_FIELDS for key in raw):
@@ -920,12 +914,6 @@ def _load_runtime_profile(
         raise RuntimeError(
             "profile {} 缺少必填字段: {}".format(profile, ", ".join(missing))
         )
-
-    configured_strategy_id = _validate_runtime_identifier(
-        raw.get("strategy_id"), "profile.strategy_id"
-    )
-    if configured_strategy_id != strategy_id:
-        raise RuntimeError("profile.strategy_id 与策略请求不一致")
 
     host = raw.get("host")
     if (
@@ -974,14 +962,26 @@ def _load_runtime_profile(
         optional_strings[field] = value
 
     return {
-        "strategy_id": configured_strategy_id,
-        "host": host,
-        "token": token,
-        "port": port,
-        "account_key": optional_strings["account_key"],
-        "tls_cert": optional_strings["tls_cert"],
-        "rpc_timeout": numeric_values["rpc_timeout"],
+        "mode": mode,
+        "profile": profile,
+        "connection": {
+            "host": host,
+            "token": token,
+            "port": port,
+            "account_key": optional_strings["account_key"],
+            "tls_cert": optional_strings["tls_cert"],
+            "rpc_timeout": numeric_values["rpc_timeout"],
+        },
     }
+
+
+def get_configured_execution_mode(
+    strategy_id: str,
+    profile_module: str = "jq_runtime_config",
+) -> str:
+    """Read the per-strategy mode; an absent entry deliberately defaults to JQ."""
+
+    return _load_runtime_configuration(profile_module, strategy_id)["mode"]
 
 
 def _runtime_mutation_guard(name: str, active_mode: str) -> Callable[..., Any]:
@@ -1009,7 +1009,7 @@ def _build_strategy_runtime_state(
     mode: str,
     run_type: str,
     strategy_id: str,
-    profile: str,
+    profile: Optional[str],
     profile_module: Optional[str] = None,
     blocked_mutations: Tuple[str, ...] = (),
     validate_remote: bool = False,
@@ -1062,7 +1062,6 @@ def install_strategy_runtime(
     namespace: Dict[str, Any],
     *,
     context: Any,
-    profile: str,
     mode: str,
     strategy_id: str,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
@@ -1091,7 +1090,6 @@ def install_strategy_runtime(
         raise RuntimeError("validate_remote必须是bool")
     if validate_remote and mode != "BACKTEST":
         raise RuntimeError("validate_remote仅用于BACKTEST远程预检")
-    profile = _validate_runtime_identifier(profile, "profile")
     strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
 
@@ -1105,6 +1103,16 @@ def install_strategy_runtime(
         raise RuntimeError("策略namespace运行记录缺失；必须使用干净运行进程重启")
 
     run_type = str(_run_type_from_context(context) or "").strip().lower()
+    runtime_config = None  # type: Optional[Dict[str, Any]]
+    if mode in ("JQ", "QMT_REMOTE") or validate_remote:
+        runtime_config = _load_runtime_configuration(
+            profile_module, strategy_id
+        )
+        if mode in ("JQ", "QMT_REMOTE") and runtime_config["mode"] != mode:
+            raise RuntimeError("安装模式与STRATEGIES配置不一致")
+        profile = runtime_config["profile"]  # type: Optional[str]
+    else:
+        profile = None
     signature = (
         mode,
         profile,
@@ -1132,11 +1140,9 @@ def install_strategy_runtime(
                 "MODE=BACKTEST仅允许聚宽回测，当前run_type={}".format(
                     run_type or "<empty>"
                 )
-            )
+        )
         if validate_remote:
-            runtime_profile = _load_runtime_profile(
-                profile_module, profile, strategy_id
-            )
+            runtime_profile = runtime_config["connection"]
         state = _build_strategy_runtime_state(
             mode=mode,
             run_type=run_type,
@@ -1152,7 +1158,7 @@ def install_strategy_runtime(
                     run_type or "<empty>"
                 )
             )
-        runtime_profile = _load_runtime_profile(profile_module, profile, strategy_id)
+        runtime_profile = runtime_config["connection"]
         state = _build_strategy_runtime_state(
             mode=mode,
             run_type=run_type,
@@ -1167,7 +1173,7 @@ def install_strategy_runtime(
                     mode, run_type or "<empty>"
                 )
             )
-        runtime_profile = _load_runtime_profile(profile_module, profile, strategy_id)
+        runtime_profile = runtime_config["connection"]
         blocked_mutations = _install_runtime_guards(namespace, mode)
         state = _build_strategy_runtime_state(
             mode=mode,
@@ -1327,7 +1333,6 @@ def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
     context: Any,
-    profile: str,
     strategy_id: str,
     initial_capital: Any,
     profile_module: str = "jq_runtime_config",
@@ -1352,7 +1357,6 @@ def install_joinquant_runtime(
     state = install_strategy_runtime(
         namespace,
         context=context,
-        profile=profile,
         mode=mode.value,
         strategy_id=strategy_id,
         expected_api_version=expected_api_version,

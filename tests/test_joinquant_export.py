@@ -313,34 +313,44 @@ def test_source_validation_rejects_unknown_role(tmp_path):
     ("body", "message"),
     [
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {}\n"
             "PROFILES = {'prod': {'host': '10.0.0.8', 'token': 'real-token'}}\n",
             "literal private value",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'prod': {'strategy_id': 'good_etf', 'host': '', "
-            "'token': '', 'account_key': 123}}\n",
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'prod': {'host': '', 'token': '', "
+            "'account_key': 123}}\n",
             "literal private value",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'prod': {'strategy_id': 'good_etf', 'host': '', "
-            "'token': ''}}\n"
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'prod': {'host': '', 'token': ''}}\n"
             "print('side effect')\n",
             "assignments only",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'prod': {'strategy_id': 'good_etf', 'host': '', "
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'prod': {'host': '', "
             "'token': 'real-' + 'token'}}\n",
             "literal data",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'prod': {'strategy_id': 'good_etf', 'host': '', "
-            "'token': '', 'credential': None}}\n",
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'prod': {'host': '', 'token': '', "
+            "'credential': None}}\n",
             "unknown fields",
+        ),
+        (
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
+            "STRATEGIES = {'good_etf': {'mode': 'REMOTE'}}\n"
+            "PROFILES = {'prod': {'host': '', 'token': ''}}\n",
+            "invalid mode",
         ),
     ],
 )
@@ -358,9 +368,12 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     identity = _repository_identity(exporter)
     private_profile = tmp_path / "jq_runtime_config.py"
     private_profile.write_text(
-        "PROFILE_SCHEMA_VERSION = 1\n"
-        "PROFILES = {'good_etf-prod': {"
-        "'strategy_id': 'good_etf', 'host': '10.0.0.8', "
+        "PROFILE_SCHEMA_VERSION = 2\n"
+        "DEFAULT_PROFILE = 'qmt-main'\n"
+        "STRATEGIES = {'good_etf': {'profile': 'qmt-main', "
+        "'mode': 'QMT_REMOTE'}}\n"
+        "PROFILES = {'qmt-main': {"
+        "'host': '10.0.0.8', "
         "'token': 'hard-coded-real-token', 'port': 58620, "
         "'account_key': None, 'tls_cert': None, 'rpc_timeout': 60.0}}\n",
         encoding="utf-8",
@@ -369,9 +382,10 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     result = exporter.validate_private_profile(private_profile, identity)
 
     assert result == {
-        "profile": "good_etf-prod",
-        "profile_schema_version": 1,
+        "profile": "qmt-main",
+        "profile_schema_version": 2,
         "strategy_id": "good_etf",
+        "mode": "QMT_REMOTE",
     }
     assert list(tmp_path.iterdir()) == [private_profile]
     assert "hard-coded-real-token" not in repr(result)
@@ -381,39 +395,45 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     ("body", "message"),
     [
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'good_etf-prod': {'strategy_id': 'other', "
-            "'host': '10.0.0.8', 'token': 'real-token'}}\n",
-            "strategy_id does not match",
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {'good_etf': {'profile': 'missing'}}\n"
+            "PROFILES = {'qmt-main': {'host': '10.0.0.8', "
+            "'token': 'real-token'}}\n",
+            "invalid profile",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'good_etf-prod': {'strategy_id': 'good_etf', "
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'qmt-main': {"
             "'host': '10.0.0.8', 'token': 'real-token', "
             "'credential': 'leak'}}\n",
             "unknown fields",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {}\n"
             "PROFILES = make_profile()\n",
             "literal data",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'good_etf-prod': {'strategy_id': 'good_etf', "
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'qmt-main': {"
             "'host': '10.0.0.8', 'token': 'real-token', "
             "'rpc_timeout': None}}\n",
             "invalid rpc_timeout",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'good_etf-prod': {'strategy_id': 'good_etf', "
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'qmt-main': {"
             "'host': 'your-host', 'token': 'your-token'}}\n",
             "invalid host",
         ),
         (
-            "PROFILE_SCHEMA_VERSION = 1\n"
-            "PROFILES = {'good_etf-prod': {'strategy_id': 'good_etf', "
+            "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
+            "STRATEGIES = {}\n"
+            "PROFILES = {'qmt-main': {"
             "'host': '10.0.0.8', 'token': 'replace-me'}}\n",
             "invalid token",
         ),
@@ -467,10 +487,11 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 7
+assert helper.STRATEGY_RUNTIME_API_VERSION == 8
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
-assert profile['PROFILE_SCHEMA_VERSION'] == 1
-assert profile['PROFILES']['good_etf-prod']['host'] == ''
+assert profile['PROFILE_SCHEMA_VERSION'] == 2
+assert profile['DEFAULT_PROFILE'] == 'qmt-main'
+assert profile['PROFILES']['qmt-main']['host'] == ''
 print('CLEANROOM_IMPORT_OK')
 """.format(root=str(destination))
 
@@ -544,7 +565,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == [7]
+assert called == [8]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

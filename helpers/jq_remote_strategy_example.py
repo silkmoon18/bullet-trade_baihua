@@ -18,20 +18,19 @@ from jqdata import *  # 聚宽内置环境
 import bullet_trade_jq_remote_helper as bt
 
 # ===== 部署契约 =====
-PROFILE = 'demo-prod'         # 对应 jq_runtime_config.PROFILES 中的键
-MODE = 'JQ'                   # 聚宽模拟下单 + BulletTrade计划通知
-STRATEGY_ID = 'demo_jq'       # 必须等于 profile 中的 strategy_id
+STRATEGY_ID = 'demo_jq'       # 对应 jq_runtime_config.STRATEGIES 中的键
+INITIAL_CAPITAL = 10000
 
 
 def initialize(context):
     # 运行时安装必须是第一条可执行语句。
-    state = bt.install_strategy_runtime(
+    runtime = bt.install_joinquant_runtime(
         globals(),
         context=context,
-        profile=PROFILE,
-        mode=MODE,
         strategy_id=STRATEGY_ID,
+        initial_capital=INITIAL_CAPITAL,
     )
+    state = runtime.state
     log.info('运行时已安装 | mode={} reason={}'.format(state['mode'], state['reason']))
 
     set_benchmark('000300.XSHG')
@@ -42,13 +41,13 @@ def initialize(context):
 
 def process_initialize(context):
     """聚宽重启/代码刷新时调用；同签名重复安装幂等返回原状态。"""
-    state = bt.install_strategy_runtime(
+    runtime = bt.install_joinquant_runtime(
         globals(),
         context=context,
-        profile=PROFILE,
-        mode=MODE,
         strategy_id=STRATEGY_ID,
+        initial_capital=INITIAL_CAPITAL,
     )
+    state = runtime.state
     log.info('运行时已恢复 | mode={} reason={}'.format(state['mode'], state['reason']))
 
 

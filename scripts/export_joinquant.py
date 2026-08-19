@@ -78,7 +78,7 @@ _SENSITIVE_NAMES = {
     "webhook_url",
 }
 
-_PROFILE_REQUIRED_FIELDS = {"strategy_id", "host", "token"}
+_PROFILE_REQUIRED_FIELDS = {"host", "token"}
 _PROFILE_OPTIONAL_FIELDS = {
     "port",
     "account_key",
@@ -86,6 +86,7 @@ _PROFILE_OPTIONAL_FIELDS = {
     "rpc_timeout",
 }
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
+_STRATEGY_ALLOWED_FIELDS = {"profile", "mode"}
 
 _SENSITIVE_NAME_SUFFIXES = (
     "_account_key",
@@ -214,7 +215,8 @@ def _profile_assignments(tree: ast.Module, source_name: str) -> Dict[str, object
                 )
             if name not in {
                 "PROFILE_SCHEMA_VERSION",
-                "EXECUTION_MODES",
+                "DEFAULT_PROFILE",
+                "STRATEGIES",
                 "PROFILES",
             }:
                 raise ValidationError(
@@ -235,28 +237,49 @@ def _validate_profile_shape(
 ) -> Mapping[str, object]:
     if (
         type(assignments.get("PROFILE_SCHEMA_VERSION")) is not int
-        or assignments.get("PROFILE_SCHEMA_VERSION") != 1
+        or assignments.get("PROFILE_SCHEMA_VERSION") != 2
     ):
         raise ValidationError("{} has unsupported profile schema".format(source_name))
     profiles = assignments.get("PROFILES")
     if type(profiles) is not dict or not profiles:
         raise ValidationError("{} must define non-empty PROFILES".format(source_name))
-    execution_modes = assignments.get("EXECUTION_MODES", {})
-    if type(execution_modes) is not dict:
+    default_profile = assignments.get("DEFAULT_PROFILE")
+    if (
+        type(default_profile) is not str
+        or not default_profile
+        or default_profile != default_profile.strip()
+    ):
         raise ValidationError(
-            "{} EXECUTION_MODES must be a dictionary".format(source_name)
+            "{} has invalid DEFAULT_PROFILE".format(source_name)
         )
-    for strategy_id, mode in execution_modes.items():
+    if default_profile not in profiles:
+        raise ValidationError(
+            "{} DEFAULT_PROFILE is missing from PROFILES".format(source_name)
+        )
+    strategies = assignments.get("STRATEGIES")
+    if type(strategies) is not dict:
+        raise ValidationError("{} STRATEGIES must be a dictionary".format(source_name))
+    for strategy_id, settings in strategies.items():
         if (
             type(strategy_id) is not str
             or not strategy_id
             or strategy_id != strategy_id.strip()
-            or type(mode) is not str
-            or mode not in ("JQ", "QMT_REMOTE")
-        ):
-            raise ValidationError(
-                "{} has invalid EXECUTION_MODES".format(source_name)
+            or len(strategy_id) > 128
+            or not all(
+                str.isalnum(char) or char in "._-" for char in strategy_id
             )
+        ):
+            raise ValidationError("{} has invalid strategy id".format(source_name))
+        if type(settings) is not dict:
+            raise ValidationError("{} has invalid strategy settings".format(source_name))
+        if not set(settings).issubset(_STRATEGY_ALLOWED_FIELDS):
+            raise ValidationError("{} strategy contains unknown fields".format(source_name))
+        profile_name = settings.get("profile", default_profile)
+        if type(profile_name) is not str or profile_name not in profiles:
+            raise ValidationError("{} strategy has invalid profile".format(source_name))
+        mode = settings.get("mode", "JQ")
+        if type(mode) is not str or mode not in ("JQ", "QMT_REMOTE"):
+            raise ValidationError("{} strategy has invalid mode".format(source_name))
     for profile_name, profile in profiles.items():
         if (
             type(profile_name) is not str
@@ -273,15 +296,6 @@ def _validate_profile_shape(
             raise ValidationError("{} profile is missing required fields".format(source_name))
         if not keys.issubset(_PROFILE_ALLOWED_FIELDS):
             raise ValidationError("{} profile contains unknown fields".format(source_name))
-        strategy_id = profile.get("strategy_id")
-        if (
-            type(strategy_id) is not str
-            or not strategy_id
-            or strategy_id != str.strip(strategy_id)
-            or len(strategy_id) > 128
-            or not all(str.isalnum(char) or char in "._-" for char in strategy_id)
-        ):
-            raise ValidationError("{} profile has invalid strategy_id".format(source_name))
         host = profile.get("host")
         token = profile.get("token")
         if require_private_values:
@@ -405,14 +419,14 @@ def _strategy_identity(text: str, source_name: str) -> Dict[str, object]:
             name = node.target.id
         else:
             continue
-        if name not in ("PROFILE", "STRATEGY_ID") or name in values:
+        if name != "STRATEGY_ID" or name in values:
             continue
         try:
             values[name] = ast.literal_eval(node.value)
         except (TypeError, ValueError, SyntaxError):
             values[name] = None
     identity: Dict[str, object] = {}
-    for field, key in (("PROFILE", "profile"), ("STRATEGY_ID", "strategy_id")):
+    for field, key in (("STRATEGY_ID", "strategy_id"),):
         value = values.get(field)
         if (
             type(value) is not str
@@ -450,17 +464,15 @@ def validate_private_profile(
         )
     assignments = _profile_assignments(tree, "private profile")
     profiles = _validate_profile_shape(assignments, "private profile", True)
-    profile_name = identity["profile"]
     strategy_id = identity["strategy_id"]
-    if profile_name not in profiles:
-        raise ValidationError("private profile is missing the strategy profile")
-    selected = profiles[profile_name]
-    if selected.get("strategy_id") != strategy_id:
-        raise ValidationError("private profile strategy_id does not match strategy")
+    settings = assignments["STRATEGIES"].get(strategy_id, {})
+    profile_name = settings.get("profile", assignments["DEFAULT_PROFILE"])
+    mode = settings.get("mode", "JQ")
     return {
         "profile": profile_name,
         "profile_schema_version": assignments["PROFILE_SCHEMA_VERSION"],
         "strategy_id": strategy_id,
+        "mode": mode,
     }
 
 

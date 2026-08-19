@@ -17,8 +17,7 @@ manifest是另一版”的混合产物，写出后还会重新读取比对SHA256
 artifact kind、文件角色、源/目标名、上传名、字节数和SHA256，不写绝对路径、
 生成时间、host、token、Webhook或账户值；相同源码重复导出的manifest完全一致。`production_ready=false`
 表示它只是自动校验候选，真实聚宽、QMT模拟和小额实盘仍分别受S18至S20门禁约束。
-L00已删除manifest的`contracts`段和跨文件契约一致性扫描；部署mode、profile和strategy_id
-以受控源码审查为准，不再由manifest重复声明。
+L00已删除manifest的`contracts`段和跨文件契约一致性扫描；`strategy_id`以受控策略源码审查为准，mode和profile以已校验私有配置为准，不再由manifest重复声明。
 
 单文件bundle不是标准路径，本slice不生成。标准部署仍是helper和私有profile上传一次，策略源码直接复制；
 任何更新都必须遵守冷升级流程，不能在旧聚宽进程中reload。
@@ -63,9 +62,8 @@ python -X utf8 scripts/export_joinquant.py --validate-only `
 
 标准部署顺序是：
 
-1. 在仓库内先确定并审查策略顶部的`PROFILE`、
-   `VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`。回测始终自动使用BACKTEST；模拟交易从私有
-   `EXECUTION_MODES[strategy_id]`读取JQ或QMT_REMOTE，缺少键时默认JQ。不得在导出后或聚宽编辑器内再次修改这些值。
+1. 在仓库内先确定并审查策略顶部的`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`。回测始终自动使用BACKTEST；模拟交易从私有
+   `STRATEGIES[strategy_id]`读取profile和JQ/QMT_REMOTE，缺少键时使用`DEFAULT_PROFILE`并默认JQ。不得在导出后或聚宽编辑器内再次修改这些值。
 2. 在仓库外复制`jq_runtime_config.example.py`为`jq_runtime_config.py`，填写真实host/token及可选账户/TLS字段，
    使用`--private-profile`通过只读校验。
 3. 以同一受控源码执行最终导出，核对`manifest.json`中的文件SHA256和三个Python文件；上传后禁止手工编辑。
@@ -78,10 +76,10 @@ python -X utf8 scripts/export_joinquant.py --validate-only `
 - 所有Python源按Python 3.8语法解析（`ast.parse(feature_version=(3, 8))`）。
 - 明显凭据扫描：文本正则拒绝飞书/Slack/Discord Webhook URL和Bearer特征；AST字面量检查拒绝常见
   `*_TOKEN`/`*_HOST`等敏感名称的非空、非占位符字面量，`configure(...)`的位置参数和调用关键字参数同样纳入检查。
-- profile模板只接受`PROFILE_SCHEMA_VERSION`/`PROFILES`的顶层字面量赋值；schema必须为v1，字段、类型
+- profile模板只接受`PROFILE_SCHEMA_VERSION`/`DEFAULT_PROFILE`/`STRATEGIES`/`PROFILES`的顶层字面量赋值；schema必须为v2，字段、类型
   和范围固定，模板host/token必须为空。
-- 策略顶层`PROFILE`/`STRATEGY_ID`必须是非空字面量且符合命名单元；`--private-profile`按同一schema
-  只读校验私有profile，并要求profile名与`strategy_id`和策略声明一致；不执行、不复制、不hash、不输出秘密。
+- 策略顶层`STRATEGY_ID`必须是非空字面量且符合命名单元；`--private-profile`按同一schema
+  只读校验私有配置并解析该策略使用的profile和mode；不执行、不复制、不hash、不输出秘密。
 - 导出目录必须不存在且不得经过symlink/junction/reparse point；先在同级临时目录写出并复核SHA256，
   再原子替换为目标，失败清理后保持调用前状态。
 - clean-room smoke仅使用导出物验证Python 3.8语法、导入以及缺helper、缺profile、版本不匹配的失败关闭路径。

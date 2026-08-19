@@ -127,3 +127,9 @@ MiniQMT和BigQMT版本、券商柜台及网关返回字段并不完全一致。S
 剩余实现合并为L01至L04四个纵向分片：QMT同步对账；目标规划与执行；策略API与聚宽真实组合视图；本机部署与小额验收。S18至S20的真实交易日要求保留为人工验收步骤，不为其建设额外框架。
 
 开始L01前先执行一次有测试保护的裁剪slice。计划删除helper的同进程对抗、热重载代际和对象投毒防御，精简导出器深层AST扫描、通用worker/lease、多租户权限及历史审查正文。不得裁剪SQLite事务、资金不变量、请求幂等、未知提交隔离、成交去重、T+1、账实对账、原子估值、启动阻断、kill switch和数据库备份。
+
+## D024：策略身份与连接profile解耦
+
+聚宽策略脚本只声明全局唯一且稳定的`STRATEGY_ID`。私有配置schema v2使用`PROFILES`保存可复用连接，使用`STRATEGIES[strategy_id]`选择profile和JQ/QMT_REMOTE模式；profile不再重复保存strategy ID。缺少策略条目时固定使用`DEFAULT_PROFILE + JQ`，QMT_REMOTE必须显式配置。
+
+同一个profile可供多个不同策略复用，但两个独立策略不得共用`STRATEGY_ID`。服务端账本、持仓归属、活动意图和幂等作用域均以strategy ID为键；相同ID表示同一逻辑策略账户，不提供多实例领导者选举。

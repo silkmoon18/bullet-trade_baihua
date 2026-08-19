@@ -17,7 +17,7 @@
 
 ## 当前使用限制
 
-`good_etf.py`已经不再保存host、token、Webhook或账户配置，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或下单包装代码。496行策略文件只保留部署声明、策略/执行参数、一次门面安装，以及ETF选股、权重、调仓、止盈止损和尾盘记录。`JoinQuantRuntime`门面对三种模式提供统一组合、下单、撤单、通知和查询入口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
+`good_etf.py`已经不再保存host、token、profile、Webhook或账户配置，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或下单包装代码。策略文件只保留唯一`STRATEGY_ID`、回测开关、策略/执行参数、一次门面安装，以及ETF选股、权重、调仓、止盈止损和尾盘记录。`JoinQuantRuntime`门面对三种模式提供统一组合、下单、撤单、通知和查询入口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
 
 当前三种模式的边界是：
 
@@ -36,11 +36,11 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
 2. 本目录策略源码保持 `from jqdata import *` 和顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
-3. 在仓库源码中审查顶部的`PROFILE`、`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`；回测自动使用`BACKTEST`。模拟交易模式在私有`jq_runtime_config.py`的`EXECUTION_MODES[strategy_id]`中选择，缺少策略键时安全地默认为`JQ`。
+3. 在仓库源码中审查顶部的`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`；回测自动使用`BACKTEST`。模拟交易的profile和模式在私有`jq_runtime_config.py`的`STRATEGIES[strategy_id]`中选择，缺少策略键时使用`DEFAULT_PROFILE`并安全地默认为`JQ`。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
    profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。
-5. 核对manifest中各文件SHA256与受控源码的部署声明（`PROFILE`/`VALIDATE_REMOTE_DURING_BACKTEST`/`STRATEGY_ID`），停止旧进程后上传统一helper与已校验的私有
+5. 核对manifest中各文件SHA256与受控源码的部署声明（`VALIDATE_REMOTE_DURING_BACKTEST`/`STRATEGY_ID`），停止旧进程后上传统一helper与已校验的私有
    `jq_runtime_config.py`，最后把导出的策略原样复制到聚宽编辑器。
 6. 导出后和聚宽侧均禁止再次编辑部署声明或helper；任何变更都回到受控源码重新校验、导出并冷升级。
 

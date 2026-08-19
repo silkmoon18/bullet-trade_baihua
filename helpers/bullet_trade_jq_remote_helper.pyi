@@ -131,7 +131,7 @@ class PortfolioView:
 class _StrategyRuntimeRequiredState(TypedDict):
     api_version: int
     profile_schema_version: int
-    profile: str
+    profile: Optional[str]
     mode: _RuntimeMode
     run_type: str
     strategy_id: str
@@ -156,7 +156,6 @@ def install_strategy_runtime(
     namespace: Dict[str, Any],
     *,
     context: Context,
-    profile: str,
     mode: _RuntimeMode,
     strategy_id: str,
     expected_api_version: int = ...,
@@ -214,7 +213,6 @@ def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
     context: Context,
-    profile: str,
     strategy_id: str,
     initial_capital: Any,
     profile_module: str = ...,

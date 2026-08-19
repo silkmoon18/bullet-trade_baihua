@@ -13,7 +13,7 @@ import pytest
 
 import helpers.bullet_trade_jq_remote_helper as _helper
 
-PROFILE = "good_etf-prod"
+PROFILE = "qmt-main"
 STRATEGY_ID = "good_etf"
 PROFILE_MODULE = "test_jq_runtime_config"
 BLOCKED_MUTATIONS = tuple(sorted({
@@ -32,26 +32,32 @@ def _context(run_type):
 
 
 def _valid_profile(**overrides):
-    value = {"strategy_id": STRATEGY_ID, "host": "127.0.0.1", "token": "unit-token"}
+    value = {"host": "127.0.0.1", "token": "unit-token"}
     value.update(overrides)
     return value
 
 
 def _profile_module(
-    monkeypatch, *, version=1, profiles=None, execution_modes=None
+    monkeypatch, *, version=2, profiles=None, strategies=None,
+    default_profile=PROFILE
 ):
     module = types.ModuleType(PROFILE_MODULE)
     module.PROFILE_SCHEMA_VERSION = version
+    module.DEFAULT_PROFILE = default_profile
     module.PROFILES = {PROFILE: _valid_profile()} if profiles is None else profiles
-    if execution_modes is not None:
-        module.EXECUTION_MODES = execution_modes
+    module.STRATEGIES = {} if strategies is None else strategies
     monkeypatch.setitem(sys.modules, PROFILE_MODULE, module)
 
 
 def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
-    kwargs.setdefault("profile", PROFILE)
     kwargs.setdefault("strategy_id", STRATEGY_ID)
     kwargs.setdefault("profile_module", PROFILE_MODULE)
+    if type(mode) is str and mode.strip().upper() in ("JQ", "QMT_REMOTE"):
+        module = sys.modules.get(kwargs["profile_module"])
+        if module is not None and type(getattr(module, "STRATEGIES", None)) is dict:
+            settings = module.STRATEGIES.setdefault(STRATEGY_ID, {})
+            if type(settings) is dict:
+                settings["mode"] = mode.strip().upper()
     return helper.install_strategy_runtime(
         {} if namespace is None else namespace,
         context=_context("sim_trade") if context is None else context,
@@ -60,9 +66,9 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 7,
-        "profile_schema_version": 1,
-        "profile": PROFILE,
+        "api_version": 8,
+        "profile_schema_version": 2,
+        "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
         "run_type": run_type,
         "strategy_id": STRATEGY_ID,
@@ -96,11 +102,11 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 7
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 8
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v7"
+        "bullet-trade-joinquant-runtime-helper-v8"
     )
-    assert helper.PROFILE_SCHEMA_VERSION == 1
+    assert helper.PROFILE_SCHEMA_VERSION == 2
 
 
 def test_execution_value_objects_are_typed_and_immutable(helper):
@@ -122,14 +128,16 @@ def test_strategy_mode_is_per_strategy_and_missing_key_defaults_to_jq(
 ):
     _profile_module(
         monkeypatch,
-        execution_modes={"other": "QMT_REMOTE"},
+        strategies={"other": {"mode": "QMT_REMOTE"}},
     )
 
     assert helper.get_configured_execution_mode(
         STRATEGY_ID, PROFILE_MODULE
     ) == "JQ"
 
-    sys.modules[PROFILE_MODULE].EXECUTION_MODES[STRATEGY_ID] = "QMT_REMOTE"
+    sys.modules[PROFILE_MODULE].STRATEGIES[STRATEGY_ID] = {
+        "mode": "QMT_REMOTE"
+    }
     assert helper.get_configured_execution_mode(
         STRATEGY_ID, PROFILE_MODULE
     ) == "QMT_REMOTE"
@@ -140,7 +148,7 @@ def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
 ):
     _profile_module(
         monkeypatch,
-        execution_modes={STRATEGY_ID: "QMT_REMOTE"},
+        strategies={STRATEGY_ID: {"mode": "QMT_REMOTE"}},
     )
     namespace = {
         name: lambda *args, **kwargs: None for name in BLOCKED_MUTATIONS
@@ -149,7 +157,6 @@ def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
     runtime = helper.install_joinquant_runtime(
         namespace,
         context=_context("sim_trade"),
-        profile=PROFILE,
         strategy_id=STRATEGY_ID,
         initial_capital="10000",
         profile_module=PROFILE_MODULE,
@@ -160,13 +167,54 @@ def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
     assert runtime.state["production_ready"] is False
 
 
+def test_missing_strategy_uses_default_profile_and_jq(helper, monkeypatch):
+    _profile_module(
+        monkeypatch,
+        strategies={"other": {"mode": "QMT_REMOTE"}},
+    )
+
+    runtime = helper.install_joinquant_runtime(
+        {},
+        context=_context("sim_trade"),
+        strategy_id=STRATEGY_ID,
+        initial_capital="10000",
+        profile_module=PROFILE_MODULE,
+    )
+
+    assert runtime.mode is helper.RuntimeMode.JQ
+    assert runtime.state["profile"] == PROFILE
+
+
+def test_strategy_can_override_reusable_connection_profile(helper, monkeypatch):
+    _profile_module(
+        monkeypatch,
+        profiles={
+            PROFILE: _valid_profile(),
+            "qmt-backup": _valid_profile(host="127.0.0.2"),
+        },
+        strategies={
+            STRATEGY_ID: {"profile": "qmt-backup", "mode": "JQ"}
+        },
+    )
+
+    runtime = helper.install_joinquant_runtime(
+        {},
+        context=_context("sim_trade"),
+        strategy_id=STRATEGY_ID,
+        initial_capital="10000",
+        profile_module=PROFILE_MODULE,
+    )
+
+    assert runtime.state["profile"] == "qmt-backup"
+    assert helper._active_profile["host"] == "127.0.0.2"
+
+
 def test_joinquant_runtime_facade_backtest_does_not_load_profile_by_default(
     helper
 ):
     runtime = helper.install_joinquant_runtime(
         {},
         context=_context("full_backtest"),
-        profile=PROFILE,
         strategy_id=STRATEGY_ID,
         initial_capital="10000",
         profile_module="module_that_does_not_exist",
@@ -222,7 +270,6 @@ def test_backtest_remote_validation_is_reused_after_runtime_reinstall(
 
     kwargs = {
         "context": _context("full_backtest"),
-        "profile": PROFILE,
         "strategy_id": STRATEGY_ID,
         "initial_capital": "10000",
         "profile_module": PROFILE_MODULE,
@@ -407,8 +454,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8, "7", True, None])
-def test_expected_api_version_must_equal_seven(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 9, "8", True, None])
+def test_expected_api_version_must_equal_eight(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -450,11 +497,10 @@ def test_invalid_mode_rejected(helper, mode):
         _install(helper, mode=mode)
 
 
-@pytest.mark.parametrize("field", ["profile", "strategy_id"])
 @pytest.mark.parametrize("value", ["", " padded", "x" * 129, "bad name", 7])
-def test_invalid_identifiers_rejected(helper, field, value):
-    with pytest.raises(RuntimeError, match=field):
-        _install(helper, **{field: value})
+def test_invalid_strategy_identifier_rejected(helper, value):
+    with pytest.raises(RuntimeError, match="strategy_id"):
+        _install(helper, strategy_id=value)
 
 
 @pytest.mark.parametrize("name", ["", "bad name", "foo-bar", 7])
@@ -471,7 +517,7 @@ def test_profile_module_import_failure_breaks_exception_chain(helper):
 
 
 def test_profile_schema_version_mismatch(helper, monkeypatch):
-    _profile_module(monkeypatch, version=2)
+    _profile_module(monkeypatch, version=1)
     with pytest.raises(RuntimeError, match="schema版本不匹配"):
         _install(helper)
 
@@ -484,7 +530,7 @@ def test_profiles_must_be_plain_dict(helper, monkeypatch):
 
 def test_missing_profile_rejected(helper, monkeypatch):
     _profile_module(monkeypatch, profiles={"other": _valid_profile()})
-    with pytest.raises(RuntimeError, match="不存在profile"):
+    with pytest.raises(RuntimeError, match="DEFAULT_PROFILE在PROFILES中不存在"):
         _install(helper)
 
 
@@ -524,11 +570,15 @@ def test_invalid_port_rejected(helper, monkeypatch, port):
         _install(helper)
 
 
-def test_profile_strategy_id_mismatch_rejected(helper, monkeypatch):
+def test_multiple_strategies_can_share_one_connection_profile(helper, monkeypatch):
     _profile_module(
-        monkeypatch, profiles={PROFILE: _valid_profile(strategy_id="other_strategy")})
-    with pytest.raises(RuntimeError, match="与策略请求不一致"):
-        _install(helper)
+        monkeypatch,
+        strategies={
+            STRATEGY_ID: {"profile": PROFILE, "mode": "JQ"},
+            "another_strategy": {"profile": PROFILE, "mode": "JQ"},
+        },
+    )
+    assert _install(helper)["profile"] == PROFILE
 
 
 _NUMERIC_FIELDS = {
@@ -634,8 +684,11 @@ def test_signature_drift_rejected(helper, monkeypatch):
     _profile_module(monkeypatch)
     namespace = {}
     _install(helper, namespace)
+    module = sys.modules[PROFILE_MODULE]
+    module.PROFILES["qmt-backup"] = _valid_profile()
+    module.STRATEGIES[STRATEGY_ID]["profile"] = "qmt-backup"
     with pytest.raises(RuntimeError, match="签名漂移"):
-        _install(helper, namespace, profile="other-profile")
+        _install(helper, namespace)
 
 
 def test_previous_generation_record_rejected(helper, monkeypatch):

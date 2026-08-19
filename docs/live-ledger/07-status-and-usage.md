@@ -42,12 +42,11 @@ strategies/joinquant/good_etf.py
 同一份策略自动识别回测，不再切换字符串MODE：
 
 ```python
-PROFILE = 'good_etf-prod'
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
 
-v7 helper在所有模式均须上传。远程预检为`True`时还必须上传私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取profile、不连接服务器。
+v8 helper在所有模式均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
 
 先运行校验：
 
@@ -65,11 +64,11 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### JQ
 
-在私有`jq_runtime_config.py`中设置`EXECUTION_MODES = {"good_etf": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时也默认`JQ`。
+在私有`jq_runtime_config.py`的`STRATEGIES["good_etf"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
 
 ### QMT_REMOTE
 
-把私有配置中的`EXECUTION_MODES["good_etf"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v7 helper和私有profile；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把私有配置中的`STRATEGIES["good_etf"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v8 helper和私有配置；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 `good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前仅按服务器的保守费用缓冲预留现金，成交后只接受QMT/券商明确返回的实际费用，并通过StrategyLedger的`fees`和聚宽`real_fees`指标展示；不得用聚宽模拟佣金覆盖真实费用。迅投官方标准股票`XtTrade`结构没有佣金字段，部分柜台或扩展版本可能补充`commission_fee`、`commission`或`used_commission`，因此必须通过目标账户的`query_data(..., data_type='deal')`或小额成交证明费用字段可用。
 

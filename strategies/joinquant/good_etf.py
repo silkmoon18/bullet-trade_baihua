@@ -23,10 +23,9 @@ if TYPE_CHECKING:
     from joinquant_typing import Context  # noqa: F401
 
 # ===== 部署契约 =====
-PROFILE = 'good_etf-prod'
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 7
+_EXPECTED_RUNTIME_API_VERSION = 8
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 ExecutionMode = bt.RuntimeMode
 
@@ -55,7 +54,6 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
     _runtime = bt.install_joinquant_runtime(
         globals(),
         context=context,
-        profile=PROFILE,
         strategy_id=STRATEGY_ID,
         initial_capital=INITIAL_CAPITAL,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
