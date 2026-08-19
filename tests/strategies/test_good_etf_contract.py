@@ -274,6 +274,8 @@ def test_market_open_uses_pre_trade_asset_snapshot(monkeypatch):
         for message in strategy.log.messages
     )
     assert runtime.notifications
+    value_orders = [call for call in runtime.order_calls if call[0] == "value"]
+    assert value_orders == [("value", "510001.XSHG", 9500.0, None)]
 
 
 def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):

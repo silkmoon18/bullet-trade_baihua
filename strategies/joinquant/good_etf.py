@@ -39,8 +39,8 @@ DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、�
 # 港股类 ETF 过滤关键词（名称包含任一关键词即剔除）
 HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '港股通', '恒生互联网']
 
-# ===== 执行参数 =====
-BUY_PRICE_FLOAT_PCT = 0.002   # 限价买入浮动比例：限价 = 最新价 × (1 + 0.2%)，上浮提高成交率
+# ===== QMT_REMOTE执行参数 =====
+REMOTE_PRICE_BAND_PCT = 0.002  # 真实调仓价格边界：聚宽参考价上下0.2%；JQ模式不使用该参数
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 INITIAL_CAPITAL = 10000         # 聚宽策略分配给真实专用账户的固定初始资金
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
@@ -71,7 +71,7 @@ def _notify(message: str) -> None:
 def _rebalance_execution() -> Any:
     return bt.ExecutionRequest(
         style=bt.ConditionalLimitExecution(
-            int(BUY_PRICE_FLOAT_PCT * 1_000_000),
+            int(REMOTE_PRICE_BAND_PCT * 1_000_000),
             bt.ConditionalLimitPriceMode.BOUNDARY,
         ),
         follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
@@ -376,14 +376,8 @@ def market_open(context: 'Context') -> None:
                     action = '减持'
                 log.info(f'调仓{action} | {code} 权重={normalized_weight:.1%} '
                          f'当前市值={current_value:.2f} 目标市值={target_value:.2f}')
-                last_price = float(selected_funds.loc[code, 'last_price'])
-                limit_price = (
-                    last_price * (1 + BUY_PRICE_FLOAT_PCT)
-                    if target_value > current_value and BUY_PRICE_FLOAT_PCT > 0
-                    else None
-                )
-                order_result = _runtime.order_target_value(
-                    code, target_value, limit_price=limit_price)
+                # JQ模式完全交给聚宽原生目标市值撮合，不叠加实盘价格保护。
+                order_result = _runtime.order_target_value(code, target_value)
                 log.info('目标市值已提交 | {} order_id={}'.format(
                     code, getattr(order_result, 'order_id', None)))
             log.info('===== 开盘选股下单完成 =====')

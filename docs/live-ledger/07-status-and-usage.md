@@ -64,7 +64,7 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### JQ
 
-在私有`jq_runtime_config.py`的`STRATEGIES["good_etf"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
+在私有`jq_runtime_config.py`的`STRATEGIES["good_etf"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
 
 ### QMT_REMOTE
 
@@ -84,6 +84,17 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 | `MarketableLimitExecution` | 立即提交带保护边界的积极限价，不伪装成市价 |
 
 `FollowUpPolicy.NONE`表示订单终态后不补剩余量；`UNTIL_FILLED_TODAY`表示只在提交当日继续处理剩余目标。`KEEP_ORIGINAL`固定使用最初聚宽参考价；`RECOMPUTE`在后续补单时使用最新QMT行情重新计算。所有类型均通过同一个StrategyLedger接口，不是GoodETF专用服务器分支。
+
+GoodETF当前逐类委托如下：
+
+| 场景 | BACKTEST/JQ | QMT_REMOTE |
+|---|---|---|
+| 09:30清理非目标持仓 | 聚宽`order_target(code, 0)`，默认撮合，策略不做订单级追单 | 纳入完整组合目标，普通调仓统一按条件限价执行 |
+| 09:30调整目标ETF | 聚宽`order_target_value(code, target_value)`，不传限价，策略不做订单级追单 | 聚宽参考价上下0.2%条件限价，`UNTIL_FILLED_TODAY + KEEP_ORIGINAL` |
+| 5%止损 | 聚宽`order_target(code, 0)`；未成交且下次风控仍满足条件时会再次调用 | `MarketExecution(1.5%) + UNTIL_FILLED_TODAY` |
+| 10%止盈 | 聚宽`order_target(code, 0)`；未成交且下次风控仍满足条件时会再次调用 | 与普通调仓相同的0.2%条件限价追踪 |
+
+这里的“追踪至当日完成”不是定时撤单改价：服务器不会为了追价反复撤销仍有效的同价委托。只有上一笔委托已进入成交、撤销或拒绝等终态后仍有剩余目标，才按原始价格边界继续处理；跨交易日自动取消未完成目标。
 
 若风控触发时普通调仓仍活动，服务器先持久化取消请求：等待价格但尚未挂单的意图可立即结束；已有在途订单时先撤单并等待QMT确认，确认前不会提交第二个重叠目标，也不会在回调后恢复原调仓。
 
