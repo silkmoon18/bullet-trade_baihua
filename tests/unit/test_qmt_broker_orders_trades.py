@@ -90,7 +90,7 @@ def test_qmt_broker_get_trades_prefers_traded_price_and_preserves_zero_commissio
 
 
 @pytest.mark.unit
-def test_qmt_broker_maps_native_xttrade_id_and_used_commission(monkeypatch):
+def test_qmt_broker_maps_xttrade_id_and_optional_broker_commission_extension(monkeypatch):
     broker = QmtBroker(account_id="demo")
     broker._connected = True
 

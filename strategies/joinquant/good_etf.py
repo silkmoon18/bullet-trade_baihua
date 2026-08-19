@@ -412,7 +412,7 @@ def initialize(context: 'Context') -> None:
     set_benchmark('000300.XSHG')
     # 开启动态复权模式（真实价格）
     set_option('use_real_price', True)
-    # 设置聚宽BACKTEST/JQ的模拟交易成本；QMT_REMOTE实际费用来自券商成交回报。
+    # 设置聚宽BACKTEST/JQ的模拟交易成本；QMT_REMOTE只使用服务器确认的真实费用证据。
     set_order_cost(
         OrderCost(close_tax=0.000, open_commission=0.00025, close_commission=0.00025, min_commission=5),
         type='fund'
