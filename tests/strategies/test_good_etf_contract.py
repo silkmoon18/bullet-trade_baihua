@@ -48,7 +48,7 @@ class _Runtime:
     def __init__(self, mode, portfolio=None):
         self.mode = mode
         self.state = {
-            "api_version": 8,
+            "api_version": 9,
             "strategy_id": "good_etf",
             "mode": mode.value,
         }
@@ -154,6 +154,7 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
         "_notify",
         "_rebalance_execution",
         "_stop_loss_execution",
+        "_take_profit_execution",
         "initialize",
         "process_initialize",
         "before_market_open",
@@ -172,6 +173,7 @@ def test_good_etf_declares_execution_policy_per_call(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     rebalance = strategy._rebalance_execution()
     stop_loss = strategy._stop_loss_execution()
+    take_profit = strategy._take_profit_execution()
 
     assert isinstance(rebalance.style, real_helper.ConditionalLimitExecution)
     assert rebalance.style.price_band_ppm == 2_000
@@ -179,8 +181,12 @@ def test_good_etf_declares_execution_policy_per_call(monkeypatch):
         rebalance.style.price_mode
         is real_helper.ConditionalLimitPriceMode.BOUNDARY
     )
+    assert isinstance(rebalance.sell_style, real_helper.MarketExecution)
+    assert rebalance.sell_style.protect_price_band_ppm == 15_000
     assert isinstance(stop_loss.style, real_helper.MarketExecution)
     assert stop_loss.style.protect_price_band_ppm == 15_000
+    assert isinstance(take_profit.style, real_helper.ConditionalLimitExecution)
+    assert take_profit.sell_style is None
     assert (
         stop_loss.follow_up
         is real_helper.FollowUpPolicy.UNTIL_FILLED_TODAY
@@ -205,7 +211,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf",
         "initial_capital": 10000,
-        "expected_api_version": 8,
+        "expected_api_version": 9,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -303,3 +309,29 @@ def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):
     assert isinstance(
         runtime.submissions[0][4].style, real_helper.MarketExecution
     )
+
+
+def test_remote_take_profit_keeps_conditional_limit_execution(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    position = types.SimpleNamespace(
+        price=11.1, avg_cost=10.0, value=11100.0
+    )
+    portfolio = types.SimpleNamespace(
+        total_value=11100.0,
+        positions={"510001.XSHG": position},
+    )
+    runtime = _Runtime(real_helper.RuntimeMode.QMT_REMOTE, portfolio)
+    strategy._runtime = runtime
+    monkeypatch.setattr(strategy, "_notify", lambda message: None)
+
+    strategy.handle_risk_management(
+        types.SimpleNamespace(
+            current_dt=pd.Timestamp("2026-08-20 10:30:00")
+        )
+    )
+
+    assert len(runtime.submissions) == 1
+    assert runtime.submissions[0][1] == {"510001.XSHG": 0.0}
+    execution = runtime.submissions[0][4]
+    assert isinstance(execution.style, real_helper.ConditionalLimitExecution)
+    assert execution.sell_style is None

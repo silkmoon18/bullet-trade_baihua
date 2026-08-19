@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Mapping, Optional, Union
 
 
-EXECUTION_WIRE_SCHEMA_VERSION = 1
+EXECUTION_WIRE_SCHEMA_VERSION = 2
 _MAX_PRICE_BAND_PPM = 100_000
 
 
@@ -108,11 +108,19 @@ ExecutionStyle = Union[
 
 @dataclass(frozen=True)
 class ExecutionRequest:
+    """Execution policy with an optional sell-side style override.
+
+    ``style`` remains the default and buy-side style.  ``sell_style`` allows a
+    rotation to liquidate first with a market order while keeping buys behind
+    a conditional limit, without splitting one whole-portfolio intent.
+    """
+
     style: ExecutionStyle = field(
         default_factory=lambda: LimitExecution(price_band_ppm=2_000)
     )
     follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY
     repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL
+    sell_style: Optional[ExecutionStyle] = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -129,6 +137,16 @@ class ExecutionRequest:
             raise TypeError("follow_up must be FollowUpPolicy")
         if type(self.repricing) is not RepricingPolicy:
             raise TypeError("repricing must be RepricingPolicy")
+        if self.sell_style is not None and not isinstance(
+            self.sell_style,
+            (
+                LimitExecution,
+                ConditionalLimitExecution,
+                MarketExecution,
+                MarketableLimitExecution,
+            ),
+        ):
+            raise TypeError("sell_style must be a supported execution style or None")
 
 
 @dataclass(frozen=True)
@@ -152,12 +170,7 @@ class MarketQuote:
                 raise ValueError("{} must be a positive integer".format(name))
 
 
-def execution_request_to_wire(request: ExecutionRequest) -> Dict[str, object]:
-    """Encode the typed request at the TCP/SQLite JSON boundary."""
-
-    if type(request) is not ExecutionRequest:
-        raise TypeError("request must be ExecutionRequest")
-    style = request.style
+def _style_to_wire(style: ExecutionStyle) -> Dict[str, object]:
     style_wire: Dict[str, object] = {"type": style.execution_type.value}
     if isinstance(style, (LimitExecution, MarketableLimitExecution)):
         style_wire["price_band_ppm"] = style.price_band_ppm
@@ -168,9 +181,22 @@ def execution_request_to_wire(request: ExecutionRequest) -> Dict[str, object]:
         style_wire["protect_price_band_ppm"] = style.protect_price_band_ppm
     else:  # pragma: no cover - guarded by ExecutionRequest validation
         raise TypeError("unsupported execution style")
+    return style_wire
+
+
+def execution_request_to_wire(request: ExecutionRequest) -> Dict[str, object]:
+    """Encode the typed request at the TCP/SQLite JSON boundary."""
+
+    if type(request) is not ExecutionRequest:
+        raise TypeError("request must be ExecutionRequest")
     return {
         "schema_version": EXECUTION_WIRE_SCHEMA_VERSION,
-        "style": style_wire,
+        "style": _style_to_wire(request.style),
+        "sell_style": (
+            _style_to_wire(request.sell_style)
+            if request.sell_style is not None
+            else None
+        ),
         "follow_up": request.follow_up.value,
         "repricing": request.repricing.value,
     }
@@ -199,23 +225,11 @@ def _wire_band(style: Mapping[str, object], field_name: str) -> int:
     return value  # type: ignore[return-value]
 
 
-def execution_request_from_wire(value: Mapping[str, object]) -> ExecutionRequest:
-    """Decode and strictly validate a JSON-compatible execution request."""
-
-    if not isinstance(value, Mapping):
-        raise ValueError("execution request must be an object")
-    _require_exact_fields(
-        value,
-        frozenset({"schema_version", "style", "follow_up", "repricing"}),
-        "execution request",
-    )
-    if value.get("schema_version") != EXECUTION_WIRE_SCHEMA_VERSION:
-        raise ValueError("unsupported execution request schema_version")
-    raw_style = value.get("style")
+def _style_from_wire(raw_style: object, label: str) -> ExecutionStyle:
     if not isinstance(raw_style, Mapping):
-        raise ValueError("execution style must be an object")
+        raise ValueError("{} must be an object".format(label))
     execution_type = _enum_value(
-        ExecutionType, raw_style.get("type"), "execution style type"
+        ExecutionType, raw_style.get("type"), "{} type".format(label)
     )
     if execution_type is ExecutionType.LIMIT:
         _require_exact_fields(
@@ -256,12 +270,42 @@ def execution_request_from_wire(value: Mapping[str, object]) -> ExecutionRequest
         style = MarketableLimitExecution(
             _wire_band(raw_style, "price_band_ppm")
         )
+    return style
+
+
+def execution_request_from_wire(value: Mapping[str, object]) -> ExecutionRequest:
+    """Decode and strictly validate a JSON-compatible execution request."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("execution request must be an object")
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        allowed_fields = frozenset(
+            {"schema_version", "style", "follow_up", "repricing"}
+        )
+    elif schema_version == EXECUTION_WIRE_SCHEMA_VERSION:
+        allowed_fields = frozenset(
+            {"schema_version", "style", "sell_style", "follow_up", "repricing"}
+        )
+    else:
+        raise ValueError("unsupported execution request schema_version")
+    _require_exact_fields(
+        value,
+        allowed_fields,
+        "execution request",
+    )
+    raw_sell_style = value.get("sell_style") if schema_version == 2 else None
     return ExecutionRequest(
-        style=style,
+        style=_style_from_wire(value.get("style"), "execution style"),
         follow_up=_enum_value(
             FollowUpPolicy, value.get("follow_up"), "follow_up"
         ),
         repricing=_enum_value(
             RepricingPolicy, value.get("repricing"), "repricing"
+        ),
+        sell_style=(
+            _style_from_wire(raw_sell_style, "sell execution style")
+            if raw_sell_style is not None
+            else None
         ),
     )

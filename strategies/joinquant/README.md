@@ -23,7 +23,7 @@
 
 - `BACKTEST`：始终使用聚宽原生回测接口；helper必须与策略一起上传，关闭远程预检时不读取私有profile；
 - `JQ`：只允许聚宽模拟交易，正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标；同时通过helper/profile发送目标买入计划卡片，但绝不提交QMT目标；
-- `QMT_REMOTE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。服务端交易总开关默认仍为关闭。
+- `QMT_REMOTE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。GoodETF调仓先以沪深市价IOC卖出，收到终态回报后再按0.2%条件限价买入；止损使用市价IOC，止盈继续使用0.2%条件限价。服务端交易总开关默认仍为关闭。
 
 当前仓库代码已经具备回测、JQ模拟和QMT_REMOTE链路；服务端交易开关默认关闭。真实资金启用前仍必须在目标QMT环境完成模拟与小额人工验收，并由用户明确放行。
 

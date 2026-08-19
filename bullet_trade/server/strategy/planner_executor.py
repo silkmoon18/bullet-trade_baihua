@@ -594,7 +594,11 @@ class SQLiteTargetExecutionService:
         return max(1, mark_price_units * (NAV_SCALE - offset) // NAV_SCALE)
 
     def _prepare_execution(self, request, side, reference_price, quote):
-        style = request.style
+        style = (
+            request.sell_style
+            if side is OrderSide.SELL and request.sell_style is not None
+            else request.style
+        )
         if isinstance(style, LimitExecution):
             price = self._boundary_price(
                 reference_price, side, style.price_band_ppm
@@ -715,10 +719,7 @@ class SQLiteTargetExecutionService:
             intent.state
             in (IntentState.COMPLETED, IntentState.CANCELED, IntentState.FAILED)
             or intent.trading_day != current.date()
-            or security not in intent.targets
-            or not isinstance(
-                intent.execution_request.style, ConditionalLimitExecution
-            )
+            or security not in self.reference_prices(intent_id)
             or self.intent_cancel_requested(intent_id)
             or self._working_orders(intent.account_id)
         ):
@@ -738,6 +739,14 @@ class SQLiteTargetExecutionService:
         if delta == 0:
             return False
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+        style = (
+            intent.execution_request.sell_style
+            if side is OrderSide.SELL
+            and intent.execution_request.sell_style is not None
+            else intent.execution_request.style
+        )
+        if not isinstance(style, ConditionalLimitExecution):
+            return False
         if (
             intent.execution_request.follow_up is FollowUpPolicy.NONE
             and self._order_count(intent.intent_id, security, side) > 0

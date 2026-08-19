@@ -66,7 +66,7 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 8,
+        "api_version": 9,
         "profile_schema_version": 2,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -102,9 +102,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 8
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 9
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v8"
+        "bullet-trade-joinquant-runtime-helper-v9"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 2
 
@@ -454,8 +454,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 9, "8", True, None])
-def test_expected_api_version_must_equal_eight(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, "9", True, None])
+def test_expected_api_version_must_equal_nine(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -820,6 +820,7 @@ def test_typed_execution_request_is_explicitly_encoded_at_rpc_boundary(
         ),
         follow_up=helper.FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing=helper.RepricingPolicy.KEEP_ORIGINAL,
+        sell_style=helper.MarketExecution(15_000),
     )
 
     helper.submit_targets(
@@ -833,11 +834,15 @@ def test_typed_execution_request_is_explicitly_encoded_at_rpc_boundary(
                 "weights": {"510300.XSHG": 1},
                 "idempotency_key": "typed-execution",
                 "execution": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "style": {
                         "type": "CONDITIONAL_LIMIT",
                         "price_band_ppm": 2_000,
                         "price_mode": "BOUNDARY",
+                    },
+                    "sell_style": {
+                        "type": "MARKET",
+                        "protect_price_band_ppm": 15_000,
                     },
                     "follow_up": "UNTIL_FILLED_TODAY",
                     "repricing": "KEEP_ORIGINAL",

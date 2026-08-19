@@ -131,6 +131,16 @@ PASSORDER_USE_REMARK_SIGNATURE = True
 # 0 and no order appears, set this to 0 or 1 in QMT for broker-specific testing.
 PASSORDER_QUICK_TRADE = 2
 
+# QMT official passorder price types: 11 is a specified-price limit order.
+# Stock market orders use exchange-specific price types: Shanghai 42 and
+# Shenzhen 47 are both best-five immediate-or-cancel orders; 44 is the common
+# counterparty-best fallback.  Keep the mapping explicit so a server-side
+# ``style.type=market`` cannot silently fall back to a limit order.
+PASSORDER_LIMIT_PRICE_TYPE = 11
+PASSORDER_MARKET_SH_PRICE_TYPE = 42
+PASSORDER_MARKET_SZ_PRICE_TYPE = 47
+PASSORDER_MARKET_FALLBACK_PRICE_TYPE = 44
+
 # Match the article sample's passorder semantics: a zero/empty return means QMT
 # did not give us a usable order id, but it is not proof that the request was
 # rejected. Return submit_unknown so the BulletTrade side can poll orders before
@@ -1989,13 +1999,43 @@ def _place_order(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     qmt_security = _to_qmt_security(security)
     side = str(payload.get("side") or "BUY").upper()
     amount = int(payload.get("amount") or payload.get("volume") or 0)
-    price = payload.get("price")
     style = payload.get("style") or {}
+    style_type = str(style.get("type") or "").strip().lower()
+    explicit_pr_type = (
+        payload.get("pr_type")
+        or payload.get("prType")
+        or style.get("pr_type")
+        or style.get("prType")
+    )
+    default_market_pr_type = (
+        PASSORDER_MARKET_SH_PRICE_TYPE
+        if qmt_security.endswith(".SH")
+        else (
+            PASSORDER_MARKET_SZ_PRICE_TYPE
+            if qmt_security.endswith(".SZ")
+            else PASSORDER_MARKET_FALLBACK_PRICE_TYPE
+        )
+    )
+    pr_type = int(
+        explicit_pr_type
+        if explicit_pr_type is not None
+        else (
+            default_market_pr_type
+            if style_type == "market"
+            else PASSORDER_LIMIT_PRICE_TYPE
+        )
+    )
+    price = payload.get("price")
     if price is None:
-        price = style.get("price") or style.get("protect_price")
+        price = style.get("price")
+    if price is None and pr_type == PASSORDER_LIMIT_PRICE_TYPE:
+        price = style.get("protect_price")
+    if price is None and pr_type != PASSORDER_LIMIT_PRICE_TYPE:
+        # passorder still requires a numeric placeholder for market price types;
+        # QMT ignores PRICE unless prType is the specified-price type 11.
+        price = 0.0
     if not security or amount <= 0 or price is None:
         return _error("BAD_REQUEST", "place_order requires security, amount and price", request_id)
-    pr_type = int(payload.get("pr_type") or payload.get("prType") or style.get("pr_type") or style.get("prType") or 11)
     op_type = 23 if side == "BUY" else 24
     strategy_name = str(payload.get("strategy_name") or payload.get("strategy") or "qmt")
     order_remark = _compose_order_remark(payload)

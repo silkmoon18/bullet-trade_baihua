@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from tornado.httputil import HTTPHeaders
 
 
@@ -636,6 +637,41 @@ def test_big_qmt_helper_accepts_article_order_payload(monkeypatch):
     assert str(calls[0][9]).startswith("BT")
     assert isinstance(calls[0][10], _FakeContext)
     assert response["value"]["passorder_signature"] == "official_user_order_id"
+
+
+@pytest.mark.parametrize(
+    ("security", "expected_price_type"),
+    (("510300.XSHG", 42), ("159915.XSHE", 47)),
+)
+def test_big_qmt_helper_maps_market_style_to_exchange_market_price_type(
+    monkeypatch, security, expected_price_type
+):
+    helper = _load_helper()
+    calls = []
+
+    def fake_passorder(*args):
+        calls.append(args)
+        return "order-ref-market"
+
+    monkeypatch.setattr(helper, "passorder", fake_passorder, raising=False)
+
+    response = helper._dispatch_qmt_action(
+        _FakeContext(),
+        "place_order",
+        {
+            "security": security,
+            "amount": 100,
+            "side": "SELL",
+            "style": {"type": "market", "protect_price": 9.85},
+            "account_id": TEST_ACCOUNT_ID,
+            "request_id": "r-market",
+        },
+    )
+
+    assert response["ok"] is True
+    assert calls[0][4] == expected_price_type
+    assert calls[0][5] == 0.0
+    assert response["value"]["pr_type"] == expected_price_type
 
 
 def test_big_qmt_helper_marks_zero_passorder_return_submit_unknown(monkeypatch, tmp_path):

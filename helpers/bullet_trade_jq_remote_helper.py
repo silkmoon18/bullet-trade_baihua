@@ -74,10 +74,10 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 8
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v8"
+STRATEGY_RUNTIME_API_VERSION = 9
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v9"
 PROFILE_SCHEMA_VERSION = 2
-EXECUTION_WIRE_SCHEMA_VERSION = 1
+EXECUTION_WIRE_SCHEMA_VERSION = 2
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _RPC_ATTEMPTS = 3
@@ -234,7 +234,7 @@ _DEFAULT_EXECUTION_STYLE = object()
 
 
 _ExecutionRequestTuple = namedtuple(
-    "ExecutionRequest", ("style", "follow_up", "repricing")
+    "ExecutionRequest", ("style", "follow_up", "repricing", "sell_style")
 )
 
 
@@ -246,6 +246,7 @@ class ExecutionRequest(_ExecutionRequestTuple):
         style: Any = _DEFAULT_EXECUTION_STYLE,
         follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL,
+        sell_style: Any = None,
     ) -> "ExecutionRequest":
         if style is _DEFAULT_EXECUTION_STYLE:
             style = LimitExecution(2_000)
@@ -263,15 +264,22 @@ class ExecutionRequest(_ExecutionRequestTuple):
             raise TypeError("follow_up必须是FollowUpPolicy")
         if type(repricing) is not RepricingPolicy:
             raise TypeError("repricing必须是RepricingPolicy")
+        if sell_style is not None and not isinstance(
+            sell_style,
+            (
+                LimitExecution,
+                ConditionalLimitExecution,
+                MarketExecution,
+                MarketableLimitExecution,
+            ),
+        ):
+            raise TypeError("sell_style不是支持的执行类型或None")
         return _ExecutionRequestTuple.__new__(
-            cls, style, follow_up, repricing
+            cls, style, follow_up, repricing, sell_style
         )
 
 
-def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
-    if type(request) is not ExecutionRequest:
-        raise TypeError("execution必须是ExecutionRequest")
-    style = request.style
+def _style_to_wire(style: Any) -> Dict[str, Any]:
     style_wire = {"type": style.execution_type.value}
     if isinstance(style, (LimitExecution, MarketableLimitExecution)):
         style_wire["price_band_ppm"] = style.price_band_ppm
@@ -280,41 +288,62 @@ def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
         style_wire["price_mode"] = style.price_mode.value
     else:
         style_wire["protect_price_band_ppm"] = style.protect_price_band_ppm
+    return style_wire
+
+
+def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
+    if type(request) is not ExecutionRequest:
+        raise TypeError("execution必须是ExecutionRequest")
     return {
         "schema_version": EXECUTION_WIRE_SCHEMA_VERSION,
-        "style": style_wire,
+        "style": _style_to_wire(request.style),
+        "sell_style": (
+            _style_to_wire(request.sell_style)
+            if request.sell_style is not None
+            else None
+        ),
         "follow_up": request.follow_up.value,
         "repricing": request.repricing.value,
     }
 
 
-def _execution_from_wire(value: Dict[str, Any]) -> ExecutionRequest:
-    if type(value) is not dict or value.get("schema_version") != 1:
-        raise RuntimeError("服务器执行请求版本无效")
-    raw_style = value.get("style")
+def _style_from_wire(raw_style: Any) -> Any:
     if type(raw_style) is not dict:
         raise RuntimeError("服务器执行类型无效")
+    execution_type = ExecutionType(raw_style.get("type"))
+    if execution_type is ExecutionType.LIMIT:
+        return LimitExecution(int(raw_style["price_band_ppm"]))
+    if execution_type is ExecutionType.CONDITIONAL_LIMIT:
+        return ConditionalLimitExecution(
+            int(raw_style["price_band_ppm"]),
+            ConditionalLimitPriceMode(raw_style["price_mode"]),
+        )
+    if execution_type is ExecutionType.MARKET:
+        return MarketExecution(int(raw_style["protect_price_band_ppm"]))
+    return MarketableLimitExecution(int(raw_style["price_band_ppm"]))
+
+
+def _execution_from_wire(value: Dict[str, Any]) -> ExecutionRequest:
+    if type(value) is not dict or value.get("schema_version") not in (
+        1,
+        EXECUTION_WIRE_SCHEMA_VERSION,
+    ):
+        raise RuntimeError("服务器执行请求版本无效")
     try:
-        execution_type = ExecutionType(raw_style.get("type"))
-        if execution_type is ExecutionType.LIMIT:
-            style = LimitExecution(int(raw_style["price_band_ppm"]))
-        elif execution_type is ExecutionType.CONDITIONAL_LIMIT:
-            style = ConditionalLimitExecution(
-                int(raw_style["price_band_ppm"]),
-                ConditionalLimitPriceMode(raw_style["price_mode"]),
-            )
-        elif execution_type is ExecutionType.MARKET:
-            style = MarketExecution(
-                int(raw_style["protect_price_band_ppm"])
-            )
-        else:
-            style = MarketableLimitExecution(
-                int(raw_style["price_band_ppm"])
-            )
+        raw_sell_style = (
+            value.get("sell_style")
+            if value.get("schema_version") == EXECUTION_WIRE_SCHEMA_VERSION
+            else None
+        )
         return ExecutionRequest(
-            style=style,
+            style=_style_from_wire(value.get("style")),
             follow_up=FollowUpPolicy(value["follow_up"]),
             repricing=RepricingPolicy(value["repricing"]),
+            sell_style=(
+                _style_from_wire(raw_sell_style)
+                if raw_sell_style is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("服务器执行请求内容无效") from exc

@@ -87,10 +87,12 @@ class ExecutionRequest:
         style: _ExecutionStyle = ...,
         follow_up: FollowUpPolicy = ...,
         repricing: RepricingPolicy = ...,
+        sell_style: Optional[_ExecutionStyle] = ...,
     ) -> ExecutionRequest: ...
     style: _ExecutionStyle
     follow_up: FollowUpPolicy
     repricing: RepricingPolicy
+    sell_style: Optional[_ExecutionStyle]
 
 
 class PositionView:

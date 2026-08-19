@@ -914,6 +914,16 @@ def _positive_float(value: Any) -> float:
 def _request_order_price(payload: Dict[str, Any]) -> Optional[Any]:
     price = payload.get("price")
     style = payload.get("style")
+    if (
+        price in (None, "")
+        and isinstance(style, dict)
+        and str(style.get("type") or "").strip().lower() == "market"
+    ):
+        # A true Big QMT stock market order uses an exchange-specific passorder
+        # price type.  Its protect_price is a planner reservation bound, not
+        # the broker order price, so do not use it when matching the
+        # asynchronous order snapshot.
+        return None
     if price in (None, "") and isinstance(style, dict):
         price = style.get("price")
     if price in (None, "") and isinstance(style, dict):

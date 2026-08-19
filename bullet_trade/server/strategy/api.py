@@ -43,6 +43,12 @@ DatabasePath = Union[str, Path]
 logger = logging.getLogger(__name__)
 
 
+def _uses_conditional_execution(request: ExecutionRequest) -> bool:
+    return isinstance(request.style, ConditionalLimitExecution) or isinstance(
+        request.sell_style, ConditionalLimitExecution
+    )
+
+
 @dataclass(frozen=True)
 class StrategyAPIConfig:
     database_path: DatabasePath
@@ -211,7 +217,7 @@ class SQLiteStrategyAPI:
             execution_request = execution_request_from_wire(raw_execution)
         else:
             raise ValueError("execution must be an object")
-        if isinstance(execution_request.style, ConditionalLimitExecution):
+        if _uses_conditional_execution(execution_request):
             replace = getattr(
                 self.data_provider, "replace_execution_quotes", None
             )
@@ -248,7 +254,7 @@ class SQLiteStrategyAPI:
             execution_request=execution_request,
             quotes=quotes,
         )
-        if isinstance(execution_request.style, ConditionalLimitExecution):
+        if _uses_conditional_execution(execution_request):
             await self._sync_quote_subscriptions(strategy_id)
         dispatched = []
 
@@ -567,9 +573,7 @@ class SQLiteStrategyAPI:
         securities: Sequence[str],
         as_of: datetime,
     ) -> Mapping[str, MarketQuote]:
-        if not isinstance(
-            execution_request.style, ConditionalLimitExecution
-        ):
+        if not _uses_conditional_execution(execution_request):
             return {}
         tick_fn = getattr(self.data_provider, "get_current_tick", None)
         if tick_fn is None:
@@ -670,11 +674,8 @@ class SQLiteStrategyAPI:
             return
         for intent in self.planner.active_intents():
             if (
-                not isinstance(
-                    intent.execution_request.style,
-                    ConditionalLimitExecution,
-                )
-                or security not in intent.targets
+                not _uses_conditional_execution(intent.execution_request)
+                or security not in self.planner.reference_prices(intent.intent_id)
                 or intent.account_id not in self._runtime_bindings
             ):
                 continue
@@ -777,10 +778,10 @@ class SQLiteStrategyAPI:
     async def _sync_quote_subscriptions(self, strategy_id: str) -> None:
         symbols = set()
         for intent in self.planner.active_intents(strategy_id):
-            if isinstance(
-                intent.execution_request.style, ConditionalLimitExecution
+            if _uses_conditional_execution(
+                intent.execution_request
             ) and not self.planner.intent_cancel_requested(intent.intent_id):
-                symbols.update(intent.targets)
+                symbols.update(self.planner.reference_prices(intent.intent_id))
         replace = getattr(
             self.data_provider, "replace_execution_quotes", None
         )

@@ -487,7 +487,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 8
+assert helper.STRATEGY_RUNTIME_API_VERSION == 9
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 2
 assert profile['DEFAULT_PROFILE'] == 'qmt-main'
@@ -565,7 +565,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == [8]
+assert called == [9]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

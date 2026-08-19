@@ -62,7 +62,7 @@ PROFILES = {
 }
 ```
 
-从v1迁移时：删除profile中的`strategy_id`，删除`EXECUTION_MODES`，增加`DEFAULT_PROFILE`和`STRATEGIES`。旧v1配置会被v8 helper明确拒绝，不能与新策略混用。
+从v1迁移时：删除profile中的`strategy_id`，删除`EXECUTION_MODES`，增加`DEFAULT_PROFILE`和`STRATEGIES`。旧v1配置会被v9 helper明确拒绝，不能与新策略混用。
 
 `VALIDATE_REMOTE_DURING_BACKTEST`仍位于策略顶部，因为它属于该策略的回测行为。
 

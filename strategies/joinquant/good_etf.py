@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 # ===== 部署契约 =====
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 8
+_EXPECTED_RUNTIME_API_VERSION = 9
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 ExecutionMode = bt.RuntimeMode
 
@@ -41,6 +41,7 @@ HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '
 
 # ===== QMT_REMOTE执行参数 =====
 REMOTE_PRICE_BAND_PCT = 0.002  # 真实调仓价格边界：聚宽参考价上下0.2%；JQ模式不使用该参数
+REMOTE_MARKET_RESERVATION_BAND_PCT = 0.015  # 市价执行估值/资金预留边界，不限制QMT真实市价成交
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 INITIAL_CAPITAL = 10000         # 聚宽策略分配给真实专用账户的固定初始资金
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
@@ -74,6 +75,10 @@ def _rebalance_execution() -> Any:
             int(REMOTE_PRICE_BAND_PCT * 1_000_000),
             bt.ConditionalLimitPriceMode.BOUNDARY,
         ),
+        # 调仓先以QMT真实市价卖出，成交回报释放资金后，再执行条件限价买入。
+        sell_style=bt.MarketExecution(
+            int(REMOTE_MARKET_RESERVATION_BAND_PCT * 1_000_000)
+        ),
         follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
     )
@@ -81,7 +86,21 @@ def _rebalance_execution() -> Any:
 
 def _stop_loss_execution() -> Any:
     return bt.ExecutionRequest(
-        style=bt.MarketExecution(15_000),
+        style=bt.MarketExecution(
+            int(REMOTE_MARKET_RESERVATION_BAND_PCT * 1_000_000)
+        ),
+        follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
+    )
+
+
+def _take_profit_execution() -> Any:
+    # 止盈不承担为新仓筹资的职责，继续等待0.2%价格边界后限价卖出。
+    return bt.ExecutionRequest(
+        style=bt.ConditionalLimitExecution(
+            int(REMOTE_PRICE_BAND_PCT * 1_000_000),
+            bt.ConditionalLimitPriceMode.BOUNDARY,
+        ),
         follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
     )
@@ -455,7 +474,7 @@ def handle_risk_management(context: 'Context') -> None:
             execution = (
                 _stop_loss_execution()
                 if stop_loss_exits
-                else _rebalance_execution()
+                else _take_profit_execution()
             )
             result = _runtime.submit_targets(
                 context, target_weights, marks, key, execution)

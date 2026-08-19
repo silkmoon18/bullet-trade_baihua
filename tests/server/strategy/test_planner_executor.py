@@ -260,7 +260,7 @@ def _add_position(database, capital, acquired_day, sellable_day):
     )
 
 
-def test_sell_phase_is_created_before_any_buy(tmp_path):
+def test_sell_phase_uses_market_override_before_conditional_buy(tmp_path):
     database, _, capital, reconciliation, _, _, _, as_of = _setup(tmp_path)
     _add_position(database, capital, date(2026, 8, 10), date(2026, 8, 11))
     reconciliation.synchronize(
@@ -287,13 +287,42 @@ def test_sell_phase_is_created_before_any_buy(tmp_path):
     )
 
     result = planner.submit_target_weights(
-        ACCOUNT, "rotate-a-to-b", {A: 0, B: 1}, snapshot, marks, as_of
+        ACCOUNT,
+        "rotate-a-to-b",
+        {A: 0, B: 1},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(
+            style=ConditionalLimitExecution(2_000),
+            sell_style=MarketExecution(15_000),
+        ),
     )
 
     assert result.waiting_for_fills is True
     assert len(result.orders) == 1
     assert result.orders[0].security == A
     assert result.orders[0].side is OrderSide.SELL
+    assert result.orders[0].execution_type is ExecutionType.MARKET
+    assert result.orders[0].limit_price_units is None
+
+    connection = connect_database(database)
+    try:
+        connection.execute(
+            "UPDATE strategy_orders SET state = 'REJECTED' WHERE order_id = ?",
+            (result.orders[0].order_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    follow_up = planner.advance_intent(
+        result.intent.intent_id, snapshot, marks, as_of
+    )
+    assert len(follow_up.orders) == 1
+    assert follow_up.orders[0].security == A
+    assert follow_up.orders[0].execution_type is ExecutionType.MARKET
+    assert follow_up.orders[0].limit_price_units is None
 
 
 def test_global_switch_and_tplus1_both_block_new_buy(tmp_path):

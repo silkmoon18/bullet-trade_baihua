@@ -1192,10 +1192,10 @@ class QmtBroker(BrokerBase):
 
     def _choose_market_price_type(self, security: str, xtconstant) -> Any:
         """
-        根据市场选择更具体的市价类型，避免退回限价。
+        根据市场选择立即成交、剩余撤销的市价类型。
 
-        默认优先使用“对手方最优价”，让 order(..., price=None) 在沪深两市语义保持一致；
-        交易所专用的五档即时成交剩余撤销仅作为兼容兜底。
+        沪深优先使用各自的五档即时成交剩余撤销，使订单尽快进入终态，
+        StrategyLedger 才能依据成交回报立即补剩余目标。对手方最优价仅作兼容兜底。
         """
         market = None
         if "." in security:
@@ -1204,23 +1204,26 @@ class QmtBroker(BrokerBase):
             market = "SH"
         elif market == "XSHE":
             market = "SZ"
-        # 沪深北默认都优先使用对手方最优价，五档即时成交剩余撤销作为市场专用兜底。
-        # xtconstant.MARKET_PEER_PRICE_FIRST 标注支持上交所/深交所/北交所股票。
-        if market in ("SH", "BJ", "BSE"):
+        if market == "SH":
+            return (
+                getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
+                or getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
+                or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
+                or getattr(xtconstant, "ANY_PRICE", None)
+            )
+        if market == "SZ":
+            return (
+                getattr(xtconstant, "MARKET_SZ_CONVERT_5_CANCEL", None)
+                or getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
+                or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
+                or getattr(xtconstant, "ANY_PRICE", None)
+            )
+        if market in ("BJ", "BSE"):
             return (
                 getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
                 or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
                 or getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
                 or getattr(xtconstant, "ANY_PRICE", None)
-                or getattr(xtconstant, "FIX_PRICE", None)
-            )
-        if market == "SZ":
-            return (
-                getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
-                or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
-                or getattr(xtconstant, "MARKET_SZ_CONVERT_5_CANCEL", None)
-                or getattr(xtconstant, "ANY_PRICE", None)
-                or getattr(xtconstant, "FIX_PRICE", None)
             )
         # 兜底
         return (
@@ -1229,9 +1232,6 @@ class QmtBroker(BrokerBase):
             or getattr(xtconstant, "ORDER_PRICE_TYPE_BEST5_OR_CANCEL", None)
             or getattr(xtconstant, "ORDER_PRICE_TYPE_FIVE_LEVEL_INSTANT_OR_CANCEL", None)
             or getattr(xtconstant, "MARKET_PRICE", None)
-            or getattr(xtconstant, "FIX_PRICE", None)
-            or getattr(xtconstant, "PRICE_LIMIT", None)
-            or getattr(xtconstant, "ORDER_PRICE_TYPE_LIMIT", 0)
         )
 
     def _send_order(
@@ -1279,6 +1279,8 @@ class QmtBroker(BrokerBase):
         price_to_use = float(price)
         if market_mode:
             price_type = self._choose_market_price_type(security, xtconstant)
+            if price_type is None:
+                raise RuntimeError("当前xtquant版本未提供可用的股票市价类型")
         else:
             price_type = (
                 getattr(xtconstant, "FIX_PRICE", None)

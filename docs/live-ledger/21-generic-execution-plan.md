@@ -37,6 +37,7 @@
 - `FollowUpPolicy.UNTIL_FILLED_TODAY`：当日内对终态剩余量继续补单。
 - `RepricingPolicy.KEEP_ORIGINAL`：始终沿用原始参考价/边界。
 - `RepricingPolicy.RECOMPUTE`：补单时按最新参考价重新计算。
+- `ExecutionRequest.sell_style`：可选卖侧覆盖；未设置时买卖都使用`style`。GoodETF借此在同一组合意图中先市价卖出，再条件限价买入。
 
 ## 切片
 
@@ -71,7 +72,7 @@
 - 私有配置按 `strategy_id` 指定模式，缺失默认 `JQ`。
 - helper 暴露执行 dataclass、组合提交和真实组合视图门面。
 - `good_etf.py` 删除连接、协议和意图恢复细节，只保留策略参数、选股、权重和风控。
-- 普通调仓使用条件边界限价；止损使用当日追踪市价；止盈使用条件边界限价。
+- 普通调仓卖出使用当日追踪市价IOC，买入使用条件边界限价；止损使用当日追踪市价IOC；止盈使用条件边界限价。
 
 出口：切换 `JQ/QMT_REMOTE` 只改私有配置，聚宽导出文件可直接上传。
 

@@ -265,7 +265,7 @@ def test_qmt_orders_and_trades_include_wait_trace_fields():
     assert trades[0]["strategy_name"] == "bullet-trade"
 
 
-def test_qmt_market_price_type_prefers_peer_price_for_both_markets():
+def test_qmt_market_price_type_prefers_exchange_five_cancel_for_shenzhen_and_shanghai():
     broker = QmtBroker(account_id="test")
 
     class Const:
@@ -276,10 +276,10 @@ def test_qmt_market_price_type_prefers_peer_price_for_both_markets():
         ANY_PRICE = 15
         FIX_PRICE = 16
 
-    assert broker._choose_market_price_type("600000.SH", Const) == Const.MARKET_PEER_PRICE_FIRST
-    assert broker._choose_market_price_type("000001.SZ", Const) == Const.MARKET_PEER_PRICE_FIRST
-    assert broker._choose_market_price_type("600000.XSHG", Const) == Const.MARKET_PEER_PRICE_FIRST
-    assert broker._choose_market_price_type("000001.XSHE", Const) == Const.MARKET_PEER_PRICE_FIRST
+    assert broker._choose_market_price_type("600000.SH", Const) == Const.MARKET_SH_CONVERT_5_CANCEL
+    assert broker._choose_market_price_type("000001.SZ", Const) == Const.MARKET_SZ_CONVERT_5_CANCEL
+    assert broker._choose_market_price_type("600000.XSHG", Const) == Const.MARKET_SH_CONVERT_5_CANCEL
+    assert broker._choose_market_price_type("000001.XSHE", Const) == Const.MARKET_SZ_CONVERT_5_CANCEL
     assert broker._choose_market_price_type("430047.BJ", Const) == Const.MARKET_PEER_PRICE_FIRST
 
 
@@ -297,3 +297,14 @@ def test_qmt_market_price_type_falls_back_to_exchange_specific_five_cancel():
     assert broker._choose_market_price_type("600000.SH", Const) == Const.MARKET_SH_CONVERT_5_CANCEL
     assert broker._choose_market_price_type("000001.SZ", Const) == Const.MARKET_SZ_CONVERT_5_CANCEL
     assert broker._choose_market_price_type("430047.BJ", Const) == Const.MARKET_SH_CONVERT_5_CANCEL
+
+
+def test_qmt_market_price_type_never_silently_falls_back_to_fixed_price():
+    broker = QmtBroker(account_id="test")
+
+    class Const:
+        FIX_PRICE = 11
+        PRICE_LIMIT = 12
+        ORDER_PRICE_TYPE_LIMIT = 13
+
+    assert broker._choose_market_price_type("600000.SH", Const) is None
