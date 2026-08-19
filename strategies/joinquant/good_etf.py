@@ -64,6 +64,7 @@ HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '
 BUY_PRICE_FLOAT_PCT = 0.002   # 限价买入浮动比例：限价 = 最新价 × (1 + 0.2%)，上浮提高成交率
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 INITIAL_CAPITAL = 10000         # 聚宽策略分配给真实专用账户的固定初始资金
+RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
 
 
 def _run_type(context: 'Context') -> str:
@@ -434,15 +435,13 @@ def initialize(context: 'Context') -> None:
     run_daily(before_market_open, '09:20', reference_security='000300.XSHG')
     # 9:30 执行开盘选股+下单
     run_daily(market_open, '09:30', reference_security='000300.XSHG')
-    # 10:30 / 13:30 盘中风控检查（提高止盈止损响应速度）
-    run_daily(handle_risk_management, time='10:30', reference_security='000300.XSHG')
-    run_daily(handle_risk_management, time='13:30', reference_security='000300.XSHG')
-    # 14:50 尾盘风控检查
-    run_daily(handle_risk_management, time='14:50', reference_security='000300.XSHG')
+    # 按顶部配置注册盘中和尾盘止盈止损检查。
+    for risk_time in RISK_CHECK_TIMES:
+        run_daily(handle_risk_management, time=risk_time, reference_security='000300.XSHG')
     # 14:55 尾盘快照（S01仅记录聚宽组合；真实对账由后续StrategyLedger切片实现）
     run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
     log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | '
-             '风控: 10:30/13:30/14:50 | 14:55 尾盘快照')
+             '风控: {} | 14:55 尾盘快照'.format('/'.join(RISK_CHECK_TIMES)))
 
 
 def process_initialize(context: 'Context') -> None:

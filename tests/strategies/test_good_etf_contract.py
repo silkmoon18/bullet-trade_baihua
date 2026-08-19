@@ -104,6 +104,12 @@ def test_strategy_source_compiles():
     compile(source, str(STRATEGY_PATH), "exec")
 
 
+def test_risk_check_times_are_top_level_configuration(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+
+    assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
+
+
 @pytest.mark.parametrize("lifecycle", ["initialize", "process_initialize"])
 def test_lifecycle_gate_is_first_executable_statement(lifecycle):
     tree = ast.parse(
