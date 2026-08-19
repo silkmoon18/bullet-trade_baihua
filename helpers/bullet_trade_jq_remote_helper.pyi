@@ -1,6 +1,5 @@
 """Type contract for the standalone JoinQuant strategy runtime helper."""
 
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Literal, Optional, Tuple, TypedDict, Union
 
@@ -41,25 +40,37 @@ class ConditionalLimitPriceMode(str, Enum):
     COUNTERPARTY: str
 
 
-@dataclass(frozen=True)
 class LimitExecution:
-    price_band_ppm: int = ...
+    def __new__(cls, price_band_ppm: int = ...) -> LimitExecution: ...
+    price_band_ppm: int
+    execution_type: ExecutionType
 
 
-@dataclass(frozen=True)
 class ConditionalLimitExecution:
-    price_band_ppm: int = ...
-    price_mode: ConditionalLimitPriceMode = ...
+    def __new__(
+        cls,
+        price_band_ppm: int = ...,
+        price_mode: ConditionalLimitPriceMode = ...,
+    ) -> ConditionalLimitExecution: ...
+    price_band_ppm: int
+    price_mode: ConditionalLimitPriceMode
+    execution_type: ExecutionType
 
 
-@dataclass(frozen=True)
 class MarketExecution:
-    protect_price_band_ppm: int = ...
+    def __new__(
+        cls, protect_price_band_ppm: int = ...
+    ) -> MarketExecution: ...
+    protect_price_band_ppm: int
+    execution_type: ExecutionType
 
 
-@dataclass(frozen=True)
 class MarketableLimitExecution:
-    price_band_ppm: int = ...
+    def __new__(
+        cls, price_band_ppm: int = ...
+    ) -> MarketableLimitExecution: ...
+    price_band_ppm: int
+    execution_type: ExecutionType
 
 
 _ExecutionStyle = Union[
@@ -70,11 +81,16 @@ _ExecutionStyle = Union[
 ]
 
 
-@dataclass(frozen=True)
 class ExecutionRequest:
-    style: _ExecutionStyle = ...
-    follow_up: FollowUpPolicy = ...
-    repricing: RepricingPolicy = ...
+    def __new__(
+        cls,
+        style: _ExecutionStyle = ...,
+        follow_up: FollowUpPolicy = ...,
+        repricing: RepricingPolicy = ...,
+    ) -> ExecutionRequest: ...
+    style: _ExecutionStyle
+    follow_up: FollowUpPolicy
+    repricing: RepricingPolicy
 
 
 class PositionView:

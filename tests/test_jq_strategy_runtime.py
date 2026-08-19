@@ -103,6 +103,20 @@ def test_public_contract_exports_and_constants(helper):
     assert helper.PROFILE_SCHEMA_VERSION == 1
 
 
+def test_execution_value_objects_are_typed_and_immutable(helper):
+    first = helper.ExecutionRequest()
+    second = helper.ExecutionRequest()
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first.style is not second.style
+    assert first.style == helper.LimitExecution(2_000)
+    assert first.style.execution_type is helper.ExecutionType.LIMIT
+    assert "LimitExecution" in repr(first)
+    with pytest.raises(AttributeError):
+        first.follow_up = helper.FollowUpPolicy.NONE
+
+
 def test_strategy_mode_is_per_strategy_and_missing_key_defaults_to_jq(
     helper, monkeypatch
 ):

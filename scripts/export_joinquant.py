@@ -334,6 +334,24 @@ def _validate_profile_template(tree: ast.Module, source_name: str) -> None:
     _validate_profile_shape(assignments, source_name, False)
 
 
+def _validate_helper_imports(tree: ast.Module, source_name: str) -> None:
+    """Reject modules known to be absent from the JoinQuant runtime."""
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name.split(".", 1)[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [(node.module or "").split(".", 1)[0]]
+        else:
+            continue
+        if "dataclasses" in modules:
+            raise ValidationError(
+                "{} imports unavailable JoinQuant module dataclasses".format(
+                    source_name
+                )
+            )
+
+
 def _validate_source_data(
     role: str,
     data: bytes,
@@ -359,6 +377,8 @@ def _validate_source_data(
     _validate_sensitive_literals(tree, text, source_name)
     if role == "profile-template":
         _validate_profile_template(tree, source_name)
+    elif role == "helper":
+        _validate_helper_imports(tree, source_name)
     return {"bytes": len(data), "sha256": _sha256(data)}
 
 

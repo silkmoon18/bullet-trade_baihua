@@ -35,7 +35,7 @@ import ssl
 import struct
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import namedtuple
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -154,62 +154,103 @@ def _check_band(value: int, field_name: str) -> None:
         raise ValueError("{}必须是0到100000之间的整数".format(field_name))
 
 
-@dataclass(frozen=True)
-class LimitExecution:
-    price_band_ppm: int = 0
-    execution_type: ExecutionType = field(
-        default=ExecutionType.LIMIT, init=False
-    )
-
-    def __post_init__(self) -> None:
-        _check_band(self.price_band_ppm, "price_band_ppm")
+_LimitExecutionTuple = namedtuple(
+    "LimitExecution", ("price_band_ppm", "execution_type")
+)
 
 
-@dataclass(frozen=True)
-class ConditionalLimitExecution:
-    price_band_ppm: int = 2_000
-    price_mode: ConditionalLimitPriceMode = ConditionalLimitPriceMode.BOUNDARY
-    execution_type: ExecutionType = field(
-        default=ExecutionType.CONDITIONAL_LIMIT, init=False
-    )
+class LimitExecution(_LimitExecutionTuple):
+    __slots__ = ()
 
-    def __post_init__(self) -> None:
-        _check_band(self.price_band_ppm, "price_band_ppm")
-        if type(self.price_mode) is not ConditionalLimitPriceMode:
+    def __new__(cls, price_band_ppm: int = 0) -> "LimitExecution":
+        _check_band(price_band_ppm, "price_band_ppm")
+        return _LimitExecutionTuple.__new__(
+            cls, price_band_ppm, ExecutionType.LIMIT
+        )
+
+
+_ConditionalLimitExecutionTuple = namedtuple(
+    "ConditionalLimitExecution",
+    ("price_band_ppm", "price_mode", "execution_type"),
+)
+
+
+class ConditionalLimitExecution(_ConditionalLimitExecutionTuple):
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        price_band_ppm: int = 2_000,
+        price_mode: ConditionalLimitPriceMode = (
+            ConditionalLimitPriceMode.BOUNDARY
+        ),
+    ) -> "ConditionalLimitExecution":
+        _check_band(price_band_ppm, "price_band_ppm")
+        if type(price_mode) is not ConditionalLimitPriceMode:
             raise TypeError("price_mode必须是ConditionalLimitPriceMode")
+        return _ConditionalLimitExecutionTuple.__new__(
+            cls,
+            price_band_ppm,
+            price_mode,
+            ExecutionType.CONDITIONAL_LIMIT,
+        )
 
 
-@dataclass(frozen=True)
-class MarketExecution:
-    protect_price_band_ppm: int = 15_000
-    execution_type: ExecutionType = field(
-        default=ExecutionType.MARKET, init=False
-    )
-
-    def __post_init__(self) -> None:
-        _check_band(self.protect_price_band_ppm, "protect_price_band_ppm")
+_MarketExecutionTuple = namedtuple(
+    "MarketExecution", ("protect_price_band_ppm", "execution_type")
+)
 
 
-@dataclass(frozen=True)
-class MarketableLimitExecution:
-    price_band_ppm: int = 15_000
-    execution_type: ExecutionType = field(
-        default=ExecutionType.MARKETABLE_LIMIT, init=False
-    )
+class MarketExecution(_MarketExecutionTuple):
+    __slots__ = ()
 
-    def __post_init__(self) -> None:
-        _check_band(self.price_band_ppm, "price_band_ppm")
+    def __new__(
+        cls, protect_price_band_ppm: int = 15_000
+    ) -> "MarketExecution":
+        _check_band(protect_price_band_ppm, "protect_price_band_ppm")
+        return _MarketExecutionTuple.__new__(
+            cls, protect_price_band_ppm, ExecutionType.MARKET
+        )
 
 
-@dataclass(frozen=True)
-class ExecutionRequest:
-    style: Any = field(default_factory=lambda: LimitExecution(2_000))
-    follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY
-    repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL
+_MarketableLimitExecutionTuple = namedtuple(
+    "MarketableLimitExecution", ("price_band_ppm", "execution_type")
+)
 
-    def __post_init__(self) -> None:
+
+class MarketableLimitExecution(_MarketableLimitExecutionTuple):
+    __slots__ = ()
+
+    def __new__(
+        cls, price_band_ppm: int = 15_000
+    ) -> "MarketableLimitExecution":
+        _check_band(price_band_ppm, "price_band_ppm")
+        return _MarketableLimitExecutionTuple.__new__(
+            cls, price_band_ppm, ExecutionType.MARKETABLE_LIMIT
+        )
+
+
+_DEFAULT_EXECUTION_STYLE = object()
+
+
+_ExecutionRequestTuple = namedtuple(
+    "ExecutionRequest", ("style", "follow_up", "repricing")
+)
+
+
+class ExecutionRequest(_ExecutionRequestTuple):
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        style: Any = _DEFAULT_EXECUTION_STYLE,
+        follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL,
+    ) -> "ExecutionRequest":
+        if style is _DEFAULT_EXECUTION_STYLE:
+            style = LimitExecution(2_000)
         if not isinstance(
-            self.style,
+            style,
             (
                 LimitExecution,
                 ConditionalLimitExecution,
@@ -218,10 +259,13 @@ class ExecutionRequest:
             ),
         ):
             raise TypeError("style不是支持的执行类型")
-        if type(self.follow_up) is not FollowUpPolicy:
+        if type(follow_up) is not FollowUpPolicy:
             raise TypeError("follow_up必须是FollowUpPolicy")
-        if type(self.repricing) is not RepricingPolicy:
+        if type(repricing) is not RepricingPolicy:
             raise TypeError("repricing必须是RepricingPolicy")
+        return _ExecutionRequestTuple.__new__(
+            cls, style, follow_up, repricing
+        )
 
 
 def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:

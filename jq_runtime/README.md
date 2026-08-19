@@ -53,7 +53,7 @@ EXECUTION_MODES = {
 
 helper是策略的必需研究文件，缺失时策略在导入阶段直接中止并报告`ModuleNotFoundError`。模式解析、API版本校验、profile加载、状态发布、远程预检展示、通知容错和订单门面都在helper内完成，策略只传入稳定的期望API版本。
 
-策略通过helper的`JoinQuantRuntime`门面安装模式并调用组合、下单、撤单和查询；配置和网络边界才使用字符串。订单执行使用helper中的不可变`ExecutionRequest`、执行类型、追单和改价枚举，进入TCP/JSON边界时才显式编码。`BACKTEST`和`JQ`保持聚宽原生交易函数不变；只有`QMT_REMOTE`把namespace中的七个聚宽交易函数替换为抛错guard，并只允许经StrategyLedger提交目标。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
+策略通过helper的`JoinQuantRuntime`门面安装模式并调用组合、下单、撤单和查询；配置和网络边界才使用字符串。订单执行使用helper中的不可变`ExecutionRequest`、执行类型、追单和改价枚举，进入TCP/JSON边界时才显式编码。服务器内部结构继续使用`dataclass`；上传聚宽的helper使用等价的轻量不可变值对象，因为聚宽运行环境不提供`dataclasses`模块。`BACKTEST`和`JQ`保持聚宽原生交易函数不变；只有`QMT_REMOTE`把namespace中的七个聚宽交易函数替换为抛错guard，并只允许经StrategyLedger提交目标。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 

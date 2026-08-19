@@ -77,6 +77,43 @@ def test_export_is_deterministic_and_preserves_source_bytes(tmp_path):
         assert output.read_bytes() == source.read_bytes()
 
 
+def test_exported_helper_imports_without_dataclasses_module(tmp_path):
+    exporter = _load_export_module()
+    destination = tmp_path / "export"
+    exporter.export_joinquant(ROOT, destination)
+    helper_path = destination / "bullet_trade_jq_remote_helper.py"
+    code = """
+import builtins
+import importlib.util
+
+original_import = builtins.__import__
+def joinquant_import(name, *args, **kwargs):
+    if name == 'dataclasses':
+        raise ModuleNotFoundError('JoinQuant has no dataclasses')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = joinquant_import
+
+spec = importlib.util.spec_from_file_location('jq_helper_without_dataclasses', {path!r})
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+request = helper.ExecutionRequest(
+    style=helper.ConditionalLimitExecution(2000)
+)
+assert request.style.price_band_ppm == 2000
+try:
+    request.follow_up = helper.FollowUpPolicy.NONE
+except AttributeError:
+    pass
+else:
+    raise AssertionError('execution request is mutable')
+print('HELPER_WITHOUT_DATACLASSES_OK')
+""".format(path=str(helper_path))
+
+    result = _run_cleanroom(code, isolated=True, no_site=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HELPER_WITHOUT_DATACLASSES_OK" in result.stdout
+
+
 @pytest.mark.parametrize("with_content", [False, True])
 def test_export_refuses_any_existing_destination(tmp_path, with_content):
     exporter = _load_export_module()
@@ -247,6 +284,20 @@ def test_source_validation_rejects_python_39_syntax(tmp_path):
 
     with pytest.raises(exporter.ValidationError, match="Python 3.8 compatible"):
         exporter.validate_source("strategy", path)
+
+
+def test_source_validation_rejects_dataclasses_in_joinquant_helper(tmp_path):
+    exporter = _load_export_module()
+    path = tmp_path / "helper.py"
+    path.write_text(
+        "from dataclasses import dataclass\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        exporter.ValidationError,
+        match="unavailable JoinQuant module dataclasses",
+    ):
+        exporter.validate_source("helper", path)
 
 
 def test_source_validation_rejects_unknown_role(tmp_path):
