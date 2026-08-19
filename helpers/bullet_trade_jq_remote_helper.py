@@ -1146,9 +1146,29 @@ def install_strategy_runtime(
 class JoinQuantRuntime:
     """Small strategy-facing facade shared by JQ and QMT_REMOTE modes."""
 
-    def __init__(self, state: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        state: Dict[str, Any],
+        namespace: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.state = dict(state)
         self.mode = RuntimeMode(self.state["mode"])
+        self._namespace = namespace
+
+    def _publish_state(self) -> None:
+        if self._namespace is None:
+            return
+        global_state = self._namespace.get("g")
+        if global_state is not None:
+            setattr(global_state, "bt_runtime", self.state)
+
+    def _log(self, level: str, message: str) -> None:
+        if self._namespace is None:
+            return
+        logger = self._namespace.get("log")
+        entry = getattr(logger, level, None)
+        if callable(entry):
+            entry(message)
 
     def portfolio(self, context: Any) -> Any:
         return runtime_portfolio(context)
@@ -1160,6 +1180,7 @@ class JoinQuantRuntime:
             self.state["production_ready"] = True
             if _active_state is not None:
                 _active_state["production_ready"] = True
+            self._publish_state()
         return portfolio
 
     def submit_targets(
@@ -1201,6 +1222,62 @@ class JoinQuantRuntime:
     ) -> Dict[str, Any]:
         return notify_target_buy_plan(items, occurred_at=occurred_at)
 
+    @staticmethod
+    def target_buy_plan_item(
+        security: str,
+        target_value: float,
+        current_value: float,
+        reference_price: float,
+        lot_size: int = 100,
+    ) -> Optional[Dict[str, Any]]:
+        """Build one round-lot incremental buy-plan item for notification."""
+
+        if reference_price <= 0 or lot_size <= 0:
+            return None
+        target_delta = target_value - current_value
+        quantity = int(target_delta / reference_price) // lot_size * lot_size
+        if quantity <= 0:
+            return None
+        return {
+            "security": security,
+            "quantity": quantity,
+            "amount": round(quantity * reference_price, 2),
+            "reference_price": reference_price,
+        }
+
+    def send_target_buy_plan(
+        self, items: Any, occurred_at: Any = None
+    ) -> Optional[Dict[str, Any]]:
+        """Send a plan card without allowing notification failure to stop trading."""
+
+        if not items or self.mode is RuntimeMode.BACKTEST:
+            return None
+        try:
+            result = self.notify_target_buy_plan(
+                items, occurred_at=occurred_at
+            )
+            if result.get("accepted"):
+                self._log(
+                    "info",
+                    "策略目标买入计划卡片已提交 | 标的数={} 总金额={:.2f}".format(
+                        result.get("item_count", len(items)),
+                        float(result.get("total_amount", 0.0)),
+                    ),
+                )
+            else:
+                self._log(
+                    "warn", "策略目标买入计划卡片未启用或发送队列未接受"
+                )
+            return result
+        except Exception as exc:
+            self._log(
+                "warn",
+                "策略目标买入计划通知失败：{}".format(
+                    type(exc).__name__
+                ),
+            )
+            return None
+
 
 def install_joinquant_runtime(
     namespace: Dict[str, Any],
@@ -1238,8 +1315,15 @@ def install_joinquant_runtime(
         profile_module=profile_module,
         validate_remote=validate_remote,
     )
-    runtime = JoinQuantRuntime(state)
+    runtime = JoinQuantRuntime(state, namespace)
+    runtime._publish_state()
     if not validate_remote:
+        return runtime
+    if runtime.state.get("remote_validation"):
+        validation = runtime.state["remote_validation"]
+        global_state = namespace.get("g")
+        if global_state is not None:
+            setattr(global_state, "bt_remote_validation", validation)
         return runtime
     ensured = ensure_account(initial_capital)
     reconciliation = ensured.get("reconciliation", {})
@@ -1264,4 +1348,26 @@ def install_joinquant_runtime(
         "position_count": len(portfolio.positions),
         "reconciliation": "READY",
     }
+    if _active_state is not None:
+        _active_state["remote_validation"] = dict(
+            runtime.state["remote_validation"]
+        )
+    global_state = namespace.get("g")
+    if global_state is not None:
+        setattr(
+            global_state,
+            "bt_remote_validation",
+            runtime.state["remote_validation"],
+        )
+    runtime._publish_state()
+    runtime._log(
+        "info",
+        "回测远程预检通过 | 可用资金={:.2f} 持仓市值={:.2f} "
+        "总资产={:.2f} 持仓数={}".format(
+            portfolio.available_cash,
+            portfolio.positions_value,
+            portfolio.total_value,
+            len(portfolio.positions),
+        ),
+    )
     return runtime

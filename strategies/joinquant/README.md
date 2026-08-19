@@ -10,22 +10,22 @@
 | `jq_platform/bullet_trade_jq_remote_helper.py` | 不复制；统一使用上游 `helpers/bullet_trade_jq_remote_helper.py` |
 | `jq_platform/jq_remote_strategy_example.py` | 不复制；上游已有 `helpers/jq_remote_strategy_example.py` |
 | `jq_platform/README.md` | 由 `docs/live-ledger/` 和本文件替代 |
-| `feishu_notifier.py`、`log.py` | 不复制；通知和日志后续迁入服务器能力 |
+| `feishu_notifier.py`、`log.py` | 不复制；交易通知卡片由服务器统一发送，策略事件写聚宽日志 |
 | `runtime/`、`logs/`、`__pycache__/` | 运行产物，不导入Git |
 | `backtest_results/` | 历史产物保留在旧仓库检查点，不作为源码导入 |
 | `main.py` | IDE模板，无有效业务逻辑，不导入 |
 
 ## 当前使用限制
 
-`good_etf.py`已经不再保存host、token、Webhook或账户配置，也不再包含TCP、QMT回调、意图恢复或模式解析代码。`JoinQuantRuntime`门面对JQ/QMT_REMOTE提供统一组合、下单、撤单和查询入口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
+`good_etf.py`已经不再保存host、token、Webhook或账户配置，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或下单包装代码。496行策略文件只保留部署声明、策略/执行参数、一次门面安装，以及ETF选股、权重、调仓、止盈止损和尾盘记录。`JoinQuantRuntime`门面对三种模式提供统一组合、下单、撤单、通知和查询入口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
 
 当前三种模式的边界是：
 
-- `BACKTEST`：不需要profile且始终使用聚宽原生回测接口；helper已上传时经版本化入口校验marker/API版本与回测run_type；helper缺失（仅目标模块本身的`ModuleNotFoundError`）时只允许纯聚宽回测本地兜底，helper内部导入失败直接中止；
+- `BACKTEST`：始终使用聚宽原生回测接口；helper必须与策略一起上传，关闭远程预检时不读取私有profile；
 - `JQ`：只允许聚宽模拟交易，正常调用聚宽原生下单、撤单和模拟撮合，由聚宽维护资金、持仓和指标；同时通过helper/profile发送目标买入计划卡片，但绝不提交QMT目标；
 - `QMT_REMOTE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。服务端交易总开关默认仍为关闭。
 
-因此当前源码可用于回测和后续影子验证，但仍不能用于真实资金。聚宽真实组合视图属L03；真实聚宽、QMT模拟和用户批准的小额实盘门禁在L04按人工验收执行。
+当前仓库代码已经具备回测、JQ模拟和QMT_REMOTE链路；服务端交易开关默认关闭。真实资金启用前仍必须在目标QMT环境完成模拟与小额人工验收，并由用户明确放行。
 
 helper按D021不防御同进程恶意Python代码；旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）与全部同进程对抗机制已在L00删除。同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留记录即失败关闭，必须使用干净进程重启，禁止reload或热补丁。
 
@@ -34,7 +34,7 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 标准工作流是：
 
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
-2. 本目录策略源码保持 `from jqdata import *` 和可选的顶层helper导入；本地和聚宽使用同一个策略文件，
+2. 本目录策略源码保持 `from jqdata import *` 和顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
 3. 在仓库源码中审查顶部的`PROFILE`、`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`；回测自动使用`BACKTEST`。模拟交易模式在私有`jq_runtime_config.py`的`EXECUTION_MODES[strategy_id]`中选择，缺少策略键时安全地默认为`JQ`。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、

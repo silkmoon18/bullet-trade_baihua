@@ -150,7 +150,11 @@ def install_strategy_runtime(
 
 
 class JoinQuantRuntime:
-    def __init__(self, state: Dict[str, Any]) -> None: ...
+    def __init__(
+        self,
+        state: Dict[str, Any],
+        namespace: Optional[Dict[str, Any]] = ...,
+    ) -> None: ...
     state: Dict[str, Any]
     mode: RuntimeMode
 
@@ -177,6 +181,17 @@ class JoinQuantRuntime:
     def notify_target_buy_plan(
         self, items: Any, occurred_at: Any = ...
     ) -> Dict[str, Any]: ...
+    @staticmethod
+    def target_buy_plan_item(
+        security: str,
+        target_value: float,
+        current_value: float,
+        reference_price: float,
+        lot_size: int = ...,
+    ) -> Optional[Dict[str, Any]]: ...
+    def send_target_buy_plan(
+        self, items: Any, occurred_at: Any = ...
+    ) -> Optional[Dict[str, Any]]: ...
 
 
 def install_joinquant_runtime(

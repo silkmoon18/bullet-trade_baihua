@@ -443,12 +443,10 @@ jqdata.__all__ = []
 sys.modules['jqdata'] = jqdata
 spec = importlib.util.spec_from_file_location('missing_helper_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(strategy)
-context = types.SimpleNamespace(run_params=types.SimpleNamespace(type='sim_trade'))
 try:
-    strategy._install_runtime(context)
-except RuntimeError as exc:
-    assert 'bullet_trade_jq_remote_helper.py' in str(exc)
+    spec.loader.exec_module(strategy)
+except ModuleNotFoundError as exc:
+    assert exc.name == 'bullet_trade_jq_remote_helper'
 else:
     raise AssertionError('JQ accepted missing helper')
 print('MISSING_HELPER_FAIL_CLOSED_OK')
@@ -459,7 +457,7 @@ print('MISSING_HELPER_FAIL_CLOSED_OK')
     assert "MISSING_HELPER_FAIL_CLOSED_OK" in result.stdout
 
 
-def test_cleanroom_version_mismatch_does_not_call_helper(tmp_path):
+def test_cleanroom_version_mismatch_is_rejected_by_helper_boundary(tmp_path):
     exporter = _load_export_module()
     destination = tmp_path / "export"
     exporter.export_joinquant(ROOT, destination)
@@ -474,10 +472,16 @@ jqdata.__all__ = []
 sys.modules['jqdata'] = jqdata
 called = []
 helper = types.ModuleType('bullet_trade_jq_remote_helper')
-helper.STRATEGY_RUNTIME_HELPER_MARKER = 'bullet-trade-joinquant-runtime-helper-v7'
-helper.STRATEGY_RUNTIME_API_VERSION = 2
-helper.get_configured_execution_mode = lambda *args, **kwargs: 'JQ'
-helper.install_strategy_runtime = lambda *args, **kwargs: called.append(True)
+from enum import Enum
+class RuntimeMode(str, Enum):
+    BACKTEST = 'BACKTEST'
+    JQ = 'JQ'
+    QMT_REMOTE = 'QMT_REMOTE'
+helper.RuntimeMode = RuntimeMode
+def install(*args, **kwargs):
+    called.append(kwargs['expected_api_version'])
+    raise RuntimeError('helper运行时API版本不匹配')
+helper.install_joinquant_runtime = install
 sys.modules['bullet_trade_jq_remote_helper'] = helper
 spec = importlib.util.spec_from_file_location('bad_version_strategy', {path!r})
 strategy = importlib.util.module_from_spec(spec)
@@ -489,7 +493,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == []
+assert called == [7]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

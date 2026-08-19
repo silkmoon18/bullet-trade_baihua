@@ -47,7 +47,7 @@ VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
 
-远程预检为`True`时必须已上传v7 helper和私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`。
+v7 helper在所有模式均须上传。远程预检为`True`时还必须上传私有profile；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取profile、不连接服务器。
 
 先运行校验：
 

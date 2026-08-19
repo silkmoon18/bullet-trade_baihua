@@ -163,6 +163,133 @@ def test_joinquant_runtime_facade_backtest_does_not_load_profile_by_default(
     assert runtime.state["reason"] == "backtest"
 
 
+def test_backtest_remote_validation_is_reused_after_runtime_reinstall(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    namespace = {"g": types.SimpleNamespace()}
+    calls = []
+    portfolio = helper.PortfolioView({
+        "account_id": "paper",
+        "as_of": "2026-08-20T09:30:00",
+        "snapshot_version": "snapshot-1",
+        "ledger_version": 1,
+        "cash": 10000,
+        "reserved_cash": 0,
+        "available_cash": 10000,
+        "positions_value": 0,
+        "total_value": 10000,
+        "starting_cash": 10000,
+        "total_pnl": 0,
+        "realized_pnl": 0,
+        "unrealized_pnl": 0,
+        "fees": 0,
+        "nav": 1,
+        "returns": 0,
+        "performance_ready": True,
+        "positions": {},
+    })
+
+    def ensure_account(initial_capital):
+        calls.append(("ensure", initial_capital))
+        return {"reconciliation": {"state": "READY"}}
+
+    def get_portfolio():
+        calls.append(("portfolio", None))
+        return portfolio
+
+    def get_reconciliation():
+        calls.append(("reconciliation", None))
+        return {"reconciliation": {"state": "READY"}}
+
+    monkeypatch.setattr(helper, "ensure_account", ensure_account)
+    monkeypatch.setattr(helper, "get_portfolio", get_portfolio)
+    monkeypatch.setattr(helper, "get_reconciliation", get_reconciliation)
+
+    kwargs = {
+        "context": _context("full_backtest"),
+        "profile": PROFILE,
+        "strategy_id": STRATEGY_ID,
+        "initial_capital": "10000",
+        "profile_module": PROFILE_MODULE,
+        "validate_remote_during_backtest": True,
+    }
+    first = helper.install_joinquant_runtime(namespace, **kwargs)
+    second = helper.install_joinquant_runtime(namespace, **kwargs)
+
+    assert calls == [
+        ("ensure", "10000"),
+        ("portfolio", None),
+        ("reconciliation", None),
+    ]
+    assert first.state["remote_validation"] == second.state["remote_validation"]
+    assert namespace["g"].bt_remote_validation["total_value"] == 10000
+
+
+def test_runtime_facade_builds_round_lot_plan_and_logs_notification(
+    helper, monkeypatch
+):
+    logger = types.SimpleNamespace(messages=[])
+    logger.info = logger.messages.append
+    logger.warn = logger.messages.append
+    namespace = {"g": types.SimpleNamespace(), "log": logger}
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ", "sim_trade"), namespace
+    )
+    sent = []
+    monkeypatch.setattr(
+        helper,
+        "notify_target_buy_plan",
+        lambda items, occurred_at=None: sent.append(
+            (items, occurred_at)
+        )
+        or {
+            "accepted": True,
+            "item_count": len(items),
+            "total_amount": 2000.0,
+        },
+    )
+    item = runtime.target_buy_plan_item(
+        "510300.XSHG", 3000.0, 1000.0, 2.0
+    )
+
+    result = runtime.send_target_buy_plan(
+        [item], occurred_at="2026-08-20 09:30:00"
+    )
+
+    assert item == {
+        "security": "510300.XSHG",
+        "quantity": 1000,
+        "amount": 2000.0,
+        "reference_price": 2.0,
+    }
+    assert result["accepted"] is True
+    assert sent == [([item], "2026-08-20 09:30:00")]
+    assert any("计划卡片已提交" in message for message in logger.messages)
+
+
+def test_runtime_facade_notification_failure_does_not_escape(
+    helper, monkeypatch
+):
+    logger = types.SimpleNamespace(messages=[])
+    logger.info = logger.messages.append
+    logger.warn = logger.messages.append
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ", "sim_trade"),
+        {"g": types.SimpleNamespace(), "log": logger},
+    )
+    monkeypatch.setattr(
+        helper,
+        "notify_target_buy_plan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("network")
+        ),
+    )
+
+    assert runtime.send_target_buy_plan([{"security": "510300.XSHG"}]) is None
+    assert any("通知失败" in message for message in logger.messages)
+
+
 @pytest.mark.parametrize("run_type", ["simple_backtest", "full_backtest"])
 @pytest.mark.parametrize("context_kind", ["attr", "dict"])
 def test_backtest_state_exact_without_profile_or_namespace_mutation(

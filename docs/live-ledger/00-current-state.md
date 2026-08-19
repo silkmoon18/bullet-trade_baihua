@@ -72,7 +72,7 @@ L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真
 
 同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-`good_etf.py`保留`VALIDATE_REMOTE_DURING_BACKTEST=True`；回测自动选择BACKTEST并做一次只读远程预检，模拟交易从私有`EXECUTION_MODES[strategy_id]`读取JQ或QMT_REMOTE，缺少键时默认JQ。只有关闭远程预检时的BACKTEST允许无helper运行。
+`good_etf.py`保留`VALIDATE_REMOTE_DURING_BACKTEST=True`；回测自动选择BACKTEST并做一次只读远程预检，模拟交易从私有`EXECUTION_MODES[strategy_id]`读取JQ或QMT_REMOTE，缺少键时默认JQ。helper在所有模式均为必需；关闭回测远程预检时只是不读取profile和不连接服务器。
 
 ### BulletTrade服务器侧
 
@@ -186,9 +186,9 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v6和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
+回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v7和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
 
-L00后策略只保留普通`getattr`校验helper marker与API版本，不再维护闭包authority或深度state schema校验；安装后的执行模式保存在模块级`_active_mode`，交易入口只读取它，`g.bt_runtime`仅为聚宽侧展示副本。`initialize`与`process_initialize`的首条可执行语句均为runtime安装。S01的预提交审查与精确SHA复审均已通过，状态为DONE；逐轮审查历史见`archive/`归档。
+当前策略只保留一次`install_joinquant_runtime`调用；模式解析、API版本校验、状态发布、远程预检、通知容错和聚宽/QMT订单门面均由helper v7负责。策略交易入口只调用`JoinQuantRuntime`，`initialize`与`process_initialize`的首条可执行语句均为runtime安装。历史逐轮审查见`archive/`归档。
 
 ## 7. 安全现状
 
