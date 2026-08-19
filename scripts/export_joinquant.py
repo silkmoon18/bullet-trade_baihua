@@ -212,7 +212,11 @@ def _profile_assignments(tree: ast.Module, source_name: str) -> Dict[str, object
                 raise ValidationError(
                     "{} has a duplicate profile assignment".format(source_name)
                 )
-            if name not in {"PROFILE_SCHEMA_VERSION", "PROFILES"}:
+            if name not in {
+                "PROFILE_SCHEMA_VERSION",
+                "EXECUTION_MODES",
+                "PROFILES",
+            }:
                 raise ValidationError(
                     "{} has an unknown profile assignment".format(source_name)
                 )
@@ -237,6 +241,22 @@ def _validate_profile_shape(
     profiles = assignments.get("PROFILES")
     if type(profiles) is not dict or not profiles:
         raise ValidationError("{} must define non-empty PROFILES".format(source_name))
+    execution_modes = assignments.get("EXECUTION_MODES", {})
+    if type(execution_modes) is not dict:
+        raise ValidationError(
+            "{} EXECUTION_MODES must be a dictionary".format(source_name)
+        )
+    for strategy_id, mode in execution_modes.items():
+        if (
+            type(strategy_id) is not str
+            or not strategy_id
+            or strategy_id != strategy_id.strip()
+            or type(mode) is not str
+            or mode not in ("JQ", "QMT_REMOTE")
+        ):
+            raise ValidationError(
+                "{} has invalid EXECUTION_MODES".format(source_name)
+            )
     for profile_name, profile in profiles.items():
         if (
             type(profile_name) is not str

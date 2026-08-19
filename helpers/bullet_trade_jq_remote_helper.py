@@ -35,14 +35,28 @@ import ssl
 import struct
 import time
 import uuid
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
 __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
     "PROFILE_SCHEMA_VERSION",
+    "ExecutionType",
+    "RuntimeMode",
+    "FollowUpPolicy",
+    "RepricingPolicy",
+    "ConditionalLimitPriceMode",
+    "LimitExecution",
+    "ConditionalLimitExecution",
+    "MarketExecution",
+    "MarketableLimitExecution",
+    "ExecutionRequest",
     "PortfolioView",
     "PositionView",
+    "JoinQuantRuntime",
+    "install_joinquant_runtime",
     "install_strategy_runtime",
     "ensure_account",
     "get_portfolio",
@@ -50,11 +64,21 @@ __all__ = [
     "notify_target_buy_plan",
     "get_intent",
     "get_reconciliation",
+    "get_configured_execution_mode",
+    "runtime_portfolio",
+    "ensure_runtime_ready",
+    "submit_runtime_targets",
+    "advance_runtime_targets",
+    "cancel_runtime_targets",
+    "cancel_runtime_orders",
+    "runtime_order_target",
+    "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 6
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v6"
+STRATEGY_RUNTIME_API_VERSION = 7
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v7"
 PROFILE_SCHEMA_VERSION = 1
+EXECUTION_WIRE_SCHEMA_VERSION = 1
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _RPC_ATTEMPTS = 3
@@ -93,6 +117,163 @@ _MODULE_TOKEN = object()
 _active_signature = None  # type: Optional[Tuple[Any, ...]]
 _active_state = None  # type: Optional[Dict[str, Any]]
 _active_profile = None  # type: Optional[Dict[str, Any]]
+_active_namespace = None  # type: Optional[Dict[str, Any]]
+_runtime_target_state = None  # type: Optional[Dict[str, Any]]
+
+
+class ExecutionType(str, Enum):
+    LIMIT = "LIMIT"
+    CONDITIONAL_LIMIT = "CONDITIONAL_LIMIT"
+    MARKET = "MARKET"
+    MARKETABLE_LIMIT = "MARKETABLE_LIMIT"
+
+
+class RuntimeMode(str, Enum):
+    BACKTEST = "BACKTEST"
+    JQ = "JQ"
+    QMT_REMOTE = "QMT_REMOTE"
+
+
+class FollowUpPolicy(str, Enum):
+    NONE = "NONE"
+    UNTIL_FILLED_TODAY = "UNTIL_FILLED_TODAY"
+
+
+class RepricingPolicy(str, Enum):
+    KEEP_ORIGINAL = "KEEP_ORIGINAL"
+    RECOMPUTE = "RECOMPUTE"
+
+
+class ConditionalLimitPriceMode(str, Enum):
+    BOUNDARY = "BOUNDARY"
+    COUNTERPARTY = "COUNTERPARTY"
+
+
+def _check_band(value: int, field_name: str) -> None:
+    if type(value) is not int or not 0 <= value <= 100_000:
+        raise ValueError("{}必须是0到100000之间的整数".format(field_name))
+
+
+@dataclass(frozen=True)
+class LimitExecution:
+    price_band_ppm: int = 0
+    execution_type: ExecutionType = field(
+        default=ExecutionType.LIMIT, init=False
+    )
+
+    def __post_init__(self) -> None:
+        _check_band(self.price_band_ppm, "price_band_ppm")
+
+
+@dataclass(frozen=True)
+class ConditionalLimitExecution:
+    price_band_ppm: int = 2_000
+    price_mode: ConditionalLimitPriceMode = ConditionalLimitPriceMode.BOUNDARY
+    execution_type: ExecutionType = field(
+        default=ExecutionType.CONDITIONAL_LIMIT, init=False
+    )
+
+    def __post_init__(self) -> None:
+        _check_band(self.price_band_ppm, "price_band_ppm")
+        if type(self.price_mode) is not ConditionalLimitPriceMode:
+            raise TypeError("price_mode必须是ConditionalLimitPriceMode")
+
+
+@dataclass(frozen=True)
+class MarketExecution:
+    protect_price_band_ppm: int = 15_000
+    execution_type: ExecutionType = field(
+        default=ExecutionType.MARKET, init=False
+    )
+
+    def __post_init__(self) -> None:
+        _check_band(self.protect_price_band_ppm, "protect_price_band_ppm")
+
+
+@dataclass(frozen=True)
+class MarketableLimitExecution:
+    price_band_ppm: int = 15_000
+    execution_type: ExecutionType = field(
+        default=ExecutionType.MARKETABLE_LIMIT, init=False
+    )
+
+    def __post_init__(self) -> None:
+        _check_band(self.price_band_ppm, "price_band_ppm")
+
+
+@dataclass(frozen=True)
+class ExecutionRequest:
+    style: Any = field(default_factory=lambda: LimitExecution(2_000))
+    follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY
+    repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.style,
+            (
+                LimitExecution,
+                ConditionalLimitExecution,
+                MarketExecution,
+                MarketableLimitExecution,
+            ),
+        ):
+            raise TypeError("style不是支持的执行类型")
+        if type(self.follow_up) is not FollowUpPolicy:
+            raise TypeError("follow_up必须是FollowUpPolicy")
+        if type(self.repricing) is not RepricingPolicy:
+            raise TypeError("repricing必须是RepricingPolicy")
+
+
+def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
+    if type(request) is not ExecutionRequest:
+        raise TypeError("execution必须是ExecutionRequest")
+    style = request.style
+    style_wire = {"type": style.execution_type.value}
+    if isinstance(style, (LimitExecution, MarketableLimitExecution)):
+        style_wire["price_band_ppm"] = style.price_band_ppm
+    elif isinstance(style, ConditionalLimitExecution):
+        style_wire["price_band_ppm"] = style.price_band_ppm
+        style_wire["price_mode"] = style.price_mode.value
+    else:
+        style_wire["protect_price_band_ppm"] = style.protect_price_band_ppm
+    return {
+        "schema_version": EXECUTION_WIRE_SCHEMA_VERSION,
+        "style": style_wire,
+        "follow_up": request.follow_up.value,
+        "repricing": request.repricing.value,
+    }
+
+
+def _execution_from_wire(value: Dict[str, Any]) -> ExecutionRequest:
+    if type(value) is not dict or value.get("schema_version") != 1:
+        raise RuntimeError("服务器执行请求版本无效")
+    raw_style = value.get("style")
+    if type(raw_style) is not dict:
+        raise RuntimeError("服务器执行类型无效")
+    try:
+        execution_type = ExecutionType(raw_style.get("type"))
+        if execution_type is ExecutionType.LIMIT:
+            style = LimitExecution(int(raw_style["price_band_ppm"]))
+        elif execution_type is ExecutionType.CONDITIONAL_LIMIT:
+            style = ConditionalLimitExecution(
+                int(raw_style["price_band_ppm"]),
+                ConditionalLimitPriceMode(raw_style["price_mode"]),
+            )
+        elif execution_type is ExecutionType.MARKET:
+            style = MarketExecution(
+                int(raw_style["protect_price_band_ppm"])
+            )
+        else:
+            style = MarketableLimitExecution(
+                int(raw_style["price_band_ppm"])
+            )
+        return ExecutionRequest(
+            style=style,
+            follow_up=FollowUpPolicy(value["follow_up"]),
+            repricing=RepricingPolicy(value["repricing"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("服务器执行请求内容无效") from exc
 
 
 class _AmbiguousRequestError(RuntimeError):
@@ -188,6 +369,7 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     connect_timeout = min(timeout, 10.0)
     safe_retry = action not in (
         "strategy.submit_targets",
+        "strategy.cancel_intent",
         "strategy.notify_target_buy_plan",
     )
     last_error = None  # type: Optional[Exception]
@@ -320,10 +502,13 @@ def submit_targets(
     idempotency_key: str,
     marks: Optional[Dict[str, Any]] = None,
     as_of: Any = None,
+    execution: Optional[ExecutionRequest] = None,
 ) -> Dict[str, Any]:
     if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
         raise RuntimeError("只有QMT_REMOTE模式可以提交真实组合目标")
     payload = {"weights": weights, "idempotency_key": idempotency_key}
+    if execution is not None:
+        payload["execution"] = _execution_to_wire(execution)
     if marks is not None:
         payload["marks"] = marks
     if as_of is not None:
@@ -368,6 +553,205 @@ def get_reconciliation() -> Dict[str, Any]:
     return _strategy_request("strategy.get_reconciliation", {})
 
 
+def _record_runtime_portfolio(portfolio: PortfolioView) -> None:
+    if _active_namespace is None:
+        return
+    recorder = _active_namespace.get("record")
+    if not callable(recorder):
+        return
+    recorder(
+        real_cash=portfolio.available_cash,
+        real_total=portfolio.total_value,
+        real_positions=portfolio.positions_value,
+        real_nav=portfolio.nav,
+        real_return=portfolio.returns,
+        real_fees=portfolio.fees,
+    )
+
+
+def runtime_portfolio(context: Any) -> Any:
+    """Return the native JQ portfolio or the StrategyLedger real view."""
+
+    if _active_state is None:
+        raise RuntimeError("策略运行时尚未安装")
+    if _active_state.get("mode") != "QMT_REMOTE":
+        return context.portfolio
+    portfolio = get_portfolio(as_of=getattr(context, "current_dt", None))
+    if not portfolio.performance_ready:
+        raise RuntimeError("真实组合发生过运行中增减资，简单NAV指标不可用")
+    _record_runtime_portfolio(portfolio)
+    return portfolio
+
+
+def _restore_runtime_targets() -> None:
+    global _runtime_target_state
+    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+        _runtime_target_state = None
+        return
+    intent = get_intent()
+    if not intent or intent.get("state") in (
+        "COMPLETED", "CANCELED", "FAILED"
+    ):
+        _runtime_target_state = None
+        return
+    raw_execution = intent.get("execution")
+    execution = (
+        _execution_from_wire(raw_execution)
+        if type(raw_execution) is dict
+        else ExecutionRequest()
+    )
+    _runtime_target_state = {
+        "intent_id": intent["intent_id"],
+        "idempotency_key": intent["idempotency_key"],
+        "weights": dict(intent.get("weights", {})),
+        "marks": {},
+        "execution": execution,
+    }
+
+
+def ensure_runtime_ready(initial_capital: Any, context: Any) -> Any:
+    """Validate the remote account and restore the current daily intent."""
+
+    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+        return runtime_portfolio(context)
+    ensured = ensure_account(initial_capital)
+    reconciliation = ensured.get("reconciliation", {})
+    if reconciliation.get("state") != "READY":
+        raise RuntimeError(
+            "真实账户对账未就绪: {}".format(
+                reconciliation.get("details", {}).get("blockers", [])
+            )
+        )
+    portfolio = runtime_portfolio(context)
+    _restore_runtime_targets()
+    _active_state["production_ready"] = True
+    return portfolio
+
+
+def submit_runtime_targets(
+    context: Any,
+    weights: Dict[str, Any],
+    marks: Dict[str, Any],
+    idempotency_key: str,
+    execution: ExecutionRequest,
+) -> Dict[str, Any]:
+    """Submit one typed daily target and retain only restart state."""
+
+    global _runtime_target_state
+    existing = get_intent(idempotency_key=idempotency_key)
+    if existing:
+        weights = dict(existing.get("weights", weights))
+        if type(existing.get("execution")) is dict:
+            execution = _execution_from_wire(existing["execution"])
+    result = submit_targets(
+        weights,
+        idempotency_key,
+        marks=marks,
+        as_of=getattr(context, "current_dt", None),
+        execution=execution,
+    )
+    _runtime_target_state = {
+        "intent_id": result["intent"]["intent_id"],
+        "idempotency_key": idempotency_key,
+        "weights": dict(weights),
+        "marks": dict(marks),
+        "execution": execution,
+    }
+    portfolio = PortfolioView(result["snapshot"])
+    _record_runtime_portfolio(portfolio)
+    return result
+
+
+def advance_runtime_targets(context: Any) -> bool:
+    """Advance the restored daily intent; return False while it is active."""
+
+    global _runtime_target_state
+    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+        return True
+    if _runtime_target_state is None:
+        _restore_runtime_targets()
+    if _runtime_target_state is None:
+        return True
+    intent = get_intent(_runtime_target_state["intent_id"])
+    if intent.get("state") in ("COMPLETED", "CANCELED", "FAILED"):
+        _runtime_target_state = None
+        return True
+    result = submit_runtime_targets(
+        context,
+        _runtime_target_state["weights"],
+        _runtime_target_state["marks"],
+        _runtime_target_state["idempotency_key"],
+        _runtime_target_state["execution"],
+    )
+    if result["intent"]["state"] == "COMPLETED":
+        _runtime_target_state = None
+        return True
+    return False
+
+
+def cancel_runtime_targets() -> bool:
+    """Cancel the active remote target; return True after it is terminal."""
+
+    global _runtime_target_state
+    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+        return True
+    if _runtime_target_state is None:
+        _restore_runtime_targets()
+    if _runtime_target_state is None:
+        return True
+    result = _strategy_request(
+        "strategy.cancel_intent",
+        {"intent_id": _runtime_target_state["intent_id"]},
+    )
+    if result.get("canceled"):
+        _runtime_target_state = None
+        return True
+    return False
+
+
+def cancel_runtime_orders() -> int:
+    if _active_state is None:
+        raise RuntimeError("策略运行时尚未安装")
+    if _active_state.get("mode") == "QMT_REMOTE":
+        return 0
+    if _active_namespace is None:
+        raise RuntimeError("策略namespace不可用")
+    getter = _active_namespace.get("get_open_orders")
+    cancel = _active_namespace.get("cancel_order")
+    if not callable(getter) or not callable(cancel):
+        raise RuntimeError("聚宽订单函数不可用")
+    orders = getter() or {}
+    for order_obj in list(orders.values()):
+        cancel(order_obj)
+    return len(orders)
+
+
+def runtime_order_target(security: str, amount: int) -> Any:
+    if _active_namespace is None:
+        raise RuntimeError("策略namespace不可用")
+    order_target_fn = _active_namespace.get("order_target")
+    if not callable(order_target_fn):
+        raise RuntimeError("聚宽order_target不可用")
+    return order_target_fn(security, amount)
+
+
+def runtime_order_target_value(
+    security: str, target_value: float, limit_price: Optional[float] = None
+) -> Any:
+    if _active_namespace is None:
+        raise RuntimeError("策略namespace不可用")
+    order_target_value_fn = _active_namespace.get("order_target_value")
+    if not callable(order_target_value_fn):
+        raise RuntimeError("聚宽order_target_value不可用")
+    style = None
+    if limit_price is not None:
+        style_type = _active_namespace.get("LimitOrderStyle")
+        if not callable(style_type):
+            raise RuntimeError("聚宽LimitOrderStyle不可用")
+        style = style_type(limit_price)
+    return order_target_value_fn(security, target_value, style=style)
+
+
 def _run_type_from_context(context: Any) -> Optional[str]:
     run_params = getattr(context, "run_params", None)
     if isinstance(run_params, dict):
@@ -406,6 +790,42 @@ def _validate_profile_module_name(value: Any) -> str:
     if not all(str.isidentifier(part) for part in str.split(value, ".")):
         raise RuntimeError("profile_module 必须是合法的Python模块名")
     return value
+
+
+def get_configured_execution_mode(
+    strategy_id: str,
+    profile_module: str = "jq_runtime_config",
+) -> str:
+    """Read the per-strategy mode; a missing key deliberately defaults to JQ."""
+
+    strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
+    profile_module = _validate_profile_module_name(profile_module)
+    try:
+        module = __import__(profile_module, fromlist=["*"])
+        schema_version = getattr(module, "PROFILE_SCHEMA_VERSION", None)
+        configured = getattr(module, "EXECUTION_MODES", {})
+    except BaseException:
+        raise RuntimeError(
+            "无法加载运行配置模块 {}；请确认文件已上传且配置可读取".format(
+                profile_module
+            )
+        ) from None
+    if type(schema_version) is not int or schema_version != PROFILE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "运行配置schema版本不匹配: expected={}".format(
+                PROFILE_SCHEMA_VERSION
+            )
+        )
+    if type(configured) is not dict:
+        raise RuntimeError("运行配置EXECUTION_MODES必须是字典")
+    if any(type(key) is not str or type(value) is not str for key, value in configured.items()):
+        raise RuntimeError("运行配置EXECUTION_MODES的键和值必须是普通字符串")
+    mode = configured.get(strategy_id, "JQ").strip().upper()
+    if mode not in ("JQ", "QMT_REMOTE"):
+        raise RuntimeError(
+            "策略{}的执行模式必须是JQ或QMT_REMOTE".format(strategy_id)
+        )
+    return mode
 
 
 def _load_runtime_profile(
@@ -611,7 +1031,7 @@ def install_strategy_runtime(
     上一代 helper 遗留记录或记录缺失均失败关闭，必须使用干净进程重启。
     """
 
-    global _active_signature, _active_state, _active_profile
+    global _active_signature, _active_state, _active_profile, _active_namespace
 
     if type(namespace) is not dict:
         raise RuntimeError("策略namespace必须是普通dict（请传入globals()）")
@@ -716,7 +1136,132 @@ def install_strategy_runtime(
 
     _active_signature = signature
     _active_state = dict(state)
+    _active_namespace = namespace
     if mode in ("JQ", "QMT_REMOTE") or validate_remote:
         _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
     return dict(state)
+
+
+class JoinQuantRuntime:
+    """Small strategy-facing facade shared by JQ and QMT_REMOTE modes."""
+
+    def __init__(self, state: Dict[str, Any]) -> None:
+        self.state = dict(state)
+        self.mode = RuntimeMode(self.state["mode"])
+
+    def portfolio(self, context: Any) -> Any:
+        return runtime_portfolio(context)
+
+    def ensure_ready(self, initial_capital: Any, context: Any) -> Any:
+        global _active_state
+        portfolio = ensure_runtime_ready(initial_capital, context)
+        if self.mode is RuntimeMode.QMT_REMOTE:
+            self.state["production_ready"] = True
+            if _active_state is not None:
+                _active_state["production_ready"] = True
+        return portfolio
+
+    def submit_targets(
+        self,
+        context: Any,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        execution: ExecutionRequest,
+    ) -> Dict[str, Any]:
+        return submit_runtime_targets(
+            context, weights, marks, idempotency_key, execution
+        )
+
+    def advance_targets(self, context: Any) -> bool:
+        return advance_runtime_targets(context)
+
+    def cancel_targets(self) -> bool:
+        return cancel_runtime_targets()
+
+    def cancel_orders(self) -> int:
+        return cancel_runtime_orders()
+
+    def order_target(self, security: str, amount: int) -> Any:
+        return runtime_order_target(security, amount)
+
+    def order_target_value(
+        self,
+        security: str,
+        target_value: float,
+        limit_price: Optional[float] = None,
+    ) -> Any:
+        return runtime_order_target_value(
+            security, target_value, limit_price=limit_price
+        )
+
+    def notify_target_buy_plan(
+        self, items: Any, occurred_at: Any = None
+    ) -> Dict[str, Any]:
+        return notify_target_buy_plan(items, occurred_at=occurred_at)
+
+
+def install_joinquant_runtime(
+    namespace: Dict[str, Any],
+    *,
+    context: Any,
+    profile: str,
+    strategy_id: str,
+    initial_capital: Any,
+    profile_module: str = "jq_runtime_config",
+    validate_remote_during_backtest: bool = False,
+    expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
+) -> JoinQuantRuntime:
+    """Resolve the platform run type, install one mode, and run optional preflight."""
+
+    run_type = str(_run_type_from_context(context) or "").strip().lower()
+    if run_type in ("simple_backtest", "full_backtest"):
+        mode = RuntimeMode.BACKTEST
+        validate_remote = validate_remote_during_backtest
+    elif run_type == "sim_trade":
+        mode = RuntimeMode(
+            get_configured_execution_mode(strategy_id, profile_module)
+        )
+        validate_remote = False
+    else:
+        raise RuntimeError(
+            "不支持的聚宽run_type: {}".format(run_type or "<empty>")
+        )
+    state = install_strategy_runtime(
+        namespace,
+        context=context,
+        profile=profile,
+        mode=mode.value,
+        strategy_id=strategy_id,
+        expected_api_version=expected_api_version,
+        profile_module=profile_module,
+        validate_remote=validate_remote,
+    )
+    runtime = JoinQuantRuntime(state)
+    if not validate_remote:
+        return runtime
+    ensured = ensure_account(initial_capital)
+    reconciliation = ensured.get("reconciliation", {})
+    if reconciliation.get("state") != "READY":
+        raise RuntimeError(
+            "回测远程预检对账未就绪: {}".format(
+                reconciliation.get("details", {}).get("blockers", [])
+            )
+        )
+    portfolio = get_portfolio()
+    latest = get_reconciliation().get("reconciliation", {})
+    if latest.get("state") != "READY":
+        raise RuntimeError(
+            "回测远程预检快照对账未就绪: {}".format(
+                latest.get("details", {}).get("blockers", [])
+            )
+        )
+    runtime.state["remote_validation"] = {
+        "cash": portfolio.available_cash,
+        "positions_value": portfolio.positions_value,
+        "total_value": portfolio.total_value,
+        "position_count": len(portfolio.positions),
+        "reconciliation": "READY",
+    }
+    return runtime

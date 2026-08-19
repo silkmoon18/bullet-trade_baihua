@@ -8,8 +8,15 @@ from bullet_trade.server.strategy import (
     BrokerCapabilityProfile,
     BrokerOrder,
     BrokerPositionSnapshot,
+    ConditionalLimitExecution,
+    ConditionalLimitPriceMode,
     CapabilityState,
     MarketMark,
+    MarketExecution,
+    MarketQuote,
+    ExecutionRequest,
+    ExecutionType,
+    FollowUpPolicy,
     OrderSide,
     OrderState,
     PlannerConfig,
@@ -170,7 +177,7 @@ def test_dispatch_success_attaches_real_broker_order_id(tmp_path):
         connection.close()
 
 
-def test_submitted_order_becomes_stale_after_timeout(tmp_path):
+def test_keep_original_order_is_not_canceled_only_because_time_passed(tmp_path):
     _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
     planner.submit_target_weights(
         ACCOUNT, "stale-order", {A: "0.5"}, snapshot, marks, as_of
@@ -184,7 +191,7 @@ def test_submitted_order_becomes_stale_after_timeout(tmp_path):
     assert planner.stale_broker_order_ids(ACCOUNT) == ()
     assert planner.stale_broker_order_ids(
         ACCOUNT, datetime.now(SHANGHAI_TZ) + timedelta(minutes=11)
-    ) == ("broker-stale",)
+    ) == ()
 
 
 def test_dispatch_exception_becomes_submit_unknown_and_is_not_retried(tmp_path):
@@ -327,3 +334,197 @@ def test_global_switch_and_tplus1_both_block_new_buy(tmp_path):
     )
     assert result.orders == ()
     assert result.waiting_for_fills is True
+
+
+def test_conditional_limit_waits_without_order_then_uses_fixed_boundary(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    execution = ExecutionRequest(
+        style=ConditionalLimitExecution(
+            2_000, ConditionalLimitPriceMode.BOUNDARY
+        )
+    )
+
+    waiting = planner.submit_target_weights(
+        ACCOUNT,
+        "conditional-buy",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=execution,
+        quotes={
+            A: MarketQuote(
+                A,
+                as_of,
+                ask_price_units=price_to_units("10.03"),
+            )
+        },
+    )
+
+    assert waiting.orders == ()
+    assert waiting.waiting_for_trigger is True
+    assert planner.quote_triggers_intent(
+        waiting.intent.intent_id,
+        A,
+        MarketQuote(A, as_of, ask_price_units=price_to_units("10.03")),
+        as_of,
+    ) is False
+    assert planner.quote_triggers_intent(
+        waiting.intent.intent_id,
+        A,
+        MarketQuote(A, as_of, ask_price_units=price_to_units("10.01")),
+        as_of,
+    ) is True
+    connection = connect_database(database)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM strategy_orders"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+    triggered = planner.submit_target_weights(
+        ACCOUNT,
+        "conditional-buy",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=execution,
+        quotes={
+            A: MarketQuote(
+                A,
+                as_of,
+                ask_price_units=price_to_units("10.01"),
+            )
+        },
+    )
+
+    assert triggered.waiting_for_trigger is False
+    assert len(triggered.orders) == 1
+    assert triggered.orders[0].limit_price_units == price_to_units("10.02")
+    assert triggered.orders[0].execution_type is ExecutionType.CONDITIONAL_LIMIT
+
+
+def test_market_execution_is_not_encoded_as_limit_order(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planned = planner.submit_target_weights(
+        ACCOUNT,
+        "market-buy",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(
+            style=MarketExecution(15_000),
+            follow_up=FollowUpPolicy.NONE,
+        ),
+    )
+    submitted = []
+
+    async def submit(payload):
+        submitted.append(payload)
+        return {"order_id": "market-1"}
+
+    asyncio.run(planner.dispatch_next(submit))
+
+    assert planned.orders[0].limit_price_units is None
+    assert planned.orders[0].execution_type is ExecutionType.MARKET
+    assert submitted[0]["style"] == {
+        "type": "market",
+        "protect_price": "10.15",
+    }
+
+
+def test_follow_up_none_does_not_resubmit_terminal_remainder(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    first = planner.submit_target_weights(
+        ACCOUNT,
+        "one-shot",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(
+            follow_up=FollowUpPolicy.NONE
+        ),
+    )
+    connection = connect_database(database)
+    try:
+        connection.execute(
+            "UPDATE strategy_orders SET state = 'REJECTED' WHERE order_id = ?",
+            (first.orders[0].order_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    current_snapshot = SQLiteValuationService(database).create_snapshot(
+        ACCOUNT, marks, as_of, timedelta(minutes=1)
+    )
+    result = planner.advance_intent(
+        first.intent.intent_id, current_snapshot, marks, as_of
+    )
+
+    assert result.orders == ()
+    assert result.intent.state.value == "COMPLETED"
+
+
+def test_daily_intent_expires_instead_of_carrying_to_next_day(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    waiting = planner.submit_target_weights(
+        ACCOUNT,
+        "today-only",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(
+            style=ConditionalLimitExecution(2_000)
+        ),
+    )
+
+    result = planner.advance_intent(
+        waiting.intent.intent_id,
+        snapshot,
+        marks,
+        as_of + timedelta(days=1),
+    )
+
+    assert result.orders == ()
+    assert result.intent.state.value == "CANCELED"
+
+
+def test_cancel_requested_intent_never_resubmits_after_order_terminal(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planned = planner.submit_target_weights(
+        ACCOUNT, "cancel-in-flight", {A: "0.5"}, snapshot, marks, as_of
+    )
+
+    async def submit(_payload):
+        return {"order_id": "broker-cancel-1"}
+
+    asyncio.run(planner.dispatch_next(submit))
+    planner.request_intent_cancellation(planned.intent.intent_id)
+
+    waiting = planner.advance_intent(
+        planned.intent.intent_id, snapshot, marks, as_of
+    )
+    assert waiting.waiting_for_fills is True
+    assert waiting.orders == ()
+
+    connection = connect_database(database)
+    try:
+        connection.execute(
+            "UPDATE strategy_orders SET state = 'CANCELED' WHERE intent_id = ?",
+            (planned.intent.intent_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    canceled = planner.advance_intent(
+        planned.intent.intent_id, snapshot, marks, as_of
+    )
+    assert canceled.intent.state.value == "CANCELED"
+    assert canceled.orders == ()

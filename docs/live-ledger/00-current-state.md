@@ -62,7 +62,7 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC、`PortfolioView/PositionView`和六个策略动作封装；当前API v6将聚宽模拟撮合与目标计划通知统一为`JQ`。旧版通用远程交易兼容层及同进程对抗机制仍不恢复；按D021，helper运行在用户自有可信策略进程中。
+L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真实组合视图；当前API v7进一步提供`JoinQuantRuntime`统一门面和不可变执行请求。策略不再包含连接、协议、重启恢复或QMT回调代码；按D021，helper运行在用户自有可信策略进程中。
 
 三种有效执行语义：
 
@@ -72,7 +72,7 @@ L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC、`Po
 
 同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）即失败关闭。升级固定为冷启动：停止策略、确认旧进程退出、替换helper/config/策略文件，再由平台启动全新进程重新校验。
 
-`good_etf.py`默认`SIM_EXECUTION_MODE=ExecutionMode.JQ`、`VALIDATE_REMOTE_DURING_BACKTEST=True`。回测自动选择BACKTEST并做一次远程预检；模拟交易读取枚举配置。安装后的模式保存在模块级`_active_mode`，交易入口只读它。只有关闭远程预检时的BACKTEST允许无helper运行。
+`good_etf.py`保留`VALIDATE_REMOTE_DURING_BACKTEST=True`；回测自动选择BACKTEST并做一次只读远程预检，模拟交易从私有`EXECUTION_MODES[strategy_id]`读取JQ或QMT_REMOTE，缺少键时默认JQ。只有关闭远程预检时的BACKTEST允许无helper运行。
 
 ### BulletTrade服务器侧
 
@@ -93,11 +93,7 @@ S04至S10已具备：
 - 真实买卖成交入账：费用、FIFO lot、T+1可卖和已实现盈亏。
 - 原子估值快照：现金、持仓市值、总资产、NAV、费用和盈亏来自同一读事务。
 
-当前不具备：
-
-- QMT订单/成交/资金/持仓的持续同步与账实对账（L01）。
-- 目标组合规划与先卖后买执行（L02）。
-- L01至L04仓库代码已完成；目标QMT能力、聚宽JQ/QMT模拟和小额实盘仍需外部人工证据。
+当前已具备QMT订单/成交回调、资金/持仓对账、组合目标规划、条件行情触发和卖后买恢复。尚缺的是目标QMT环境对稳定ID、费用和跨日查询的人工能力证明，以及聚宽JQ、QMT模拟和小额实盘运行证据。
 
 ## 4. 依赖现状
 
@@ -162,19 +158,18 @@ from jqdata import *
 
 L00精简运行契约已经处理：
 
-- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、`SIM_EXECUTION_MODE`、回测远程预检开关和`STRATEGY_ID`。
+- 删除host、token、Webhook和账户定位等策略内连接配置，只保留`PROFILE`、回测远程预检开关和`STRATEGY_ID`；模拟交易模式由私有配置按策略选择。
 - 移除旧定制helper的同步追单、账户查询、全账户撤单和通知调用。
 - 过渡期组合目标改为`context.portfolio.total_value × DEPLOY_RATIO × normalized_weight`，不再用可用现金直接计算最终目标。
 - 尾盘仅记录聚宽组合快照，不再把旧helper返回的整个物理账户误报为策略级对账。
 
 仍然存在的问题：
 
-1. 过渡目标仍使用聚宽组合总资产；实盘必须改用StrategyLedger的策略虚拟NAV、working exposure和费用缓冲。
-2. 卖后买、部分成交恢复和券商硬对账已由L01/L02接入；真实柜台能力未经用户目标环境证明时仍保持BLOCKED。
-4. 09:30调仓和09:30风控可能对同一标的产生冲突。
-5. 昨日单位净值与今日开盘价不是严格同时间折价。
-6. 1万元、3只ETF受到100份整手和最低佣金显著影响。
-7. 数据故障与“有效但无候选”尚未严格区分。
+1. QMT_REMOTE已使用StrategyLedger策略虚拟NAV、working exposure和费用缓冲；真实柜台能力未经用户目标环境证明时仍保持BLOCKED。
+2. 普通调仓和风控目标不允许重叠；风控会持久化取消请求，先确认旧在途订单结束，再提交清仓目标。
+3. 昨日单位净值与今日开盘价不是严格同时间折价。
+4. 1万元、3只ETF受到100份整手和最低佣金显著影响。
+5. 数据故障与“有效但无候选”尚未严格区分。
 
 ### 6.1 与 v0.9.2 helper 的已知API差异
 

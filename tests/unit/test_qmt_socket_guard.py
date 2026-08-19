@@ -17,6 +17,7 @@ import types
 import pytest
 
 from bullet_trade.broker.qmt import QmtBroker
+from bullet_trade.data.providers.miniqmt import MiniQMTProvider
 from bullet_trade.remote import RemoteQmtConnection
 from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.qmt import QmtBrokerAdapter, QmtDataAdapter
@@ -155,6 +156,100 @@ def test_qmt_connectivity_error_classifier_is_not_too_broad():
 
     assert is_qmt_connectivity_error(RuntimeError("xtdata connection refused")) is True
     assert is_qmt_connectivity_error(RuntimeError("QMT 本地数据覆盖不足")) is False
+
+
+def test_qmt_broker_forwards_native_lifecycle_events():
+    broker = QmtBroker("account-1", data_path="C:/qmt")
+    events = []
+    broker.set_event_callback(
+        lambda event, payload=None: events.append((event, payload))
+    )
+
+    broker._emit_event("order", {"order_id": "1"})
+    broker._emit_event("trade", {"trade_id": "2"})
+
+    assert events == [
+        ("order", {"order_id": "1"}),
+        ("trade", {"trade_id": "2"}),
+    ]
+
+
+def test_qmt_data_adapter_subscribes_once_and_forwards_tick(monkeypatch):
+    guard = QmtAvailabilityGuard(config=_guard_config(), name="test-data")
+    guard.mark_ready()
+    adapter = QmtDataAdapter(guard)
+    subscriptions = []
+    unsubscriptions = []
+    ticks = []
+    monkeypatch.setattr(
+        adapter.provider,
+        "subscribe_ticks",
+        lambda symbols: subscriptions.append(tuple(symbols)),
+    )
+    monkeypatch.setattr(
+        adapter.provider,
+        "unsubscribe_ticks",
+        lambda symbols: unsubscriptions.append(tuple(symbols)),
+    )
+    adapter.add_tick_listener(ticks.append)
+
+    asyncio.run(
+        adapter.subscribe_execution_quotes(
+            ["510050.XSHG", "510050.XSHG"]
+        )
+    )
+    asyncio.run(adapter.subscribe_execution_quotes(["510050.XSHG"]))
+    asyncio.run(
+        adapter.replace_execution_quotes(
+            "good_etf", ["510300.XSHG"]
+        )
+    )
+    asyncio.run(adapter.replace_execution_quotes("good_etf", []))
+    adapter._on_provider_tick(
+        {"stockCode": "510050.SH", "askPrice": [2.5]}
+    )
+
+    assert subscriptions == [
+        ("510050.XSHG",),
+        ("510300.XSHG",),
+    ]
+    assert unsubscriptions == [
+        ("510050.XSHG",),
+        ("510300.XSHG",),
+    ]
+    assert ticks == [
+        {"stockCode": "510050.SH", "askPrice": [2.5]}
+    ]
+
+
+def test_miniqmt_unsubscribes_with_native_subscription_id(monkeypatch):
+    class FakeXtData:
+        def __init__(self):
+            self.subscribed = []
+            self.unsubscribed = []
+
+        def subscribe_quote(self, code, period, callback):
+            self.subscribed.append((code, period, callback))
+            return 700 + len(self.subscribed)
+
+        def unsubscribe_quote(self, subscription_id):
+            self.unsubscribed.append(subscription_id)
+
+    fake = FakeXtData()
+    monkeypatch.setattr(
+        MiniQMTProvider,
+        "_ensure_xtdata",
+        staticmethod(lambda: fake),
+    )
+    provider = MiniQMTProvider({"cache_dir": None})
+
+    provider.subscribe_ticks(["510050.XSHG", "510050.XSHG"])
+    provider.unsubscribe_ticks(["510050.XSHG"])
+
+    assert [item[:2] for item in fake.subscribed] == [
+        ("510050.SH", "tick")
+    ]
+    assert fake.unsubscribed == [701]
 
 
 @pytest.mark.unit

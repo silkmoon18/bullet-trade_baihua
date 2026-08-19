@@ -37,10 +37,14 @@ def _valid_profile(**overrides):
     return value
 
 
-def _profile_module(monkeypatch, *, version=1, profiles=None):
+def _profile_module(
+    monkeypatch, *, version=1, profiles=None, execution_modes=None
+):
     module = types.ModuleType(PROFILE_MODULE)
     module.PROFILE_SCHEMA_VERSION = version
     module.PROFILES = {PROFILE: _valid_profile()} if profiles is None else profiles
+    if execution_modes is not None:
+        module.EXECUTION_MODES = execution_modes
     monkeypatch.setitem(sys.modules, PROFILE_MODULE, module)
 
 
@@ -56,7 +60,7 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 6,
+        "api_version": 7,
         "profile_schema_version": 1,
         "profile": PROFILE,
         "mode": mode,
@@ -72,7 +76,7 @@ def _state(mode, run_type, **extra):
 
 
 def test_public_contract_exports_and_constants(helper):
-    assert sorted(helper.__all__) == [
+    assert {
         "PROFILE_SCHEMA_VERSION",
         "PortfolioView",
         "PositionView",
@@ -85,12 +89,78 @@ def test_public_contract_exports_and_constants(helper):
         "install_strategy_runtime",
         "notify_target_buy_plan",
         "submit_targets",
-    ]
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 6
+        "ExecutionRequest",
+        "ConditionalLimitExecution",
+        "MarketExecution",
+        "get_configured_execution_mode",
+        "submit_runtime_targets",
+        "cancel_runtime_targets",
+    }.issubset(set(helper.__all__))
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 7
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v6"
+        "bullet-trade-joinquant-runtime-helper-v7"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 1
+
+
+def test_strategy_mode_is_per_strategy_and_missing_key_defaults_to_jq(
+    helper, monkeypatch
+):
+    _profile_module(
+        monkeypatch,
+        execution_modes={"other": "QMT_REMOTE"},
+    )
+
+    assert helper.get_configured_execution_mode(
+        STRATEGY_ID, PROFILE_MODULE
+    ) == "JQ"
+
+    sys.modules[PROFILE_MODULE].EXECUTION_MODES[STRATEGY_ID] = "QMT_REMOTE"
+    assert helper.get_configured_execution_mode(
+        STRATEGY_ID, PROFILE_MODULE
+    ) == "QMT_REMOTE"
+
+
+def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
+    helper, monkeypatch
+):
+    _profile_module(
+        monkeypatch,
+        execution_modes={STRATEGY_ID: "QMT_REMOTE"},
+    )
+    namespace = {
+        name: lambda *args, **kwargs: None for name in BLOCKED_MUTATIONS
+    }
+
+    runtime = helper.install_joinquant_runtime(
+        namespace,
+        context=_context("sim_trade"),
+        profile=PROFILE,
+        strategy_id=STRATEGY_ID,
+        initial_capital="10000",
+        profile_module=PROFILE_MODULE,
+    )
+
+    assert runtime.mode is helper.RuntimeMode.QMT_REMOTE
+    assert runtime.state["mode"] == "QMT_REMOTE"
+    assert runtime.state["production_ready"] is False
+
+
+def test_joinquant_runtime_facade_backtest_does_not_load_profile_by_default(
+    helper
+):
+    runtime = helper.install_joinquant_runtime(
+        {},
+        context=_context("full_backtest"),
+        profile=PROFILE,
+        strategy_id=STRATEGY_ID,
+        initial_capital="10000",
+        profile_module="module_that_does_not_exist",
+        validate_remote_during_backtest=False,
+    )
+
+    assert runtime.mode is helper.RuntimeMode.BACKTEST
+    assert runtime.state["reason"] == "backtest"
 
 
 @pytest.mark.parametrize("run_type", ["simple_backtest", "full_backtest"])
@@ -196,8 +266,8 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 7, "6", True, None])
-def test_expected_api_version_must_equal_six(helper, version):
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8, "7", True, None])
+def test_expected_api_version_must_equal_seven(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -537,6 +607,71 @@ def test_jq_cannot_submit_qmt_targets(helper, monkeypatch):
 
     with pytest.raises(RuntimeError, match="只有QMT_REMOTE模式"):
         helper.submit_targets({"510300.XSHG": 1}, "jq-must-not-submit")
+
+
+def test_typed_execution_request_is_explicitly_encoded_at_rpc_boundary(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    _install(helper, mode="QMT_REMOTE")
+    calls = []
+    monkeypatch.setattr(
+        helper,
+        "_strategy_request",
+        lambda action, payload: calls.append((action, payload)) or {},
+    )
+    execution = helper.ExecutionRequest(
+        style=helper.ConditionalLimitExecution(
+            2_000, helper.ConditionalLimitPriceMode.BOUNDARY
+        ),
+        follow_up=helper.FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing=helper.RepricingPolicy.KEEP_ORIGINAL,
+    )
+
+    helper.submit_targets(
+        {"510300.XSHG": 1}, "typed-execution", execution=execution
+    )
+
+    assert calls == [
+        (
+            "strategy.submit_targets",
+            {
+                "weights": {"510300.XSHG": 1},
+                "idempotency_key": "typed-execution",
+                "execution": {
+                    "schema_version": 1,
+                    "style": {
+                        "type": "CONDITIONAL_LIMIT",
+                        "price_band_ppm": 2_000,
+                        "price_mode": "BOUNDARY",
+                    },
+                    "follow_up": "UNTIL_FILLED_TODAY",
+                    "repricing": "KEEP_ORIGINAL",
+                },
+            },
+        )
+    ]
+
+
+def test_cancel_runtime_targets_clears_confirmed_remote_intent(
+    helper, monkeypatch
+):
+    _profile_module(monkeypatch)
+    _install(helper, mode="QMT_REMOTE")
+    helper._runtime_target_state = {"intent_id": "intent-1"}
+    calls = []
+    monkeypatch.setattr(
+        helper,
+        "_strategy_request",
+        lambda action, payload: calls.append((action, payload))
+        or {"canceled": True},
+    )
+
+    assert helper.cancel_runtime_targets() is True
+    assert helper._runtime_target_state is None
+    assert calls == [
+        ("strategy.cancel_intent", {"intent_id": "intent-1"})
+    ]
 
 
 def test_notify_target_buy_plan_uses_jq_mode_and_no_retry_after_send(

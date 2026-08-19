@@ -291,6 +291,10 @@ class ServerApplication:
             return await self.strategy_api.submit_targets(account_context, resolved_key, payload)
         if method == "get_intent":
             return self.strategy_api.get_intent(payload)
+        if method == "cancel_intent":
+            return await self.strategy_api.cancel_intent(
+                account_context, resolved_key, payload
+            )
         if method == "get_reconciliation":
             return self.strategy_api.get_reconciliation(resolved_key, payload)
         if method == "notify_target_buy_plan":

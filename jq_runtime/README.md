@@ -6,7 +6,7 @@
 
 1. 在仓库外的受限目录中复制 `jq_runtime_config.example.py` 并命名为 `jq_runtime_config.py`；不要在本目录
    创建或维护真实配置。
-2. 在私有文件中填写服务器地址、长随机 token，以及可选的账户定位和 TLS 证书名。
+2. 在私有文件中填写服务器地址、token，以及可选的账户定位和 TLS 证书名；在`EXECUTION_MODES`中按`strategy_id`选择`JQ`或`QMT_REMOTE`。
 3. 保持 `PROFILE_SCHEMA_VERSION = 1`，并确保 profile 中的 `strategy_id` 与策略声明一致。
 4. 从仓库根运行 `python -X utf8 scripts/export_joinquant.py --validate-only --private-profile <仓库外文件>`；
    该校验不执行、不复制且不输出其中的秘密。
@@ -36,21 +36,24 @@
 | 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
 | `simple_backtest`、`full_backtest` | `ExecutionMode.BACKTEST` | 默认不需要helper/profile；远程预检开启时需要 | 聚宽历史撮合；远程快照只写日志，不参与历史决策，也不提交远程目标 |
-| `sim_trade` + `ExecutionMode.JQ` | `JQ` | 需要helper/profile | 聚宽原生下单、撤单、模拟撮合和指标；同时发送目标计划卡片，绝不提交QMT目标 |
-| `sim_trade` + `ExecutionMode.QMT_REMOTE` | `QMT_REMOTE` | 需要helper/profile | 读取StrategyLedger组合并提交远程目标；是否下QMT订单取决于服务器交易开关 |
+| `sim_trade` + 配置`JQ` | `JQ` | 需要helper/profile | 聚宽原生下单、撤单、模拟撮合和指标；同时发送目标计划卡片，绝不提交QMT目标 |
+| `sim_trade` + 配置`QMT_REMOTE` | `QMT_REMOTE` | 需要helper/profile | 读取StrategyLedger组合并提交远程目标；是否下QMT订单取决于服务器交易开关 |
 
-用户只配置：
+模式在私有配置中按策略独立设置；找不到策略键时默认`JQ`，不会静默进入真实下单：
 
 ```python
-SIM_EXECUTION_MODE = ExecutionMode.JQ
-VALIDATE_REMOTE_DURING_BACKTEST = True
+EXECUTION_MODES = {
+    "good_etf": "JQ",  # 完成前置测试后再改为 QMT_REMOTE
+}
 ```
+
+`VALIDATE_REMOTE_DURING_BACKTEST`仍位于策略顶部，因为它属于该策略的回测行为。
 
 `VALIDATE_REMOTE_DURING_BACKTEST`在模拟交易中完全无作用。设为`True`时，回测初始化会幂等执行`ensure_account`和`get_portfolio`，验证公网连接、认证、资金覆盖、账实对账及真实快照，但不会调用`submit_targets`，因此不能替代QMT下单/成交能力探针。设为`False`时允许不上传helper/profile做纯离线回测。
 
 只有导入目标`bullet_trade_jq_remote_helper`本身得到`ModuleNotFoundError`（`exc.name`匹配）时，策略才把helper视为缺失；仅`BACKTEST`关闭远程预检时允许无helper运行。`JQ`需要helper/profile发送计划通知。helper文件已上传但其内部导入失败会直接中止。helper导出稳定marker和API版本，策略用普通`getattr`校验二者。
 
-策略内部使用`ExecutionMode`枚举；只在独立helper和网络协议边界传递`BACKTEST/JQ/QMT_REMOTE`字符串。`BACKTEST`和`JQ`保持聚宽原生交易函数不变；只有`QMT_REMOTE`把namespace中的七个聚宽交易函数替换为抛错guard，并只允许经StrategyLedger提交目标。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
+策略通过helper的`JoinQuantRuntime`门面安装模式并调用组合、下单、撤单和查询；配置和网络边界才使用字符串。订单执行使用helper中的不可变`ExecutionRequest`、执行类型、追单和改价枚举，进入TCP/JSON边界时才显式编码。`BACKTEST`和`JQ`保持聚宽原生交易函数不变；只有`QMT_REMOTE`把namespace中的七个聚宽交易函数替换为抛错guard，并只允许经StrategyLedger提交目标。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 

@@ -206,6 +206,65 @@ class QmtDataAdapter(RemoteDataAdapter):
         self.guard = guard or QmtAvailabilityGuard(name="qmt-data")
         self._allow_request_probe = allow_request_probe
         self.provider = MiniQMTProvider(_provider_config())
+        self._tick_listeners = []
+        self._execution_symbols: Set[str] = set()
+        self._execution_symbols_by_owner = {}
+        set_tick_callback = getattr(
+            self.provider, "set_tick_callback", None
+        )
+        if callable(set_tick_callback):
+            set_tick_callback(self._on_provider_tick)
+
+    def add_tick_listener(self, callback) -> None:
+        if callback not in self._tick_listeners:
+            self._tick_listeners.append(callback)
+
+    def _on_provider_tick(self, payload: Any) -> None:
+        for callback in tuple(self._tick_listeners):
+            try:
+                callback(payload)
+            except Exception as exc:
+                log.warning("QMT tick监听处理失败: %s", exc)
+
+    async def subscribe_execution_quotes(self, symbols) -> None:
+        """Backward-compatible additive subscription used by older callers."""
+
+        cleaned = {
+            str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
+        }
+        pending = sorted(cleaned - self._execution_symbols)
+        if not pending:
+            return
+        await self._run_guarded_qmt_call(self.provider.subscribe_ticks, pending)
+        self._execution_symbols.update(pending)
+
+    async def replace_execution_quotes(self, owner: str, symbols) -> None:
+        """Replace one strategy's callback symbols and release unused quotes."""
+
+        cleaned = {
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip()
+        }
+        owner_key = str(owner).strip()
+        if cleaned:
+            self._execution_symbols_by_owner[owner_key] = cleaned
+        else:
+            self._execution_symbols_by_owner.pop(owner_key, None)
+        desired = set()
+        for owner_symbols in self._execution_symbols_by_owner.values():
+            desired.update(owner_symbols)
+        pending = sorted(desired - self._execution_symbols)
+        obsolete = sorted(self._execution_symbols - desired)
+        if pending:
+            await self._run_guarded_qmt_call(
+                self.provider.subscribe_ticks, pending
+            )
+        if obsolete:
+            await self._run_guarded_qmt_call(
+                self.provider.unsubscribe_ticks, obsolete
+            )
+        self._execution_symbols = desired
 
     async def _run_guarded_qmt_call(self, func, *args, **kwargs):
         """在 QMT guard 保护下执行 live xtdata 调用。
@@ -485,6 +544,34 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         self.guard = guard or QmtAvailabilityGuard(name="qmt-broker")
         self._reconnect_task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._event_listeners = []
+
+    def add_event_listener(self, callback) -> None:
+        if callback not in self._event_listeners:
+            self._event_listeners.append(callback)
+
+    def _notify_broker_event(
+        self, account_key: str, event: str, payload: Any = None
+    ) -> None:
+        for callback in tuple(self._event_listeners):
+            try:
+                callback(account_key, event, payload)
+            except Exception as exc:
+                log.warning(
+                    "QMT broker事件监听处理失败: account=%s event=%s error=%s",
+                    account_key,
+                    event,
+                    exc,
+                )
+
+    def _bind_broker_events(self, account_key: str, broker: QmtBroker) -> None:
+        setter = getattr(broker, "set_event_callback", None)
+        if callable(setter):
+            setter(
+                lambda event, payload=None, key=account_key: self._notify_broker_event(
+                    key, event, payload
+                )
+            )
 
     @staticmethod
     def strategy_ledger_capabilities() -> BrokerCapabilityProfile:
@@ -514,6 +601,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                 session_id=ctx.config.session_id,
                 auto_subscribe=ctx.config.auto_subscribe,
             )
+            self._bind_broker_events(ctx.config.key, broker)
             self._brokers[ctx.config.key] = broker
 
         if self._brokers:
@@ -630,6 +718,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                     session_id=ctx.config.session_id,
                     auto_subscribe=ctx.config.auto_subscribe,
                 )
+                self._bind_broker_events(key, broker)
                 self._brokers[key] = broker
             try:
                 await _run_in_qmt_executor(broker.disconnect)
@@ -637,6 +726,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                 pass
             await _run_in_qmt_executor(broker.connect)
             await self.account_router.attach_handle(key, broker)
+            self._notify_broker_event(key, "connected")
 
     async def _disconnect_all_brokers(self) -> None:
         """断开全部 QMT broker。

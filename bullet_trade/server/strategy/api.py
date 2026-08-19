@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -18,7 +20,19 @@ from ..feishu_notifier import (
 )
 from .capital import SQLiteCapitalService
 from .domain import MONEY_SCALE, NAV_SCALE, PRICE_SCALE, SHANGHAI_TZ, money_to_units, price_to_units
-from .planner_executor import PlannerConfig, SQLiteTargetExecutionService
+from .execution import (
+    ConditionalLimitExecution,
+    ExecutionRequest,
+    MarketQuote,
+    RepricingPolicy,
+    execution_request_from_wire,
+    execution_request_to_wire,
+)
+from .planner_executor import (
+    PlannerConfig,
+    SQLiteTargetExecutionService,
+    TargetPlanningError,
+)
 from .reconciliation import SQLiteReconciliationService, collect_async_broker_snapshot
 from .repository import AccountNotFoundError, SQLiteStrategyRepository
 from .schema import connect_database
@@ -26,6 +40,7 @@ from .valuation import MarketMark, SQLiteValuationService
 
 
 DatabasePath = Union[str, Path]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -81,6 +96,11 @@ class SQLiteStrategyAPI:
         self.data_provider = data_provider
         self.notification_handler = notification_handler
         self.startup_ready = False
+        self._event_loop = None
+        self._runtime_bindings = {}
+        self._quote_cache = {}
+        self._resume_locks = {}
+        self._background_tasks = set()
         self.repository = SQLiteStrategyRepository(self.database_path)
         self.repository.initialize()
         self.capital = SQLiteCapitalService(self.database_path)
@@ -103,6 +123,16 @@ class SQLiteStrategyAPI:
             ),
             notification_handler,
         )
+        add_tick_listener = getattr(
+            self.data_provider, "add_tick_listener", None
+        )
+        if callable(add_tick_listener):
+            add_tick_listener(self._on_tick_event)
+        add_broker_listener = getattr(
+            self.broker, "add_event_listener", None
+        )
+        if callable(add_broker_listener):
+            add_broker_listener(self._on_broker_event)
 
     async def ensure_account(
         self,
@@ -111,6 +141,7 @@ class SQLiteStrategyAPI:
         payload: Mapping[str, object],
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
+        self._bind_runtime(strategy_id, account_context, account_key)
         initial = payload.get("initial_capital", "10000")
         initial_units = money_to_units(str(initial) if type(initial) is float else initial)  # type: ignore[arg-type]
         physical_id = self._physical_id(account_key)
@@ -147,6 +178,7 @@ class SQLiteStrategyAPI:
         payload: Mapping[str, object],
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
+        self._bind_runtime(strategy_id, account_context, account_key)
         snapshot, reconciliation, marks = await self._refresh(
             account_context, account_key, strategy_id, payload
         )
@@ -165,12 +197,31 @@ class SQLiteStrategyAPI:
         payload: Mapping[str, object],
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
+        self._bind_runtime(strategy_id, account_context, account_key)
         if not self.startup_ready:
             raise RuntimeError("StrategyLedger startup reconciliation is not READY")
         key = str(payload.get("idempotency_key") or "").strip()
         weights = payload.get("weights")
         if not key or not isinstance(weights, Mapping):
             raise ValueError("idempotency_key and weights are required")
+        raw_execution = payload.get("execution")
+        if raw_execution is None:
+            execution_request = ExecutionRequest()
+        elif isinstance(raw_execution, Mapping):
+            execution_request = execution_request_from_wire(raw_execution)
+        else:
+            raise ValueError("execution must be an object")
+        if isinstance(execution_request.style, ConditionalLimitExecution):
+            replace = getattr(
+                self.data_provider, "replace_execution_quotes", None
+            )
+            subscribe = getattr(
+                self.data_provider, "subscribe_execution_quotes", None
+            )
+            if not callable(replace) and not callable(subscribe):
+                raise RuntimeError(
+                    "current data adapter has no native quote callback support"
+                )
         snapshot, _, marks = await self._refresh(
             account_context, account_key, strategy_id, payload
         )
@@ -184,6 +235,9 @@ class SQLiteStrategyAPI:
             snapshot, _, marks = await self._refresh(
                 account_context, account_key, strategy_id, payload
             )
+        quotes = await self._execution_quotes(
+            execution_request, tuple(marks), snapshot.as_of
+        )
         advance = self.planner.submit_target_weights(
             strategy_id,
             key,
@@ -191,7 +245,11 @@ class SQLiteStrategyAPI:
             snapshot,
             marks,
             snapshot.as_of,
+            execution_request=execution_request,
+            quotes=quotes,
         )
+        if isinstance(execution_request.style, ConditionalLimitExecution):
+            await self._sync_quote_subscriptions(strategy_id)
         dispatched = []
 
         async def submitter(order_payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -209,6 +267,7 @@ class SQLiteStrategyAPI:
         refreshed, reconciliation, _ = await self._refresh(
             account_context, account_key, strategy_id, payload
         )
+        await self._sync_quote_subscriptions(strategy_id)
         return {
             "intent": _json_value(self.planner.get_intent(advance.intent.intent_id)),
             "planned_orders": _json_value(advance.orders),
@@ -231,6 +290,7 @@ class SQLiteStrategyAPI:
         if row is None:
             self.startup_ready = False
             return False
+        self._bind_runtime(str(row[0]), account_context, account_key)
         snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
@@ -269,6 +329,12 @@ class SQLiteStrategyAPI:
         if intent.account_id != strategy_id:
             raise ValueError("intent does not belong to strategy")
         result = cast(Dict[str, object], _json_value(intent))
+        result["execution"] = execution_request_to_wire(
+            intent.execution_request
+        )
+        result["trading_day"] = (
+            intent.trading_day.isoformat() if intent.trading_day else None
+        )
         connection = connect_database(self.database_path)
         try:
             row = connection.execute(
@@ -283,6 +349,58 @@ class SQLiteStrategyAPI:
             for security, value in stored.get("weights_ppm", {}).items()
         }
         return result
+
+    async def cancel_intent(
+        self,
+        account_context: object,
+        account_key: str,
+        payload: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Cancel one strategy intent without allowing overlapping targets."""
+
+        strategy_id = self._strategy_id(payload)
+        self._bind_runtime(strategy_id, account_context, account_key)
+        intent_id = str(payload.get("intent_id") or "").strip()
+        if not intent_id:
+            raise ValueError("intent_id is required")
+        intent = self.planner.get_intent(intent_id)
+        if intent.account_id != strategy_id:
+            raise ValueError("intent does not belong to strategy")
+        requested = []
+        broker_order_ids = self.planner.cancelable_broker_order_ids(intent_id)
+        self.planner.request_intent_cancellation(intent_id)
+        for broker_order_id in broker_order_ids:
+            await cast(Any, self.broker).cancel_order(
+                account_context, broker_order_id
+            )
+            requested.append(broker_order_id)
+        if requested:
+            await self._refresh(
+                account_context, account_key, strategy_id, {}
+            )
+        canceled = False
+        try:
+            intent = self.planner.cancel_intent_if_idle(intent_id)
+            canceled = intent.state.value == "CANCELED"
+        except TargetPlanningError as exc:
+            if not requested:
+                raise
+            logger.info(
+                "intent %s cancellation still pending: %s",
+                intent_id,
+                exc,
+            )
+            intent = self.planner.get_intent(intent_id)
+        await self._sync_quote_subscriptions(strategy_id)
+        result = cast(Dict[str, object], _json_value(intent))
+        result["execution"] = execution_request_to_wire(
+            intent.execution_request
+        )
+        return {
+            "intent": result,
+            "canceled": canceled,
+            "cancel_requested_order_ids": requested,
+        }
 
     def get_reconciliation(
         self, account_key: str, payload: Mapping[str, object]
@@ -442,6 +560,300 @@ class SQLiteStrategyAPI:
                 security, price_to_units(str(price)), as_of, "qmt"
             )
         return marks
+
+    async def _execution_quotes(
+        self,
+        execution_request: ExecutionRequest,
+        securities: Sequence[str],
+        as_of: datetime,
+    ) -> Mapping[str, MarketQuote]:
+        if not isinstance(
+            execution_request.style, ConditionalLimitExecution
+        ):
+            return {}
+        tick_fn = getattr(self.data_provider, "get_current_tick", None)
+        if tick_fn is None:
+            return {}
+        quotes = {}
+        for security in securities:
+            tick = await tick_fn(security)
+            if not isinstance(tick, Mapping):
+                continue
+            bid = self._best_quote_price(tick, "bid")
+            ask = self._best_quote_price(tick, "ask")
+            last = self._tick_price_or_none(tick)
+            quotes[security] = MarketQuote(
+                security=security,
+                as_of=as_of,
+                bid_price_units=(
+                    price_to_units(str(bid)) if bid is not None else None
+                ),
+                ask_price_units=(
+                    price_to_units(str(ask)) if ask is not None else None
+                ),
+                last_price_units=(
+                    price_to_units(str(last)) if last is not None else None
+                ),
+            )
+            self._quote_cache[security] = quotes[security]
+        return quotes
+
+    def _bind_runtime(
+        self, strategy_id: str, account_context: object, account_key: str
+    ) -> None:
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        self._runtime_bindings[strategy_id] = (
+            account_context,
+            account_key,
+        )
+        self._resume_locks.setdefault(strategy_id, asyncio.Lock())
+
+    def _on_tick_event(self, payload: object) -> None:
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            return
+        safe_payload = dict(payload) if isinstance(payload, Mapping) else payload
+        loop.call_soon_threadsafe(self._accept_tick_event, safe_payload)
+
+    def _on_broker_event(
+        self, account_key: str, event: str, payload: object = None
+    ) -> None:
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(
+            self._schedule_background,
+            self._handle_broker_event(account_key, event),
+        )
+
+    def _schedule_background(self, awaitable) -> None:
+        task = asyncio.create_task(awaitable)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_done)
+
+    def _background_done(self, task: "asyncio.Task[object]") -> None:
+        self._background_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("StrategyLedger callback task failed")
+
+    def _accept_tick_event(self, payload: object) -> None:
+        for security, tick in self._tick_items(payload):
+            bid = self._best_quote_price(tick, "bid")
+            ask = self._best_quote_price(tick, "ask")
+            last = self._tick_price_or_none(tick)
+            quote = MarketQuote(
+                security=security,
+                as_of=datetime.now(SHANGHAI_TZ),
+                bid_price_units=(
+                    price_to_units(str(bid)) if bid is not None else None
+                ),
+                ask_price_units=(
+                    price_to_units(str(ask)) if ask is not None else None
+                ),
+                last_price_units=(
+                    price_to_units(str(last)) if last is not None else None
+                ),
+            )
+            self._quote_cache[security] = quote
+            self._schedule_background(self._handle_quote(security))
+
+    async def _handle_quote(self, security: str) -> None:
+        quote = self._quote_cache.get(security)
+        if quote is None:
+            return
+        for intent in self.planner.active_intents():
+            if (
+                not isinstance(
+                    intent.execution_request.style,
+                    ConditionalLimitExecution,
+                )
+                or security not in intent.targets
+                or intent.account_id not in self._runtime_bindings
+            ):
+                continue
+            if not self.planner.quote_triggers_intent(
+                intent.intent_id, security, quote
+            ):
+                continue
+            await self._resume_intent(intent.intent_id)
+
+    async def _handle_broker_event(
+        self, account_key: str, event: str
+    ) -> None:
+        if event == "disconnected":
+            self.startup_ready = False
+            return
+        strategy_ids = [
+            strategy_id
+            for strategy_id, (_, key) in self._runtime_bindings.items()
+            if key == account_key
+        ]
+        for strategy_id in strategy_ids:
+            lock = self._resume_locks[strategy_id]
+            async with lock:
+                binding = self._runtime_bindings[strategy_id]
+                intents = self.planner.active_intents(strategy_id)
+                if not intents:
+                    await self._refresh(
+                        binding[0], binding[1], strategy_id, {}
+                    )
+                for intent in intents:
+                    await self._resume_intent_locked(intent.intent_id)
+                await self._sync_quote_subscriptions(strategy_id)
+
+    async def _resume_intent(self, intent_id: str) -> None:
+        intent = self.planner.get_intent(intent_id)
+        lock = self._resume_locks.get(intent.account_id)
+        if lock is None:
+            return
+        async with lock:
+            await self._resume_intent_locked(intent_id)
+
+    async def _resume_intent_locked(self, intent_id: str) -> None:
+        intent = self.planner.get_intent(intent_id)
+        binding = self._runtime_bindings.get(intent.account_id)
+        if binding is None:
+            return
+        now = datetime.now(SHANGHAI_TZ)
+        references = self.planner.reference_prices(intent_id)
+        if (
+            intent.execution_request.repricing
+            is RepricingPolicy.RECOMPUTE
+        ):
+            references = {
+                security: (
+                    self._quote_cache[security].last_price_units
+                    if security in self._quote_cache
+                    and self._quote_cache[security].last_price_units
+                    is not None
+                    else price_units
+                )
+                for security, price_units in references.items()
+            }
+        marks = {
+            security: {
+                "price": _price(price_units),
+                "as_of": now.isoformat(),
+            }
+            for security, price_units in references.items()
+        }
+        snapshot, _, market_marks = await self._refresh(
+            binding[0],
+            binding[1],
+            intent.account_id,
+            {
+                "marks": marks,
+                "weights": {security: 0 for security in intent.targets},
+                "as_of": now,
+            },
+        )
+        advance = self.planner.advance_intent(
+            intent_id,
+            snapshot,
+            market_marks,
+            now,
+            quotes=self._quote_cache,
+        )
+        if not advance.orders:
+            await self._sync_quote_subscriptions(intent.account_id)
+            return
+
+        async def submitter(order_payload: Mapping[str, object]):
+            return await cast(Any, self.broker).place_order(
+                binding[0], dict(order_payload)
+            )
+
+        while await self.planner.dispatch_next(submitter) is not None:
+            pass
+        await self._sync_quote_subscriptions(intent.account_id)
+
+    async def _sync_quote_subscriptions(self, strategy_id: str) -> None:
+        symbols = set()
+        for intent in self.planner.active_intents(strategy_id):
+            if isinstance(
+                intent.execution_request.style, ConditionalLimitExecution
+            ) and not self.planner.intent_cancel_requested(intent.intent_id):
+                symbols.update(intent.targets)
+        replace = getattr(
+            self.data_provider, "replace_execution_quotes", None
+        )
+        if callable(replace):
+            await replace(strategy_id, tuple(sorted(symbols)))
+            return
+        subscribe = getattr(
+            self.data_provider, "subscribe_execution_quotes", None
+        )
+        if symbols and callable(subscribe):
+            await subscribe(tuple(sorted(symbols)))
+
+    @classmethod
+    def _tick_items(cls, payload: object):
+        if not isinstance(payload, Mapping):
+            return ()
+        direct_code = (
+            payload.get("stockCode")
+            or payload.get("stock_code")
+            or payload.get("security")
+            or payload.get("code")
+        )
+        if direct_code:
+            return ((cls._joinquant_security(str(direct_code)), payload),)
+        items = []
+        for raw_security, tick in payload.items():
+            if isinstance(tick, Mapping):
+                items.append(
+                    (cls._joinquant_security(str(raw_security)), tick)
+                )
+        return tuple(items)
+
+    @staticmethod
+    def _joinquant_security(value: str) -> str:
+        upper = value.strip().upper()
+        if upper.endswith(".SH"):
+            return upper[:-3] + ".XSHG"
+        if upper.endswith(".SZ"):
+            return upper[:-3] + ".XSHE"
+        if upper.endswith(".BJ"):
+            return upper[:-3] + ".XBSE"
+        return upper
+
+    @staticmethod
+    def _best_quote_price(tick: Mapping[str, object], side: str):
+        names = (
+            ("ask_price1", "ask1", "askPrice", "ask_price")
+            if side == "ask"
+            else ("bid_price1", "bid1", "bidPrice", "bid_price")
+        )
+        for name in names:
+            value = tick.get(name)
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else None
+            elif value is not None and not isinstance(value, (str, bytes)):
+                try:
+                    value = value[0]  # type: ignore[index]
+                except (IndexError, KeyError, TypeError):
+                    pass
+            try:
+                number = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return None
+
+    @staticmethod
+    def _tick_price_or_none(tick: Mapping[str, object]):
+        try:
+            return SQLiteStrategyAPI._tick_price(tick)
+        except ValueError:
+            return None
 
     def _ensure_physical_account(self, physical_id: str, account_context: object) -> None:
         connection = connect_database(self.database_path)

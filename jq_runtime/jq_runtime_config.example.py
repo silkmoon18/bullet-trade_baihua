@@ -7,6 +7,11 @@ is ignored by Git; never commit credentials.
 
 PROFILE_SCHEMA_VERSION = 1
 
+# 每个策略可独立切换。缺少某个 strategy_id 时 helper 安全地默认使用 JQ。
+EXECUTION_MODES = {
+    "good_etf": "JQ",
+}
+
 PROFILES = {
     "good_etf-prod": {
         "strategy_id": "good_etf",

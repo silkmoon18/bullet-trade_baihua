@@ -25,6 +25,20 @@ from .domain import (
     PortfolioIntent,
 )
 from .fill_booking import SQLiteFillBookingService
+from .execution import (
+    ConditionalLimitExecution,
+    ConditionalLimitPriceMode,
+    ExecutionRequest,
+    ExecutionType,
+    FollowUpPolicy,
+    LimitExecution,
+    MarketExecution,
+    MarketQuote,
+    MarketableLimitExecution,
+    RepricingPolicy,
+    execution_request_from_wire,
+    execution_request_to_wire,
+)
 from .idempotency import SQLiteOperationRepository
 from .repository import RepositoryError, SQLiteStrategyRepository
 from .schema import connect_database
@@ -80,7 +94,8 @@ class PlannedOrder:
     security: str
     side: OrderSide
     quantity: int
-    limit_price_units: int
+    limit_price_units: Optional[int]
+    execution_type: ExecutionType = ExecutionType.LIMIT
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,7 @@ class IntentAdvanceResult:
     intent: PortfolioIntent
     orders: Tuple[PlannedOrder, ...]
     waiting_for_fills: bool
+    waiting_for_trigger: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,6 +133,13 @@ def _weight_units(value: Weight) -> int:
 def _intent(row: sqlite3.Row) -> PortfolioIntent:
     payload = json.loads(row["targets_json"])
     targets = payload.get("target_quantities", payload)
+    raw_execution = payload.get("execution_request")
+    execution_request = (
+        execution_request_from_wire(raw_execution)
+        if isinstance(raw_execution, Mapping)
+        else ExecutionRequest()
+    )
+    raw_trading_day = payload.get("trading_day")
     return PortfolioIntent(
         intent_id=row["intent_id"],
         account_id=row["strategy_account_id"],
@@ -124,6 +147,12 @@ def _intent(row: sqlite3.Row) -> PortfolioIntent:
         expected_ledger_version=row["expected_ledger_version"],
         targets={key: int(value) for key, value in targets.items()},
         state=IntentState(row["state"]),
+        trading_day=(
+            datetime.fromisoformat(str(raw_trading_day)).date()
+            if raw_trading_day
+            else datetime.fromisoformat(row["created_at"]).date()
+        ),
+        execution_request=execution_request,
     )
 
 
@@ -144,7 +173,16 @@ class SQLiteTargetExecutionService:
         snapshot: PortfolioSnapshot,
         marks: Mapping[str, MarketMark],
         now: Optional[datetime] = None,
+        execution_request: Optional[ExecutionRequest] = None,
+        quotes: Optional[Mapping[str, MarketQuote]] = None,
     ) -> IntentAdvanceResult:
+        request = execution_request or ExecutionRequest(
+            style=LimitExecution(self.config.limit_price_offset_ppm)
+        )
+        if type(request) is not ExecutionRequest:
+            raise TypeError("execution_request must be ExecutionRequest")
+        current = now or datetime.now(SHANGHAI_TZ)
+        self._expire_old_intents(account_id, current)
         normalized = {security: _weight_units(value) for security, value in weights.items()}
         if not normalized or any(not security for security in normalized):
             raise TargetPlanningError("target weights cannot be empty")
@@ -152,11 +190,18 @@ class SQLiteTargetExecutionService:
             raise TargetPlanningError("target weights exceed 100%")
         existing = self._intent_by_key(account_id, idempotency_key)
         if existing is not None:
-            stored = self._intent_payload(existing.intent_id)["weights_ppm"]
+            intent_payload = self._intent_payload(existing.intent_id)
+            stored = intent_payload["weights_ppm"]
             if stored != dict(sorted(normalized.items())):
                 raise TargetPlanningError("idempotency key has different weights")
-            return self.advance_intent(existing.intent_id, snapshot, marks, now)
-        self._require_ready(account_id, snapshot, now or datetime.now(SHANGHAI_TZ))
+            if existing.execution_request != request:
+                raise TargetPlanningError(
+                    "idempotency key has different execution request"
+                )
+            return self.advance_intent(
+                existing.intent_id, snapshot, marks, current, quotes=quotes
+            )
+        self._require_ready(account_id, snapshot, current)
         # Weights describe the whole portfolio. Enforce the cash buffer only
         # when buys are made; subtracting it here shrinks existing positions
         # and double-applies a strategy-level reserve such as DEPLOY_RATIO.
@@ -175,8 +220,13 @@ class SQLiteTargetExecutionService:
             snapshot.ledger_version,
             normalized,
             quantities,
+            marks,
+            request,
+            current,
         )
-        return self.advance_intent(intent.intent_id, snapshot, marks, now)
+        return self.advance_intent(
+            intent.intent_id, snapshot, marks, current, quotes=quotes
+        )
 
     def advance_intent(
         self,
@@ -184,21 +234,41 @@ class SQLiteTargetExecutionService:
         snapshot: PortfolioSnapshot,
         marks: Mapping[str, MarketMark],
         now: Optional[datetime] = None,
+        quotes: Optional[Mapping[str, MarketQuote]] = None,
     ) -> IntentAdvanceResult:
         intent = self.get_intent(intent_id)
         if intent.state in (IntentState.COMPLETED, IntentState.CANCELED, IntentState.FAILED):
             return IntentAdvanceResult(intent, (), False)
+        current = now or datetime.now(SHANGHAI_TZ)
+        if intent.trading_day is not None and current.date() != intent.trading_day:
+            return IntentAdvanceResult(
+                self._set_state(intent_id, IntentState.CANCELED), (), False
+            )
         working = self._working_orders(intent.account_id)
         if any(row["state"] == OrderState.SUBMIT_UNKNOWN.value for row in working):
             raise TargetPlanningError("submit-unknown order blocks execution")
+        intent_payload = self._intent_payload(intent.intent_id)
+        if intent_payload.get("cancel_requested") is True:
+            if working:
+                return IntentAdvanceResult(intent, (), True)
+            return IntentAdvanceResult(
+                self._set_state(intent_id, IntentState.CANCELED), (), False
+            )
         if working:
             return IntentAdvanceResult(intent, (), True)
-        self._require_ready(intent.account_id, snapshot, now or datetime.now(SHANGHAI_TZ))
+        self._require_ready(intent.account_id, snapshot, current)
 
         positions = {item.security: item for item in snapshot.positions}
         sells = []
         buys = []
         sell_pending = False
+        waiting_for_trigger = False
+        original_references = {
+            security: int(value)
+            for security, value in intent_payload.get(
+                "reference_prices_units", {}
+            ).items()
+        }
         for security in sorted(set(intent.targets) | set(positions)):
             position = positions.get(security)
             current = position.total_qty if position else 0
@@ -206,11 +276,36 @@ class SQLiteTargetExecutionService:
             delta = target - current
             if delta == 0:
                 continue
+            side = OrderSide.SELL if delta < 0 else OrderSide.BUY
+            if delta < 0:
+                sell_pending = True
+            if (
+                intent.execution_request.follow_up is FollowUpPolicy.NONE
+                and self._order_count(intent.intent_id, security, side) > 0
+            ):
+                continue
             mark = marks.get(security)
             if mark is None:
                 raise TargetPlanningError("missing execution mark: {}".format(security))
+            reference_price = mark.price_units
+            if (
+                intent.execution_request.repricing
+                is RepricingPolicy.KEEP_ORIGINAL
+            ):
+                reference_price = original_references.get(
+                    security, reference_price
+                )
+            prepared = self._prepare_execution(
+                intent.execution_request,
+                side,
+                reference_price,
+                (quotes or {}).get(security),
+            )
+            if prepared is None:
+                waiting_for_trigger = True
+                continue
+            order_price, reservation_price, execution_type = prepared
             if delta < 0:
-                sell_pending = True
                 desired = min(-delta, position.sellable_qty if position else 0)
                 quantity = desired if target == 0 and desired == current else desired // self.config.lot_size * self.config.lot_size
                 if quantity:
@@ -218,7 +313,9 @@ class SQLiteTargetExecutionService:
                         (
                             security,
                             quantity,
-                            self._limit_price(mark.price_units, OrderSide.SELL),
+                            order_price,
+                            reservation_price,
+                            execution_type,
                         )
                     )
             elif self.config.allow_buys:
@@ -228,21 +325,46 @@ class SQLiteTargetExecutionService:
                         (
                             security,
                             quantity,
-                            self._limit_price(mark.price_units, OrderSide.BUY),
+                            order_price,
+                            reservation_price,
+                            execution_type,
                         )
                     )
 
         if sell_pending and not sells:
             return IntentAdvanceResult(
-                self._set_state(intent_id, IntentState.EXECUTING), (), True
+                self._set_state(intent_id, IntentState.EXECUTING), (), True,
+                waiting_for_trigger,
             )
         selected = sells or self._affordable_buys(snapshot, buys)
         if not selected:
+            if waiting_for_trigger:
+                return IntentAdvanceResult(
+                    self._set_state(intent_id, IntentState.EXECUTING),
+                    (),
+                    False,
+                    True,
+                )
             return IntentAdvanceResult(self._set_state(intent_id, IntentState.COMPLETED), (), False)
         side = OrderSide.SELL if sells else OrderSide.BUY
         orders = tuple(
-            self._enqueue(intent, side, security, quantity, price, snapshot.as_of)
-            for security, quantity, price in selected
+            self._enqueue(
+                intent,
+                side,
+                security,
+                quantity,
+                order_price,
+                reservation_price,
+                execution_type,
+                snapshot.as_of,
+            )
+            for (
+                security,
+                quantity,
+                order_price,
+                reservation_price,
+                execution_type,
+            ) in selected
         )
         return IntentAdvanceResult(
             self._set_state(intent_id, IntentState.EXECUTING),
@@ -297,6 +419,14 @@ class SQLiteTargetExecutionService:
         current = now or datetime.now(SHANGHAI_TZ)
         result = []
         for row in self._working_orders(account_id):
+            if not row["intent_id"]:
+                continue
+            intent = self.get_intent(str(row["intent_id"]))
+            if (
+                intent.execution_request.repricing
+                is not RepricingPolicy.RECOMPUTE
+            ):
+                continue
             if row["state"] not in (
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIALLY_FILLED.value,
@@ -312,10 +442,21 @@ class SQLiteTargetExecutionService:
                 result.append(str(row["broker_order_id"]))
         return tuple(result)
 
-    def _create_intent(self, account_id, key, version, weights, quantities):
+    def _create_intent(
+        self, account_id, key, version, weights, quantities, marks, request, now
+    ):
         if not key:
             raise TargetPlanningError("idempotency key cannot be empty")
-        payload = {"weights_ppm": dict(sorted(weights.items())), "target_quantities": dict(sorted(quantities.items()))}
+        payload = {
+            "weights_ppm": dict(sorted(weights.items())),
+            "target_quantities": dict(sorted(quantities.items())),
+            "reference_prices_units": {
+                security: mark.price_units
+                for security, mark in sorted(marks.items())
+            },
+            "trading_day": now.date().isoformat(),
+            "execution_request": execution_request_to_wire(request),
+        }
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         connection = connect_database(self.database_path)
         try:
@@ -361,15 +502,33 @@ class SQLiteTargetExecutionService:
         finally:
             connection.close()
 
-    def _enqueue(self, intent, side, security, quantity, price, as_of):
+    def _enqueue(
+        self,
+        intent,
+        side,
+        security,
+        quantity,
+        order_price,
+        reservation_price,
+        execution_type,
+        as_of,
+    ):
         retry = self._order_count(intent.intent_id, security, side)
         key = "{}:{}:{}:{}".format(intent.intent_id, security, side.value, retry)
+        broker_style = {"type": "market"} if execution_type is ExecutionType.MARKET else {
+            "type": "limit",
+            "price": str(Decimal(order_price) / PRICE_SCALE),
+        }
+        if execution_type is ExecutionType.MARKET:
+            broker_style["protect_price"] = str(
+                Decimal(reservation_price) / PRICE_SCALE
+            )
         payload = {
             "intent_id": intent.intent_id,
             "security": security,
             "side": side.value,
             "amount": quantity,
-            "style": {"type": "limit", "price": str(Decimal(price) / PRICE_SCALE)},
+            "style": broker_style,
         }
         operation = self._operations.create_operation(
             intent.account_id, "broker.place_order", key, payload, topic="strategy.order"
@@ -379,7 +538,8 @@ class SQLiteTargetExecutionService:
                 account = self._ledger.get_strategy_account(intent.account_id)
                 self._capital.reserve_cash(
                     intent.account_id,
-                    _trade_value(price, quantity) + self.config.buy_fee_buffer_units,
+                    _trade_value(reservation_price, quantity)
+                    + self.config.buy_fee_buffer_units,
                     account.ledger_version,
                     operation.operation_id,
                 )
@@ -395,28 +555,293 @@ class SQLiteTargetExecutionService:
                     filled_qty=0,
                     state=OrderState.PENDING_SUBMIT,
                     trading_day=as_of.date(),
-                    limit_price_units=price,
+                    limit_price_units=order_price,
                 )
             )
-        return PlannedOrder(operation.operation_id, security, side, quantity, price)
+        return PlannedOrder(
+            operation.operation_id,
+            security,
+            side,
+            quantity,
+            order_price,
+            execution_type,
+        )
 
     def _affordable_buys(self, snapshot, buys):
         available = max(0, snapshot.available_cash_units - self.config.cash_buffer_units)
         result = []
-        for security, desired, price in buys:
-            lot_value = _trade_value(price, self.config.lot_size)
+        for security, desired, order_price, reservation_price, execution_type in buys:
+            lot_value = _trade_value(reservation_price, self.config.lot_size)
             quantity = min(desired, max(0, available - self.config.buy_fee_buffer_units) // lot_value * self.config.lot_size)
-            value = _trade_value(price, quantity)
+            value = _trade_value(reservation_price, quantity)
             if quantity and value >= self.config.minimum_order_units:
-                result.append((security, quantity, price))
+                result.append(
+                    (
+                        security,
+                        quantity,
+                        order_price,
+                        reservation_price,
+                        execution_type,
+                    )
+                )
                 available -= value + self.config.buy_fee_buffer_units
         return result
 
-    def _limit_price(self, mark_price_units, side):
-        offset = self.config.limit_price_offset_ppm
+    @staticmethod
+    def _boundary_price(mark_price_units, side, offset):
         if side is OrderSide.BUY:
             return (mark_price_units * (NAV_SCALE + offset) + NAV_SCALE - 1) // NAV_SCALE
         return max(1, mark_price_units * (NAV_SCALE - offset) // NAV_SCALE)
+
+    def _prepare_execution(self, request, side, reference_price, quote):
+        style = request.style
+        if isinstance(style, LimitExecution):
+            price = self._boundary_price(
+                reference_price, side, style.price_band_ppm
+            )
+            return price, price, style.execution_type
+        if isinstance(style, MarketableLimitExecution):
+            price = self._boundary_price(
+                reference_price, side, style.price_band_ppm
+            )
+            return price, price, style.execution_type
+        if isinstance(style, MarketExecution):
+            protect = self._boundary_price(
+                reference_price, side, style.protect_price_band_ppm
+            )
+            return None, protect, style.execution_type
+        if not isinstance(style, ConditionalLimitExecution):
+            raise TargetPlanningError("unsupported execution style")
+        boundary = self._boundary_price(
+            reference_price, side, style.price_band_ppm
+        )
+        if quote is None:
+            return None
+        if side is OrderSide.BUY:
+            counterparty = quote.ask_price_units
+            condition_met = counterparty is not None and counterparty <= boundary
+        else:
+            counterparty = quote.bid_price_units
+            condition_met = counterparty is not None and counterparty >= boundary
+        if not condition_met or counterparty is None:
+            return None
+        price = (
+            boundary
+            if style.price_mode is ConditionalLimitPriceMode.BOUNDARY
+            else counterparty
+        )
+        return price, price, style.execution_type
+
+    def _expire_old_intents(self, account_id, now):
+        connection = connect_database(self.database_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM portfolio_intents
+                WHERE strategy_account_id = ?
+                  AND state IN ('CREATED','PLANNED','EXECUTING','RECONCILING')
+                """,
+                (account_id,),
+            ).fetchall()
+            for row in rows:
+                intent = _intent(cast(sqlite3.Row, row))
+                if intent.trading_day == now.date():
+                    continue
+                working = connection.execute(
+                    """
+                    SELECT 1 FROM strategy_orders
+                    WHERE intent_id = ? AND state IN (
+                        'PENDING_SUBMIT','SUBMIT_UNKNOWN','SUBMITTED','PARTIALLY_FILLED'
+                    ) LIMIT 1
+                    """,
+                    (intent.intent_id,),
+                ).fetchone()
+                if working is not None:
+                    raise TargetPlanningError(
+                        "previous trading day order still needs reconciliation"
+                    )
+                connection.execute(
+                    "UPDATE portfolio_intents SET state = 'CANCELED', updated_at = ? WHERE intent_id = ?",
+                    (now.isoformat(), intent.intent_id),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def active_intents(
+        self, account_id: Optional[str] = None
+    ) -> Tuple[PortfolioIntent, ...]:
+        connection = connect_database(self.database_path)
+        try:
+            sql = (
+                "SELECT * FROM portfolio_intents WHERE state IN "
+                "('CREATED','PLANNED','EXECUTING','RECONCILING')"
+            )
+            params = ()
+            if account_id is not None:
+                sql += " AND strategy_account_id = ?"
+                params = (account_id,)
+            sql += " ORDER BY created_at"
+            rows = connection.execute(sql, params).fetchall()
+            return tuple(_intent(cast(sqlite3.Row, row)) for row in rows)
+        finally:
+            connection.close()
+
+    def reference_prices(self, intent_id: str) -> Mapping[str, int]:
+        payload = self._intent_payload(intent_id)
+        return {
+            str(security): int(value)
+            for security, value in payload.get(
+                "reference_prices_units", {}
+            ).items()
+        }
+
+    def quote_triggers_intent(
+        self,
+        intent_id: str,
+        security: str,
+        quote: MarketQuote,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Return whether one quote can turn a waiting conditional target into an order.
+
+        This deliberately reads only StrategyLedger state.  The comparatively
+        expensive broker refresh is performed after the condition is met.
+        """
+
+        intent = self.get_intent(intent_id)
+        current = now or datetime.now(SHANGHAI_TZ)
+        if (
+            intent.state
+            in (IntentState.COMPLETED, IntentState.CANCELED, IntentState.FAILED)
+            or intent.trading_day != current.date()
+            or security not in intent.targets
+            or not isinstance(
+                intent.execution_request.style, ConditionalLimitExecution
+            )
+            or self.intent_cancel_requested(intent_id)
+            or self._working_orders(intent.account_id)
+        ):
+            return False
+        connection = connect_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT total_qty FROM positions "
+                "WHERE strategy_account_id = ? AND security = ?",
+                (intent.account_id, security),
+            ).fetchone()
+        finally:
+            connection.close()
+        position_qty = int(row[0]) if row is not None else 0
+        target_qty = int(intent.targets.get(security, 0))
+        delta = target_qty - position_qty
+        if delta == 0:
+            return False
+        side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+        if (
+            intent.execution_request.follow_up is FollowUpPolicy.NONE
+            and self._order_count(intent.intent_id, security, side) > 0
+        ):
+            return False
+        reference_price = self.reference_prices(intent_id).get(security)
+        if reference_price is None:
+            return False
+        if (
+            intent.execution_request.repricing
+            is RepricingPolicy.RECOMPUTE
+            and quote.last_price_units is not None
+        ):
+            reference_price = quote.last_price_units
+        return (
+            self._prepare_execution(
+                intent.execution_request,
+                side,
+                reference_price,
+                quote,
+            )
+            is not None
+        )
+
+    def cancel_intent_if_idle(self, intent_id: str) -> PortfolioIntent:
+        """Cancel an active intent only when no broker order remains working."""
+
+        intent = self.get_intent(intent_id)
+        if intent.state in (
+            IntentState.COMPLETED,
+            IntentState.CANCELED,
+            IntentState.FAILED,
+        ):
+            return intent
+        working = [
+            row
+            for row in self._working_orders(intent.account_id)
+            if row["intent_id"] == intent_id
+        ]
+        if working:
+            raise TargetPlanningError(
+                "working orders must finish cancellation before intent cancellation"
+            )
+        return self._set_state(intent_id, IntentState.CANCELED)
+
+    def request_intent_cancellation(self, intent_id: str) -> PortfolioIntent:
+        """Persist cancellation intent so callbacks can never resume its target."""
+
+        intent = self.get_intent(intent_id)
+        if intent.state in (
+            IntentState.COMPLETED,
+            IntentState.CANCELED,
+            IntentState.FAILED,
+        ):
+            return intent
+        connection = connect_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT targets_json FROM portfolio_intents WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                raise TargetPlanningError("target intent not found")
+            payload = json.loads(row[0])
+            payload["cancel_requested"] = True
+            connection.execute(
+                "UPDATE portfolio_intents SET targets_json = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (
+                    json.dumps(
+                        payload, sort_keys=True, separators=(",", ":")
+                    ),
+                    datetime.now(SHANGHAI_TZ).isoformat(),
+                    intent_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get_intent(intent_id)
+
+    def intent_cancel_requested(self, intent_id: str) -> bool:
+        return self._intent_payload(intent_id).get("cancel_requested") is True
+
+    def cancelable_broker_order_ids(
+        self, intent_id: str
+    ) -> Tuple[str, ...]:
+        """Return known working broker orders belonging to one intent."""
+
+        intent = self.get_intent(intent_id)
+        result = []
+        for row in self._working_orders(intent.account_id):
+            if row["intent_id"] != intent_id:
+                continue
+            if row["state"] in (
+                OrderState.PENDING_SUBMIT.value,
+                OrderState.SUBMIT_UNKNOWN.value,
+            ):
+                raise TargetPlanningError(
+                    "order submission is unresolved; cancellation is blocked"
+                )
+            if row["broker_order_id"]:
+                result.append(str(row["broker_order_id"]))
+        return tuple(result)
 
     def _require_ready(self, account_id, snapshot, now):
         if not self.config.trading_enabled:

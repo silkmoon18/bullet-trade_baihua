@@ -1,3 +1,4 @@
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -7,10 +8,13 @@ from bullet_trade.server.adapters.base import AccountContext
 from bullet_trade.server.strategy import (
     BrokerCapabilityProfile,
     CapabilityState,
+    ConditionalLimitExecution,
+    ExecutionRequest,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
     MINI_QMT_CAPABILITIES,
+    execution_request_to_wire,
 )
 from bullet_trade.server.strategy.schema import connect_database
 from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
@@ -85,6 +89,35 @@ class FakeBroker:
 class FakeData:
     async def get_current_tick(self, security):
         return {"last_price": 10.0}
+
+
+class CallbackData(FakeData):
+    def __init__(self):
+        self.listener = None
+        self.subscriptions = []
+        self.ask_price = 10.03
+
+    def add_tick_listener(self, callback):
+        self.listener = callback
+
+    async def subscribe_execution_quotes(self, symbols):
+        self.subscriptions.append(tuple(symbols))
+
+    async def replace_execution_quotes(self, owner, symbols):
+        replacement = tuple(symbols)
+        if not self.subscriptions or self.subscriptions[-1] != replacement:
+            self.subscriptions.append(replacement)
+
+    async def get_current_tick(self, security):
+        return {
+            "last_price": 10.0,
+            "bidPrice": [9.99],
+            "askPrice": [self.ask_price],
+        }
+
+    def emit(self, payload):
+        assert self.listener is not None
+        self.listener(payload)
 
 
 @pytest.fixture
@@ -206,8 +239,8 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     restored = service.get_intent({"strategy_id": "good_etf"})
 
     assert broker.order_calls == 1
-    assert broker.cancel_calls == ["broker-1"]
-    assert second["cancel_requested_order_ids"] == ["broker-1"]
+    assert broker.cancel_calls == []
+    assert second["cancel_requested_order_ids"] == []
     assert any(item.event == "ORDER_SUBMITTED" for item in notifications)
     assert first["intent"]["intent_id"] == second["intent"]["intent_id"]
     assert restored["intent_id"] == intent_id
@@ -260,6 +293,115 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     assert notification.items[0].quantity == 1000
     with pytest.raises(Exception, match="not found"):
         service.repository.get_strategy_account("good_etf")
+
+
+@pytest.mark.asyncio
+async def test_conditional_target_is_resumed_by_native_tick_callback(tmp_path):
+    broker = FakeBroker()
+    data = CallbackData()
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            database_path=tmp_path / "callback.db",
+            trading_enabled=True,
+            cash_buffer_units=0,
+            max_age=timedelta(minutes=5),
+        ),
+        broker,
+        _capabilities(),
+        data,
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": "10000"},
+    )
+
+    result = await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "conditional-callback",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+            "execution": execution_request_to_wire(
+                ExecutionRequest(
+                    style=ConditionalLimitExecution(2_000)
+                )
+            ),
+        },
+    )
+
+    assert result["planned_orders"] == []
+    assert broker.order_calls == 0
+    assert data.subscriptions == [(SECURITY,)]
+
+    data.emit(
+        {
+            "stockCode": "510050.SH",
+            "lastPrice": 10.0,
+            "bidPrice": [9.99],
+            "askPrice": [10.01],
+        }
+    )
+    for _ in range(100):
+        if broker.order_calls:
+            break
+        await asyncio.sleep(0.01)
+
+    assert broker.order_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_intent_can_be_canceled_before_risk_replacement(tmp_path):
+    broker = FakeBroker()
+    data = CallbackData()
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            database_path=tmp_path / "strategy-cancel.db",
+            trading_enabled=True,
+            cash_buffer_units=0,
+            max_age=timedelta(minutes=5),
+        ),
+        broker,
+        _capabilities(),
+        data,
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": 10_000},
+    )
+    submitted = await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "waiting-to-cancel",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+            "execution": execution_request_to_wire(
+                ExecutionRequest(
+                    style=ConditionalLimitExecution(2_000)
+                )
+            ),
+        },
+    )
+
+    canceled = await service.cancel_intent(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "intent_id": submitted["intent"]["intent_id"],
+        },
+    )
+
+    assert canceled["canceled"] is True
+    assert canceled["intent"]["state"] == "CANCELED"
+    assert data.subscriptions[-1] == ()
 
 
 @pytest.mark.parametrize(

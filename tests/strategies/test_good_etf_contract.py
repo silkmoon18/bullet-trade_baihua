@@ -14,10 +14,11 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from helpers import bullet_trade_jq_remote_helper as real_helper
 
 ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PATH = ROOT / "strategies" / "joinquant" / "good_etf.py"
-HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v6"
+HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v7"
 BLOCKED_MUTATIONS = tuple(sorted({
     "order", "order_value", "order_percent", "order_target",
     "order_target_value", "order_target_percent", "cancel_order",
@@ -63,7 +64,13 @@ def _load_strategy(monkeypatch, helper_module=None):
     return module
 
 
-def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=6):
+def _fake_helper(
+    install=None,
+    *,
+    marker=HELPER_MARKER,
+    api_version=7,
+    configured_mode="JQ",
+):
     module = types.ModuleType("bullet_trade_jq_remote_helper")
     if marker is not None:
         module.STRATEGY_RUNTIME_HELPER_MARKER = marker
@@ -71,12 +78,104 @@ def _fake_helper(install=None, *, marker=HELPER_MARKER, api_version=6):
         module.STRATEGY_RUNTIME_API_VERSION = api_version
     if install is not None:
         module.install_strategy_runtime = install
+    module.get_configured_execution_mode = (
+        lambda strategy_id, profile_module=None: configured_mode
+    )
+    module.RuntimeMode = real_helper.RuntimeMode
+    for name in (
+        "ExecutionRequest",
+        "ConditionalLimitExecution",
+        "ConditionalLimitPriceMode",
+        "MarketExecution",
+        "FollowUpPolicy",
+        "RepricingPolicy",
+    ):
+        setattr(module, name, getattr(real_helper, name))
+    if install is not None:
+        class Runtime:
+            def __init__(self, state, namespace):
+                self.state = state
+                mode = state.get("mode") if isinstance(state, dict) else "JQ"
+                self.mode = types.SimpleNamespace(value=mode)
+                self.namespace = namespace
+
+            def ensure_ready(self, capital, context):
+                result = module.ensure_runtime_ready(capital, context)
+                self.state["production_ready"] = True
+                return result
+
+            def portfolio(self, context):
+                entry = getattr(module, "runtime_portfolio", None)
+                return entry(context) if callable(entry) else context.portfolio
+
+            def notify_target_buy_plan(self, items, occurred_at=None):
+                return module.notify_target_buy_plan(
+                    items, occurred_at=occurred_at
+                )
+
+            def cancel_orders(self):
+                orders = self.namespace.get("get_open_orders", lambda: {})() or {}
+                cancel = self.namespace.get("cancel_order")
+                for order in list(orders.values()):
+                    cancel(order)
+                return len(orders)
+
+            def order_target(self, security, amount):
+                return self.namespace["order_target"](security, amount)
+
+            def order_target_value(self, security, value, limit_price=None):
+                style = None
+                if limit_price is not None:
+                    style = self.namespace["LimitOrderStyle"](limit_price)
+                return self.namespace["order_target_value"](
+                    security, value, style=style
+                )
+
+        def install_facade(namespace, **kwargs):
+            context = kwargs["context"]
+            run_type = context.run_params.type
+            if run_type in ("simple_backtest", "full_backtest"):
+                mode = "BACKTEST"
+                validate_remote = kwargs["validate_remote_during_backtest"]
+            else:
+                mode = configured_mode
+                if mode not in ("JQ", "QMT_REMOTE"):
+                    raise RuntimeError(
+                        "私有配置中的执行模式必须是JQ或QMT_REMOTE"
+                    )
+                validate_remote = False
+            state = install(
+                namespace,
+                context=context,
+                profile=kwargs["profile"],
+                mode=mode,
+                strategy_id=kwargs["strategy_id"],
+                expected_api_version=kwargs["expected_api_version"],
+                profile_module=kwargs["profile_module"],
+                validate_remote=validate_remote,
+            )
+            runtime = Runtime(state, namespace)
+            if validate_remote and isinstance(state, dict):
+                ensured = module.ensure_account(kwargs["initial_capital"])
+                assert ensured["reconciliation"]["state"] == "READY"
+                portfolio = module.get_portfolio()
+                assert module.get_reconciliation()["reconciliation"]["state"] == "READY"
+                runtime.state["remote_validation"] = {
+                    "cash": portfolio.available_cash,
+                    "positions_value": portfolio.positions_value,
+                    "total_value": portfolio.total_value,
+                    "position_count": len(portfolio.positions),
+                    "reconciliation": "READY",
+                }
+            return runtime
+
+        module.install_joinquant_runtime = install_facade
     return module
 
 
 def _runtime_state(mode="JQ"):
     state = {
-        "api_version": 6,
+        "api_version": 7,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": mode,
@@ -110,6 +209,29 @@ def test_risk_check_times_are_top_level_configuration(monkeypatch):
     assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
 
 
+def test_good_etf_declares_rebalance_and_stop_loss_execution_per_call(
+    monkeypatch,
+):
+    strategy = _load_strategy(monkeypatch, _fake_helper())
+
+    rebalance = strategy._rebalance_execution()
+    stop_loss = strategy._stop_loss_execution()
+
+    assert isinstance(
+        rebalance.style, real_helper.ConditionalLimitExecution
+    )
+    assert rebalance.style.price_band_ppm == 2_000
+    assert (
+        rebalance.style.price_mode
+        is real_helper.ConditionalLimitPriceMode.BOUNDARY
+    )
+    assert isinstance(stop_loss.style, real_helper.MarketExecution)
+    assert (
+        stop_loss.follow_up
+        is real_helper.FollowUpPolicy.UNTIL_FILLED_TODAY
+    )
+
+
 @pytest.mark.parametrize("lifecycle", ["initialize", "process_initialize"])
 def test_lifecycle_gate_is_first_executable_statement(lifecycle):
     tree = ast.parse(
@@ -140,7 +262,7 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     strategy.VALIDATE_REMOTE_DURING_BACKTEST = False
     state = strategy._install_runtime(_Context(run_type))
     assert state == {
-        "api_version": 6,
+        "api_version": 7,
         "profile_schema_version": 1,
         "profile": "good_etf-prod",
         "mode": "BACKTEST",
@@ -155,40 +277,22 @@ def test_backtest_fallback_without_helper(monkeypatch, run_type):
     assert strategy._runtime_mode() is strategy.ExecutionMode.BACKTEST
 
 
-@pytest.mark.parametrize("mode", ["JQ", "QMT_REMOTE"])
-def test_fallback_without_helper_rejects_remote_modes(monkeypatch, mode):
+def test_sim_trade_without_helper_is_rejected(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = (
-        strategy.ExecutionMode.JQ
-        if mode == "JQ"
-        else strategy.ExecutionMode.QMT_REMOTE
-    )
-    run_type = "sim_trade"
     with pytest.raises(RuntimeError, match="需要bullet_trade_jq_remote_helper"):
-        strategy._install_runtime(_Context(run_type))
-
-
-def test_fallback_backtest_rejects_sim_trade_run_type(monkeypatch):
-    strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.BACKTEST
-    with pytest.raises(RuntimeError, match="ExecutionMode.JQ或QMT_REMOTE"):
         strategy._install_runtime(_Context("sim_trade"))
 
 
 def test_remote_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    strategy.g.bt_runtime = {"production_ready": False}
-    monkeypatch.setattr(
-        strategy,
-        "bt",
-        types.SimpleNamespace(
-            ensure_account=lambda _capital: {
-                "reconciliation": {"state": "READY"}
-            }
+    state = {"production_ready": False}
+    strategy._runtime = types.SimpleNamespace(
+        state=state,
+        ensure_ready=lambda _capital, _context: state.update(
+            production_ready=True
         ),
     )
-    monkeypatch.setattr(strategy, "_portfolio", lambda _context: object())
-    monkeypatch.setattr(strategy, "_restore_remote_intent", lambda: None)
+    strategy.g.bt_runtime = state
 
     strategy._ensure_remote_ready(_Context("sim_trade"))
 
@@ -197,19 +301,14 @@ def test_remote_readiness_is_set_only_after_ready_reconciliation(monkeypatch):
 
 def test_remote_readiness_stays_false_when_reconciliation_is_blocked(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    strategy.g.bt_runtime = {"production_ready": False}
-    monkeypatch.setattr(
-        strategy,
-        "bt",
-        types.SimpleNamespace(
-            ensure_account=lambda _capital: {
-                "reconciliation": {
-                    "state": "BLOCKED",
-                    "details": {"blockers": ["fee_fields"]},
-                }
-            }
-        ),
+    state = {"production_ready": False}
+    strategy._runtime = types.SimpleNamespace(
+        state=state,
+        ensure_ready=lambda _capital, _context: (_ for _ in ()).throw(
+                RuntimeError("真实账户对账未就绪: fee_fields")
+            ),
     )
+    strategy.g.bt_runtime = state
 
     with pytest.raises(RuntimeError, match="fee_fields"):
         strategy._ensure_remote_ready(_Context("sim_trade"))
@@ -229,7 +328,7 @@ def test_helper_marker_mismatch_rejected(monkeypatch, marker):
     assert install_calls == []
 
 
-@pytest.mark.parametrize("api_version", [0, 1, 2, 3, 4, 5, 7])
+@pytest.mark.parametrize("api_version", [0, 1, 2, 3, 4, 5, 6, 8])
 def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
     helper = _fake_helper(
         lambda *args, **kwargs: pytest.fail("版本不匹配不得进入安装"),
@@ -244,7 +343,7 @@ def test_helper_api_version_mismatch_rejected(monkeypatch, api_version):
 def test_helper_invalid_entry_rejected(monkeypatch, entry):
     helper = _fake_helper()
     if entry == "uncallable":
-        helper.install_strategy_runtime = object()
+        helper.install_joinquant_runtime = object()
     strategy = _load_strategy(monkeypatch, helper)
     with pytest.raises(RuntimeError, match="运行时入口无效"):
         strategy._install_runtime(_Context("full_backtest"))
@@ -257,18 +356,16 @@ def test_remote_installs_strategy_ledger_runtime(monkeypatch):
         calls.append(kwargs)
         return _runtime_state("QMT_REMOTE")
 
-    helper = _fake_helper(install)
+    helper = _fake_helper(install, configured_mode="QMT_REMOTE")
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.QMT_REMOTE
     state = strategy._install_runtime(_Context("sim_trade"))
     assert state["mode"] == "QMT_REMOTE"
-    assert calls[0]["expected_api_version"] == 6
+    assert calls[0]["expected_api_version"] == 7
 
 
 def test_helper_non_dict_state_rejected(monkeypatch):
     helper = _fake_helper(lambda namespace, **kwargs: None)
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
@@ -288,7 +385,6 @@ def test_helper_state_contract_mismatch_rejected(monkeypatch, tamper):
         return state
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     with pytest.raises(RuntimeError, match="无效的运行时状态"):
         strategy._install_runtime(_Context("sim_trade"))
 
@@ -301,7 +397,6 @@ def test_jq_install_success_and_call_contract(monkeypatch):
         return _runtime_state("JQ")
 
     strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     context = _Context("sim_trade")
     state = strategy._install_runtime(context)
 
@@ -313,7 +408,7 @@ def test_jq_install_success_and_call_contract(monkeypatch):
         "profile": "good_etf-prod",
         "mode": "JQ",
         "strategy_id": "good_etf",
-        "expected_api_version": 6,
+        "expected_api_version": 7,
         "profile_module": "jq_runtime_config",
         "validate_remote": False,
     }
@@ -372,7 +467,6 @@ def test_backtest_remote_validation_uses_real_snapshot_without_submitting(
         "回测远程预检不得提交组合目标"
     )
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.QMT_REMOTE
 
     state = strategy._install_runtime(_Context("simple_backtest"))
 
@@ -399,8 +493,9 @@ def test_backtest_validation_flag_has_no_effect_in_sim_trade(
         calls.append(kwargs)
         return _runtime_state(mode_name)
 
-    strategy = _load_strategy(monkeypatch, _fake_helper(install))
-    strategy.SIM_EXECUTION_MODE = getattr(strategy.ExecutionMode, mode_name)
+    strategy = _load_strategy(
+        monkeypatch, _fake_helper(install, configured_mode=mode_name)
+    )
     # 即使模拟交易时该名字被设置为无效值，也必须完全不参与执行路径。
     strategy.VALIDATE_REMOTE_DURING_BACKTEST = "ignored-in-sim-trade"
 
@@ -416,10 +511,13 @@ def test_invalid_backtest_validation_flag_rejected(monkeypatch):
         strategy._install_runtime(_Context("simple_backtest"))
 
 
-def test_sim_execution_mode_rejects_plain_string(monkeypatch):
-    strategy = _load_strategy(monkeypatch)
-    strategy.SIM_EXECUTION_MODE = "JQ"
-    with pytest.raises(RuntimeError, match="ExecutionMode.JQ或QMT_REMOTE"):
+def test_invalid_configured_execution_mode_is_rejected(monkeypatch):
+    helper = _fake_helper(
+        lambda namespace, **kwargs: _runtime_state("JQ"),
+        configured_mode="INVALID",
+    )
+    strategy = _load_strategy(monkeypatch, helper)
+    with pytest.raises(RuntimeError, match="执行模式必须是JQ或QMT_REMOTE"):
         strategy._install_runtime(_Context("sim_trade"))
 
 
@@ -496,7 +594,6 @@ def test_jq_target_buy_plan_calls_helper(monkeypatch):
         or {"accepted": True, "item_count": len(items), "total_amount": 2000.0}
     )
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     strategy._install_runtime(_Context("sim_trade"))
     context = types.SimpleNamespace(current_dt="2026-08-13 09:30:00")
     items = [{"security": "510001.XSHG", "quantity": 1000, "amount": 2000.0}]
@@ -515,7 +612,6 @@ def test_jq_uses_native_order_and_cancel(monkeypatch):
         "total_amount": sum(float(item["amount"]) for item in items),
     }
     strategy = _load_strategy(monkeypatch, helper)
-    strategy.SIM_EXECUTION_MODE = strategy.ExecutionMode.JQ
     strategy._install_runtime(_Context("sim_trade"))
     calls = []
     open_order = types.SimpleNamespace(order_id="jq-open-1")
@@ -542,6 +638,45 @@ def test_jq_uses_native_order_and_cancel(monkeypatch):
         ("amount", "510001.XSHG", 100),
         ("value", "510001.XSHG", 2000.0, None),
     ]
+
+
+def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):
+    strategy = _load_strategy(monkeypatch, _fake_helper())
+    position = types.SimpleNamespace(
+        price=9.0,
+        avg_cost=10.0,
+        value=9000.0,
+    )
+    portfolio = types.SimpleNamespace(
+        total_value=10000.0,
+        positions={"510001.XSHG": position},
+    )
+    submissions = []
+    monkeypatch.setattr(
+        strategy,
+        "_runtime_mode",
+        lambda: strategy.ExecutionMode.QMT_REMOTE,
+    )
+    monkeypatch.setattr(strategy, "_portfolio", lambda context: portfolio)
+    monkeypatch.setattr(strategy, "_advance_remote_intent", lambda context: False)
+    monkeypatch.setattr(strategy, "_cancel_remote_intent", lambda: True)
+    monkeypatch.setattr(strategy, "_notify", lambda message: None)
+    monkeypatch.setattr(
+        strategy,
+        "_submit_remote_targets",
+        lambda *args: submissions.append(args)
+        or {"intent": {"intent_id": "risk-1"}},
+    )
+
+    strategy.handle_risk_management(
+        types.SimpleNamespace(
+            current_dt=pd.Timestamp("2026-08-20 10:30:00")
+        )
+    )
+
+    assert len(submissions) == 1
+    assert submissions[0][1] == {"510001.XSHG": 0.0}
+    assert isinstance(submissions[0][4].style, real_helper.MarketExecution)
 
 
 def test_runtime_mode_raises_before_install(monkeypatch):

@@ -108,6 +108,21 @@ class QmtBroker(BrokerBase):
         except (TypeError, ValueError):
             self._retry_interval = 60
         self._last_order_wait_results: Dict[str, Dict[str, Any]] = {}
+        self._event_callback = None
+
+    def set_event_callback(self, callback) -> None:
+        """Set a lightweight listener for native trader lifecycle callbacks."""
+
+        self._event_callback = callback
+
+    def _emit_event(self, event: str, payload: Any = None) -> None:
+        callback = self._event_callback
+        if not callable(callback):
+            return
+        try:
+            callback(event, payload)
+        except Exception as exc:
+            log.warning("QMT事件回调处理失败: event=%s error=%s", event, exc)
 
     def _ensure_connected(self):
         if not self._connected:
@@ -200,8 +215,19 @@ class QmtBroker(BrokerBase):
                     """
 
                     self.outer._connected = False
+                    self.outer._emit_event("disconnected")
 
-                # 其余回调后续接入（订单、成交、持仓变更）
+                def on_stock_order(self, order):  # noqa: N802
+                    self.outer._emit_event("order", order)
+
+                def on_stock_trade(self, trade):  # noqa: N802
+                    self.outer._emit_event("trade", trade)
+
+                def on_order_error(self, error):  # noqa: N802
+                    self.outer._emit_event("order_error", error)
+
+                def on_cancel_error(self, error):  # noqa: N802
+                    self.outer._emit_event("cancel_error", error)
 
             trader = XtQuantTrader(data_path, session_id)  # type: ignore
             callback = _Callback(self)

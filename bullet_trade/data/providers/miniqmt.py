@@ -77,6 +77,7 @@ class MiniQMTProvider(DataProvider):
             fallback_to_env=not cache_dir_set,
         )
         self._tick_callback = None
+        self._tick_subscription_ids: Dict[str, Any] = {}
 
     # ------------------------ 工具函数 ------------------------
     @staticmethod
@@ -578,7 +579,12 @@ class MiniQMTProvider(DataProvider):
             xtdata = self._ensure_xtdata()
             mapped = [self._normalize_security_code(s) for s in symbols]
             for code in mapped:
-                xtdata.subscribe_quote(code, period="tick", callback=self._tick_callback)  # type: ignore[attr-defined]
+                if code in self._tick_subscription_ids:
+                    continue
+                subscription_id = xtdata.subscribe_quote(  # type: ignore[attr-defined]
+                    code, period="tick", callback=self._tick_callback
+                )
+                self._tick_subscription_ids[code] = subscription_id
             logger.info("MiniQMT 订阅 tick: %s", mapped)
         except Exception as exc:
             logger.error("MiniQMT 订阅 tick 失败: %s", exc)
@@ -597,13 +603,18 @@ class MiniQMTProvider(DataProvider):
     def unsubscribe_ticks(self, symbols: Optional[List[str]] = None) -> None:
         try:
             xtdata = self._ensure_xtdata()
-            if symbols:
-                mapped = [self._normalize_security_code(s) for s in symbols]
-                if hasattr(xtdata, "unsubscribe_quote"):
-                    xtdata.unsubscribe_quote(mapped)  # type: ignore[attr-defined]
-            else:
-                if hasattr(xtdata, "unsubscribe_all"):
-                    xtdata.unsubscribe_all()  # type: ignore[attr-defined]
+            mapped = (
+                [self._normalize_security_code(s) for s in symbols]
+                if symbols
+                else list(self._tick_subscription_ids)
+            )
+            if hasattr(xtdata, "unsubscribe_quote"):
+                for code in mapped:
+                    subscription_id = self._tick_subscription_ids.pop(
+                        code, None
+                    )
+                    if subscription_id is not None:
+                        xtdata.unsubscribe_quote(subscription_id)  # type: ignore[attr-defined]
             logger.info("MiniQMT 退订 tick: %s", symbols if symbols else "ALL")
         except Exception:
             pass

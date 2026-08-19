@@ -13,6 +13,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Optional, Union
 
+from .execution import ExecutionRequest
+
 
 MONEY_SCALE = 10_000
 PRICE_SCALE = 1_000_000
@@ -217,6 +219,8 @@ class PortfolioIntent:
     expected_ledger_version: int
     targets: Mapping[str, int]
     state: IntentState = IntentState.CREATED
+    trading_day: Optional[date] = None
+    execution_request: ExecutionRequest = ExecutionRequest()
 
     def __post_init__(self) -> None:
         _require_int(self.expected_ledger_version, "expected_ledger_version")
@@ -225,6 +229,10 @@ class PortfolioIntent:
                 raise ValueError("target security cannot be empty")
             _require_int(target_qty, "target_qty")
         object.__setattr__(self, "targets", MappingProxyType(dict(self.targets)))
+        if self.trading_day is not None and type(self.trading_day) is not date:
+            raise TypeError("trading_day must be date")
+        if type(self.execution_request) is not ExecutionRequest:
+            raise TypeError("execution_request must be ExecutionRequest")
 
 
 @dataclass(frozen=True)
