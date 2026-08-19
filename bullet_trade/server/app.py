@@ -36,6 +36,9 @@ from .session import ClientSession
 from .tick import TickSubscriptionManager
 
 
+_STRATEGY_STARTUP_RETRY_SECONDS = 5.0
+
+
 @dataclass
 class _IdempotencyEntry:
     fingerprint: str
@@ -72,6 +75,7 @@ class ServerApplication:
         self._started: Optional[asyncio.Event] = None
         self._idempotency_cache: Dict[Tuple[str, str, str], _IdempotencyEntry] = {}
         self._idempotency_lock = asyncio.Lock()
+        self._strategy_startup_task: Optional[asyncio.Task] = None
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
         self.strategy_api: Optional[SQLiteStrategyAPI] = None
@@ -140,6 +144,13 @@ class ServerApplication:
         if self._shutdown.is_set():
             return
         self._shutdown.set()
+        if self._strategy_startup_task:
+            self._strategy_startup_task.cancel()
+            try:
+                await self._strategy_startup_task
+            except asyncio.CancelledError:
+                pass
+            self._strategy_startup_task = None
         if self.tick_manager:
             await self.tick_manager.stop()
         for session in list(self._sessions):
@@ -645,22 +656,46 @@ class ServerApplication:
         if self.adapters.broker_adapter:
             await self.adapters.broker_adapter.start()
         if self.strategy_api:
-            for account_context in self.router.list_accounts():
-                account_key = account_context.config.key or "default"
-                try:
-                    ready = await self.strategy_api.startup_check(
-                        account_context, account_key
-                    )
-                except Exception as exc:
-                    ready = False
+            ready = await self._check_strategy_startup(log_failure=True)
+            if not ready:
+                self._strategy_startup_task = asyncio.create_task(
+                    self._retry_strategy_startup(),
+                    name="strategy-ledger-startup-retry",
+                )
+        if self.tick_manager:
+            await self.tick_manager.start()
+
+    async def _check_strategy_startup(self, *, log_failure: bool) -> bool:
+        """Reconcile existing strategy accounts after the broker becomes ready."""
+        if self.strategy_api is None:
+            return True
+        all_ready = True
+        for account_context in self.router.list_accounts():
+            account_key = account_context.config.key or "default"
+            try:
+                ready = await self.strategy_api.startup_check(
+                    account_context, account_key
+                )
+            except Exception as exc:
+                ready = False
+                if log_failure:
                     log.error("StrategyLedger启动对账失败，保持只读: %s", exc)
-                if not ready:
+            if not ready:
+                all_ready = False
+                if log_failure:
                     log.warning(
                         "StrategyLedger账户%s启动未就绪，真实组合下单保持阻断",
                         account_key,
                     )
-        if self.tick_manager:
-            await self.tick_manager.start()
+        return all_ready
+
+    async def _retry_strategy_startup(self) -> None:
+        """Retry the one-time startup reconciliation while QMT is connecting."""
+        while True:
+            await asyncio.sleep(_STRATEGY_STARTUP_RETRY_SECONDS)
+            if await self._check_strategy_startup(log_failure=False):
+                log.info("QMT连接就绪，StrategyLedger启动对账已自动恢复")
+                return
 
     def _health_snapshot(self) -> Dict:
         value = {

@@ -49,7 +49,7 @@ Set-Location E:\dev\Github\bullet-trade
 .\.venv\Scripts\python.exe -m bullet_trade --env-file E:\bullet-trade-data\.env server
 ```
 
-服务器启动后会对已存在策略账户立即同步QMT；失败时`strategy_ledger_ready=false`并保持只读。第一次由聚宽调用`ensure_account`建立1万元策略账户。交易关闭时能力证明可以暂缓，账本仍可返回`READY`；将`QMT_STRATEGY_TRADING_ENABLED`改为`true`后，能力证明缺失会立即重新阻断。
+服务器启动后会对已存在策略账户立即同步QMT；若QMT仍在启动，则保持`strategy_ledger_ready=false`并每5秒重试，成功后停止重试。第一次由聚宽调用`ensure_account`建立1万元策略账户。交易关闭时能力证明可以暂缓，账本仍可返回`READY`；将`QMT_STRATEGY_TRADING_ENABLED`改为`true`后，能力证明缺失会立即重新阻断。
 
 日志已使用`RotatingFileHandler`，单文件5MB、保留3个历史文件。配置`QMT_SERVER_LOG_FILE`即可，无需另一套日志轮转程序。
 
