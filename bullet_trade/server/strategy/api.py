@@ -34,7 +34,11 @@ from .planner_executor import (
     TargetPlanningError,
 )
 from .reconciliation import SQLiteReconciliationService, collect_async_broker_snapshot
-from .repository import AccountNotFoundError, SQLiteStrategyRepository
+from .repository import (
+    AccountNotFoundError,
+    LedgerInvariantError,
+    SQLiteStrategyRepository,
+)
 from .schema import connect_database
 from .valuation import MarketMark, SQLiteValuationService
 
@@ -171,9 +175,18 @@ class SQLiteStrategyAPI:
                         strategy_id,
                     )
                 ) from exc
-            ensured = self.capital.ensure_strategy_account(
-                strategy_id, strategy_id, physical_id, initial_units
-            )
+            try:
+                ensured = self.capital.ensure_strategy_account(
+                    strategy_id, strategy_id, physical_id, initial_units
+                )
+            except LedgerInvariantError as exc:
+                raise LedgerInvariantError(
+                    "{}; broker_available_cash={:.4f}, new_strategy_id={}".format(
+                        exc,
+                        broker_snapshot.available_cash_units / MONEY_SCALE,
+                        strategy_id,
+                    )
+                ) from exc
             account, created = ensured.account, ensured.created
         result = self._synchronize(strategy_id, physical_id, broker_snapshot)
         account = self.repository.get_strategy_account(strategy_id)

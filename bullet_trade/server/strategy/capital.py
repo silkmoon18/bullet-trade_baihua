@@ -112,25 +112,48 @@ class SQLiteCapitalService:
             strategy_available = sum(
                 row["cash_units"] - row["reserved_cash_units"] for row in accounts
             )
-            expected_available = unallocated_available + strategy_available
-            if expected_available != broker_available_cash_units:
+            external_unallocated_available = (
+                broker_available_cash_units - strategy_available
+            )
+            if external_unallocated_available < 0:
+                expected_available = unallocated_available + strategy_available
                 difference = broker_available_cash_units - expected_available
                 raise BrokerCashMismatchError(
-                    "broker available cash does not match StrategyLedger: "
+                    "broker available cash cannot cover StrategyLedger-owned cash: "
                     "physical_account_id={}, broker_available_cash={:.4f}, "
-                    "ledger_expected_available_cash={:.4f}, difference={:+.4f}, "
-                    "ledger_unallocated_available_cash={:.4f}, "
-                    "ledger_strategy_available_cash={:.4f}".format(
+                    "ledger_strategy_available_cash={:.4f}, shortfall={:.4f}, "
+                    "ledger_unallocated_available_cash_before={:.4f}, "
+                    "ledger_expected_available_cash_before={:.4f}, "
+                    "difference={:+.4f}".format(
                         physical_account_id,
                         broker_available_cash_units / MONEY_SCALE,
+                        strategy_available / MONEY_SCALE,
+                        -external_unallocated_available / MONEY_SCALE,
+                        unallocated_available / MONEY_SCALE,
                         expected_available / MONEY_SCALE,
                         difference / MONEY_SCALE,
-                        unallocated_available / MONEY_SCALE,
-                        strategy_available / MONEY_SCALE,
                     )
                 )
+
+            # The physical account may also contain manual trades or assets owned by
+            # other systems.  StrategyLedger only promises the cash attributed to its
+            # own strategies; any remaining broker cash belongs to the unallocated
+            # pool.  Rebase that pool before allocating a new strategy account instead
+            # of requiring unrelated account activity to match an old pool snapshot.
+            new_unallocated_total = (
+                external_unallocated_available + pool["reserved_cash_units"]
+            )
+            if new_unallocated_total != pool["unallocated_cash_units"]:
+                connection.execute(
+                    """
+                    UPDATE cash_pools
+                    SET unallocated_cash_units = ?, version = version + 1
+                    WHERE physical_account_id = ?
+                    """,
+                    (new_unallocated_total, physical_account_id),
+                )
             connection.commit()
-            return cast(int, expected_available)
+            return broker_available_cash_units
         except (AccountNotFoundError, BrokerCashMismatchError):
             connection.rollback()
             raise
@@ -190,7 +213,17 @@ class SQLiteCapitalService:
                 raise AccountNotFoundError("physical account cash pool not found")
             available = pool["unallocated_cash_units"] - pool["reserved_cash_units"]
             if available < initial_capital_units:
-                raise LedgerInvariantError("real account has insufficient available cash")
+                raise LedgerInvariantError(
+                    "real account has insufficient available cash: "
+                    "physical_account_id={}, "
+                    "ledger_unallocated_available_cash={:.4f}, "
+                    "requested_initial_capital={:.4f}, shortfall={:.4f}".format(
+                        physical_account_id,
+                        available / MONEY_SCALE,
+                        initial_capital_units / MONEY_SCALE,
+                        (initial_capital_units - available) / MONEY_SCALE,
+                    )
+                )
             updated = connection.execute(
                 """
                 UPDATE cash_pools

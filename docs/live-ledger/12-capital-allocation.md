@@ -5,7 +5,7 @@
 S08把聚宽配置的策略初始资金与真实QMT账户现金分开处理：
 
 1. 从QMT账户读取`available_cash`并转换为StrategyLedger货币整数单位。
-2. `calibrate_broker_available_cash()`校准物理账户可用现金。
+2. `calibrate_broker_available_cash()`以QMT真实可用现金重算未分配资金池。
 3. `ensure_strategy_account(..., initial_capital_units=100_000_000)`申请1万元策略资金。
 4. 真实账户可用资金不足时抛出`LedgerInvariantError`，策略账户、资金池和资金流水都不会创建。
 5. 足够时在同一事务扣减物理资金池、创建策略账户并写初始`ALLOCATE`流水。
@@ -27,7 +27,13 @@ result = capital.ensure_strategy_account(
 
 ## 重启和账实校验
 
-策略账户存在后，再次校准不会覆盖本地账本。它要求“券商可用现金 = 物理未分配可用现金 + 所有策略账户可用现金”。不一致时抛出`BrokerCashMismatchError`并停止后续交易，差异留给S11对账处理。
+策略账户存在后，再次校准不会覆盖任何策略现金、持仓或流水。共享物理账户中的人工交易、其他策略和外部资金变化统一由未分配资金池承担：
+
+```text
+未分配可用现金 = QMT真实可用现金 - 所有StrategyLedger策略可用现金
+```
+
+只要结果不小于新策略申请的初始资金，就可以创建新的虚拟策略账户。QMT真实可用现金小于已有策略可用现金总和时，才抛出`BrokerCashMismatchError`并停止后续交易；这表示物理账户已经无法覆盖StrategyLedger承诺的策略现金。新增策略申请超过剩余未分配现金时抛出`LedgerInvariantError`，且不会创建账户或资金流水。
 
 ## 下单前冻结与释放
 

@@ -11,6 +11,7 @@ from bullet_trade.server.strategy import (
     CapabilityState,
     ConditionalLimitExecution,
     ExecutionRequest,
+    LedgerInvariantError,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
@@ -165,7 +166,7 @@ async def test_ensure_account_and_real_snapshot(api):
 
 
 @pytest.mark.asyncio
-async def test_new_strategy_cash_mismatch_reports_broker_ledger_and_request(api):
+async def test_new_strategy_rebases_external_cash_and_uses_remaining_pool(api):
     service, broker, account, _ = api
     await service.ensure_account(
         account,
@@ -174,7 +175,39 @@ async def test_new_strategy_cash_mismatch_reports_broker_ledger_and_request(api)
     )
     broker.cash = 19_999.0
 
-    with pytest.raises(BrokerCashMismatchError) as exc_info:
+    result = await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "new-strategy", "initial_capital": 9_000},
+    )
+
+    assert result["created"] is True
+    assert result["account"]["available_cash"] == 9_000.0
+    connection = connect_database(service.database_path)
+    try:
+        pool = connection.execute(
+            """
+            SELECT unallocated_cash_units, reserved_cash_units
+            FROM cash_pools WHERE physical_account_id = ?
+            """,
+            ("qmt:default",),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(pool) == (money_to_units("999"), 0)
+
+
+@pytest.mark.asyncio
+async def test_new_strategy_rejects_when_remaining_real_cash_is_insufficient(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "existing", "initial_capital": 10_000},
+    )
+    broker.cash = 19_999.0
+
+    with pytest.raises(LedgerInvariantError) as exc_info:
         await service.ensure_account(
             account,
             "default",
@@ -182,10 +215,35 @@ async def test_new_strategy_cash_mismatch_reports_broker_ledger_and_request(api)
         )
 
     message = str(exc_info.value)
-    assert "broker_available_cash=19999.0000" in message
-    assert "ledger_expected_available_cash=20000.0000" in message
-    assert "difference=-1.0000" in message
+    assert "ledger_unallocated_available_cash=9999.0000" in message
     assert "requested_initial_capital=10000.0000" in message
+    assert "shortfall=1.0000" in message
+    assert "broker_available_cash=19999.0000" in message
+    assert "new_strategy_id=new-strategy" in message
+
+
+@pytest.mark.asyncio
+async def test_new_strategy_reports_when_broker_cannot_cover_existing_strategies(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "existing", "initial_capital": 10_000},
+    )
+    broker.cash = 9_999.0
+
+    with pytest.raises(BrokerCashMismatchError) as exc_info:
+        await service.ensure_account(
+            account,
+            "default",
+            {"strategy_id": "new-strategy", "initial_capital": 1_000},
+        )
+
+    message = str(exc_info.value)
+    assert "broker_available_cash=9999.0000" in message
+    assert "ledger_strategy_available_cash=10000.0000" in message
+    assert "shortfall=1.0000" in message
+    assert "requested_initial_capital=1000.0000" in message
     assert "new_strategy_id=new-strategy" in message
 
 

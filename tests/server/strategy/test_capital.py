@@ -104,25 +104,58 @@ def test_concurrent_ensure_allocates_initial_capital_once(capital_service):
     assert _pool(capital_service) == (50_000_000, 0, 2)
 
 
-def test_existing_account_calibration_detects_broker_cash_mismatch(capital_service):
+def test_existing_account_calibration_rebases_external_cash_changes(capital_service):
     capital_service.calibrate_broker_available_cash("qmt-main", BROKER_CASH)
-    _ensure(capital_service)
+    account = _ensure(capital_service).account
 
     assert capital_service.calibrate_broker_available_cash(
         "qmt-main", BROKER_CASH
     ) == BROKER_CASH
-    with pytest.raises(BrokerCashMismatchError, match="does not match") as exc_info:
+    assert capital_service.calibrate_broker_available_cash(
+        "qmt-main", BROKER_CASH - 1
+    ) == BROKER_CASH - 1
+    assert _pool(capital_service) == (50_000_000 - 1, 0, 3)
+    assert capital_service.calibrate_broker_available_cash(
+        "qmt-main", BROKER_CASH + 25_000_000
+    ) == BROKER_CASH + 25_000_000
+    assert _pool(capital_service) == (75_000_000, 0, 4)
+    assert capital_service._ledger.get_strategy_account("good-etf") == account
+
+
+def test_existing_account_calibration_rejects_cash_below_strategy_commitments(
+    capital_service,
+):
+    capital_service.calibrate_broker_available_cash("qmt-main", BROKER_CASH)
+    _ensure(capital_service)
+
+    with pytest.raises(BrokerCashMismatchError, match="cannot cover") as exc_info:
         capital_service.calibrate_broker_available_cash(
-            "qmt-main", BROKER_CASH - 1
+            "qmt-main", INITIAL_CAPITAL - 1
         )
 
     message = str(exc_info.value)
     assert "physical_account_id=qmt-main" in message
-    assert "broker_available_cash=14999.9999" in message
-    assert "ledger_expected_available_cash=15000.0000" in message
-    assert "difference=-0.0001" in message
-    assert "ledger_unallocated_available_cash=5000.0000" in message
+    assert "broker_available_cash=9999.9999" in message
     assert "ledger_strategy_available_cash=10000.0000" in message
+    assert "shortfall=0.0001" in message
+    assert "ledger_unallocated_available_cash_before=5000.0000" in message
+    assert "ledger_expected_available_cash_before=15000.0000" in message
+    assert "difference=-5000.0001" in message
+    assert _pool(capital_service) == (50_000_000, 0, 2)
+
+
+def test_calibration_uses_available_cash_after_strategy_reservation(capital_service):
+    capital_service.calibrate_broker_available_cash("qmt-main", BROKER_CASH)
+    _ensure(capital_service)
+    capital_service.reserve_cash(
+        "good-etf", 30_000_000, expected_ledger_version=0, order_id="order-1"
+    )
+
+    # The broker also excludes the working order's frozen cash from available_cash.
+    assert capital_service.calibrate_broker_available_cash(
+        "qmt-main", BROKER_CASH - 30_000_000
+    ) == BROKER_CASH - 30_000_000
+    assert _pool(capital_service) == (50_000_000, 0, 2)
 
 
 def test_reserve_and_release_change_available_cash_with_ledger_events(capital_service):
