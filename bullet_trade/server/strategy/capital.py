@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Union, cast
 from uuid import uuid4
 
-from .domain import SHANGHAI_TZ, AccountStatus, StrategyAccount
+from .domain import MONEY_SCALE, SHANGHAI_TZ, AccountStatus, StrategyAccount
 from .repository import (
     AccountNotFoundError,
     LedgerInvariantError,
@@ -106,14 +106,28 @@ class SQLiteCapitalService:
                 connection.commit()
                 return broker_available_cash_units
 
-            expected_available = (
+            unallocated_available = (
                 pool["unallocated_cash_units"] - pool["reserved_cash_units"]
-            ) + sum(
+            )
+            strategy_available = sum(
                 row["cash_units"] - row["reserved_cash_units"] for row in accounts
             )
+            expected_available = unallocated_available + strategy_available
             if expected_available != broker_available_cash_units:
+                difference = broker_available_cash_units - expected_available
                 raise BrokerCashMismatchError(
-                    "broker available cash does not match StrategyLedger"
+                    "broker available cash does not match StrategyLedger: "
+                    "physical_account_id={}, broker_available_cash={:.4f}, "
+                    "ledger_expected_available_cash={:.4f}, difference={:+.4f}, "
+                    "ledger_unallocated_available_cash={:.4f}, "
+                    "ledger_strategy_available_cash={:.4f}".format(
+                        physical_account_id,
+                        broker_available_cash_units / MONEY_SCALE,
+                        expected_available / MONEY_SCALE,
+                        difference / MONEY_SCALE,
+                        unallocated_available / MONEY_SCALE,
+                        strategy_available / MONEY_SCALE,
+                    )
                 )
             connection.commit()
             return cast(int, expected_available)

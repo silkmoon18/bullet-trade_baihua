@@ -111,10 +111,18 @@ def test_existing_account_calibration_detects_broker_cash_mismatch(capital_servi
     assert capital_service.calibrate_broker_available_cash(
         "qmt-main", BROKER_CASH
     ) == BROKER_CASH
-    with pytest.raises(BrokerCashMismatchError, match="does not match"):
+    with pytest.raises(BrokerCashMismatchError, match="does not match") as exc_info:
         capital_service.calibrate_broker_available_cash(
             "qmt-main", BROKER_CASH - 1
         )
+
+    message = str(exc_info.value)
+    assert "physical_account_id=qmt-main" in message
+    assert "broker_available_cash=14999.9999" in message
+    assert "ledger_expected_available_cash=15000.0000" in message
+    assert "difference=-0.0001" in message
+    assert "ledger_unallocated_available_cash=5000.0000" in message
+    assert "ledger_strategy_available_cash=10000.0000" in message
 
 
 def test_reserve_and_release_change_available_cash_with_ledger_events(capital_service):

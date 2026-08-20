@@ -6,6 +6,7 @@ import pytest
 from bullet_trade.server.config import AccountConfig
 from bullet_trade.server.adapters.base import AccountContext
 from bullet_trade.server.strategy import (
+    BrokerCashMismatchError,
     BrokerCapabilityProfile,
     CapabilityState,
     ConditionalLimitExecution,
@@ -161,6 +162,31 @@ async def test_ensure_account_and_real_snapshot(api):
     assert snapshot["reconciliation"]["state"] == "READY"
     service.startup_ready = False
     assert await service.startup_check(account, "default") is True
+
+
+@pytest.mark.asyncio
+async def test_new_strategy_cash_mismatch_reports_broker_ledger_and_request(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "existing", "initial_capital": 10_000},
+    )
+    broker.cash = 19_999.0
+
+    with pytest.raises(BrokerCashMismatchError) as exc_info:
+        await service.ensure_account(
+            account,
+            "default",
+            {"strategy_id": "new-strategy", "initial_capital": 10_000},
+        )
+
+    message = str(exc_info.value)
+    assert "broker_available_cash=19999.0000" in message
+    assert "ledger_expected_available_cash=20000.0000" in message
+    assert "difference=-1.0000" in message
+    assert "requested_initial_capital=10000.0000" in message
+    assert "new_strategy_id=new-strategy" in message
 
 
 @pytest.mark.asyncio

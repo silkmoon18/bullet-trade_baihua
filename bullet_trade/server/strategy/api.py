@@ -18,7 +18,7 @@ from ..feishu_notifier import (
     TargetBuyPlanNotification,
     TradeNotification,
 )
-from .capital import SQLiteCapitalService
+from .capital import BrokerCashMismatchError, SQLiteCapitalService
 from .domain import MONEY_SCALE, NAV_SCALE, PRICE_SCALE, SHANGHAI_TZ, money_to_units, price_to_units
 from .execution import (
     ConditionalLimitExecution,
@@ -159,9 +159,18 @@ class SQLiteStrategyAPI:
             account = self.repository.get_strategy_account(strategy_id)
             created = False
         except AccountNotFoundError:
-            self.capital.calibrate_broker_available_cash(
-                physical_id, broker_snapshot.available_cash_units
-            )
+            try:
+                self.capital.calibrate_broker_available_cash(
+                    physical_id, broker_snapshot.available_cash_units
+                )
+            except BrokerCashMismatchError as exc:
+                raise BrokerCashMismatchError(
+                    "{}; requested_initial_capital={:.4f}, new_strategy_id={}".format(
+                        exc,
+                        initial_units / MONEY_SCALE,
+                        strategy_id,
+                    )
+                ) from exc
             ensured = self.capital.ensure_strategy_account(
                 strategy_id, strategy_id, physical_id, initial_units
             )
