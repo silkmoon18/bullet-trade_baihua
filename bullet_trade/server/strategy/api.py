@@ -540,6 +540,7 @@ class SQLiteStrategyAPI:
                 self.notification_handler(
                     TradeNotification(
                         event="RECONCILIATION_BLOCKED",
+                        strategy_id=strategy_id,
                         security="-",
                         side="-",
                         status="BLOCKED",

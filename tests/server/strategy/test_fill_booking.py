@@ -346,6 +346,9 @@ def test_order_and_fill_emit_structured_trade_notifications(services):
     )
 
     assert [item.event for item in notifications] == ["ORDER_SUBMITTED", "FILLED"]
+    assert [item.strategy_id for item in notifications] == [
+        "good_etf", "good_etf"
+    ]
     assert notifications[0].security == SECURITY
     assert notifications[0].quantity == 1000
     assert str(notifications[0].price) == "2"

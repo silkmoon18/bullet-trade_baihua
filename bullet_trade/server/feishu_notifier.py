@@ -37,6 +37,7 @@ class TradeNotification:
     detail: str = ""
     occurred_at: Optional[datetime] = None
     title: Optional[str] = None
+    strategy_id: str = "-"
 
 
 @dataclass(frozen=True)
@@ -117,10 +118,13 @@ class FeishuTradeNotifier:
             "CANCELED": "订单已撤销",
             "REJECTED": "订单被拒绝",
         }.get(notification.event.upper(), "量化交易通知")
+        if notification.strategy_id and notification.strategy_id != "-":
+            title = "{} · {}".format(title, notification.strategy_id)
         occurred_at = notification.occurred_at or datetime.now(SHANGHAI_TZ)
         if occurred_at.tzinfo is not None:
             occurred_at = occurred_at.astimezone(SHANGHAI_TZ)
         lines = [
+            "**策略ID：** `{}`".format(notification.strategy_id or "-"),
             "**标的：** `{}`".format(notification.security or "-"),
             "**方向：** {}".format(notification.side or "-"),
             "**状态：** {}".format(notification.status or "-"),
@@ -167,7 +171,7 @@ class FeishuTradeNotifier:
             Decimal("0"),
         )
         summary_lines = [
-            "**策略：** `{}`".format(notification.strategy_id),
+            "**策略ID：** `{}`".format(notification.strategy_id),
             "**模式：** `{}`".format(notification.mode),
             "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
         ]
@@ -199,8 +203,9 @@ class FeishuTradeNotifier:
                     "template": "orange",
                     "title": {
                         "tag": "plain_text",
-                        "content": "策略目标买入计划 · {}".format(
-                            notification.mode
+                        "content": "策略目标买入计划 · {} · {}".format(
+                            notification.strategy_id,
+                            notification.mode,
                         ),
                     },
                 },

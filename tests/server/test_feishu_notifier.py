@@ -15,6 +15,7 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
     payload = notifier.build_payload(
         TradeNotification(
             event="FILLED",
+            strategy_id="good_etf",
             security="510050.XSHG",
             side="BUY",
             status="FILLED",
@@ -29,9 +30,13 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
 
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["template"] == "green"
+    assert payload["card"]["header"]["title"]["content"] == (
+        "订单全部成交 · good_etf"
+    )
     content = payload["card"]["elements"][0]["text"]["content"]
     lines = content.splitlines()
-    assert lines[:7] == [
+    assert lines[:8] == [
+        "**策略ID：** `good_etf`",
         "**标的：** `510050.XSHG`",
         "**方向：** BUY",
         "**状态：** FILLED",
@@ -83,14 +88,14 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
 
     assert payload["card"]["header"]["template"] == "orange"
     assert payload["card"]["header"]["title"]["content"] == (
-        "策略目标买入计划 · JQ"
+        "策略目标买入计划 · good_etf · JQ"
     )
     elements = payload["card"]["elements"]
     assert [element["tag"] for element in elements] == [
         "div", "hr", "div", "hr", "div", "hr", "div"
     ]
     assert elements[0]["text"]["content"].splitlines() == [
-        "**策略：** `good_etf`",
+        "**策略ID：** `good_etf`",
         "**模式：** `JQ`",
         "**时间：** 2026-08-13 09:30:00",
     ]

@@ -118,7 +118,9 @@ class SQLiteFillBookingService:
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._select_account(connection, order.account_id)
+            account = _account_from_row(
+                self._select_account(connection, order.account_id)
+            )
             existing = connection.execute(
                 "SELECT * FROM strategy_orders WHERE order_id = ?",
                 (order.order_id,),
@@ -160,6 +162,7 @@ class SQLiteFillBookingService:
                 self._notify(
                     TradeNotification(
                         event="ORDER_SUBMITTED",
+                        strategy_id=account.strategy_id,
                         security=order.security,
                         side=order.side.value,
                         status=order.state.value,
@@ -205,6 +208,9 @@ class SQLiteFillBookingService:
             row = self._select_order(connection, order_id)
             if row["strategy_account_id"] != account_id:
                 raise FillConflictError("order belongs to another strategy account")
+            account = _account_from_row(
+                self._select_account(connection, account_id)
+            )
             if row["broker_order_id"] not in (None, broker_order_id):
                 raise FillConflictError("order already has another broker order id")
             if row["state"] in (
@@ -237,6 +243,7 @@ class SQLiteFillBookingService:
             self._notify(
                 TradeNotification(
                     event="ORDER_SUBMITTED",
+                    strategy_id=account.strategy_id,
                     security=current.security,
                     side=current.side.value,
                     status=current.state.value,
@@ -281,6 +288,9 @@ class SQLiteFillBookingService:
             row = self._select_order(connection, order_id)
             if row["strategy_account_id"] != account_id:
                 raise FillConflictError("order belongs to another strategy account")
+            account = _account_from_row(
+                self._select_account(connection, account_id)
+            )
             if row["state"] == OrderState.SUBMIT_UNKNOWN.value:
                 connection.commit()
                 return self._order_from_row(row)
@@ -299,6 +309,7 @@ class SQLiteFillBookingService:
             self._notify(
                 TradeNotification(
                     event="ERROR",
+                    strategy_id=account.strategy_id,
                     security=current.security,
                     side=current.side.value,
                     status=current.state.value,
@@ -531,6 +542,7 @@ class SQLiteFillBookingService:
             self._notify(
                 TradeNotification(
                     event=order_state.value,
+                    strategy_id=updated_account.strategy_id,
                     security=fill.security,
                     side=fill.side.value,
                     status=order_state.value,
@@ -663,6 +675,7 @@ class SQLiteFillBookingService:
             self._notify(
                 TradeNotification(
                     event=terminal_state.value,
+                    strategy_id=updated_account.strategy_id,
                     security=order["security"],
                     side=order["side"],
                     status=terminal_state.value,

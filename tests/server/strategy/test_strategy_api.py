@@ -580,4 +580,5 @@ async def test_unverified_capabilities_block_when_trading_is_enabled(tmp_path):
 
     assert result["reconciliation"]["state"] == "BLOCKED"
     assert notifications[-1].event == "RECONCILIATION_BLOCKED"
+    assert notifications[-1].strategy_id == "good_etf"
     assert "capability" in notifications[-1].detail
