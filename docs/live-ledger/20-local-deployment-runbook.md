@@ -8,6 +8,7 @@
 
 ```dotenv
 QMT_STRATEGY_TRADING_ENABLED=false
+QMT_STRATEGY_ENABLED_IDS=good_etf_remote
 ```
 
 ## 1. 准备专用账户和目录
@@ -18,7 +19,7 @@ StrategyLedger只归属带有本策略订单标记的委托、成交和持仓，
 E:\bullet-trade-data\
 ├─ .env
 ├─ strategy-ledger.db
-├─ strategy-capabilities.json
+├─ xtquant-capabilities.json
 ├─ logs\
 └─ backups\
 ```
@@ -40,7 +41,7 @@ E:\bullet-trade-data\
 
 佣金以QMT/券商明确返回的数据为最终依据。迅投标准股票`XtTrade`提供`traded_id`、成交量、成交价和成交金额，但官方结构没有佣金字段；`used_commission`属于期货持仓统计字段，不能预设为股票逐笔成交佣金。部分柜台或扩展版本可能在成交或`query_data(..., data_type='deal')`中补充费用，服务器会兼容读取；买入费用缓冲只用于下单前现金预留，不是最终佣金。字段缺失或目标QMT版本没有明确费用证据时保持Remote交易阻断，不回退到聚宽`set_order_cost`估算。
 
-复制[能力证明模板](strategy-capabilities.example.json)到仓库外，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。任一必需项为false时服务器会拒绝加载，不能靠代码猜值或补零。
+复制[直连xtquant能力证明模板](xtquant-capabilities.example.json)到仓库外，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。任一必需项为false时服务器会拒绝加载，不能靠代码猜值或补零。
 
 ## 3. 首次只读启动
 
@@ -49,7 +50,7 @@ Set-Location E:\dev\Github\bullet-trade
 .\.venv\Scripts\python.exe -m bullet_trade --env-file E:\bullet-trade-data\.env server
 ```
 
-服务器启动后会对已存在策略账户立即同步QMT；若QMT仍在启动，则保持`strategy_ledger_ready=false`并每5秒重试，成功后停止重试。第一次由聚宽调用`ensure_account`建立1万元策略账户。交易关闭时能力证明可以暂缓，账本仍可返回`READY`；将`QMT_STRATEGY_TRADING_ENABLED`改为`true`后，能力证明缺失会立即重新阻断。
+服务器启动后会对已存在策略账户立即同步QMT；若QMT仍在启动，则保持`strategy_ledger_ready=false`并每5秒重试，成功后停止重试。第一次由聚宽调用`ensure_account`建立1万元策略账户。交易关闭时能力证明可以暂缓，账本仍可返回`READY`；将`QMT_STRATEGY_TRADING_ENABLED`改为`true`后，能力证明缺失会立即重新阻断。即使全局开关已打开，`QMT_STRATEGY_ENABLED_IDS`为空或不包含请求中的精确`strategy_id`时也不会创建委托。
 
 日志已使用`RotatingFileHandler`，单文件5MB、保留3个历史文件。配置`QMT_SERVER_LOG_FILE`即可，无需另一套日志轮转程序。
 

@@ -8,7 +8,7 @@ from bullet_trade.server.adapters.big_qmt import BigQmtBrokerAdapter
 from bullet_trade.server.adapters.qmt import QmtBrokerAdapter
 from bullet_trade.server.strategy.broker_contract import (
     BIG_QMT_CAPABILITIES,
-    MINI_QMT_CAPABILITIES,
+    XTQUANT_DIRECT_CAPABILITIES,
     BrokerContractError,
     CapabilityState,
     normalize_trade_batch,
@@ -39,11 +39,16 @@ def _verified_profile(profile):
 
 
 def test_qmt_adapters_expose_their_strategy_ledger_profiles():
-    assert QmtBrokerAdapter.strategy_ledger_capabilities() is MINI_QMT_CAPABILITIES
+    assert (
+        QmtBrokerAdapter.strategy_ledger_capabilities()
+        is XTQUANT_DIRECT_CAPABILITIES
+    )
     assert BigQmtBrokerAdapter.strategy_ledger_capabilities() is BIG_QMT_CAPABILITIES
 
 
-@pytest.mark.parametrize("profile", [MINI_QMT_CAPABILITIES, BIG_QMT_CAPABILITIES])
+@pytest.mark.parametrize(
+    "profile", [XTQUANT_DIRECT_CAPABILITIES, BIG_QMT_CAPABILITIES]
+)
 def test_unprobed_qmt_profile_is_not_live_ready(profile):
     blockers = strategy_ledger_v1_blockers(profile)
     assert "stable_trade_id=PROBE_REQUIRED" in blockers
@@ -52,7 +57,9 @@ def test_unprobed_qmt_profile_is_not_live_ready(profile):
         require_strategy_ledger_v1(profile)
 
 
-@pytest.mark.parametrize("profile", [MINI_QMT_CAPABILITIES, BIG_QMT_CAPABILITIES])
+@pytest.mark.parametrize(
+    "profile", [XTQUANT_DIRECT_CAPABILITIES, BIG_QMT_CAPABILITIES]
+)
 def test_verified_qmt_profile_can_use_order_mapping_for_trade_side(profile):
     verified = _verified_profile(profile)
     assert verified.direct_trade_side is CapabilityState.UNSUPPORTED
@@ -79,7 +86,7 @@ def test_verified_capability_evidence_loads_for_matching_adapter(tmp_path):
         json.dumps(
             {
                 "schema_version": 1,
-                "adapter_kind": "MINI_QMT",
+                "adapter_kind": "XTQUANT_DIRECT",
                 "verified_at": "2026-08-11T20:00:00+08:00",
                 "probe_report": "runtime-probe/probe_report.json",
                 "order_lookback_days": 1,
@@ -89,7 +96,7 @@ def test_verified_capability_evidence_loads_for_matching_adapter(tmp_path):
         ),
         encoding="utf-8",
     )
-    profile = load_verified_capabilities(path, "MINI_QMT")
+    profile = load_verified_capabilities(path, "XTQUANT_DIRECT")
     assert strategy_ledger_v1_blockers(profile) == ()
     with pytest.raises(BrokerContractError, match="adapter does not match"):
         load_verified_capabilities(path, "BIG_QMT")
@@ -101,7 +108,7 @@ def test_incomplete_capability_evidence_is_rejected(tmp_path):
         json.dumps(
             {
                 "schema_version": 1,
-                "adapter_kind": "MINI_QMT",
+                "adapter_kind": "XTQUANT_DIRECT",
                 "verified_at": "2026-08-11",
                 "probe_report": "probe.json",
                 "capabilities": {},
@@ -110,12 +117,12 @@ def test_incomplete_capability_evidence_is_rejected(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(BrokerContractError, match="non-boolean"):
-        load_verified_capabilities(path, "MINI_QMT")
+        load_verified_capabilities(path, "XTQUANT_DIRECT")
 
 
 def test_trade_order_link_without_order_side_does_not_satisfy_side_contract():
     profile = replace(
-        _verified_profile(MINI_QMT_CAPABILITIES),
+        _verified_profile(XTQUANT_DIRECT_CAPABILITIES),
         order_side_for_trade=CapabilityState.PROBE_REQUIRED,
     )
     assert "trade_side_has_no_order_mapping" in strategy_ledger_v1_blockers(profile)

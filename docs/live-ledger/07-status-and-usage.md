@@ -68,7 +68,7 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### QMT_REMOTE
 
-把私有配置中的`STRATEGIES["good_etf"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`。必须上传v9 helper和私有配置；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把私有配置中的`STRATEGIES["good_etf_remote"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`，启用时还必须把精确策略ID加入`QMT_STRATEGY_ENABLED_IDS`。必须上传v9 helper和私有配置；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 `good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前仅按服务器的保守费用缓冲预留现金，成交后只接受QMT/券商明确返回的实际费用，并通过StrategyLedger的`fees`和聚宽`real_fees`指标展示；不得用聚宽模拟佣金覆盖真实费用。迅投官方标准股票`XtTrade`结构没有佣金字段，部分柜台或扩展版本可能补充`commission_fee`、`commission`或`used_commission`，因此必须通过目标账户的`query_data(..., data_type='deal')`或小额成交证明费用字段可用。
 

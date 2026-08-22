@@ -15,6 +15,7 @@ L03复用BulletTrade现有TCP协议和token，提供六个动作：`strategy.ens
 ```dotenv
 QMT_STRATEGY_LEDGER_DB=E:\bullet-trade-data\strategy-ledger.db
 QMT_STRATEGY_TRADING_ENABLED=false
+QMT_STRATEGY_ENABLED_IDS=good_etf_remote
 QMT_STRATEGY_ALLOW_BUYS=true
 QMT_STRATEGY_MAX_AGE_SECONDS=300
 QMT_STRATEGY_CASH_BUFFER=100

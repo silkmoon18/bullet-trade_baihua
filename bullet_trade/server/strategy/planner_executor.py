@@ -64,6 +64,7 @@ class PlannerConfig:
     working_order_timeout: timedelta = timedelta(minutes=10)
     order_wait_timeout_seconds: float = 16.0
     trading_enabled: bool = False
+    enabled_strategy_ids: Tuple[str, ...] = ()
     allow_buys: bool = True
 
     def __post_init__(self) -> None:
@@ -856,6 +857,8 @@ class SQLiteTargetExecutionService:
         if not self.config.trading_enabled:
             raise TargetPlanningError("global trading switch is disabled")
         account = self._ledger.get_strategy_account(account_id)
+        if account.strategy_id not in self.config.enabled_strategy_ids:
+            raise TargetPlanningError("strategy is not in trading allowlist")
         if account.status is not AccountStatus.ACTIVE or snapshot.account_id != account_id:
             raise TargetPlanningError("strategy account is not ready")
         if snapshot.ledger_version != account.ledger_version:

@@ -15,7 +15,7 @@ from bullet_trade.server.strategy import (
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
-    MINI_QMT_CAPABILITIES,
+    XTQUANT_DIRECT_CAPABILITIES,
     execution_request_to_wire,
 )
 from bullet_trade.server.strategy.schema import connect_database
@@ -130,6 +130,7 @@ def api(tmp_path):
         StrategyAPIConfig(
             database_path=tmp_path / "strategy.db",
             trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
             cash_buffer_units=0,
             max_age=timedelta(minutes=5),
         ),
@@ -387,6 +388,7 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(tmp_path):
         StrategyAPIConfig(
             database_path=tmp_path / "callback.db",
             trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
             cash_buffer_units=0,
             max_age=timedelta(minutes=5),
         ),
@@ -445,6 +447,7 @@ async def test_idle_intent_can_be_canceled_before_risk_replacement(tmp_path):
         StrategyAPIConfig(
             database_path=tmp_path / "strategy-cancel.db",
             trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
             cash_buffer_units=0,
             max_age=timedelta(minutes=5),
         ),
@@ -542,7 +545,7 @@ async def test_unverified_capabilities_are_deferred_while_trading_is_disabled(tm
     service = SQLiteStrategyAPI(
         StrategyAPIConfig(tmp_path / "blocked.db"),
         broker,
-        MINI_QMT_CAPABILITIES,
+        XTQUANT_DIRECT_CAPABILITIES,
         FakeData(),
         notifications.append,
     )
@@ -564,9 +567,13 @@ async def test_unverified_capabilities_block_when_trading_is_enabled(tmp_path):
     broker = FakeBroker()
     notifications = []
     service = SQLiteStrategyAPI(
-        StrategyAPIConfig(tmp_path / "blocked-live.db", trading_enabled=True),
+        StrategyAPIConfig(
+            tmp_path / "blocked-live.db",
+            trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
+        ),
         broker,
-        MINI_QMT_CAPABILITIES,
+        XTQUANT_DIRECT_CAPABILITIES,
         FakeData(),
         notifications.append,
     )

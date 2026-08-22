@@ -35,6 +35,7 @@ from bullet_trade.server.strategy.schema import connect_database
 
 
 ACCOUNT = "good-etf"
+STRATEGY_ID = "good_etf"
 PHYSICAL = "qmt-main"
 A = "510050.XSHG"
 B = "510300.XSHG"
@@ -85,6 +86,7 @@ def _setup(tmp_path, as_of=None):
     config = PlannerConfig(
         cash_buffer_units=0,
         trading_enabled=True,
+        enabled_strategy_ids=(STRATEGY_ID,),
         max_age=timedelta(minutes=10),
     )
     planner = SQLiteTargetExecutionService(database, config)
@@ -119,6 +121,7 @@ def test_cash_buffer_does_not_shrink_weight_target(tmp_path):
         PlannerConfig(
             cash_buffer_units=money_to_units("100"),
             trading_enabled=True,
+            enabled_strategy_ids=(STRATEGY_ID,),
             max_age=timedelta(minutes=10),
         ),
     )
@@ -283,7 +286,11 @@ def test_sell_phase_uses_market_override_before_conditional_buy(tmp_path):
     )
     planner = SQLiteTargetExecutionService(
         database,
-        PlannerConfig(cash_buffer_units=0, trading_enabled=True),
+        PlannerConfig(
+            cash_buffer_units=0,
+            trading_enabled=True,
+            enabled_strategy_ids=(STRATEGY_ID,),
+        ),
     )
 
     result = planner.submit_target_weights(
@@ -354,9 +361,26 @@ def test_global_switch_and_tplus1_both_block_new_buy(tmp_path):
     with pytest.raises(TargetPlanningError, match="global trading switch"):
         disabled.submit_target_weights(ACCOUNT, "disabled", {A: 0}, snapshot, marks, as_of)
 
+    blocked = SQLiteTargetExecutionService(
+        database,
+        PlannerConfig(
+            cash_buffer_units=0,
+            trading_enabled=True,
+            enabled_strategy_ids=("another-strategy",),
+        ),
+    )
+    with pytest.raises(TargetPlanningError, match="trading allowlist"):
+        blocked.submit_target_weights(
+            ACCOUNT, "not-allowed", {A: 0}, snapshot, marks, as_of
+        )
+
     planner = SQLiteTargetExecutionService(
         database,
-        PlannerConfig(cash_buffer_units=0, trading_enabled=True),
+        PlannerConfig(
+            cash_buffer_units=0,
+            trading_enabled=True,
+            enabled_strategy_ids=(STRATEGY_ID,),
+        ),
     )
     result = planner.submit_target_weights(
         ACCOUNT, "tplus1", {A: 0, B: 1}, snapshot, marks, as_of

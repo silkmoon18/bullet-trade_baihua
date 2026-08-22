@@ -62,6 +62,7 @@ class ServerConfig:
     idempotency_ttl_seconds: int = 300
     strategy_database_path: Optional[str] = None
     strategy_trading_enabled: bool = False
+    strategy_enabled_ids: List[str] = field(default_factory=list)
     strategy_allow_buys: bool = True
     strategy_max_age_seconds: int = 300
     strategy_cash_buffer: float = 100.0
@@ -248,6 +249,9 @@ def build_server_config(args) -> ServerConfig:
         idempotency_ttl_seconds=max(0, int(idempotency_ttl_seconds)),
         strategy_database_path=strategy_database_path,
         strategy_trading_enabled=get_env_bool("QMT_STRATEGY_TRADING_ENABLED", False),
+        strategy_enabled_ids=list(dict.fromkeys(
+            _split_items(get_env("QMT_STRATEGY_ENABLED_IDS"))
+        )),
         strategy_allow_buys=get_env_bool("QMT_STRATEGY_ALLOW_BUYS", True),
         strategy_max_age_seconds=max(1, get_env_int("QMT_STRATEGY_MAX_AGE_SECONDS", 300)),
         strategy_cash_buffer=max(0.0, get_env_float("QMT_STRATEGY_CASH_BUFFER", 100.0)),

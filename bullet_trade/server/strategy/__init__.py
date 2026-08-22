@@ -49,7 +49,7 @@ from .repository import (
 )
 from .broker_contract import (
     BIG_QMT_CAPABILITIES,
-    MINI_QMT_CAPABILITIES,
+    XTQUANT_DIRECT_CAPABILITIES,
     BrokerCapabilityProfile,
     BrokerContractError,
     BrokerTradeEvidence,
@@ -145,7 +145,7 @@ __all__ = [
     "LATEST_SCHEMA_VERSION",
     "LedgerEntry",
     "LedgerInvariantError",
-    "MINI_QMT_CAPABILITIES",
+    "XTQUANT_DIRECT_CAPABILITIES",
     "MarketMark",
     "LimitExecution",
     "MarketExecution",

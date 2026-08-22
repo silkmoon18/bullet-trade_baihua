@@ -106,6 +106,7 @@ class ServerApplication:
                 StrategyAPIConfig(
                     database_path=self.config.strategy_database_path,
                     trading_enabled=self.config.strategy_trading_enabled,
+                    enabled_strategy_ids=tuple(self.config.strategy_enabled_ids),
                     allow_buys=self.config.strategy_allow_buys,
                     max_age=timedelta(seconds=self.config.strategy_max_age_seconds),
                     cash_buffer_units=money_to_units(str(self.config.strategy_cash_buffer)),

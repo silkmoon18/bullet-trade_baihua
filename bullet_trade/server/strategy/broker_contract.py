@@ -49,8 +49,8 @@ class BrokerCapabilityProfile:
                 raise ValueError("{} must be a non-negative integer or None".format(name))
 
 
-MINI_QMT_CAPABILITIES = BrokerCapabilityProfile(
-    adapter_kind="MINI_QMT",
+XTQUANT_DIRECT_CAPABILITIES = BrokerCapabilityProfile(
+    adapter_kind="XTQUANT_DIRECT",
     client_tag_roundtrip=CapabilityState.PROBE_REQUIRED,
     stable_order_id=CapabilityState.PROBE_REQUIRED,
     stable_trade_id=CapabilityState.PROBE_REQUIRED,

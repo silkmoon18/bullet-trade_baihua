@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "adapter_kind": "MINI_QMT",
+  "adapter_kind": "XTQUANT_DIRECT",
   "verified_at": "replace-after-real-probe",
   "probe_report": "replace-with-probe-report-path",
   "order_lookback_days": 0,

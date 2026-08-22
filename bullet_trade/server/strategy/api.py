@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Union, cast
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, cast
 
 from .broker_contract import BrokerCapabilityProfile
 from ..feishu_notifier import (
@@ -57,6 +57,7 @@ def _uses_conditional_execution(request: ExecutionRequest) -> bool:
 class StrategyAPIConfig:
     database_path: DatabasePath
     trading_enabled: bool = False
+    enabled_strategy_ids: Tuple[str, ...] = ()
     allow_buys: bool = True
     max_age: timedelta = timedelta(minutes=5)
     cash_buffer_units: int = money_to_units("100")
@@ -125,6 +126,7 @@ class SQLiteStrategyAPI:
             self.database_path,
             PlannerConfig(
                 trading_enabled=config.trading_enabled,
+                enabled_strategy_ids=config.enabled_strategy_ids,
                 allow_buys=config.allow_buys,
                 max_age=config.max_age,
                 cash_buffer_units=config.cash_buffer_units,
