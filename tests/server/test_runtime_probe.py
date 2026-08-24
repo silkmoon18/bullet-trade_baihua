@@ -238,5 +238,92 @@ def test_runtime_probe_trade_smoke_with_stub(seeded_stub_server, tmp_path: Path)
     assert limit_payload["live_snapshot"]["high_limit"] > limit_payload["live_snapshot"]["last_price"]
     assert limit_payload["live_snapshot"]["low_limit"] < limit_payload["live_snapshot"]["last_price"]
     assert "requested_protect_price" in market_payload
+    assert market_payload["cleanup_complete"] is True
     assert market_payload["live_snapshot"]["high_limit"] > market_payload["live_snapshot"]["last_price"]
     assert market_payload["live_snapshot"]["low_limit"] < market_payload["live_snapshot"]["last_price"]
+
+
+def test_runtime_probe_market_fill_is_sold_back_to_baseline(tmp_path: Path):
+    class FilledBroker:
+        def __init__(self):
+            self.amount = 2500
+            self.orders = {}
+            self.trades = {}
+
+        def get_positions(self):
+            return [
+                {
+                    "security": "518880.XSHG",
+                    "amount": self.amount,
+                    "closeable_amount": self.amount,
+                }
+            ]
+
+        async def buy(self, security, amount, price=None, wait_timeout=None, remark=None, *, market=False):
+            self.amount += amount
+            self.orders["buy-1"] = {
+                "order_id": "buy-1",
+                "security": security,
+                "amount": amount,
+                "filled": amount,
+                "status": "filled",
+                "side": "BUY",
+                "order_remark": remark,
+            }
+            self.trades["buy-1"] = [{"trade_id": "trade-buy-1", "order_id": "buy-1", "amount": amount}]
+            return "buy-1"
+
+        async def sell(self, security, amount, price=None, wait_timeout=None, remark=None, *, market=False):
+            self.amount -= amount
+            self.orders["sell-1"] = {
+                "order_id": "sell-1",
+                "security": security,
+                "amount": amount,
+                "filled": amount,
+                "status": "filled",
+                "side": "SELL",
+                "order_remark": remark,
+            }
+            self.trades["sell-1"] = [{"trade_id": "trade-sell-1", "order_id": "sell-1", "amount": amount}]
+            return "sell-1"
+
+        async def get_order_status(self, order_id):
+            return dict(self.orders[order_id])
+
+        def get_orders(self, order_id=None, **_kwargs):
+            if order_id:
+                return [dict(self.orders[order_id])]
+            return [dict(row) for row in self.orders.values()]
+
+        def get_trades(self, order_id=None, **_kwargs):
+            if order_id:
+                return [dict(row) for row in self.trades.get(order_id, [])]
+            return [dict(row) for rows in self.trades.values() for row in rows]
+
+    class SnapshotConnection:
+        @staticmethod
+        def request(action, _payload):
+            assert action == "data.live_current"
+            return {"last_price": 10.0, "high_limit": 11.0, "low_limit": 9.0}
+
+    probe = RemoteRuntimeProbe(
+        ProbeConfig(
+            host="127.0.0.1",
+            port=1,
+            token="unused",
+            output_dir=tmp_path,
+            market_symbol="518880.XSHG",
+            order_amount=100,
+        )
+    )
+    broker = FilledBroker()
+    probe._broker = broker  # type: ignore[assignment]
+    probe._conn = SnapshotConnection()  # type: ignore[assignment]
+
+    result = probe._run_market_buy_cleanup_smoke()
+
+    assert result["bought_amount"] == 100
+    assert result["cleanup_complete"] is True
+    assert result["after_cleanup_amount"] == 2500
+    assert result["cleanup_order_ids"] == ["sell-1"]
+    assert broker.amount == 2500

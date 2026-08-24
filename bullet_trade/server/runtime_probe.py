@@ -5,11 +5,12 @@ import asyncio
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from bullet_trade.broker.qmt_remote import RemoteQmtBroker
 from bullet_trade.core import pricing
@@ -349,6 +350,42 @@ class RemoteRuntimeProbe:
         )
         if isinstance(market_result, dict):
             self._observe_dict_keys("order_keys", market_result.get("status") or {})
+            self._observe_list_item_keys("order_keys", market_result.get("buy_orders") or [])
+            self._observe_list_item_keys("order_keys", market_result.get("cleanup_orders") or [])
+            self._observe_list_item_keys("trade_keys", market_result.get("buy_trades") or [])
+            self._observe_list_item_keys("trade_keys", market_result.get("cleanup_trades") or [])
+            if not market_result.get("cleanup_complete"):
+                self._steps.append(
+                    {
+                        "name": "broker.market_buy_cleanup.verify",
+                        "category": "trade_smoke",
+                        "status": "error",
+                        "started_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                        "summary": "测试买入产生的仓位未恢复到验证前数量",
+                    }
+                )
+
+        orders_after = self._run_step(
+            name="broker.orders.after_trade_smoke",
+            category="trade_smoke",
+            request=self._base_broker_request(),
+            fn=lambda: self.broker.get_orders(from_broker=True),
+        )
+        self._observe_list_item_keys("order_keys", orders_after)
+        trades_after = self._run_step(
+            name="broker.trades.after_trade_smoke",
+            category="trade_smoke",
+            request=self._base_broker_request(),
+            fn=lambda: self.broker.get_trades(),
+        )
+        self._observe_list_item_keys("trade_keys", trades_after)
+        working_after = self._run_step(
+            name="broker.working_orders.after_trade_smoke",
+            category="trade_smoke",
+            request=self._base_broker_request(),
+            fn=lambda: self.broker.get_open_orders(),
+        )
+        self._observe_list_item_keys("order_keys", working_after)
 
     def _run_limit_buy_cancel_smoke(self) -> Dict[str, Any]:
         symbol = self.config.limit_symbol
@@ -363,7 +400,9 @@ class RemoteRuntimeProbe:
             raise RuntimeError(f"无法为 {symbol} 获取最新价，限价 smoke 无法继续")
         tick_size = pricing.get_min_price_step(symbol, float(base_price))
         low_limit = _maybe_float(live_snapshot.get("low_limit"))
-        limit_price = max(float(base_price) - tick_size, tick_size)
+        # 与最新价保持约 1% 距离，主要验证“委托已受理 -> 可查询 -> 可撤单”，
+        # 避免仅低一个 tick 时行情轻微波动就意外成交。
+        limit_price = max(float(base_price) * 0.99, tick_size)
         if low_limit and low_limit > 0:
             limit_price = max(limit_price, low_limit)
         limit_price = round(limit_price / tick_size) * tick_size
@@ -373,6 +412,7 @@ class RemoteRuntimeProbe:
                 self.config.order_amount,
                 price=limit_price,
                 wait_timeout=0,
+                remark=self._probe_remark("limit-buy"),
             )
         )
         status = asyncio.run(self.broker.get_order_status(order_id))
@@ -399,6 +439,8 @@ class RemoteRuntimeProbe:
 
     def _run_market_buy_cleanup_smoke(self) -> Dict[str, Any]:
         symbol = self.config.market_symbol
+        before_positions = self.broker.get_positions()
+        before_amount, before_closeable = _position_amounts(before_positions, symbol)
         live_snapshot = self._get_live_snapshot(symbol)
         last_price = (
             live_snapshot.get("last_price")
@@ -421,7 +463,8 @@ class RemoteRuntimeProbe:
                 symbol,
                 self.config.order_amount,
                 price=requested_protect_price,
-                wait_timeout=0,
+                wait_timeout=8,
+                remark=self._probe_remark("market-buy"),
                 market=True,
             )
         )
@@ -439,14 +482,118 @@ class RemoteRuntimeProbe:
             cleanup["cancel_ok"] = _extract_cancel_ok(cancel_response)
             cleanup["after_cancel_status"] = asyncio.run(self.broker.get_order_status(order_id))
             cleanup["order_row_after_cancel"] = self._fetch_order_row(order_id)
+        buy_orders = self.broker.get_orders(order_id=order_id, from_broker=True)
+        buy_trades = self.broker.get_trades(order_id=order_id)
+        position_after_buy = self._wait_for_position_change(symbol, before_amount)
+        after_buy_amount, after_buy_closeable = _position_amounts(position_after_buy, symbol)
+        bought_amount = max(0, after_buy_amount - before_amount)
+        cleanup_orders: List[Dict[str, Any]] = []
+        cleanup_trades: List[Dict[str, Any]] = []
+        cleanup_order_ids: List[str] = []
+
+        for attempt in range(1, 4):
+            current_positions = self.broker.get_positions()
+            current_amount, current_closeable = _position_amounts(current_positions, symbol)
+            remaining = max(0, current_amount - before_amount)
+            if remaining <= 0:
+                break
+            newly_closeable = max(0, current_closeable - before_closeable)
+            sell_amount = min(remaining, newly_closeable)
+            if sell_amount <= 0:
+                break
+            sell_snapshot = self._get_live_snapshot(symbol)
+            sell_last = (
+                sell_snapshot.get("last_price")
+                or sell_snapshot.get("lastPrice")
+                or sell_snapshot.get("price")
+                or 0
+            )
+            if not sell_last:
+                break
+            sell_protect_price = pricing.compute_market_protect_price(
+                symbol,
+                float(sell_last),
+                _maybe_float(sell_snapshot.get("high_limit")),
+                _maybe_float(sell_snapshot.get("low_limit")),
+                -0.015,
+                False,
+            )
+            cleanup_order_id = asyncio.run(
+                self.broker.sell(
+                    symbol,
+                    sell_amount,
+                    price=sell_protect_price,
+                    wait_timeout=8,
+                    remark=self._probe_remark(f"cleanup-{attempt}"),
+                    market=True,
+                )
+            )
+            cleanup_order_ids.append(cleanup_order_id)
+            cleanup_status = asyncio.run(self.broker.get_order_status(cleanup_order_id))
+            cleanup_status_name = str(cleanup_status.get("status") or "").lower()
+            if cleanup_status_name in {"", "new", "submitted", "open", "filling", "canceling"}:
+                self.connection.request(
+                    "broker.cancel_order",
+                    {**self._base_broker_request(), "order_id": cleanup_order_id},
+                )
+            cleanup_orders.extend(
+                self.broker.get_orders(order_id=cleanup_order_id, from_broker=True)
+            )
+            cleanup_trades.extend(self.broker.get_trades(order_id=cleanup_order_id))
+            self._wait_for_position_at_most(symbol, before_amount, timeout_sec=5.0)
+
+        positions_after_cleanup = self.broker.get_positions()
+        after_cleanup_amount, _ = _position_amounts(positions_after_cleanup, symbol)
+        cleanup_complete = after_cleanup_amount <= before_amount
         return {
             "order_id": order_id,
             "requested_protect_price": requested_protect_price,
             "live_snapshot": live_snapshot,
             "status": status,
             "order_row_before_cleanup": order_row_before_cleanup,
+            "before_amount": before_amount,
+            "after_buy_amount": after_buy_amount,
+            "after_buy_closeable": after_buy_closeable,
+            "bought_amount": bought_amount,
+            "buy_orders": buy_orders,
+            "buy_trades": buy_trades,
+            "cleanup_order_ids": cleanup_order_ids,
+            "cleanup_orders": cleanup_orders,
+            "cleanup_trades": cleanup_trades,
+            "after_cleanup_amount": after_cleanup_amount,
+            "cleanup_complete": cleanup_complete,
             **cleanup,
         }
+
+    def _wait_for_position_change(
+        self, symbol: str, baseline_amount: int, *, timeout_sec: float = 8.0
+    ) -> List[Dict[str, Any]]:
+        deadline = time.monotonic() + timeout_sec
+        latest = self.broker.get_positions()
+        while time.monotonic() < deadline:
+            amount, _ = _position_amounts(latest, symbol)
+            if amount != baseline_amount:
+                return latest
+            time.sleep(0.25)
+            latest = self.broker.get_positions()
+        return latest
+
+    def _wait_for_position_at_most(
+        self, symbol: str, target_amount: int, *, timeout_sec: float
+    ) -> List[Dict[str, Any]]:
+        deadline = time.monotonic() + timeout_sec
+        latest = self.broker.get_positions()
+        while time.monotonic() < deadline:
+            amount, _ = _position_amounts(latest, symbol)
+            if amount <= target_amount:
+                return latest
+            time.sleep(0.25)
+            latest = self.broker.get_positions()
+        return latest
+
+    @staticmethod
+    def _probe_remark(stage: str) -> str:
+        return "btprobe-{}-{}".format(stage, datetime.now().strftime("%H%M%S"))[:32]
 
     def _capture_tick_event(self, symbol: str) -> Dict[str, Any]:
         q: Queue = Queue()
@@ -814,6 +961,29 @@ def _maybe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _position_amounts(rows: Any, symbol: str) -> Tuple[int, int]:
+    if not isinstance(rows, list):
+        return 0, 0
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("security") or "") != symbol:
+            continue
+        try:
+            amount = int(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        closeable_raw = row.get("closeable_amount")
+        if closeable_raw is None:
+            closeable_raw = row.get("available_amount")
+        if closeable_raw is None:
+            closeable_raw = row.get("can_use_volume")
+        try:
+            closeable = int(closeable_raw or 0)
+        except (TypeError, ValueError):
+            closeable = 0
+        return max(0, amount), max(0, closeable)
+    return 0, 0
 
 
 def _extract_cancel_ok(value: Any) -> bool:
