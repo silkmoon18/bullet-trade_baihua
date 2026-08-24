@@ -303,6 +303,8 @@ def test_runtime_probe_market_fill_is_sold_back_to_baseline(tmp_path: Path):
     class SnapshotConnection:
         @staticmethod
         def request(action, _payload):
+            if action == "broker.cancel_order":
+                return {"value": True, "success": True}
             assert action == "data.live_current"
             return {"last_price": 10.0, "high_limit": 11.0, "low_limit": 9.0}
 
@@ -312,6 +314,7 @@ def test_runtime_probe_market_fill_is_sold_back_to_baseline(tmp_path: Path):
             port=1,
             token="unused",
             output_dir=tmp_path,
+            limit_symbol="518880.XSHG",
             market_symbol="518880.XSHG",
             order_amount=100,
         )
@@ -320,6 +323,16 @@ def test_runtime_probe_market_fill_is_sold_back_to_baseline(tmp_path: Path):
     probe._broker = broker  # type: ignore[assignment]
     probe._conn = SnapshotConnection()  # type: ignore[assignment]
 
+    limit_result = probe._run_limit_buy_cancel_smoke()
+
+    assert limit_result["filled"] == 100
+    assert limit_result["cleanup_complete"] is True
+    assert limit_result["after_cleanup_amount"] == 2500
+    assert limit_result["cleanup_order_ids"] == ["sell-1"]
+    assert broker.amount == 2500
+
+    broker.orders.clear()
+    broker.trades.clear()
     result = probe._run_market_buy_cleanup_smoke()
 
     assert result["bought_amount"] == 100

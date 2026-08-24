@@ -323,7 +323,7 @@ class RemoteRuntimeProbe:
         self._observe_list_item_keys("trade_keys", trades)
 
     def _run_trade_smoke_steps(self) -> None:
-        limit_order_id = self._run_step(
+        limit_result = self._run_step(
             name="broker.limit_buy_cancel",
             category="trade_smoke",
             request={
@@ -334,8 +334,20 @@ class RemoteRuntimeProbe:
             },
             fn=self._run_limit_buy_cancel_smoke,
         )
-        if isinstance(limit_order_id, dict):
-            self._observe_dict_keys("order_keys", limit_order_id)
+        if isinstance(limit_result, dict):
+            self._observe_dict_keys("order_keys", limit_result)
+            self._observe_list_item_keys("order_keys", limit_result.get("cleanup_orders") or [])
+            self._observe_list_item_keys("trade_keys", limit_result.get("cleanup_trades") or [])
+            if not limit_result.get("cleanup_complete"):
+                self._steps.append(
+                    {
+                        "name": "broker.limit_buy_cancel.cleanup_verify",
+                        "category": "trade_smoke",
+                        "status": "error",
+                        "started_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                        "summary": "限价测试意外成交的仓位未恢复到验证前数量",
+                    }
+                )
 
         market_result = self._run_step(
             name="broker.market_buy_cleanup",
@@ -389,6 +401,8 @@ class RemoteRuntimeProbe:
 
     def _run_limit_buy_cancel_smoke(self) -> Dict[str, Any]:
         symbol = self.config.limit_symbol
+        before_positions = self.broker.get_positions()
+        before_amount, before_closeable = _position_amounts(before_positions, symbol)
         live_snapshot = self._get_live_snapshot(symbol)
         base_price = (
             live_snapshot.get("last_price")
@@ -424,6 +438,15 @@ class RemoteRuntimeProbe:
         cancel_ok = _extract_cancel_ok(cancel_response)
         canceled = asyncio.run(self.broker.get_order_status(order_id))
         order_row_after_cancel = self._fetch_order_row(order_id)
+        filled = _order_filled_amount(order_row_after_cancel or canceled)
+        if filled > 0:
+            self._wait_for_position_change(symbol, before_amount)
+        position_cleanup = self._cleanup_position_to_baseline(
+            symbol,
+            before_amount=before_amount,
+            before_closeable=before_closeable,
+            remark_stage="limit-cleanup",
+        )
         return {
             "order_id": order_id,
             "limit_price": limit_price,
@@ -435,6 +458,8 @@ class RemoteRuntimeProbe:
             "cancel_response": cancel_response,
             "canceled_status": canceled,
             "order_row_after_cancel": order_row_after_cancel,
+            "filled": filled,
+            **position_cleanup,
         }
 
     def _run_market_buy_cleanup_smoke(self) -> Dict[str, Any]:
@@ -487,10 +512,39 @@ class RemoteRuntimeProbe:
         position_after_buy = self._wait_for_position_change(symbol, before_amount)
         after_buy_amount, after_buy_closeable = _position_amounts(position_after_buy, symbol)
         bought_amount = max(0, after_buy_amount - before_amount)
+        position_cleanup = self._cleanup_position_to_baseline(
+            symbol,
+            before_amount=before_amount,
+            before_closeable=before_closeable,
+            remark_stage="market-cleanup",
+        )
+        return {
+            "order_id": order_id,
+            "requested_protect_price": requested_protect_price,
+            "live_snapshot": live_snapshot,
+            "status": status,
+            "order_row_before_cleanup": order_row_before_cleanup,
+            "before_amount": before_amount,
+            "after_buy_amount": after_buy_amount,
+            "after_buy_closeable": after_buy_closeable,
+            "bought_amount": bought_amount,
+            "buy_orders": buy_orders,
+            "buy_trades": buy_trades,
+            **position_cleanup,
+            **cleanup,
+        }
+
+    def _cleanup_position_to_baseline(
+        self,
+        symbol: str,
+        *,
+        before_amount: int,
+        before_closeable: int,
+        remark_stage: str,
+    ) -> Dict[str, Any]:
         cleanup_orders: List[Dict[str, Any]] = []
         cleanup_trades: List[Dict[str, Any]] = []
         cleanup_order_ids: List[str] = []
-
         for attempt in range(1, 4):
             current_positions = self.broker.get_positions()
             current_amount, current_closeable = _position_amounts(current_positions, symbol)
@@ -524,7 +578,7 @@ class RemoteRuntimeProbe:
                     sell_amount,
                     price=sell_protect_price,
                     wait_timeout=8,
-                    remark=self._probe_remark(f"cleanup-{attempt}"),
+                    remark=self._probe_remark(f"{remark_stage}-{attempt}"),
                     market=True,
                 )
             )
@@ -542,27 +596,13 @@ class RemoteRuntimeProbe:
             cleanup_trades.extend(self.broker.get_trades(order_id=cleanup_order_id))
             self._wait_for_position_at_most(symbol, before_amount, timeout_sec=5.0)
 
-        positions_after_cleanup = self.broker.get_positions()
-        after_cleanup_amount, _ = _position_amounts(positions_after_cleanup, symbol)
-        cleanup_complete = after_cleanup_amount <= before_amount
+        after_cleanup_amount, _ = _position_amounts(self.broker.get_positions(), symbol)
         return {
-            "order_id": order_id,
-            "requested_protect_price": requested_protect_price,
-            "live_snapshot": live_snapshot,
-            "status": status,
-            "order_row_before_cleanup": order_row_before_cleanup,
-            "before_amount": before_amount,
-            "after_buy_amount": after_buy_amount,
-            "after_buy_closeable": after_buy_closeable,
-            "bought_amount": bought_amount,
-            "buy_orders": buy_orders,
-            "buy_trades": buy_trades,
             "cleanup_order_ids": cleanup_order_ids,
             "cleanup_orders": cleanup_orders,
             "cleanup_trades": cleanup_trades,
             "after_cleanup_amount": after_cleanup_amount,
-            "cleanup_complete": cleanup_complete,
-            **cleanup,
+            "cleanup_complete": after_cleanup_amount == before_amount,
         }
 
     def _wait_for_position_change(
@@ -984,6 +1024,18 @@ def _position_amounts(rows: Any, symbol: str) -> Tuple[int, int]:
             closeable = 0
         return max(0, amount), max(0, closeable)
     return 0, 0
+
+
+def _order_filled_amount(row: Any) -> int:
+    if not isinstance(row, dict):
+        return 0
+    value = row.get("filled")
+    if value is None:
+        value = row.get("traded_volume")
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _extract_cancel_ok(value: Any) -> bool:
