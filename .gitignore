@@ -217,3 +217,6 @@ helpers/bt_big_qmt_order_tags.json
 /dist/joinquant/
 /jq_runtime/jq_runtime_config.py
 /jq_runtime/*.local.py
+
+# Server-local configuration, ledgers, backups, and capability evidence.
+/.data/
