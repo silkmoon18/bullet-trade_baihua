@@ -39,6 +39,11 @@ E:\bullet-trade-data\
 
 `trade-smoke`会产生真实小额委托，执行前必须确认标的、数量和模拟/小额账户。结合`probe_report.json`及QMT原始查询，跨进程、跨交易日人工核对：remark回显、稳定order/trade ID、trade-order关联、方向、明确费用、订单状态、当前与working查询、前一交易日lookback。
 
+直连 xtquant 只能查询当日委托和成交。服务器启用 StrategyLedger 后会自动在同一
+SQLite 中保存已收到的委托/成交回调及查询结果，对账自动合并这些本地历史；
+`broker.orders` / `broker.trades` 的默认响应仍保持当日语义。SQLite 每日备份同时覆盖
+这部分历史。它只能保存服务器实际观察到的数据，不能补回跨日停机期间遗漏的回报。
+
 佣金以QMT/券商明确返回的数据为最终依据。迅投标准股票`XtTrade`提供`traded_id`、成交量、成交价和成交金额，但官方结构没有佣金字段；`used_commission`属于期货持仓统计字段，不能预设为股票逐笔成交佣金。部分柜台或扩展版本可能在成交或`query_data(..., data_type='deal')`中补充费用，服务器会兼容读取；买入费用缓冲只用于下单前现金预留，不是最终佣金。字段缺失或目标QMT版本没有明确费用证据时保持Remote交易阻断，不回退到聚宽`set_order_cost`估算。
 
 复制[直连xtquant能力证明模板](xtquant-capabilities.example.json)到仓库外，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。任一必需项为false时服务器会拒绝加载，不能靠代码猜值或补零。

@@ -100,6 +100,7 @@ class SQLiteStrategyAPI:
         capabilities: BrokerCapabilityProfile,
         data_provider: Optional[object] = None,
         notification_handler=None,
+        durable_broker_history: bool = False,
     ) -> None:
         self.config = config
         self.database_path = Path(config.database_path)
@@ -120,6 +121,7 @@ class SQLiteStrategyAPI:
             capabilities,
             notification_handler,
             require_verified_capabilities=config.trading_enabled,
+            durable_broker_history=durable_broker_history,
         )
         self.valuation = SQLiteValuationService(self.database_path)
         self.planner = SQLiteTargetExecutionService(

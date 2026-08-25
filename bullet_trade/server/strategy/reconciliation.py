@@ -167,8 +167,10 @@ async def collect_async_broker_snapshot(
 
     account = await broker.get_account_info(account_context)
     positions = await broker.get_positions(account_context)
-    orders = await broker.list_orders(account_context, {"from_broker": True})
-    trades = await broker.list_trades(account_context)
+    orders = await broker.list_orders(
+        account_context, {"from_broker": True, "include_history": True}
+    )
+    trades = await broker.list_trades(account_context, {"include_history": True})
     return _build_broker_snapshot(account, positions, orders, trades, as_of)
 
 
@@ -268,10 +270,12 @@ class SQLiteReconciliationService:
         capabilities: BrokerCapabilityProfile,
         notification_handler=None,
         require_verified_capabilities: bool = True,
+        durable_broker_history: bool = False,
     ) -> None:
         self.database_path = Path(database_path)
         self.capabilities = capabilities
         self.require_verified_capabilities = bool(require_verified_capabilities)
+        self.durable_broker_history = bool(durable_broker_history)
         self._ledger = SQLiteStrategyRepository(database_path)
         self._booking = SQLiteFillBookingService(
             database_path,
@@ -286,7 +290,10 @@ class SQLiteReconciliationService:
     ) -> ReconciliationResult:
         if self.require_verified_capabilities:
             try:
-                require_strategy_ledger_v1(self.capabilities)
+                require_strategy_ledger_v1(
+                    self.capabilities,
+                    durable_broker_history=self.durable_broker_history,
+                )
             except BrokerContractError as exc:
                 return self._persist_result(
                     account_id,
@@ -422,13 +429,17 @@ class SQLiteReconciliationService:
             except RepositoryError as exc:
                 blockers.append("order_error:{}:{}".format(broker_order_id, str(exc)))
 
-        broker_ids = set(broker_orders)
+        current_broker_ids = {
+            broker_order_id
+            for broker_order_id, row in broker_orders.items()
+            if row.get("_broker_history_only") is not True
+        }
         for broker_order_id, local in orders_by_broker_id.items():
             if local["state"] in (
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIALLY_FILLED.value,
                 OrderState.SUBMIT_UNKNOWN.value,
-            ) and broker_order_id not in broker_ids:
+            ) and broker_order_id not in current_broker_ids:
                 blockers.append("missing_working_order:{}".format(broker_order_id))
 
         required_cash, owned_positions = self._ledger_view(
@@ -469,6 +480,7 @@ class SQLiteReconciliationService:
             "strategy_required_cash_units": required_cash,
             "strategy_owned_position_count": len(owned_positions),
             "capability_verification_required": self.require_verified_capabilities,
+            "durable_broker_history": self.durable_broker_history,
         }
         state = ReconciliationState.BLOCKED if blockers else ReconciliationState.READY
         return self._persist_result(

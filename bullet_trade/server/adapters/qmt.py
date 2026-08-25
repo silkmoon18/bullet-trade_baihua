@@ -23,6 +23,11 @@ from bullet_trade.server.strategy.broker_contract import (
     XTQUANT_DIRECT_CAPABILITIES,
     BrokerCapabilityProfile,
 )
+from bullet_trade.server.strategy.broker_history import (
+    BrokerHistoryError,
+    SQLiteBrokerHistoryStore,
+    merge_broker_rows,
+)
 from bullet_trade.utils.env_loader import get_data_provider_config
 
 from ..config import AccountConfig, ServerConfig
@@ -545,6 +550,11 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._stopping = False
         self._event_listeners = []
+        self._history_store = (
+            SQLiteBrokerHistoryStore(config.strategy_database_path)
+            if config.strategy_database_path
+            else None
+        )
 
     def add_event_listener(self, callback) -> None:
         if callback not in self._event_listeners:
@@ -553,6 +563,19 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
     def _notify_broker_event(
         self, account_key: str, event: str, payload: Any = None
     ) -> None:
+        if self._history_store is not None and isinstance(payload, dict):
+            try:
+                if event == "order":
+                    self._history_store.record_order(account_key, payload)
+                elif event == "trade":
+                    self._history_store.record_trade(account_key, payload)
+            except BrokerHistoryError as exc:
+                log.warning(
+                    "QMT broker历史写入失败: account=%s event=%s error=%s",
+                    account_key,
+                    event,
+                    exc,
+                )
         for callback in tuple(self._event_listeners):
             try:
                 callback(account_key, event, payload)
@@ -576,6 +599,9 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
     @staticmethod
     def strategy_ledger_capabilities() -> BrokerCapabilityProfile:
         return XTQUANT_DIRECT_CAPABILITIES
+
+    def has_durable_broker_history(self) -> bool:
+        return self._history_store is not None
 
     async def start(self) -> None:
         """启动 broker 适配器并安排后台 QMT 重连探针。
@@ -848,6 +874,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         security = filters.get("security") if filters else None
         status = filters.get("status") if filters else None
         from_broker = bool(filters.get("from_broker")) if filters else False
+        include_history = bool(filters.get("include_history")) if filters else False
         getter = getattr(broker, "get_orders", None)
         if getter:
             orders = await _run_in_qmt_executor(
@@ -858,7 +885,21 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                     from_broker=from_broker,
                 )
             )
-            return orders or []
+            current = orders or []
+            if self._history_store is not None:
+                try:
+                    self._history_store.record_orders(account.config.key, current)
+                    if include_history:
+                        history = self._history_store.list_orders(
+                            account.config.key,
+                            order_id=order_id,
+                            security=security,
+                            status=status,
+                        )
+                        return list(merge_broker_rows(current, history, "order_id"))
+                except BrokerHistoryError as exc:
+                    log.warning("QMT broker委托历史处理失败: %s", exc)
+            return current
         getter = getattr(broker, "get_open_orders", None)
         if getter:
             orders = await _run_in_qmt_executor(getter)
@@ -880,12 +921,26 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         broker = self._broker_for(account)
         order_id = filters.get("order_id") if filters else None
         security = filters.get("security") if filters else None
+        include_history = bool(filters.get("include_history")) if filters else False
         getter = getattr(broker, "get_trades", None)
         if getter:
             trades = await _run_in_qmt_executor(
                 lambda: getter(order_id=order_id, security=security)
             )
-            return trades or []
+            current = trades or []
+            if self._history_store is not None:
+                try:
+                    self._history_store.record_trades(account.config.key, current)
+                    if include_history:
+                        history = self._history_store.list_trades(
+                            account.config.key,
+                            order_id=order_id,
+                            security=security,
+                        )
+                        return list(merge_broker_rows(current, history, "trade_id"))
+                except BrokerHistoryError as exc:
+                    log.warning("QMT broker成交历史处理失败: %s", exc)
+            return current
         return []
 
     async def get_order_status(

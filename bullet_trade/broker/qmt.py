@@ -58,6 +58,18 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _pick_value(obj: object, *names: str) -> Optional[Any]:
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj:
+                return obj.get(name)
+        return None
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
 class QmtBroker(BrokerBase):
     """
     QMT 券商适配（基于 xtquant/xttrader）。
@@ -218,10 +230,14 @@ class QmtBroker(BrokerBase):
                     self.outer._emit_event("disconnected")
 
                 def on_stock_order(self, order):  # noqa: N802
-                    self.outer._emit_event("order", order)
+                    self.outer._emit_event(
+                        "order", self.outer.normalize_order_event(order) or order
+                    )
 
                 def on_stock_trade(self, trade):  # noqa: N802
-                    self.outer._emit_event("trade", trade)
+                    self.outer._emit_event(
+                        "trade", self.outer.normalize_trade_event(trade) or trade
+                    )
 
                 def on_order_error(self, error):  # noqa: N802
                     self.outer._emit_event("order_error", error)
@@ -473,132 +489,138 @@ class QmtBroker(BrokerBase):
         else:
             iterable = list(trades)
 
-        def _pick(obj: object, *names: str) -> Optional[Any]:
-            if isinstance(obj, dict):
-                for name in names:
-                    if name in obj:
-                        return obj.get(name)
-                return None
-            for name in names:
-                if hasattr(obj, name):
-                    return getattr(obj, name)
-            return None
-
         target_id = str(order_id) if order_id is not None else None
         result: List[Dict[str, Any]] = []
         for item in iterable:
-            oid = _pick(item, "order_id", "entrust_id")
-            if target_id and str(oid) != target_id:
+            row = self.normalize_trade_event(item)
+            if row is None:
                 continue
-            raw_code = _pick(item, "stock_code", "code", "security")
-            jq_code = self._map_to_jq_symbol(raw_code) if raw_code else None
-            if security and jq_code != security:
+            if target_id and str(row.get("order_id")) != target_id:
                 continue
-            trade_id = _pick(item, "trade_id", "traded_id", "deal_no", "trade_no")
-            trade_id_source = "broker"
-            price = _first_present(
-                _pick(item, "traded_price"),
-                _pick(item, "trade_price"),
-                _pick(item, "avg_price", "avg_cost"),
-                _pick(item, "price"),
-            )
-            amount = _first_present(
-                _pick(item, "trade_volume"),
-                _pick(item, "traded_volume"),
-                _pick(item, "volume"),
-                _pick(item, "amount"),
-            )
-            trade_time = _first_present(
-                _pick(item, "trade_time"),
-                _pick(item, "traded_time"),
-                _pick(item, "time"),
-            )
-            commission = _first_present(
-                _pick(item, "commission_fee"),
-                _pick(item, "commission"),
-                _pick(item, "used_commission"),
-                _pick(item, "comm"),
-            )
-            tax = _first_present(_pick(item, "tax"), _pick(item, "stamp_tax"))
-            deal_balance = _first_present(
-                _pick(item, "deal_balance"),
-                _pick(item, "traded_amount"),
-                _pick(item, "trade_value"),
-                _pick(item, "amount_value"),
-            )
-            order_remark = _first_present(_pick(item, "order_remark"), _pick(item, "remark"))
-            strategy_name = _first_present(_pick(item, "strategy_name"), _pick(item, "strategy"))
-            if not trade_id:
-                base = f"{oid}-{trade_time}-{price}-{amount}"
-                trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
-                trade_id_source = "synthetic"
-            try:
-                normalized_amount = int(amount or 0)
-            except Exception:
-                normalized_amount = 0
-            try:
-                normalized_price = float(price or 0.0)
-            except Exception:
-                normalized_price = 0.0
-            commission_known = False
-            normalized_commission = 0.0
-            if commission is not None:
-                try:
-                    normalized_commission = float(commission)
-                    commission_known = math.isfinite(normalized_commission)
-                except (TypeError, ValueError):
-                    normalized_commission = 0.0
-                if not commission_known:
-                    normalized_commission = 0.0
-            tax_known = False
-            normalized_tax = 0.0
-            if tax is not None:
-                try:
-                    normalized_tax = float(tax)
-                    tax_known = math.isfinite(normalized_tax)
-                except (TypeError, ValueError):
-                    normalized_tax = 0.0
-                if not tax_known:
-                    normalized_tax = 0.0
-            if deal_balance in (None, "") and normalized_amount > 0 and normalized_price > 0:
-                deal_balance = normalized_amount * normalized_price
-            try:
-                normalized_deal_balance = float(deal_balance or 0.0)
-            except Exception:
-                normalized_deal_balance = 0.0
-            row = {
-                "trade_id": str(trade_id),
-                "trade_id_source": trade_id_source,
-                "order_id": str(oid) if oid is not None else "",
-                "security": jq_code,
-                "amount": normalized_amount,
-                "price": normalized_price,
-                "traded_price": normalized_price,
-                "deal_balance": normalized_deal_balance,
-                "time": trade_time,
-                "commission": normalized_commission,
-                "commission_fee": normalized_commission,
-                "commission_known": commission_known,
-                "tax": normalized_tax,
-                "tax_known": tax_known,
-                "order_remark": order_remark,
-                "strategy_name": strategy_name,
-            }
-            self._attach_order_wait_trace(row, oid)
+            if security and row.get("security") != security:
+                continue
             result.append(row)
             _emit_order_debug(
                 "get_trades_row",
-                trade_id=str(trade_id),
-                order_id=str(oid) if oid is not None else "",
-                security=jq_code,
-                price=price,
-                amount=amount,
-                trade_time=trade_time,
-                commission=commission,
-                tax=tax,
-                deal_balance=deal_balance,
+                trade_id=row.get("trade_id"),
+                order_id=row.get("order_id"),
+                security=row.get("security"),
+                price=row.get("price"),
+                amount=row.get("amount"),
+                trade_time=row.get("time"),
+                commission=row.get("commission"),
+                tax=row.get("tax"),
+                deal_balance=row.get("deal_balance"),
             )
         return result
+
+    def normalize_trade_event(self, item: object) -> Optional[Dict[str, Any]]:
+        """Normalize one native QMT trade query row or callback payload."""
+
+        oid = _pick_value(item, "order_id", "entrust_id")
+        raw_code = _pick_value(item, "stock_code", "code", "security")
+        trade_id = _pick_value(
+            item, "trade_id", "traded_id", "deal_no", "trade_no"
+        )
+        trade_id_source = "broker"
+        price = _first_present(
+            _pick_value(item, "traded_price"),
+            _pick_value(item, "trade_price"),
+            _pick_value(item, "avg_price", "avg_cost"),
+            _pick_value(item, "price"),
+        )
+        amount = _first_present(
+            _pick_value(item, "trade_volume"),
+            _pick_value(item, "traded_volume"),
+            _pick_value(item, "volume"),
+            _pick_value(item, "amount"),
+        )
+        trade_time = _first_present(
+            _pick_value(item, "trade_time"),
+            _pick_value(item, "traded_time"),
+            _pick_value(item, "time"),
+        )
+        commission = _first_present(
+            _pick_value(item, "commission_fee"),
+            _pick_value(item, "commission"),
+            _pick_value(item, "used_commission"),
+            _pick_value(item, "comm"),
+        )
+        tax = _first_present(
+            _pick_value(item, "tax"), _pick_value(item, "stamp_tax")
+        )
+        deal_balance = _first_present(
+            _pick_value(item, "deal_balance"),
+            _pick_value(item, "traded_amount"),
+            _pick_value(item, "trade_value"),
+            _pick_value(item, "amount_value"),
+        )
+        order_remark = _first_present(
+            _pick_value(item, "order_remark"), _pick_value(item, "remark")
+        )
+        strategy_name = _first_present(
+            _pick_value(item, "strategy_name"), _pick_value(item, "strategy")
+        )
+        if not trade_id:
+            if oid in (None, "") and trade_time in (None, ""):
+                return None
+            base = f"{oid}-{trade_time}-{price}-{amount}"
+            trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
+            trade_id_source = "synthetic"
+        try:
+            normalized_amount = int(amount or 0)
+        except Exception:
+            normalized_amount = 0
+        try:
+            normalized_price = float(price or 0.0)
+        except Exception:
+            normalized_price = 0.0
+        commission_known = False
+        normalized_commission = 0.0
+        if commission is not None:
+            try:
+                normalized_commission = float(commission)
+                commission_known = math.isfinite(normalized_commission)
+            except (TypeError, ValueError):
+                normalized_commission = 0.0
+            if not commission_known:
+                normalized_commission = 0.0
+        tax_known = False
+        normalized_tax = 0.0
+        if tax is not None:
+            try:
+                normalized_tax = float(tax)
+                tax_known = math.isfinite(normalized_tax)
+            except (TypeError, ValueError):
+                normalized_tax = 0.0
+            if not tax_known:
+                normalized_tax = 0.0
+        if deal_balance in (None, "") and normalized_amount > 0 and normalized_price > 0:
+            deal_balance = normalized_amount * normalized_price
+        try:
+            normalized_deal_balance = float(deal_balance or 0.0)
+        except Exception:
+            normalized_deal_balance = 0.0
+        row = {
+            "trade_id": str(trade_id),
+            "trade_id_source": trade_id_source,
+            "order_id": str(oid) if oid is not None else "",
+            "security": self._map_to_jq_symbol(raw_code) if raw_code else None,
+            "amount": normalized_amount,
+            "price": normalized_price,
+            "traded_price": normalized_price,
+            "deal_balance": normalized_deal_balance,
+            "time": trade_time,
+            "commission": normalized_commission,
+            "commission_fee": normalized_commission,
+            "commission_known": commission_known,
+            "tax": normalized_tax,
+            "tax_known": tax_known,
+            "order_remark": order_remark,
+            "strategy_name": strategy_name,
+        }
+        self._attach_order_wait_trace(row, oid)
+        return row
 
     async def buy(
         self,
@@ -1346,6 +1368,61 @@ class QmtBroker(BrokerBase):
         self._ensure_connected()
         return self._build_account_snapshot()
 
+    def normalize_order_event(self, item: object) -> Optional[Dict[str, Any]]:
+        """Normalize one native QMT order query row or callback payload."""
+
+        oid = _pick_value(item, "order_id", "entrust_id")
+        if not oid:
+            return None
+        code = _pick_value(item, "stock_code", "code")
+        amount = _pick_value(item, "order_volume", "volume")
+        raw_price = _pick_value(item, "price")
+        status = _pick_value(item, "order_status", "status")
+        filled = _pick_value(
+            item,
+            "traded_volume",
+            "deal_volume",
+            "filled_volume",
+            "volume_traded",
+        )
+        traded_price = _pick_value(
+            item, "traded_price", "avg_price", "trade_price"
+        )
+        order_type = _pick_value(item, "order_type", "orderType", "type")
+        order_remark = _pick_value(item, "order_remark", "remark")
+        strategy_name = _pick_value(item, "strategy_name", "strategy")
+        order_sysid = _pick_value(item, "order_sysid", "sysid")
+        status_msg = _pick_value(item, "status_msg")
+        price_type = _pick_value(item, "price_type", "priceType")
+        order_time = _pick_value(item, "order_time", "time")
+        explicit_order_price = _pick_value(item, "order_price")
+        if explicit_order_price is not None:
+            order_price = explicit_order_price
+        elif self._is_market_price_type(price_type) and traded_price is not None:
+            order_price = None
+        else:
+            order_price = raw_price
+        row = {
+            "order_id": str(oid),
+            "security": self._map_to_jq_symbol(code) if code else None,
+            "amount": amount,
+            "filled": 0 if filled is None else filled,
+            "price": 0.0 if traded_price is None else traded_price,
+            "order_price": order_price,
+            "status": status,
+            "order_type": order_type,
+            "is_buy": self._map_order_side(order_type),
+            "order_remark": order_remark,
+            "strategy_name": strategy_name,
+            "order_sysid": order_sysid,
+            "status_msg": status_msg,
+            "price_type": price_type,
+            "order_time": order_time,
+            "broker_price": raw_price,
+        }
+        self._attach_order_wait_trace(row, oid)
+        return row
+
     def sync_orders(self) -> List[Dict[str, Any]]:
         self._ensure_connected()
         orders: List[Dict[str, Any]] = []
@@ -1369,75 +1446,25 @@ class QmtBroker(BrokerBase):
         else:
             iterable = list(candidates)
 
-        def _pick(obj: object, *names: str) -> Optional[Any]:
-            if isinstance(obj, dict):
-                for name in names:
-                    if name in obj:
-                        return obj.get(name)
-                return None
-            for name in names:
-                if hasattr(obj, name):
-                    return getattr(obj, name)
-            return None
-
         for item in iterable:
             try:
-                oid = _pick(item, "order_id", "entrust_id")
-                code = _pick(item, "stock_code", "code")
-                amount = _pick(item, "order_volume", "volume")
-                raw_price = _pick(item, "price")
-                status = _pick(item, "order_status", "status")
-                filled = _pick(item, "traded_volume", "deal_volume", "filled_volume", "volume_traded")
-                traded_price = _pick(item, "traded_price", "avg_price", "trade_price")
-                order_type = _pick(item, "order_type", "orderType", "type")
-                order_remark = _pick(item, "order_remark", "remark")
-                strategy_name = _pick(item, "strategy_name", "strategy")
-                order_sysid = _pick(item, "order_sysid", "sysid")
-                status_msg = _pick(item, "status_msg", "status_msg")
-                price_type = _pick(item, "price_type", "priceType")
-                order_time = _pick(item, "order_time", "time")
-                explicit_order_price = _pick(item, "order_price")
-                if explicit_order_price is not None:
-                    order_price = explicit_order_price
-                elif self._is_market_price_type(price_type) and traded_price is not None:
-                    order_price = None
-                else:
-                    order_price = raw_price
-                if not oid:
+                row = self.normalize_order_event(item)
+                if row is None:
                     continue
-                row = {
-                    "order_id": str(oid),
-                    "security": self._map_to_jq_symbol(code) if code else None,
-                    "amount": amount,
-                    "filled": 0 if filled is None else filled,
-                    "price": 0.0 if traded_price is None else traded_price,
-                    "order_price": order_price,
-                    "status": status,
-                    "order_type": order_type,
-                    "is_buy": self._map_order_side(order_type),
-                    "order_remark": order_remark,
-                    "strategy_name": strategy_name,
-                    "order_sysid": order_sysid,
-                    "status_msg": status_msg,
-                    "price_type": price_type,
-                    "order_time": order_time,
-                    "broker_price": raw_price,
-                }
-                self._attach_order_wait_trace(row, oid)
                 orders.append(row)
                 _emit_order_debug(
                     "sync_orders_row",
-                    order_id=str(oid),
-                    security=self._map_to_jq_symbol(code) if code else None,
-                    raw_status=status,
-                    order_price=order_price,
-                    broker_price=raw_price,
-                    traded_price=traded_price,
-                    filled=filled,
-                    amount=amount,
-                    order_type=order_type,
-                    order_remark=order_remark,
-                    strategy_name=strategy_name,
+                    order_id=row.get("order_id"),
+                    security=row.get("security"),
+                    raw_status=row.get("status"),
+                    order_price=row.get("order_price"),
+                    broker_price=row.get("broker_price"),
+                    traded_price=row.get("price"),
+                    filled=row.get("filled"),
+                    amount=row.get("amount"),
+                    order_type=row.get("order_type"),
+                    order_remark=row.get("order_remark"),
+                    strategy_name=row.get("strategy_name"),
                 )
             except Exception:
                 continue

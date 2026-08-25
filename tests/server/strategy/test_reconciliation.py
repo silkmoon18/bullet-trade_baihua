@@ -271,6 +271,23 @@ def test_canceled_buy_releases_reservation_before_cash_compare(tmp_path):
     assert result.state is ReconciliationState.READY
 
 
+def test_historical_open_order_does_not_prove_it_is_still_working(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+
+    historical = dict(_broker_order("open"), _broker_history_only=True)
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot("20000", orders=(historical,)),
+    )
+
+    assert result.state is ReconciliationState.BLOCKED
+    assert "missing_working_order:broker-buy-1" in result.details["blockers"]
+
+
 def test_unrelated_trade_is_not_guessed_or_booked(tmp_path):
     _, _, _, reconciliation = _services(tmp_path)
     trade = dict(_broker_trade())
@@ -339,10 +356,11 @@ def test_async_server_adapter_snapshot_is_supported():
             return [{"security": "510050.SH", "amount": 100, "closeable_amount": 50}]
 
         async def list_orders(self, account, filters=None):
-            assert filters == {"from_broker": True}
+            assert filters == {"from_broker": True, "include_history": True}
             return []
 
         async def list_trades(self, account, filters=None):
+            assert filters == {"include_history": True}
             return []
 
     snapshot = asyncio.run(

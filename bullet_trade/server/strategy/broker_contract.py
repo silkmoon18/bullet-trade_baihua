@@ -84,6 +84,8 @@ BIG_QMT_CAPABILITIES = BrokerCapabilityProfile(
 def load_verified_capabilities(
     evidence_path: Union[str, Path],
     expected_adapter_kind: str,
+    *,
+    durable_broker_history: bool = False,
 ) -> BrokerCapabilityProfile:
     """Load a user-reviewed capability probe result for one QMT environment."""
 
@@ -128,11 +130,17 @@ def load_verified_capabilities(
         order_lookback_days=payload.get("order_lookback_days"),
         trade_lookback_days=payload.get("trade_lookback_days"),
     )
-    require_strategy_ledger_v1(profile)
+    require_strategy_ledger_v1(
+        profile, durable_broker_history=durable_broker_history
+    )
     return profile
 
 
-def strategy_ledger_v1_blockers(profile: BrokerCapabilityProfile) -> Tuple[str, ...]:
+def strategy_ledger_v1_blockers(
+    profile: BrokerCapabilityProfile,
+    *,
+    durable_broker_history: bool = False,
+) -> Tuple[str, ...]:
     blockers = []
     required = (
         ("client_tag_roundtrip", profile.client_tag_roundtrip),
@@ -153,15 +161,22 @@ def strategy_ledger_v1_blockers(profile: BrokerCapabilityProfile) -> Tuple[str, 
         and profile.order_side_for_trade is not CapabilityState.SUPPORTED
     ):
         blockers.append("trade_side_has_no_order_mapping")
-    if profile.order_lookback_days is None or profile.order_lookback_days < 1:
-        blockers.append("order_lookback_days<1")
-    if profile.trade_lookback_days is None or profile.trade_lookback_days < 1:
-        blockers.append("trade_lookback_days<1")
+    if not durable_broker_history:
+        if profile.order_lookback_days is None or profile.order_lookback_days < 1:
+            blockers.append("order_lookback_days<1")
+        if profile.trade_lookback_days is None or profile.trade_lookback_days < 1:
+            blockers.append("trade_lookback_days<1")
     return tuple(blockers)
 
 
-def require_strategy_ledger_v1(profile: BrokerCapabilityProfile) -> None:
-    blockers = strategy_ledger_v1_blockers(profile)
+def require_strategy_ledger_v1(
+    profile: BrokerCapabilityProfile,
+    *,
+    durable_broker_history: bool = False,
+) -> None:
+    blockers = strategy_ledger_v1_blockers(
+        profile, durable_broker_history=durable_broker_history
+    )
     if blockers:
         raise BrokerContractError(
             "{} does not satisfy strategy_ledger_v1: {}".format(

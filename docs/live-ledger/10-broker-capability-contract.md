@@ -26,6 +26,16 @@
 | working orders查询 | PROBE_REQUIRED | PROBE_REQUIRED | 必须在重启后仍能恢复在途单 |
 | orders/trades lookback | 未知 | 未知 | `strategy_ledger_v1`最低要求覆盖前一交易日 |
 
+直连 `XtQuantTrader.query_stock_orders/query_stock_trades` 的官方语义是当日委托、
+当日成交。本项目启用 StrategyLedger 数据库时，会把 QMT 回调和每次当日查询的
+规范化结果写入同一个 SQLite 文件；对账读取“当日实时结果 + 已观察到的本地历史”。
+因此，本地持久历史可以替代券商跨日 lookback 要求，但不能补回服务器连续停机并
+跨过交易日边界期间从未观察到的回报。活动委托仍只以当日实时查询为准，历史中的
+未完成状态不会被误当作仍在挂单。
+
+手续费字段与历史留存是两项独立能力。字段缺失时保持 `*_known=false`，不能因为
+本地保存成功就把未知费用改成 0 或宣称费用能力已验证。
+
 因此当前两个静态profile都会被`require_strategy_ledger_v1()`拒绝，这是正确状态；S19在目标QMT模拟环境执行探针并保存证据后，才能把对应项提升为`SUPPORTED`。
 
 ## 成交证据规则

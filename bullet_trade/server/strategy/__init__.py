@@ -60,6 +60,12 @@ from .broker_contract import (
     strategy_ledger_v1_blockers,
     load_verified_capabilities,
 )
+from .broker_history import (
+    BrokerHistoryError,
+    BrokerHistorySnapshot,
+    SQLiteBrokerHistoryStore,
+    merge_broker_rows,
+)
 from .idempotency import (
     IdempotencyConflictError,
     OperationCreateResult,
@@ -123,6 +129,8 @@ __all__ = [
     "BrokerPositionSnapshot",
     "BrokerSnapshotReader",
     "BrokerFill",
+    "BrokerHistoryError",
+    "BrokerHistorySnapshot",
     "BrokerOrder",
     "BrokerTradeEvidence",
     "CashPool",
@@ -175,6 +183,7 @@ __all__ = [
     "SQLiteOperationRepository",
     "SQLiteReconciliationService",
     "SQLiteCapitalService",
+    "SQLiteBrokerHistoryStore",
     "SQLiteFillBookingService",
     "SQLiteValuationService",
     "StrategyEvent",
@@ -192,6 +201,7 @@ __all__ = [
     "collect_async_broker_snapshot",
     "migrate_database",
     "money_to_units",
+    "merge_broker_rows",
     "load_verified_capabilities",
     "normalize_trade_batch",
     "normalize_trade_evidence",

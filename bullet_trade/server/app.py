@@ -94,11 +94,18 @@ class ServerApplication:
             if not callable(capability_fn):
                 raise RuntimeError("broker adapter does not expose StrategyLedger capabilities")
             capabilities = cast(BrokerCapabilityProfile, capability_fn())
+            durable_history_fn = getattr(
+                self.adapters.broker_adapter, "has_durable_broker_history", None
+            )
+            durable_broker_history = bool(
+                durable_history_fn() if callable(durable_history_fn) else False
+            )
             if self.config.strategy_capabilities_path:
                 try:
                     capabilities = load_verified_capabilities(
                         self.config.strategy_capabilities_path,
                         capabilities.adapter_kind,
+                        durable_broker_history=durable_broker_history,
                     )
                 except BrokerContractError as exc:
                     log.error("QMT能力证明无效，StrategyLedger保持只读: %s", exc)
@@ -117,6 +124,7 @@ class ServerApplication:
                 capabilities,
                 self.adapters.data_adapter,
                 self.feishu_notifier.queue_message if self.feishu_notifier else None,
+                durable_broker_history=durable_broker_history,
             )
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():

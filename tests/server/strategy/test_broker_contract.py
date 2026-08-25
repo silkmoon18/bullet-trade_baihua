@@ -67,6 +67,20 @@ def test_verified_qmt_profile_can_use_order_mapping_for_trade_side(profile):
     require_strategy_ledger_v1(verified)
 
 
+def test_durable_local_history_can_replace_native_cross_day_query():
+    verified_without_lookback = replace(
+        _verified_profile(XTQUANT_DIRECT_CAPABILITIES),
+        order_lookback_days=0,
+        trade_lookback_days=0,
+    )
+    assert strategy_ledger_v1_blockers(
+        verified_without_lookback, durable_broker_history=True
+    ) == ()
+    require_strategy_ledger_v1(
+        verified_without_lookback, durable_broker_history=True
+    )
+
+
 def test_verified_capability_evidence_loads_for_matching_adapter(tmp_path):
     path = tmp_path / "capabilities.json"
     states = {
