@@ -11,7 +11,7 @@ S05提供单机SQLite repository和最小资金划拨原语，不提供下单或
 ```python
 from bullet_trade.server.strategy import SQLiteStrategyRepository
 
-repository = SQLiteStrategyRepository(r"E:\bullet-trade-data\strategy-ledger.db")
+repository = SQLiteStrategyRepository(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 repository.initialize()
 ```
 

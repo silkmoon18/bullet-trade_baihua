@@ -43,7 +43,7 @@ strategies/joinquant/good_etf.py
 
 ```python
 VALIDATE_REMOTE_DURING_BACKTEST = True
-STRATEGY_ID = 'good_etf'
+STRATEGY_ID = 'good_etf_remote'
 ```
 
 v10 helper在所有模式均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
@@ -64,7 +64,7 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### JQ
 
-在私有`jq_runtime_config.py`的`STRATEGIES["good_etf"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
+在私有`jq_runtime_config.py`的`STRATEGIES["good_etf_remote"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
 
 ### QMT_REMOTE
 

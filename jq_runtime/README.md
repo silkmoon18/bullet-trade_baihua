@@ -47,7 +47,7 @@ PROFILE_SCHEMA_VERSION = 2
 DEFAULT_PROFILE = "qmt-main"
 
 STRATEGIES = {
-    "good_etf": {
+    "good_etf_remote": {
         "profile": "qmt-main",
         "mode": "JQ",  # 完成前置测试后再改为 QMT_REMOTE
     },

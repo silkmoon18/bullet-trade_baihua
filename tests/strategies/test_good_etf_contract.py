@@ -49,7 +49,7 @@ class _Runtime:
         self.mode = mode
         self.state = {
             "api_version": 10,
-            "strategy_id": "good_etf",
+            "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
         self._portfolio = portfolio
@@ -209,7 +209,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
     assert namespace is strategy.__dict__
     assert kwargs == {
         "context": context,
-        "strategy_id": "good_etf",
+        "strategy_id": "good_etf_remote",
         "initial_capital": 10000,
         "expected_api_version": 10,
         "profile_module": "jq_runtime_config",

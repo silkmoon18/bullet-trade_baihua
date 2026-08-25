@@ -10,7 +10,7 @@ S10把StrategyLedger的真实现金、真实持仓和带时间的行情mark合�
 from datetime import timedelta
 from bullet_trade.server.strategy import MarketMark, SQLiteValuationService
 
-valuation = SQLiteValuationService(r"E:\bullet-trade-data\strategy-ledger.db")
+valuation = SQLiteValuationService(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 snapshot = valuation.create_snapshot(
     account_id="good-etf",
     marks={

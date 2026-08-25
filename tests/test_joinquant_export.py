@@ -348,7 +348,7 @@ def test_source_validation_rejects_unknown_role(tmp_path):
         ),
         (
             "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'prod'\n"
-            "STRATEGIES = {'good_etf': {'mode': 'REMOTE'}}\n"
+            "STRATEGIES = {'good_etf_remote': {'mode': 'REMOTE'}}\n"
             "PROFILES = {'prod': {'host': '', 'token': ''}}\n",
             "invalid mode",
         ),
@@ -370,7 +370,7 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     private_profile.write_text(
         "PROFILE_SCHEMA_VERSION = 2\n"
         "DEFAULT_PROFILE = 'qmt-main'\n"
-        "STRATEGIES = {'good_etf': {'profile': 'qmt-main', "
+        "STRATEGIES = {'good_etf_remote': {'profile': 'qmt-main', "
         "'mode': 'QMT_REMOTE'}}\n"
         "PROFILES = {'qmt-main': {"
         "'host': '10.0.0.8', "
@@ -384,7 +384,7 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     assert result == {
         "profile": "qmt-main",
         "profile_schema_version": 2,
-        "strategy_id": "good_etf",
+        "strategy_id": "good_etf_remote",
         "mode": "QMT_REMOTE",
     }
     assert list(tmp_path.iterdir()) == [private_profile]
@@ -396,7 +396,7 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     [
         (
             "PROFILE_SCHEMA_VERSION = 2\nDEFAULT_PROFILE = 'qmt-main'\n"
-            "STRATEGIES = {'good_etf': {'profile': 'missing'}}\n"
+            "STRATEGIES = {'good_etf_remote': {'profile': 'missing'}}\n"
             "PROFILES = {'qmt-main': {'host': '10.0.0.8', "
             "'token': 'real-token'}}\n",
             "invalid profile",

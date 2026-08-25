@@ -18,7 +18,7 @@ DEFAULT_PROFILE = "qmt-main"
 # - mode：只能填"JQ"或"QMT_REMOTE"；省略或找不到策略key时为"JQ"。
 # - BACKTEST不能写在这里，聚宽回测会根据run_type自动选择BACKTEST。
 STRATEGIES = {
-    "good_etf": {
+    "good_etf_remote": {
         "profile": "qmt-main",
         "mode": "JQ",
     },

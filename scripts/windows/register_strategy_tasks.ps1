@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$EnvFile,
     [Parameter(Mandatory = $true)][string]$LedgerDatabase,
     [Parameter(Mandatory = $true)][string]$BackupDir,
-    [string]$TaskPrefix = 'BulletTradeStrategy'
+    [string]$TaskPrefix = 'BulletTradeBaihua'
 )
 
 $ErrorActionPreference = 'Stop'

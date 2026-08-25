@@ -55,7 +55,7 @@ S04只保证schema和静态约束；事件追加、CAS、资金划拨、成交�
 ```python
 from bullet_trade.server.strategy import migrate_database
 
-migrate_database(r"E:\bullet-trade-data\strategy-ledger.db")
+migrate_database(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 ```
 
 连接默认启用：

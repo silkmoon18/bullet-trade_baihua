@@ -13,7 +13,7 @@
 ```python
 from bullet_trade.server.strategy import SQLiteFillBookingService
 
-booking = SQLiteFillBookingService(r"E:\bullet-trade-data\strategy-ledger.db")
+booking = SQLiteFillBookingService(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 booking.register_order(strategy_order)
 result = booking.book_fill(
     "good-etf",

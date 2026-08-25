@@ -11,7 +11,7 @@ S07提供单机SQLite的请求幂等和券商提交outbox，不直接调用QMT�
 ```python
 from bullet_trade.server.strategy import SQLiteOperationRepository
 
-operations = SQLiteOperationRepository(r"E:\bullet-trade-data\strategy-ledger.db")
+operations = SQLiteOperationRepository(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 created = operations.create_operation(
     strategy_account_id="good-etf",
     endpoint="portfolio.submit",

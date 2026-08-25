@@ -13,18 +13,22 @@ QMT_STRATEGY_ENABLED_IDS=good_etf_remote
 
 ## 1. 准备专用账户和目录
 
-StrategyLedger只归属带有本策略订单标记的委托、成交和持仓，允许QMT物理账户存在人工交易或其他策略资产。若外部操作导致物理现金或持仓不足以覆盖策略账本，仍会阻断。建议把运行数据放在仓库外：
+StrategyLedger只归属带有本策略订单标记的委托、成交和持仓，允许QMT物理账户存在人工交易或其他策略资产。若外部操作导致物理现金或持仓不足以覆盖策略账本，仍会阻断。当前统一把运行数据放在个人fork根目录下的`.data`；该目录已被Git忽略，禁止提交：
 
 ```text
-E:\bullet-trade-data\
-├─ .env
-├─ strategy-ledger.db
-├─ xtquant-capabilities.json
-├─ logs\
-└─ backups\
+E:\dev\Github\bullet-trade_baihua\
+├─ bullet_trade\
+├─ strategies\
+├─ scripts\
+└─ .data\
+   ├─ .env
+   ├─ strategy-ledger.db
+   ├─ xtquant-capabilities.json
+   ├─ logs\
+   └─ backups\
 ```
 
-复制`env.example`为上述`.env`并填写QMT、server、StrategyLedger和可选飞书配置。私有文件不要提交Git。
+复制`env.example`为`.data\.env`并填写QMT、server、StrategyLedger和可选飞书配置。私有文件不要提交Git。
 
 ## 2. 运行真实QMT探针
 
@@ -32,8 +36,8 @@ E:\bullet-trade-data\
 
 ```powershell
 .\.venv\Scripts\python.exe -m bullet_trade.server.runtime_probe `
-  --env-file E:\bullet-trade-data\.env `
-  --output-dir E:\bullet-trade-data\runtime-probe `
+  --env-file E:\dev\Github\bullet-trade_baihua\.data\.env `
+  --output-dir E:\dev\Github\bullet-trade_baihua\.data\runtime-probe `
   --trade-smoke
 ```
 
@@ -44,15 +48,15 @@ SQLite 中保存已收到的委托/成交回调及查询结果，对账自动合
 `broker.orders` / `broker.trades` 的默认响应仍保持当日语义。SQLite 每日备份同时覆盖
 这部分历史。它只能保存服务器实际观察到的数据，不能补回跨日停机期间遗漏的回报。
 
-佣金以QMT/券商明确返回的数据为最终依据。迅投标准股票`XtTrade`提供`traded_id`、成交量、成交价和成交金额，但官方结构没有佣金字段；`used_commission`属于期货持仓统计字段，不能预设为股票逐笔成交佣金。部分柜台或扩展版本可能在成交或`query_data(..., data_type='deal')`中补充费用，服务器会兼容读取；买入费用缓冲只用于下单前现金预留，不是最终佣金。字段缺失或目标QMT版本没有明确费用证据时保持Remote交易阻断，不回退到聚宽`set_order_cost`估算。
+佣金以QMT/券商明确返回的数据为最终依据。迅投标准股票`XtTrade`提供`traded_id`、成交量、成交价和成交金额，但官方结构没有佣金字段；`used_commission`属于期货持仓统计字段，不能预设为股票逐笔成交佣金。部分柜台或扩展版本可能在成交或`query_data(..., data_type='deal')`中补充费用，服务器会兼容读取；买入费用缓冲只用于下单前现金预留，不是最终佣金。字段缺失时佣金和税费记为未知，不伪造为0，也不阻断委托与成交入账；此时现金、持仓和资产是暂估值，精确`fees/NAV/returns/PnL`保持未知。
 
-复制[直连xtquant能力证明模板](xtquant-capabilities.example.json)到仓库外，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。任一必需项为false时服务器会拒绝加载，不能靠代码猜值或补零。
+复制[直连xtquant能力证明模板](xtquant-capabilities.example.json)到`.data`，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。订单归属、稳定ID、成交关联、方向映射、状态与查询等执行必需项为false时服务器会拒绝加载；`fee_fields=false`允许运行，但绩效费用维持未知。不能靠代码猜值或补零。
 
 ## 3. 首次只读启动
 
 ```powershell
-Set-Location E:\dev\Github\bullet-trade
-.\.venv\Scripts\python.exe -m bullet_trade --env-file E:\bullet-trade-data\.env server
+Set-Location E:\dev\Github\bullet-trade_baihua
+.\.venv\Scripts\python.exe -m bullet_trade --env-file .\.data\.env server
 ```
 
 服务器启动后会对已存在策略账户立即同步QMT；若QMT仍在启动，则保持`strategy_ledger_ready=false`并每5秒重试，成功后停止重试。第一次由聚宽调用`ensure_account`建立1万元策略账户。交易关闭时能力证明可以暂缓，账本仍可返回`READY`；将`QMT_STRATEGY_TRADING_ENABLED`改为`true`后，能力证明缺失会立即重新阻断。即使全局开关已打开，`QMT_STRATEGY_ENABLED_IDS`为空或不包含请求中的精确`strategy_id`时也不会创建委托。
@@ -65,10 +69,10 @@ Set-Location E:\dev\Github\bullet-trade
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\windows\register_strategy_tasks.ps1 `
-  -ProjectDir E:\dev\Github\bullet-trade `
-  -EnvFile E:\bullet-trade-data\.env `
-  -LedgerDatabase E:\bullet-trade-data\strategy-ledger.db `
-  -BackupDir E:\bullet-trade-data\backups
+  -ProjectDir E:\dev\Github\bullet-trade_baihua `
+  -EnvFile E:\dev\Github\bullet-trade_baihua\.data\.env `
+  -LedgerDatabase E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db `
+  -BackupDir E:\dev\Github\bullet-trade_baihua\.data\backups
 ```
 
 注册两个当前用户、有限权限任务：登录时启动server（失败最多重启3次），每日18:00在线备份SQLite。QMT通常依赖登录桌面会话，因此不注册无人登录的SYSTEM服务。
@@ -79,16 +83,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows\register_strategy_tas
 
 ```powershell
 python scripts\strategy_ledger_backup.py backup `
-  --database E:\bullet-trade-data\strategy-ledger.db `
-  --output-dir E:\bullet-trade-data\backups
+  --database E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db `
+  --output-dir E:\dev\Github\bullet-trade_baihua\.data\backups
 ```
 
 恢复前停止BulletTrade server，把当前数据库及`-wal/-shm`文件整体移到单独故障目录，然后恢复到不存在的目标；工具拒绝覆盖已有数据库：
 
 ```powershell
 python scripts\strategy_ledger_backup.py restore `
-  --backup E:\bullet-trade-data\backups\strategy-ledger-YYYYMMDD-HHMMSS.db `
-  --database E:\bullet-trade-data\strategy-ledger.db
+  --backup E:\dev\Github\bullet-trade_baihua\.data\backups\strategy-ledger-YYYYMMDD-HHMMSS.db `
+  --database E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db
 ```
 
 恢复后先保持交易关闭，启动server并确认启动对账READY，再恢复聚宽策略。

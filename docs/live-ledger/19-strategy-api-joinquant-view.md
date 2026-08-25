@@ -13,7 +13,7 @@ L03复用BulletTrade现有TCP协议和token，提供六个动作：`strategy.ens
 仅配置数据库路径时才启用策略API：
 
 ```dotenv
-QMT_STRATEGY_LEDGER_DB=E:\bullet-trade-data\strategy-ledger.db
+QMT_STRATEGY_LEDGER_DB=E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db
 QMT_STRATEGY_TRADING_ENABLED=false
 QMT_STRATEGY_ENABLED_IDS=good_etf_remote
 QMT_STRATEGY_ALLOW_BUYS=true
@@ -41,9 +41,9 @@ QMT_STRATEGY_BUY_FEE_BUFFER=5
 
 ## 聚宽运行时
 
-当前helper契约为`v5`。旧helper会因marker/API版本不匹配而失败，避免模式名称或执行语义不一致。
+当前helper契约为`v10`。旧helper会因marker/API版本不匹配而失败，避免模式名称或执行语义不一致。
 
-`good_etf`的QMT_REMOTE路径：
+`good_etf_remote`的QMT_REMOTE路径：
 
 1. 初始化调用`ensure_account(INITIAL_CAPITAL)`并要求对账`READY`；
 2. 从`PortfolioView`读取真实现金、持仓和总资产；

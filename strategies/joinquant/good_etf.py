@@ -23,8 +23,9 @@ if TYPE_CHECKING:
     from joinquant_typing import Context  # noqa: F401
 
 # ===== 部署契约 =====
+STRATEGY_ID = 'good_etf_remote'
+
 VALIDATE_REMOTE_DURING_BACKTEST = True
-STRATEGY_ID = 'good_etf'
 _EXPECTED_RUNTIME_API_VERSION = 10
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 ExecutionMode = bt.RuntimeMode

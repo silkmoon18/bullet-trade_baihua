@@ -13,11 +13,11 @@ S08把聚宽配置的策略初始资金与真实QMT账户现金分开处理：
 ```python
 from bullet_trade.server.strategy import SQLiteCapitalService, money_to_units
 
-capital = SQLiteCapitalService(r"E:\bullet-trade-data\strategy-ledger.db")
+capital = SQLiteCapitalService(r"E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db")
 capital.calibrate_broker_available_cash("qmt-main", money_to_units("12500.00"))
 result = capital.ensure_strategy_account(
     account_id="good-etf",
-    strategy_id="good_etf",
+    strategy_id="good_etf_remote",
     physical_account_id="qmt-main",
     initial_capital_units=money_to_units("10000.00"),
 )

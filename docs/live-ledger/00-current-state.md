@@ -1,21 +1,22 @@
 # 当前架构、依赖与状态
 
-更新时间：2026-08-10（Asia/Shanghai）
+更新时间：2026-08-25（Asia/Shanghai）
 
 ## 1. 仓库与版本状态
 
 ### BulletTrade 统一仓库
 
-- 路径：`E:\dev\Github\bullet-trade`
+- 路径：`E:\dev\Github\bullet-trade_baihua`
+- 个人仓库：`https://github.com/silkmoon18/bullet-trade_baihua.git`
 - 上游：`https://github.com/BulletTrade/bullet-trade.git`
 - 基线标签：`v0.9.2`
 - 基线提交：`be0451b`
-- 开发分支：`feat/joinquant-live-ledger`
+- 开发分支：`codex/joinquant-execution-modes`
 - S00策略和文档已压平为 `v0.9.2` 之上的单个脱敏基线提交 `7085155`，返工期间的提交不再位于分支可达历史。
 - S01实现候选提交为`a94aa12060c5e8cef479224952e302eeac99f37d`；预提交与精确SHA的契约、并发/对抗、部署/文档三路审查均APPROVE。
 - 官方远端已改名为只读 `upstream`；fetch URL保留官方GitHub，push URL为`DISABLED`。
-- 用户私有 `origin` 尚未配置；在提供私有fork URL前，本分支仅允许本地提交。
-- `.idea/`、根目录`runtime/`、聚宽导出目录和本地运行profile已经加入忽略规则。
+- `origin`指向个人仓库并可推送；`upstream`仅用于获取官方更新，push保持禁用。
+- `.idea/`、根目录`.data/`、聚宽导出目录和本地运行profile已经加入忽略规则。
 
 ### 原 bt_quant 仓库
 
@@ -30,7 +31,7 @@
 ## 2. 当前目录职责
 
 ```text
-bullet-trade/
+bullet-trade_baihua/
 ├─ bullet_trade/
 │  ├─ core/                 回测、调度、订单模型、风险控制
 │  ├─ data/                 聚宽兼容数据API及数据源适配
