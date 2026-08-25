@@ -74,8 +74,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 9
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v9"
+STRATEGY_RUNTIME_API_VERSION = 10
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v10"
 PROFILE_SCHEMA_VERSION = 2
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 
@@ -384,17 +384,37 @@ class PortfolioView(object):
         self.positions_value = float(payload["positions_value"])
         self.total_value = float(payload["total_value"])
         self.starting_cash = float(payload["starting_cash"])
-        self.total_pnl = float(payload["total_pnl"])
-        self.realized_pnl = float(payload["realized_pnl"])
-        self.unrealized_pnl = float(payload["unrealized_pnl"])
-        self.fees = float(payload["fees"])
-        self.nav = float(payload["nav"])
-        self.returns = float(payload["returns"])
+        self.total_pnl = _optional_float(payload.get("total_pnl"))
+        self.realized_pnl = _optional_float(payload.get("realized_pnl"))
+        self.unrealized_pnl = _optional_float(payload.get("unrealized_pnl"))
+        self.fees = _optional_float(payload.get("fees"))
+        self.fees_known = bool(payload.get("fees_known", self.fees is not None))
+        self.unknown_fee_fill_count = int(payload.get("unknown_fee_fill_count", 0))
+        self.nav = _optional_float(payload.get("nav"))
+        self.returns = _optional_float(payload.get("returns"))
+        self.performance_blockers = tuple(payload.get("performance_blockers", ()))
         self.performance_ready = bool(payload["performance_ready"])
+        if self.fees_known and self.fees is None:
+            raise RuntimeError("费用标记为已知但缺少费用数值")
+        if self.performance_ready and any(
+            value is None
+            for value in (
+                self.total_pnl,
+                self.realized_pnl,
+                self.unrealized_pnl,
+                self.nav,
+                self.returns,
+            )
+        ):
+            raise RuntimeError("绩效标记为可用但缺少绩效数值")
         self.positions = {
             security: PositionView(item)
             for security, item in payload.get("positions", {}).items()
         }
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    return None if value is None else float(value)
 
 
 def _json_default(value: Any) -> Any:
@@ -632,14 +652,18 @@ def _record_runtime_portfolio(portfolio: PortfolioView) -> None:
     recorder = _active_namespace.get("record")
     if not callable(recorder):
         return
-    recorder(
-        real_cash=portfolio.available_cash,
-        real_total=portfolio.total_value,
-        real_positions=portfolio.positions_value,
-        real_nav=portfolio.nav,
-        real_return=portfolio.returns,
-        real_fees=portfolio.fees,
-    )
+    metrics = {
+        "real_cash": portfolio.available_cash,
+        "real_total": portfolio.total_value,
+        "real_positions": portfolio.positions_value,
+    }
+    if portfolio.nav is not None:
+        metrics["real_nav"] = portfolio.nav
+    if portfolio.returns is not None:
+        metrics["real_return"] = portfolio.returns
+    if portfolio.fees is not None:
+        metrics["real_fees"] = portfolio.fees
+    recorder(**metrics)
 
 
 def runtime_portfolio(context: Any) -> Any:
@@ -650,8 +674,6 @@ def runtime_portfolio(context: Any) -> Any:
     if _active_state.get("mode") != "QMT_REMOTE":
         return context.portfolio
     portfolio = get_portfolio(as_of=getattr(context, "current_dt", None))
-    if not portfolio.performance_ready:
-        raise RuntimeError("真实组合发生过运行中增减资，简单NAV指标不可用")
     _record_runtime_portfolio(portfolio)
     return portfolio
 

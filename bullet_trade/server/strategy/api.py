@@ -122,6 +122,7 @@ class SQLiteStrategyAPI:
             notification_handler,
             require_verified_capabilities=config.trading_enabled,
             durable_broker_history=durable_broker_history,
+            unknown_fee_tolerance_units_per_order=config.buy_fee_buffer_units,
         )
         self.valuation = SQLiteValuationService(self.database_path)
         self.planner = SQLiteTargetExecutionService(
@@ -983,6 +984,7 @@ class SQLiteStrategyAPI:
                 "value": _money(item.market_value_units),
                 "unrealized_pnl": _money(item.unrealized_pnl_units),
             }
+        performance_ready = snapshot.performance_ready
         return {
             "account_id": snapshot.account_id,
             "strategy_id": snapshot.strategy_id,
@@ -995,12 +997,21 @@ class SQLiteStrategyAPI:
             "positions_value": _money(snapshot.positions_value_units),
             "total_value": _money(snapshot.total_assets_units),
             "starting_cash": _money(snapshot.net_capital_units),
-            "total_pnl": _money(snapshot.total_pnl_units),
-            "realized_pnl": _money(snapshot.realized_pnl_units),
-            "unrealized_pnl": _money(snapshot.unrealized_pnl_units),
-            "fees": _money(snapshot.fees_units),
-            "nav": snapshot.nav_units / NAV_SCALE,
-            "returns": snapshot.nav_units / NAV_SCALE - 1.0,
-            "performance_ready": snapshot.performance_ready,
+            "total_pnl": _money(snapshot.total_pnl_units) if performance_ready else None,
+            "realized_pnl": (
+                _money(snapshot.realized_pnl_units) if performance_ready else None
+            ),
+            "unrealized_pnl": (
+                _money(snapshot.unrealized_pnl_units) if performance_ready else None
+            ),
+            "fees": _money(snapshot.fees_units) if snapshot.fees_known else None,
+            "fees_known": snapshot.fees_known,
+            "unknown_fee_fill_count": snapshot.unknown_fee_fill_count,
+            "nav": snapshot.nav_units / NAV_SCALE if performance_ready else None,
+            "returns": (
+                snapshot.nav_units / NAV_SCALE - 1.0 if performance_ready else None
+            ),
+            "performance_blockers": list(snapshot.performance_blockers),
+            "performance_ready": performance_ready,
             "positions": positions,
         }

@@ -48,7 +48,7 @@ class _Runtime:
     def __init__(self, mode, portfolio=None):
         self.mode = mode
         self.state = {
-            "api_version": 9,
+            "api_version": 10,
             "strategy_id": "good_etf",
             "mode": mode.value,
         }
@@ -211,7 +211,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf",
         "initial_capital": 10000,
-        "expected_api_version": 9,
+        "expected_api_version": 10,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }

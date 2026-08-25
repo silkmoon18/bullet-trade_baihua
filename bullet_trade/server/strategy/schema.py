@@ -401,6 +401,20 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    Migration(
+        6,
+        "explicit_unknown_fill_fees",
+        (
+            (
+                "ALTER TABLE fills ADD COLUMN commission_known INTEGER NOT NULL "
+                "DEFAULT 1 CHECK (commission_known IN (0, 1))"
+            ),
+            (
+                "ALTER TABLE fills ADD COLUMN tax_known INTEGER NOT NULL "
+                "DEFAULT 1 CHECK (tax_known IN (0, 1))"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

@@ -79,6 +79,9 @@ class PortfolioSnapshot:
     unrealized_pnl_units: int
     fees_units: int
     nav_units: int
+    fees_known: bool
+    unknown_fee_fill_count: int
+    performance_blockers: Tuple[str, ...]
     performance_ready: bool
     positions: Tuple[PortfolioPositionSnapshot, ...]
 
@@ -217,15 +220,21 @@ class SQLiteValuationService:
                 )
 
             realized_pnl = self._realized_pnl(connection, account_id)
-            fees = connection.execute(
+            fee_row = connection.execute(
                 """
-                SELECT COALESCE(SUM(f.commission_units + f.tax_units), 0)
+                SELECT COALESCE(SUM(f.commission_units + f.tax_units), 0),
+                       COALESCE(SUM(
+                           CASE WHEN f.commission_known = 0 OR f.tax_known = 0
+                                THEN 1 ELSE 0 END
+                       ), 0)
                 FROM fills f
                 JOIN strategy_orders o ON o.order_id = f.order_id
                 WHERE o.strategy_account_id = ?
                 """,
                 (account_id,),
-            ).fetchone()[0]
+            ).fetchone()
+            fees = cast(int, fee_row[0])
+            unknown_fee_fill_count = cast(int, fee_row[1])
             flow_rows = connection.execute(
                 """
                 SELECT flow_type, amount_units FROM capital_flows
@@ -273,6 +282,11 @@ class SQLiteValuationService:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
+            performance_blockers = []
+            if len(flow_rows) != 1:
+                performance_blockers.append("capital_flows_unsupported")
+            if unknown_fee_fill_count:
+                performance_blockers.append("unknown_fill_fees")
             result = PortfolioSnapshot(
                 account_id=account.account_id,
                 strategy_id=account.strategy_id,
@@ -290,7 +304,10 @@ class SQLiteValuationService:
                 unrealized_pnl_units=unrealized_pnl,
                 fees_units=fees,
                 nav_units=nav_units,
-                performance_ready=len(flow_rows) == 1,
+                fees_known=unknown_fee_fill_count == 0,
+                unknown_fee_fill_count=unknown_fee_fill_count,
+                performance_blockers=tuple(performance_blockers),
+                performance_ready=not performance_blockers,
                 positions=position_tuple,
             )
             connection.commit()

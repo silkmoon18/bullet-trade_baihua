@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime
 
 import pytest
@@ -177,6 +178,39 @@ def test_same_broker_trade_id_with_different_fill_is_rejected(services):
             2,
             sellable_from_trade_date=date(2026, 8, 11),
         )
+
+
+def test_later_known_fee_does_not_conflict_with_booked_unknown_fill(services):
+    repository, capital, booking = services
+    booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
+    original = _fill(
+        "f-1", "buy-1", OrderSide.BUY, 1000, commission="0",
+        broker_trade_id="T-1",
+    )
+    unknown = replace(
+        original,
+        fingerprint="fp-unknown",
+        commission_units=None,
+        tax_units=None,
+    )
+    later_known = replace(
+        original,
+        fingerprint="fp-known",
+        commission_units=money_to_units("5"),
+        tax_units=0,
+    )
+
+    first = booking.book_fill(
+        "good-etf", unknown, 1, sellable_from_trade_date=date(2026, 8, 11)
+    )
+    duplicate = booking.book_fill(
+        "good-etf", later_known, 0, sellable_from_trade_date=date(2026, 8, 11)
+    )
+
+    assert duplicate.duplicate is True
+    assert duplicate.account == first.account
+    assert repository.replay_account("good-etf") == first.account
 
 
 def test_sell_consumes_t1_lot_and_returns_real_proceeds(services):

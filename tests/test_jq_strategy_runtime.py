@@ -66,7 +66,7 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 9,
+        "api_version": 10,
         "profile_schema_version": 2,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -102,9 +102,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 9
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 10
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v9"
+        "bullet-trade-joinquant-runtime-helper-v10"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 2
 
@@ -251,6 +251,7 @@ def test_backtest_remote_validation_is_reused_after_runtime_reinstall(
         "performance_ready": True,
         "positions": {},
     })
+    assert portfolio.fees_known is True
 
     def ensure_account(initial_capital):
         calls.append(("ensure", initial_capital))
@@ -285,6 +286,64 @@ def test_backtest_remote_validation_is_reused_after_runtime_reinstall(
     ]
     assert first.state["remote_validation"] == second.state["remote_validation"]
     assert namespace["g"].bt_remote_validation["total_value"] == 10000
+
+
+def test_portfolio_view_preserves_unknown_remote_performance(helper):
+    portfolio = helper.PortfolioView({
+        "account_id": "paper",
+        "as_of": "2026-08-20T09:30:00",
+        "snapshot_version": "snapshot-unknown-fees",
+        "ledger_version": 2,
+        "cash": 8000,
+        "reserved_cash": 0,
+        "available_cash": 8000,
+        "positions_value": 2000,
+        "total_value": 10000,
+        "starting_cash": 10000,
+        "total_pnl": None,
+        "realized_pnl": None,
+        "unrealized_pnl": None,
+        "fees": None,
+        "fees_known": False,
+        "unknown_fee_fill_count": 1,
+        "nav": None,
+        "returns": None,
+        "performance_blockers": ["unknown_fill_fees"],
+        "performance_ready": False,
+        "positions": {},
+    })
+
+    assert portfolio.fees is None
+    assert portfolio.fees_known is False
+    assert portfolio.nav is None
+    assert portfolio.performance_blockers == ("unknown_fill_fees",)
+
+
+def test_portfolio_view_rejects_inconsistent_fee_status(helper):
+    payload = {
+        "account_id": "paper",
+        "as_of": "2026-08-20T09:30:00",
+        "snapshot_version": "bad-fees",
+        "ledger_version": 2,
+        "cash": 8000,
+        "reserved_cash": 0,
+        "available_cash": 8000,
+        "positions_value": 2000,
+        "total_value": 10000,
+        "starting_cash": 10000,
+        "total_pnl": None,
+        "realized_pnl": None,
+        "unrealized_pnl": None,
+        "fees": None,
+        "fees_known": True,
+        "nav": None,
+        "returns": None,
+        "performance_ready": False,
+        "positions": {},
+    }
+
+    with pytest.raises(RuntimeError, match="费用标记"):
+        helper.PortfolioView(payload)
 
 
 def test_runtime_facade_builds_round_lot_plan_and_logs_notification(

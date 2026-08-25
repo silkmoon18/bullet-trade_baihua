@@ -67,6 +67,16 @@ def test_verified_qmt_profile_can_use_order_mapping_for_trade_side(profile):
     require_strategy_ledger_v1(verified)
 
 
+def test_unknown_fee_capability_does_not_block_execution_evidence():
+    profile = replace(
+        _verified_profile(XTQUANT_DIRECT_CAPABILITIES),
+        fee_fields=CapabilityState.UNSUPPORTED,
+    )
+
+    assert strategy_ledger_v1_blockers(profile) == ()
+    require_strategy_ledger_v1(profile)
+
+
 def test_durable_local_history_can_replace_native_cross_day_query():
     verified_without_lookback = replace(
         _verified_profile(XTQUANT_DIRECT_CAPABILITIES),
@@ -183,10 +193,9 @@ def test_trade_without_matching_side_is_rejected():
         )
 
 
-@pytest.mark.parametrize(
-    "trade, message",
-    [
-        (
+def test_synthetic_trade_id_is_rejected():
+    with pytest.raises(BrokerContractError, match="missing or synthetic"):
+        normalize_trade_evidence(
             {
                 "trade_id": "synthetic-id",
                 "trade_id_source": "synthetic",
@@ -199,30 +208,31 @@ def test_trade_without_matching_side_is_rejected():
                 "tax": 0,
                 "time": "2026-08-10 10:00:00",
             },
-            "missing or synthetic",
-        ),
-        (
-            {
-                "trade_id": "T-1",
-                "trade_id_source": "broker",
-                "order_id": "O-1",
-                "security": "510050.XSHG",
-                "amount": 100,
-                "price": 2.5,
-                "side": "BUY",
-                "commission_fee": 0,
-                "commission_known": False,
-                "tax": 0,
-                "tax_known": True,
-                "time": "2026-08-10 10:00:00",
-            },
-            "fee fields are incomplete",
-        ),
-    ],
-)
-def test_synthetic_trade_id_and_missing_fee_evidence_are_rejected(trade, message):
-    with pytest.raises(BrokerContractError, match=message):
-        normalize_trade_evidence(trade, {})
+            {},
+        )
+
+
+def test_missing_fee_evidence_is_preserved_as_unknown():
+    evidence = normalize_trade_evidence(
+        {
+            "trade_id": "T-1",
+            "trade_id_source": "broker",
+            "order_id": "O-1",
+            "security": "510050.XSHG",
+            "amount": 100,
+            "price": 2.5,
+            "side": "BUY",
+            "commission_fee": 0,
+            "commission_known": False,
+            "tax": 0,
+            "tax_known": True,
+            "time": "2026-08-10 10:00:00",
+        },
+        {},
+    )
+
+    assert evidence.commission_units is None
+    assert evidence.tax_units == 0
 
 
 @pytest.mark.parametrize(

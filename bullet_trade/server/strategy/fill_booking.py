@@ -74,6 +74,27 @@ def _trade_value_units(price_units: int, quantity: int) -> int:
     return _round_div(price_units * quantity * MONEY_SCALE, PRICE_SCALE)
 
 
+def _known_fee_units(fill: BrokerFill) -> int:
+    return (fill.commission_units or 0) + (fill.tax_units or 0)
+
+
+def _fee_notification_detail(fill: BrokerFill) -> str:
+    def display(label: str, value: Optional[int]) -> str:
+        if value is None:
+            return "{} 未知".format(label)
+        return "{} ¥{}".format(label, money_units_to_display(value))
+
+    detail = "；".join(
+        (
+            display("佣金", fill.commission_units),
+            display("税费", fill.tax_units),
+        )
+    )
+    if fill.commission_units is None or fill.tax_units is None:
+        detail += "；成交金额仅计已知费用"
+    return detail
+
+
 def _cost_price_units(total_cost_units: int, quantity: int) -> int:
     return _round_div(total_cost_units * PRICE_SCALE, quantity * MONEY_SCALE)
 
@@ -378,15 +399,17 @@ class SQLiteFillBookingService:
                 raise FillConflictError("fill quantity exceeds requested quantity")
 
             gross_units = _trade_value_units(fill.price_units, fill.quantity)
-            fee_units = fill.commission_units + fill.tax_units
+            fee_units = _known_fee_units(fill)
+            stored_commission_units = fill.commission_units or 0
+            stored_tax_units = fill.tax_units or 0
             timestamp = _timestamp()
             connection.execute(
                 """
                 INSERT INTO fills(
                     fill_id, order_id, broker_trade_id, fill_fingerprint,
                     security, side, quantity, price_units, commission_units,
-                    tax_units, traded_at, booked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tax_units, commission_known, tax_known, traded_at, booked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fill.fill_id,
@@ -397,8 +420,10 @@ class SQLiteFillBookingService:
                     fill.side.value,
                     fill.quantity,
                     fill.price_units,
-                    fill.commission_units,
-                    fill.tax_units,
+                    stored_commission_units,
+                    stored_tax_units,
+                    int(fill.commission_units is not None),
+                    int(fill.tax_units is not None),
                     fill.traded_at.isoformat(),
                     timestamp,
                 ),
@@ -493,6 +518,8 @@ class SQLiteFillBookingService:
                 "gross_units": gross_units,
                 "commission_units": fill.commission_units,
                 "tax_units": fill.tax_units,
+                "commission_known": fill.commission_units is not None,
+                "tax_known": fill.tax_units is not None,
                 "reservation_released_units": reservation_released,
                 "realized_pnl_units": realized_pnl_units,
             }
@@ -555,9 +582,7 @@ class SQLiteFillBookingService:
                     ),
                     order_id=fill.order_id,
                     trade_id=fill.broker_trade_id,
-                    detail="佣金及税费 ¥{}".format(
-                        money_units_to_display(fee_units)
-                    ),
+                    detail=_fee_notification_detail(fill),
                     occurred_at=fill.traded_at,
                 )
             )
@@ -724,25 +749,36 @@ class SQLiteFillBookingService:
             fill.fill_id,
             fill.order_id,
             fill.broker_trade_id,
-            fill.fingerprint,
             fill.security,
             fill.side.value,
             fill.quantity,
             fill.price_units,
-            fill.commission_units,
-            fill.tax_units,
             fill.traded_at.isoformat(),
         )
         actual = tuple(
             row[name]
             for name in (
-                "fill_id", "order_id", "broker_trade_id", "fill_fingerprint",
-                "security", "side", "quantity", "price_units",
-                "commission_units", "tax_units", "traded_at",
+                "fill_id", "order_id", "broker_trade_id", "security", "side",
+                "quantity", "price_units", "traded_at",
             )
         )
-        if actual != expected:
+        if actual != expected or (
+            fill.broker_trade_id is None
+            and row["fill_fingerprint"] != fill.fingerprint
+        ):
             raise FillConflictError("broker fill id was reused with different fields")
+        for units_field, known_field, incoming in (
+            ("commission_units", "commission_known", fill.commission_units),
+            ("tax_units", "tax_known", fill.tax_units),
+        ):
+            if (
+                row[known_field]
+                and incoming is not None
+                and row[units_field] != incoming
+            ):
+                raise FillConflictError(
+                    "broker fill id was reused with different known fees"
+                )
         return cast(sqlite3.Row, row)
 
     def _book_buy_position(

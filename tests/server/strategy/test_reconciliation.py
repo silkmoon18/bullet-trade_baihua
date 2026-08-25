@@ -156,6 +156,73 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert account.cash_units == money_to_units("7995")
 
 
+def test_unknown_fee_fill_is_booked_and_small_cash_gap_is_tolerated(tmp_path):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    trade = dict(_broker_trade())
+    trade.update(
+        {
+            "commission_fee": 0.0,
+            "commission_known": False,
+            "tax": 0.0,
+            "tax_known": False,
+        }
+    )
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "7995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),),
+            trades=(trade,),
+        ),
+    )
+
+    assert result.state is ReconciliationState.READY
+    assert result.details["unknown_fee_order_count"] == 1
+    assert result.details["broker_cash_shortfall_units"] == money_to_units("5")
+    assert result.details["unknown_fee_cash_tolerance_units"] == money_to_units("5")
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("8000")
+    connection = connect_database(database)
+    try:
+        fee_row = connection.execute(
+            "SELECT commission_known, tax_known FROM fills"
+        ).fetchone()
+        assert tuple(fee_row) == (0, 0)
+    finally:
+        connection.close()
+
+
+def test_unknown_fee_cash_gap_beyond_configured_tolerance_blocks(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    trade = dict(_broker_trade())
+    trade.update({"commission_known": False, "tax_known": False})
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "7994.99",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),),
+            trades=(trade,),
+        ),
+    )
+
+    assert result.state is ReconciliationState.BLOCKED
+    assert any(
+        blocker.startswith("broker_cash_insufficient:")
+        for blocker in result.details["blockers"]
+    )
+
+
 def test_unrelated_broker_order_is_ignored_in_shared_account(tmp_path):
     _, repository, _, reconciliation = _services(tmp_path)
     snapshot = _snapshot(

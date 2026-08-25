@@ -268,16 +268,18 @@ class BrokerFill:
     side: OrderSide
     quantity: int
     price_units: int
-    commission_units: int
-    tax_units: int
+    commission_units: Optional[int]
+    tax_units: Optional[int]
     traded_at: datetime
     broker_trade_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         _require_int(self.quantity, "quantity", minimum=1)
         _require_int(self.price_units, "price_units", minimum=1)
-        _require_int(self.commission_units, "commission_units")
-        _require_int(self.tax_units, "tax_units")
+        if self.commission_units is not None:
+            _require_int(self.commission_units, "commission_units")
+        if self.tax_units is not None:
+            _require_int(self.tax_units, "tax_units")
         object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 

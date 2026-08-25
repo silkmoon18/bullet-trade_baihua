@@ -48,7 +48,7 @@ booking.finalize_order(
 4. `positions`和`position_lots`；
 5. ledger entry与strategy event。
 
-任一写入失败都会全部回滚。买入lot成本包含该fill的佣金和税费，lot时间使用券商真实`traded_at`，因此同日乱序到达的fill仍按成交时间FIFO；卖出净回款扣除佣金和税费，已实现盈亏保存在fill账本事件中。
+任一写入失败都会全部回滚。买入lot成本包含该fill中已知的佣金和税费，lot时间使用券商真实`traded_at`，因此同日乱序到达的fill仍按成交时间FIFO；卖出净回款扣除已知费用，已实现盈亏保存在fill账本事件中。`fills.commission_known/tax_known`单独保存费用完整性；缺失值的数值列只用于内部暂估运算，外部API不会把它展示成真实0。存在未知费用时现金、成本和资产为暂估值，绩效字段保持不可用。
 
 ## 当前边界
 

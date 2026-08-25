@@ -120,12 +120,15 @@ class PortfolioView:
     positions_value: float
     total_value: float
     starting_cash: float
-    total_pnl: float
-    realized_pnl: float
-    unrealized_pnl: float
-    fees: float
-    nav: float
-    returns: float
+    total_pnl: Optional[float]
+    realized_pnl: Optional[float]
+    unrealized_pnl: Optional[float]
+    fees: Optional[float]
+    fees_known: bool
+    unknown_fee_fill_count: int
+    nav: Optional[float]
+    returns: Optional[float]
+    performance_blockers: Tuple[str, ...]
     performance_ready: bool
     positions: Dict[str, PositionView]
 

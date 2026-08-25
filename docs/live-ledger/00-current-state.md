@@ -62,7 +62,7 @@ bullet-trade/
 - `helpers/bullet_trade_jq_remote_helper.py` 作为上传到聚宽研究目录的单文件helper。
 - 聚宽负责选股、取数、触发下单和日志展示。
 
-L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真实组合视图；当前API v9进一步提供`JoinQuantRuntime`统一门面、买卖侧可独立声明的不可变执行请求和多策略配置v2。策略不再包含连接、协议、重启恢复或QMT回调代码；按D021，helper运行在用户自有可信策略进程中。
+L00先将helper精简为安装契约；L03增加StrategyLedger短连接RPC和真实组合视图；当前API v10进一步提供`JoinQuantRuntime`统一门面、买卖侧可独立声明的不可变执行请求、多策略配置v2和未知费用视图。策略不再包含连接、协议、重启恢复或QMT回调代码；按D021，helper运行在用户自有可信策略进程中。
 
 三种有效执行语义：
 
@@ -186,9 +186,9 @@ L00精简运行契约已经处理：
 | `bt.order_target_sync(...)` | 上游helper无此扩展 | 已移除；生产由组合执行状态机异步完成 |
 | `bt.order_target_value_sync(...)` | 上游helper无此扩展 | 已移除；生产改为TargetPortfolioIntent |
 
-回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v9和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
+回测继续BACKTEST原生运行，JQ走聚宽原生模拟订单并发送目标买入卡片，QMT_REMOTE通过helper v10和StrategyLedger运行。服务端交易开关默认关闭；真实QMT、JQ模拟和小额资金验收不可由mock替代。
 
-当前策略只保留一次`install_joinquant_runtime`调用；模式解析、API版本校验、状态发布、远程预检、通知容错和聚宽/QMT订单门面均由helper v9负责。策略交易入口只调用`JoinQuantRuntime`，`initialize`与`process_initialize`的首条可执行语句均为runtime安装。历史逐轮审查见`archive/`归档。
+当前策略只保留一次`install_joinquant_runtime`调用；模式解析、API版本校验、状态发布、远程预检、通知容错和聚宽/QMT订单门面均由helper v10负责。策略交易入口只调用`JoinQuantRuntime`，`initialize`与`process_initialize`的首条可执行语句均为runtime安装。历史逐轮审查见`archive/`归档。
 
 ## 7. 安全现状
 

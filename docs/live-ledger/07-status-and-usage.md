@@ -10,7 +10,7 @@
 - 私有profile只读校验不会执行、复制、hash或输出其中的host/token等值。
 - BACKTEST使用聚宽历史撮合；JQ使用聚宽模拟账户和原生订单，同时发送目标计划通知；QMT_REMOTE使用服务器真实PortfolioView和一次组合目标。
 - 已具备真实券商可用现金校准、初始1万元单次分配、按订单冻结/释放和显式增减资的事务服务。
-- 已具备按真实买卖成交更新现金、订单冻结、持仓lot、费用和已实现盈亏的事务服务，重复fill不会重复入账。
+- 已具备按真实买卖成交更新现金、订单冻结、持仓lot、费用和已实现盈亏的事务服务，重复fill不会重复入账；费用字段缺失时保留`UNKNOWN`，不伪造为0。
 - 已具备基于新鲜行情的现金、持仓市值、总资产、NAV、费用和盈亏原子快照，可作为后续聚宽组合视图数据源。
 - MiniQMT包装账户快照已统一解包；提交响应未知的订单可按完整`client_tag`自动认领。
 - 目标权重按总资产计算，现金缓冲只在实际买入检查时执行；QMT_REMOTE每次调用明确携带买卖两侧的执行类型、追单和改价策略。GoodETF调仓卖出使用交易所市价IOC，买入使用0.2%条件边界限价。
@@ -46,7 +46,7 @@ VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
 ```
 
-v9 helper在所有模式均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
+v10 helper在所有模式均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
 
 先运行校验：
 
@@ -68,9 +68,9 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### QMT_REMOTE
 
-把私有配置中的`STRATEGIES["good_etf_remote"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`，启用时还必须把精确策略ID加入`QMT_STRATEGY_ENABLED_IDS`。必须上传v9 helper和私有配置；启动时真实资金不足、能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+把私有配置中的`STRATEGIES["good_etf_remote"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`，启用时还必须把精确策略ID加入`QMT_STRATEGY_ENABLED_IDS`。必须上传v10 helper和私有配置；启动时真实资金不足、订单归属能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
-`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前仅按服务器的保守费用缓冲预留现金，成交后只接受QMT/券商明确返回的实际费用，并通过StrategyLedger的`fees`和聚宽`real_fees`指标展示；不得用聚宽模拟佣金覆盖真实费用。迅投官方标准股票`XtTrade`结构没有佣金字段，部分柜台或扩展版本可能补充`commission_fee`、`commission`或`used_commission`，因此必须通过目标账户的`query_data(..., data_type='deal')`或小额成交证明费用字段可用。
+`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。任一成交的佣金或税费缺失时，账本继续维护现金、持仓与订单，但`fees/NAV/returns/PnL`明确为未知，聚宽只记录真实现金、总资产和持仓市值；待费用可证明前不能把这些暂估资产解释为精确绩效。迅投官方标准股票`XtTrade`结构没有佣金字段，部分柜台或扩展版本可能补充`commission_fee`、`commission`或`used_commission`。
 
 ### 每次调用的执行参数
 

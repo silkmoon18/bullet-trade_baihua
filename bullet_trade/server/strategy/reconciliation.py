@@ -271,11 +271,20 @@ class SQLiteReconciliationService:
         notification_handler=None,
         require_verified_capabilities: bool = True,
         durable_broker_history: bool = False,
+        unknown_fee_tolerance_units_per_order: int = money_to_units("5"),
     ) -> None:
+        if (
+            type(unknown_fee_tolerance_units_per_order) is not int
+            or unknown_fee_tolerance_units_per_order < 0
+        ):
+            raise ValueError("unknown fee tolerance must be a non-negative integer")
         self.database_path = Path(database_path)
         self.capabilities = capabilities
         self.require_verified_capabilities = bool(require_verified_capabilities)
         self.durable_broker_history = bool(durable_broker_history)
+        self.unknown_fee_tolerance_units_per_order = (
+            unknown_fee_tolerance_units_per_order
+        )
         self._ledger = SQLiteStrategyRepository(database_path)
         self._booking = SQLiteFillBookingService(
             database_path,
@@ -445,7 +454,14 @@ class SQLiteReconciliationService:
         required_cash, owned_positions = self._ledger_view(
             account_id, physical_account_id, snapshot.as_of
         )
-        if snapshot.available_cash_units < required_cash:
+        unknown_fee_order_count = self._unknown_fee_order_count(physical_account_id)
+        unknown_fee_cash_tolerance = (
+            unknown_fee_order_count * self.unknown_fee_tolerance_units_per_order
+        )
+        broker_cash_shortfall = max(
+            0, required_cash - snapshot.available_cash_units
+        )
+        if broker_cash_shortfall > unknown_fee_cash_tolerance:
             blockers.append(
                 "broker_cash_insufficient:strategy_required={}:broker={}".format(
                     required_cash, snapshot.available_cash_units
@@ -478,6 +494,9 @@ class SQLiteReconciliationService:
             "ignored_broker_order_count": ignored_broker_order_count,
             "ignored_broker_trade_count": ignored_broker_trade_count,
             "strategy_required_cash_units": required_cash,
+            "broker_cash_shortfall_units": broker_cash_shortfall,
+            "unknown_fee_order_count": unknown_fee_order_count,
+            "unknown_fee_cash_tolerance_units": unknown_fee_cash_tolerance,
             "strategy_owned_position_count": len(owned_positions),
             "capability_verification_required": self.require_verified_capabilities,
             "durable_broker_history": self.durable_broker_history,
@@ -612,6 +631,27 @@ class SQLiteReconciliationService:
         except BaseException:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def _unknown_fee_order_count(self, physical_account_id: str) -> int:
+        connection = connect_database(self.database_path)
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT f.order_id)
+                FROM fills f
+                JOIN strategy_orders o ON o.order_id = f.order_id
+                JOIN strategy_accounts a
+                  ON a.strategy_account_id = o.strategy_account_id
+                WHERE a.physical_account_id = ?
+                  AND (f.commission_known = 0 OR f.tax_known = 0)
+                """,
+                (physical_account_id,),
+            ).fetchone()
+            return cast(int, row[0])
+        except sqlite3.DatabaseError as exc:
+            raise RepositoryError("failed to inspect unknown broker fees") from exc
         finally:
             connection.close()
 

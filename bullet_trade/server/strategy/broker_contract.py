@@ -147,7 +147,6 @@ def strategy_ledger_v1_blockers(
         ("stable_order_id", profile.stable_order_id),
         ("stable_trade_id", profile.stable_trade_id),
         ("trade_order_link", profile.trade_order_link),
-        ("fee_fields", profile.fee_fields),
         ("order_status", profile.order_status),
         ("current_orders_query", profile.current_orders_query),
         ("current_trades_query", profile.current_trades_query),
@@ -194,8 +193,8 @@ class BrokerTradeEvidence:
     side: OrderSide
     quantity: int
     price_units: int
-    commission_units: int
-    tax_units: int
+    commission_units: Optional[int]
+    tax_units: Optional[int]
     traded_at: datetime
 
     def __post_init__(self) -> None:
@@ -205,10 +204,14 @@ class BrokerTradeEvidence:
             raise ValueError("broker trade quantity must be a positive integer")
         if type(self.price_units) is not int or self.price_units <= 0:
             raise ValueError("broker trade price must be a positive integer")
-        if type(self.commission_units) is not int or self.commission_units < 0:
-            raise ValueError("broker trade commission must be a non-negative integer")
-        if type(self.tax_units) is not int or self.tax_units < 0:
-            raise ValueError("broker trade tax must be a non-negative integer")
+        if self.commission_units is not None and (
+            type(self.commission_units) is not int or self.commission_units < 0
+        ):
+            raise ValueError("broker trade commission must be non-negative or unknown")
+        if self.tax_units is not None and (
+            type(self.tax_units) is not int or self.tax_units < 0
+        ):
+            raise ValueError("broker trade tax must be non-negative or unknown")
         object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 
@@ -232,19 +235,24 @@ def _side_from_row(row: Mapping[str, object]) -> Optional[OrderSide]:
     return None
 
 
-def _known_fee(
+def _optional_fee(
     row: Mapping[str, object],
     known_key: str,
     value_keys: Tuple[str, ...],
-) -> object:
+) -> Optional[int]:
     known = row.get(known_key)
     if known is False:
-        raise BrokerContractError("broker trade fee fields are incomplete")
+        return None
     for key in value_keys:
         if key in row and row.get(key) is not None:
             if known is None or known is True:
-                return row.get(key)
-    raise BrokerContractError("broker trade fee fields are incomplete")
+                units = _broker_money_to_units(row.get(key))
+                if units < 0:
+                    raise BrokerContractError("broker trade fees cannot be negative")
+                return units
+    if known is True:
+        raise BrokerContractError("broker trade fee is marked known but has no value")
+    return None
 
 
 def _decimal_input(value: object) -> Union[str, int, Decimal]:
@@ -354,16 +362,12 @@ def normalize_trade_evidence(
     if side is None:
         raise BrokerContractError("broker trade side cannot be mapped to its order")
 
-    commission = _known_fee(
+    commission_units = _optional_fee(
         trade,
         "commission_known",
         ("commission_fee", "commission"),
     )
-    tax = _known_fee(trade, "tax_known", ("tax", "stamp_tax"))
-    commission_units = _broker_money_to_units(commission)
-    tax_units = _broker_money_to_units(tax)
-    if commission_units < 0 or tax_units < 0:
-        raise BrokerContractError("broker trade fees cannot be negative")
+    tax_units = _optional_fee(trade, "tax_known", ("tax", "stamp_tax"))
     traded_at = _broker_trade_time(trade.get("time") or trade.get("trade_time"))
     return BrokerTradeEvidence(
         broker_trade_id=trade_id,

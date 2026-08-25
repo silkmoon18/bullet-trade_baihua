@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 # ===== 部署契约 =====
 VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf'
-_EXPECTED_RUNTIME_API_VERSION = 9
+_EXPECTED_RUNTIME_API_VERSION = 10
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 ExecutionMode = bt.RuntimeMode
 
@@ -503,5 +503,17 @@ def after_market_check(context: 'Context') -> None:
             position.avg_cost,
             position.price))
     if _runtime.mode is ExecutionMode.QMT_REMOTE:
-        log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
-            portfolio.nav, portfolio.returns, portfolio.fees))
+        if portfolio.performance_ready:
+            assert portfolio.nav is not None
+            assert portfolio.returns is not None
+            assert portfolio.fees is not None
+            log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
+                portfolio.nav, portfolio.returns, portfolio.fees))
+        else:
+            fee_display = '未知'
+            if portfolio.fees_known:
+                assert portfolio.fees is not None
+                fee_display = '{:.2f}'.format(portfolio.fees)
+            log.info('真实指标 | 暂不可用 | 费用={} | 原因={}'.format(
+                fee_display,
+                ','.join(portfolio.performance_blockers)))

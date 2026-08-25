@@ -13,6 +13,7 @@ from bullet_trade.server.strategy import (
     OrderState,
     SQLiteCapitalService,
     SQLiteFillBookingService,
+    SQLiteStrategyAPI,
     SQLiteStrategyRepository,
     SQLiteValuationService,
     ValuationReadinessError,
@@ -144,6 +145,46 @@ def test_buy_snapshot_uses_real_cash_fees_and_mark(ledger_services):
     assert snapshot.total_pnl_units == money_to_units("495")
     assert snapshot.positions[0].remaining_cost_units == money_to_units("2005")
     assert snapshot.positions[0].sellable_qty == 1000
+
+
+def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
+    _, _, capital, booking, valuation = ledger_services
+    booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
+    fill = _fill("f-buy", "buy-1", OrderSide.BUY, 1000, "2", "0")
+    fill = BrokerFill(
+        fill_id=fill.fill_id,
+        order_id=fill.order_id,
+        fingerprint=fill.fingerprint,
+        broker_trade_id=fill.broker_trade_id,
+        security=fill.security,
+        side=fill.side,
+        quantity=fill.quantity,
+        price_units=fill.price_units,
+        commission_units=None,
+        tax_units=None,
+        traded_at=fill.traded_at,
+    )
+    booking.book_fill(
+        "good-etf", fill, 1, sellable_from_trade_date=date(2026, 8, 11)
+    )
+
+    snapshot = valuation.create_snapshot(
+        "good-etf", {SECURITY: _mark()}, AS_OF, timedelta(minutes=1)
+    )
+
+    assert snapshot.cash_units == money_to_units("8000")
+    assert snapshot.fees_units == 0
+    assert snapshot.fees_known is False
+    assert snapshot.unknown_fee_fill_count == 1
+    assert snapshot.performance_ready is False
+    assert snapshot.performance_blockers == ("unknown_fill_fees",)
+    payload = SQLiteStrategyAPI._snapshot_payload(snapshot)
+    assert payload["fees"] is None
+    assert payload["fees_known"] is False
+    assert payload["nav"] is None
+    assert payload["returns"] is None
+    assert payload["total_pnl"] is None
 
 
 def test_sell_snapshot_reconciles_realized_and_unrealized_pnl(ledger_services):

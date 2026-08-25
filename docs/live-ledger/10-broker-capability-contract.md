@@ -20,7 +20,7 @@
 | trade关联order ID | PROBE_REQUIRED | PROBE_REQUIRED | 缺失时无法安全确定归属和方向 |
 | trade直接提供side | UNSUPPORTED | UNSUPPORTED | 当前统一返回不承诺；允许按同一order ID映射 |
 | order提供可映射side | PROBE_REQUIRED | PROBE_REQUIRED | trade缺side时必须额外验证该能力，只有order ID关联仍不够 |
-| commission/tax字段 | PROBE_REQUIRED | PROBE_REQUIRED | 明确返回0才是零费用；字段缺失不能按0入账 |
+| commission/tax字段 | PROBE_REQUIRED | PROBE_REQUIRED | 明确返回0才是零费用；字段缺失以`UNKNOWN`入账，不再伪造成0 |
 | 订单状态 | PROBE_REQUIRED | PROBE_REQUIRED | 需要覆盖部分成交、已成、已撤和拒单 |
 | 当前orders/trades查询 | PROBE_REQUIRED | PROBE_REQUIRED | 路径存在，真实返回范围待探针 |
 | working orders查询 | PROBE_REQUIRED | PROBE_REQUIRED | 必须在重启后仍能恢复在途单 |
@@ -34,9 +34,13 @@
 未完成状态不会被误当作仍在挂单。
 
 手续费字段与历史留存是两项独立能力。字段缺失时保持 `*_known=false`，不能因为
-本地保存成功就把未知费用改成 0 或宣称费用能力已验证。
+本地保存成功就把未知费用改成 0 或宣称费用能力已验证。费用完整性不再阻断订单、
+成交归属和持仓同步；但只要任一成交费用未知，`fees/NAV/returns/PnL`就返回`null`，
+`performance_ready=false`。现金与成本只计已知费用，因此是可交易的暂估账，不是精确绩效账。
 
-因此当前两个静态profile都会被`require_strategy_ledger_v1()`拒绝，这是正确状态；S19在目标QMT模拟环境执行探针并保存证据后，才能把对应项提升为`SUPPORTED`。
+当前两个静态profile仍会因订单标识、归属、状态和查询能力未经验证而被
+`require_strategy_ledger_v1()`拒绝；费用能力本身不再是执行硬门槛。S19在目标QMT
+模拟环境执行探针并保存证据后，才能把实际观察到的对应项提升为`SUPPORTED`。
 
 ## 成交证据规则
 
@@ -45,7 +49,7 @@
 1. 必须有来源标记为`broker`的原生成交号和broker order ID。
 2. 必须有证券、正成交数量和正成交价格。
 3. side优先取成交记录；缺失时只按broker order ID读取已验证含side的对应订单，不能按证券、数量或价格猜测。
-4. commission和tax字段必须真实存在且可解析为非负数，显式`0`有效，字段缺失或无效不能默认成0。
+4. commission和tax字段真实存在时必须可解析为非负数，显式`0`有效；字段缺失保存为`None/UNKNOWN`，不能默认成真实0。
 5. 同一原生成交号的完全相同重复记录归并为一条；经济字段冲突则报错。
 
 MiniQMT现有兼容代码在缺少原生成交号时仍生成合成ID用于日志和旧接口，同时新增`trade_id_source='synthetic'`。StrategyLedger合同会拒绝这种记录。MiniQMT与BigQMT规范化结果也新增`commission_known`和`tax_known`，避免把“字段缺失后默认0”误当成真实零费用。
@@ -59,4 +63,4 @@ S19至少需要用目标账户完成一次可撤委托和一次小额成交，�
 - 费用字段明确出现，零费用品种也返回明确的0；
 - working order及前一交易日orders/trades可查询。
 
-探针失败只表示当前QMT/网关配置不满足合同，不应通过代码猜测或自动补零绕过。
+探针未发现费用字段时保持费用能力为`false`和费用指标未知；不得通过猜测或自动补零把绩效标成精确。
