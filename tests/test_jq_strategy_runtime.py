@@ -66,7 +66,7 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 def _state(mode, run_type, **extra):
     state = {
-        "api_version": 10,
+        "api_version": 11,
         "profile_schema_version": 2,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -102,9 +102,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 10
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 11
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v10"
+        "bullet-trade-joinquant-runtime-helper-v11"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 2
 
@@ -513,8 +513,10 @@ def test_namespace_must_be_plain_dict(helper):
             _install(helper, candidate)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, "9", True, None])
-def test_expected_api_version_must_equal_nine(helper, version):
+@pytest.mark.parametrize(
+    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "11", True, None]
+)
+def test_expected_api_version_must_equal_eleven(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -930,6 +932,32 @@ def test_cancel_runtime_targets_clears_confirmed_remote_intent(
     assert calls == [
         ("strategy.cancel_intent", {"intent_id": "intent-1"})
     ]
+
+
+@pytest.mark.parametrize("terminal_state", ["COMPLETED", "CANCELED", "FAILED"])
+def test_advance_runtime_targets_clears_every_terminal_result(
+    helper, monkeypatch, terminal_state
+):
+    _profile_module(monkeypatch)
+    _install(helper, mode="QMT_REMOTE")
+    helper._runtime_target_state = {
+        "intent_id": "intent-1",
+        "idempotency_key": "open-20260826",
+        "weights": {"510300.XSHG": 0.95},
+        "marks": {"510300.XSHG": 4.0},
+        "execution": helper.ExecutionRequest(),
+    }
+    monkeypatch.setattr(
+        helper, "get_intent", lambda intent_id: {"state": "EXECUTING"}
+    )
+    monkeypatch.setattr(
+        helper,
+        "submit_runtime_targets",
+        lambda *args, **kwargs: {"intent": {"state": terminal_state}},
+    )
+
+    assert helper.advance_runtime_targets(object()) is True
+    assert helper._runtime_target_state is None
 
 
 def test_notify_target_buy_plan_uses_jq_mode_and_no_retry_after_send(

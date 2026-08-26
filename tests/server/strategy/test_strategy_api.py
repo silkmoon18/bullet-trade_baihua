@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import pytest
 
+import bullet_trade.server.strategy.api as strategy_api_module
 from bullet_trade.server.config import AccountConfig
 from bullet_trade.server.adapters.base import AccountContext
 from bullet_trade.server.strategy import (
@@ -381,7 +382,15 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
 
 
 @pytest.mark.asyncio
-async def test_conditional_target_is_resumed_by_native_tick_callback(tmp_path):
+async def test_conditional_target_is_resumed_by_native_tick_callback(
+    tmp_path, monkeypatch
+):
+    log_messages = []
+    monkeypatch.setattr(
+        strategy_api_module.logger,
+        "info",
+        lambda message, *args: log_messages.append(message % args),
+    )
     broker = FakeBroker()
     data = CallbackData()
     service = SQLiteStrategyAPI(
@@ -423,12 +432,23 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(tmp_path):
     assert broker.order_calls == 0
     assert data.subscriptions == [(SECURITY,)]
 
+    # xtdata.subscribe_quote sends {stock: [tick, ...]}.  The first tick
+    # reaches the fixed boundary while the later tick moves back outside it;
+    # the crossing must not be lost when the callback contains a batch.
     data.emit(
         {
-            "stockCode": "510050.SH",
-            "lastPrice": 10.0,
-            "bidPrice": [9.99],
-            "askPrice": [10.01],
+            "510050.SH": [
+                {
+                    "lastPrice": 10.0,
+                    "bidPrice": [9.99],
+                    "askPrice": [10.01],
+                },
+                {
+                    "lastPrice": 10.03,
+                    "bidPrice": [10.02],
+                    "askPrice": [10.03],
+                },
+            ]
         }
     )
     for _ in range(100):
@@ -437,6 +457,9 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(tmp_path):
         await asyncio.sleep(0.01)
 
     assert broker.order_calls == 1
+    assert log_messages == [
+        "StrategyLedger 首次收到执行行情 | 510050.XSHG"
+    ]
 
 
 @pytest.mark.asyncio

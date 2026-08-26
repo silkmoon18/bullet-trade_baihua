@@ -74,8 +74,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 10
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v10"
+STRATEGY_RUNTIME_API_VERSION = 11
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v11"
 PROFILE_SCHEMA_VERSION = 2
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 
@@ -119,6 +119,7 @@ _active_state = None  # type: Optional[Dict[str, Any]]
 _active_profile = None  # type: Optional[Dict[str, Any]]
 _active_namespace = None  # type: Optional[Dict[str, Any]]
 _runtime_target_state = None  # type: Optional[Dict[str, Any]]
+_TERMINAL_INTENT_STATES = frozenset({"COMPLETED", "CANCELED", "FAILED"})
 
 
 class ExecutionType(str, Enum):
@@ -684,9 +685,7 @@ def _restore_runtime_targets() -> None:
         _runtime_target_state = None
         return
     intent = get_intent()
-    if not intent or intent.get("state") in (
-        "COMPLETED", "CANCELED", "FAILED"
-    ):
+    if not intent or intent.get("state") in _TERMINAL_INTENT_STATES:
         _runtime_target_state = None
         return
     raw_execution = intent.get("execution")
@@ -768,7 +767,7 @@ def advance_runtime_targets(context: Any) -> bool:
     if _runtime_target_state is None:
         return True
     intent = get_intent(_runtime_target_state["intent_id"])
-    if intent.get("state") in ("COMPLETED", "CANCELED", "FAILED"):
+    if intent.get("state") in _TERMINAL_INTENT_STATES:
         _runtime_target_state = None
         return True
     result = submit_runtime_targets(
@@ -778,7 +777,7 @@ def advance_runtime_targets(context: Any) -> bool:
         _runtime_target_state["idempotency_key"],
         _runtime_target_state["execution"],
     )
-    if result["intent"]["state"] == "COMPLETED":
+    if result["intent"]["state"] in _TERMINAL_INTENT_STATES:
         _runtime_target_state = None
         return True
     return False

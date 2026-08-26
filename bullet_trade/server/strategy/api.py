@@ -111,6 +111,7 @@ class SQLiteStrategyAPI:
         self._event_loop = None
         self._runtime_bindings = {}
         self._quote_cache = {}
+        self._seen_tick_symbols = set()
         self._resume_locks = {}
         self._background_tasks = set()
         self.repository = SQLiteStrategyRepository(self.database_path)
@@ -694,10 +695,17 @@ class SQLiteStrategyAPI:
                 ),
             )
             self._quote_cache[security] = quote
-            self._schedule_background(self._handle_quote(security))
+            if security not in self._seen_tick_symbols:
+                self._seen_tick_symbols.add(security)
+                logger.info(
+                    "StrategyLedger 首次收到执行行情 | %s", security
+                )
+            self._schedule_background(self._handle_quote(security, quote))
 
-    async def _handle_quote(self, security: str) -> None:
-        quote = self._quote_cache.get(security)
+    async def _handle_quote(
+        self, security: str, quote: Optional[MarketQuote] = None
+    ) -> None:
+        quote = quote or self._quote_cache.get(security)
         if quote is None:
             return
         for intent in self.planner.active_intents():
@@ -711,7 +719,9 @@ class SQLiteStrategyAPI:
                 intent.intent_id, security, quote
             ):
                 continue
-            await self._resume_intent(intent.intent_id)
+            await self._resume_intent(
+                intent.intent_id, {security: quote}
+            )
 
     async def _handle_broker_event(
         self, account_key: str, event: str
@@ -737,20 +747,31 @@ class SQLiteStrategyAPI:
                     await self._resume_intent_locked(intent.intent_id)
                 await self._sync_quote_subscriptions(strategy_id)
 
-    async def _resume_intent(self, intent_id: str) -> None:
+    async def _resume_intent(
+        self,
+        intent_id: str,
+        quote_overrides: Optional[Mapping[str, MarketQuote]] = None,
+    ) -> None:
         intent = self.planner.get_intent(intent_id)
         lock = self._resume_locks.get(intent.account_id)
         if lock is None:
             return
         async with lock:
-            await self._resume_intent_locked(intent_id)
+            await self._resume_intent_locked(intent_id, quote_overrides)
 
-    async def _resume_intent_locked(self, intent_id: str) -> None:
+    async def _resume_intent_locked(
+        self,
+        intent_id: str,
+        quote_overrides: Optional[Mapping[str, MarketQuote]] = None,
+    ) -> None:
         intent = self.planner.get_intent(intent_id)
         binding = self._runtime_bindings.get(intent.account_id)
         if binding is None:
             return
         now = datetime.now(SHANGHAI_TZ)
+        execution_quotes = dict(self._quote_cache)
+        if quote_overrides:
+            execution_quotes.update(quote_overrides)
         references = self.planner.reference_prices(intent_id)
         if (
             intent.execution_request.repricing
@@ -758,9 +779,9 @@ class SQLiteStrategyAPI:
         ):
             references = {
                 security: (
-                    self._quote_cache[security].last_price_units
-                    if security in self._quote_cache
-                    and self._quote_cache[security].last_price_units
+                    execution_quotes[security].last_price_units
+                    if security in execution_quotes
+                    and execution_quotes[security].last_price_units
                     is not None
                     else price_units
                 )
@@ -788,7 +809,7 @@ class SQLiteStrategyAPI:
             snapshot,
             market_marks,
             now,
-            quotes=self._quote_cache,
+            quotes=execution_quotes,
         )
         if not advance.orders:
             await self._sync_quote_subscriptions(intent.account_id)
@@ -839,6 +860,15 @@ class SQLiteStrategyAPI:
             if isinstance(tick, Mapping):
                 items.append(
                     (cls._joinquant_security(str(raw_security)), tick)
+                )
+            elif isinstance(tick, (list, tuple)):
+                items.extend(
+                    (
+                        cls._joinquant_security(str(raw_security)),
+                        item,
+                    )
+                    for item in tick
+                    if isinstance(item, Mapping)
                 )
         return tuple(items)
 

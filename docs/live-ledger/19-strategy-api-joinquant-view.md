@@ -41,7 +41,7 @@ QMT_STRATEGY_BUY_FEE_BUFFER=5
 
 ## 聚宽运行时
 
-当前helper契约为`v10`。旧helper会因marker/API版本不匹配而失败，避免模式名称或执行语义不一致。
+当前helper契约为`v11`。旧helper会因marker/API版本不匹配而失败，避免模式名称或执行语义不一致。
 
 `good_etf_remote`的QMT_REMOTE路径：
 
