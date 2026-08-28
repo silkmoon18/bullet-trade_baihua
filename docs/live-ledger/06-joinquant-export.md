@@ -17,7 +17,7 @@ manifest是另一版”的混合产物，写出后还会重新读取比对SHA256
 artifact kind、文件角色、源/目标名、上传名、字节数和SHA256，不写绝对路径、
 生成时间、host、token、Webhook或账户值；相同源码重复导出的manifest完全一致。`production_ready=false`
 表示它只是自动校验候选，真实聚宽、QMT模拟和小额实盘仍分别受S18至S20门禁约束。
-L00已删除manifest的`contracts`段和跨文件契约一致性扫描；`strategy_id`以受控策略源码审查为准，mode和profile以已校验私有配置为准，不再由manifest重复声明。
+L00已删除manifest的`contracts`段和跨文件契约一致性扫描；`strategy_id`以受控策略源码审查为准，profile和两个账户开关以已校验私有配置为准。
 
 单文件bundle不是标准路径，本slice不生成。标准部署仍是helper和私有profile上传一次，策略源码直接复制；
 任何更新都必须遵守冷升级流程，不能在旧聚宽进程中reload。

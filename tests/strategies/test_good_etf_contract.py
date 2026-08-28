@@ -47,8 +47,17 @@ class _Context:
 class _Runtime:
     def __init__(self, mode, portfolio=None):
         self.mode = mode
+        self.jq_account_enabled = mode in (
+            real_helper.RuntimeMode.BACKTEST,
+            real_helper.RuntimeMode.JQ,
+            real_helper.RuntimeMode.JQ_QMT_PARALLEL,
+        )
+        self.qmt_account_enabled = mode in (
+            real_helper.RuntimeMode.QMT_REMOTE,
+            real_helper.RuntimeMode.JQ_QMT_PARALLEL,
+        )
         self.state = {
-            "api_version": 11,
+            "api_version": 14,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -59,10 +68,7 @@ class _Runtime:
         self.submissions = []
         self.order_calls = []
         self.notifications = []
-
-    def ensure_ready(self, initial_capital, context):
-        self.state["production_ready"] = True
-        return self._portfolio
+        self.rebalances = []
 
     def portfolio(self, context):
         return self._portfolio or context.portfolio
@@ -95,6 +101,72 @@ class _Runtime:
     def submit_targets(self, context, weights, marks, key, execution):
         self.submissions.append((context, weights, marks, key, execution))
         return {"intent": {"intent_id": "intent-1", "state": "PLANNED"}}
+
+    def execute_rebalance(self, context, weights, marks, key, execution):
+        self.rebalances.append((context, weights, marks, key, execution))
+        result = {"qmt": None, "jq_orders": [], "errors": []}
+        if self.qmt_account_enabled:
+            result["qmt"] = self.submit_targets(
+                context, weights, marks, key, execution
+            )
+        if self.jq_account_enabled:
+            total = float(self._portfolio.total_value)
+            for security, weight in weights.items():
+                order = types.SimpleNamespace(order_id="value-order")
+                result["jq_orders"].append(
+                    (security, total * float(weight), order)
+                )
+        return result
+
+    def execute_risk_management(
+        self,
+        context,
+        stop_loss_ratio,
+        take_profit_ratio,
+        key,
+        stop_loss_execution,
+        take_profit_execution,
+    ):
+        checks = []
+        stop_loss = []
+        take_profit = []
+        for security, position in self._portfolio.positions.items():
+            action = "HOLD"
+            if position.price < position.avg_cost * stop_loss_ratio:
+                action = "STOP_LOSS"
+                stop_loss.append(security)
+            elif position.price > position.avg_cost * take_profit_ratio:
+                action = "TAKE_PROFIT"
+                take_profit.append(security)
+            checks.append({
+                "security": security,
+                "price": position.price,
+                "avg_cost": position.avg_cost,
+                "pnl": position.price / position.avg_cost - 1,
+                "action": action,
+            })
+        account = "QMT" if self.qmt_account_enabled else "JQ"
+        account_result = {
+            "account": account,
+            "checks": checks,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "intent": None,
+        }
+        exits = stop_loss + take_profit
+        if self.qmt_account_enabled and exits:
+            weights = {
+                security: (0.0 if security in exits else position.value / self._portfolio.total_value)
+                for security, position in self._portfolio.positions.items()
+            }
+            execution = stop_loss_execution if stop_loss else take_profit_execution
+            account_result["intent"] = self.submit_targets(
+                context, weights, {}, key, execution
+            )
+        return {"accounts": [account_result], "errors": []}
+
+    def log_account_snapshots(self, context):
+        return None
 
 
 def _helper_with_install(runtime, calls):
@@ -210,8 +282,8 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
     assert kwargs == {
         "context": context,
         "strategy_id": "good_etf_remote",
-        "initial_capital": 10000,
-        "expected_api_version": 11,
+        "qmt_initial_capital": 10000,
+        "expected_api_version": 14,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -243,7 +315,17 @@ def test_lifecycle_installs_runtime_before_platform_calls():
         assert first.value.func.id == "_install_runtime"
 
 
-def test_market_open_uses_pre_trade_asset_snapshot(monkeypatch):
+def test_strategy_does_not_manage_account_readiness_or_reconciliation():
+    source = STRATEGY_PATH.read_text(encoding="utf-8")
+
+    assert ".ensure_ready(" not in source
+    assert "ensure_runtime_ready" not in source
+    assert ".qmt_account_enabled" not in source
+    assert ".jq_account_enabled" not in source
+    assert ".account_portfolios(" not in source
+
+
+def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     strategy.g.fund_list = pd.DataFrame(
         {"unit_net_value": [2.0]}, index=["510001.XSHG"]
@@ -265,23 +347,17 @@ def test_market_open_uses_pre_trade_asset_snapshot(monkeypatch):
     )
     monkeypatch.setattr(strategy, "_notify", lambda message: None)
 
-    def sell_old_position(security, amount):
-        portfolio.total_value = 9800.0
-        return types.SimpleNamespace(order_id="sell-1")
-
-    runtime.order_target = sell_old_position
     strategy.market_open(
-        types.SimpleNamespace(current_dt="2026-08-19 09:30:00")
+        types.SimpleNamespace(
+            current_dt=pd.Timestamp("2026-08-19 09:30:00")
+        )
     )
 
-    assert any(
-        "计划时组合总资产=10000.00 目标部署=9500.00 计划现金缓冲=500.00"
-        in message
-        for message in strategy.log.messages
-    )
-    assert runtime.notifications
-    value_orders = [call for call in runtime.order_calls if call[0] == "value"]
-    assert value_orders == [("value", "510001.XSHG", 9500.0, None)]
+    assert len(runtime.rebalances) == 1
+    _, weights, marks, key, _ = runtime.rebalances[0]
+    assert weights == {"510001.XSHG": 0.95}
+    assert marks == {"510001.XSHG": 1.0}
+    assert key == "open-20260819"
 
 
 def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):

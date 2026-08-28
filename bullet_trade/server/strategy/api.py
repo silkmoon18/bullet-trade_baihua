@@ -112,6 +112,7 @@ class SQLiteStrategyAPI:
         self._runtime_bindings = {}
         self._quote_cache = {}
         self._seen_tick_symbols = set()
+        self._rejected_tick_symbols = set()
         self._resume_locks = {}
         self._background_tasks = set()
         self.repository = SQLiteStrategyRepository(self.database_path)
@@ -523,6 +524,11 @@ class SQLiteStrategyAPI:
         marks = await self._marks(
             payload.get("marks"), as_of, strategy_id, target_securities
         )
+        qmt_mark_times = [
+            mark.as_of for mark in marks.values() if mark.source == "qmt"
+        ]
+        if qmt_mark_times:
+            as_of = max((as_of, *qmt_mark_times))
         snapshot = self.valuation.create_snapshot(
             strategy_id, marks, as_of, self.config.max_age
         )
@@ -591,8 +597,17 @@ class SQLiteStrategyAPI:
                 raise ValueError("missing mark: {}".format(security))
             tick = await tick_fn(security)
             price = self._tick_price(tick)
+            mark_as_of = self._tick_as_of(tick)
+            if not self._market_time_is_fresh(
+                mark_as_of, datetime.now(SHANGHAI_TZ)
+            ):
+                raise ValueError(
+                    "QMT mark is stale or in the future: {} as_of={}".format(
+                        security, mark_as_of.isoformat()
+                    )
+                )
             marks[security] = MarketMark(
-                security, price_to_units(str(price)), as_of, "qmt"
+                security, price_to_units(str(price)), mark_as_of, "qmt"
             )
         return marks
 
@@ -615,9 +630,13 @@ class SQLiteStrategyAPI:
             bid = self._best_quote_price(tick, "bid")
             ask = self._best_quote_price(tick, "ask")
             last = self._tick_price_or_none(tick)
-            quotes[security] = MarketQuote(
+            try:
+                quote_as_of = self._tick_as_of(tick)
+            except ValueError:
+                continue
+            quote = MarketQuote(
                 security=security,
-                as_of=as_of,
+                as_of=quote_as_of,
                 bid_price_units=(
                     price_to_units(str(bid)) if bid is not None else None
                 ),
@@ -628,7 +647,12 @@ class SQLiteStrategyAPI:
                     price_to_units(str(last)) if last is not None else None
                 ),
             )
-            self._quote_cache[security] = quotes[security]
+            if not self._quote_is_fresh(
+                quote, datetime.now(SHANGHAI_TZ)
+            ):
+                continue
+            quotes[security] = quote
+            self._quote_cache[security] = quote
         return quotes
 
     def _bind_runtime(
@@ -681,9 +705,14 @@ class SQLiteStrategyAPI:
             bid = self._best_quote_price(tick, "bid")
             ask = self._best_quote_price(tick, "ask")
             last = self._tick_price_or_none(tick)
+            try:
+                quote_as_of = self._tick_as_of(tick)
+            except ValueError as exc:
+                self._reject_tick_once(security, str(exc))
+                continue
             quote = MarketQuote(
                 security=security,
-                as_of=datetime.now(SHANGHAI_TZ),
+                as_of=quote_as_of,
                 bid_price_units=(
                     price_to_units(str(bid)) if bid is not None else None
                 ),
@@ -694,6 +723,12 @@ class SQLiteStrategyAPI:
                     price_to_units(str(last)) if last is not None else None
                 ),
             )
+            if not self._quote_is_fresh(quote, datetime.now(SHANGHAI_TZ)):
+                self._reject_tick_once(
+                    security,
+                    "execution quote timestamp is stale or in the future",
+                )
+                continue
             self._quote_cache[security] = quote
             if security not in self._seen_tick_symbols:
                 self._seen_tick_symbols.add(security)
@@ -951,14 +986,72 @@ class SQLiteStrategyAPI:
                 return value
         raise ValueError("QMT mark response has no valid price")
 
+    @classmethod
+    def _tick_as_of(cls, tick: object) -> datetime:
+        if not isinstance(tick, Mapping):
+            raise ValueError("QMT mark response is invalid")
+        for name in ("dt", "timetag", "datetime", "time", "timestamp"):
+            value = tick.get(name)
+            if value not in (None, ""):
+                try:
+                    return cls._as_of(value, None)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "QMT mark response has invalid market timestamp"
+                    ) from exc
+        raise ValueError("QMT mark response has no market timestamp")
+
+    def _quote_is_fresh(self, quote: MarketQuote, now: datetime) -> bool:
+        return self._market_time_is_fresh(quote.as_of, now)
+
+    def _market_time_is_fresh(
+        self, market_as_of: datetime, now: datetime
+    ) -> bool:
+        current = self._as_of(now, None)
+        age = current - market_as_of
+        return -timedelta(seconds=5) <= age <= self.config.max_age
+
+    def _reject_tick_once(self, security: str, reason: str) -> None:
+        key = (security, reason)
+        if key in self._rejected_tick_symbols:
+            return
+        self._rejected_tick_symbols.add(key)
+        logger.warning(
+            "StrategyLedger 忽略不可验证新鲜度的执行行情 | %s | %s",
+            security,
+            reason,
+        )
+
     @staticmethod
-    def _as_of(value: object, default: datetime) -> datetime:
+    def _as_of(value: object, default: Optional[datetime]) -> datetime:
         if value is None:
-            return default
+            if default is None:
+                raise ValueError("timestamp is required")
+            result = default
         if isinstance(value, datetime):
             result = value
-        else:
-            result = datetime.fromisoformat(str(value))
+        elif value is not None:
+            text = str(value).strip()
+            numeric_text = text[:-2] if text.endswith(".0") else text
+            if numeric_text.isdigit() and len(numeric_text) in (8, 12, 14, 17):
+                compact = numeric_text[:14]
+                format_text = {
+                    8: "%Y%m%d",
+                    12: "%Y%m%d%H%M",
+                    14: "%Y%m%d%H%M%S",
+                    17: "%Y%m%d%H%M%S",
+                }[len(numeric_text)]
+                result = datetime.strptime(compact, format_text)
+            else:
+                try:
+                    numeric = float(text)
+                except ValueError:
+                    normalized = text.replace("/", "-")
+                    result = datetime.fromisoformat(normalized)
+                else:
+                    if abs(numeric) >= 10**11:
+                        numeric /= 1000.0
+                    result = datetime.fromtimestamp(numeric, tz=SHANGHAI_TZ)
         if result.tzinfo is None or result.utcoffset() is None:
             result = result.replace(tzinfo=SHANGHAI_TZ)
         return result.astimezone(SHANGHAI_TZ)
@@ -1011,6 +1104,8 @@ class SQLiteStrategyAPI:
                 "closeable_amount": item.sellable_qty,
                 "avg_cost": _price(item.avg_cost_price_units),
                 "price": _price(item.mark_price_units),
+                "mark_as_of": item.mark_as_of.isoformat(),
+                "mark_source": item.mark_source,
                 "value": _money(item.market_value_units),
                 "unrealized_pnl": _money(item.unrealized_pnl_units),
             }

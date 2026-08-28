@@ -9,7 +9,7 @@ STRATEGY_RUNTIME_API_VERSION: int
 STRATEGY_RUNTIME_HELPER_MARKER: str
 PROFILE_SCHEMA_VERSION: int
 
-_RuntimeMode = Literal["BACKTEST", "JQ", "QMT_REMOTE"]
+_RuntimeMode = Literal["BACKTEST", "JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL"]
 
 
 class ExecutionType(str, Enum):
@@ -23,6 +23,7 @@ class RuntimeMode(str, Enum):
     BACKTEST: str
     JQ: str
     QMT_REMOTE: str
+    JQ_QMT_PARALLEL: str
 
 
 class FollowUpPolicy(str, Enum):
@@ -103,6 +104,8 @@ class PositionView:
     closeable_amount: int
     avg_cost: float
     price: float
+    mark_as_of: Optional[str]
+    mark_source: Optional[str]
     value: float
     unrealized_pnl: float
 
@@ -133,6 +136,11 @@ class PortfolioView:
     positions: Dict[str, PositionView]
 
 
+class AccountPortfolioView:
+    account: Literal["JQ", "QMT"]
+    portfolio: Any
+
+
 class _StrategyRuntimeRequiredState(TypedDict):
     api_version: int
     profile_schema_version: int
@@ -140,6 +148,8 @@ class _StrategyRuntimeRequiredState(TypedDict):
     mode: _RuntimeMode
     run_type: str
     strategy_id: str
+    jq_account_enabled: bool
+    qmt_account_enabled: bool
     enabled: bool
     orders_enabled: bool
     production_ready: bool
@@ -174,12 +184,17 @@ class JoinQuantRuntime:
         self,
         state: Dict[str, Any],
         namespace: Optional[Dict[str, Any]] = ...,
+        qmt_initial_capital: Any = ...,
     ) -> None: ...
     state: Dict[str, Any]
     mode: RuntimeMode
+    jq_account_enabled: bool
+    qmt_account_enabled: bool
 
     def portfolio(self, context: Context) -> Any: ...
-    def ensure_ready(self, initial_capital: Any, context: Context) -> Any: ...
+    def account_portfolios(self, context: Context) -> Tuple[AccountPortfolioView, ...]: ...
+    def log_account_snapshots(self, context: Context) -> None: ...
+    def ensure_ready(self, qmt_initial_capital: Any, context: Context) -> Any: ...
     def submit_targets(
         self,
         context: Context,
@@ -212,6 +227,23 @@ class JoinQuantRuntime:
     def send_target_buy_plan(
         self, items: Any, occurred_at: Any = ...
     ) -> Optional[Dict[str, Any]]: ...
+    def execute_rebalance(
+        self,
+        context: Context,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        execution: ExecutionRequest,
+    ) -> Dict[str, Any]: ...
+    def execute_risk_management(
+        self,
+        context: Context,
+        stop_loss_ratio: float,
+        take_profit_ratio: float,
+        idempotency_key: str,
+        stop_loss_execution: ExecutionRequest,
+        take_profit_execution: ExecutionRequest,
+    ) -> Dict[str, Any]: ...
 
 
 def install_joinquant_runtime(
@@ -219,7 +251,7 @@ def install_joinquant_runtime(
     *,
     context: Context,
     strategy_id: str,
-    initial_capital: Any,
+    qmt_initial_capital: Any,
     profile_module: str = ...,
     validate_remote_during_backtest: bool = ...,
     expected_api_version: int = ...,
@@ -251,6 +283,10 @@ def get_configured_execution_mode(
     strategy_id: str,
     profile_module: str = ...,
 ) -> _RuntimeMode: ...
+def get_configured_account_switches(
+    strategy_id: str,
+    profile_module: str = ...,
+) -> Dict[str, bool]: ...
 def runtime_portfolio(context: Context) -> Any: ...
 def ensure_runtime_ready(initial_capital: Any, context: Context) -> Any: ...
 def submit_runtime_targets(

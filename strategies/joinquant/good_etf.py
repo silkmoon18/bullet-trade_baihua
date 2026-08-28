@@ -9,7 +9,7 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# QMT_REMOTE通过StrategyLedger提交组合目标并展示真实账户视图；回测保持聚宽原生。
+# 统一策略脚本：同一组选股决策可独立驱动聚宽和QMT账户。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
@@ -26,9 +26,8 @@ if TYPE_CHECKING:
 STRATEGY_ID = 'good_etf_remote'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 11
+_EXPECTED_RUNTIME_API_VERSION = 14
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
-ExecutionMode = bt.RuntimeMode
 
 # ===== 策略参数 =====
 MAX_HOLD_NUM = 3           # 最大持仓只数：选折价最深的前 N 只
@@ -40,11 +39,11 @@ DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、�
 # 港股类 ETF 过滤关键词（名称包含任一关键词即剔除）
 HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '港股通', '恒生互联网']
 
-# ===== QMT_REMOTE执行参数 =====
+# ===== QMT执行参数 =====
 REMOTE_PRICE_BAND_PCT = 0.002  # 真实调仓价格边界：聚宽参考价上下0.2%；JQ模式不使用该参数
 REMOTE_MARKET_RESERVATION_BAND_PCT = 0.015  # 市价执行估值/资金预留边界，不限制QMT真实市价成交
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
-INITIAL_CAPITAL = 10000         # 聚宽策略分配给真实专用账户的固定初始资金
+QMT_INITIAL_CAPITAL = 10000     # 分配给QMT策略虚拟账户的固定初始资金；不影响聚宽账户资金
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
 
 _runtime: Any = None
@@ -57,7 +56,7 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         globals(),
         context=context,
         strategy_id=STRATEGY_ID,
-        initial_capital=INITIAL_CAPITAL,
+        qmt_initial_capital=QMT_INITIAL_CAPITAL,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
         profile_module=_EXPECTED_RUNTIME_PROFILE_MODULE,
         validate_remote_during_backtest=VALIDATE_REMOTE_DURING_BACKTEST,
@@ -119,7 +118,7 @@ def initialize(context: 'Context') -> None:
     set_benchmark('000300.XSHG')
     # 开启动态复权模式（真实价格）
     set_option('use_real_price', True)
-    # 设置聚宽BACKTEST/JQ的模拟交易成本；QMT_REMOTE只使用服务器确认的真实费用证据。
+    # 设置聚宽账户的模拟交易成本；QMT账户只使用服务器确认的真实费用证据。
     set_order_cost(
         OrderCost(close_tax=0.000, open_commission=0.00025, close_commission=0.00025, min_commission=5),
         type='fund'
@@ -129,10 +128,7 @@ def initialize(context: 'Context') -> None:
 
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
-    if _runtime.mode is ExecutionMode.QMT_REMOTE:
-        _runtime.ensure_ready(INITIAL_CAPITAL, context)
-
-    log.info(f'策略初始化完成 | 模式={_runtime.mode.value} 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
+    log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
 
     # 每日运行函数调度
@@ -143,7 +139,7 @@ def initialize(context: 'Context') -> None:
     # 按顶部配置注册盘中和尾盘止盈止损检查。
     for risk_time in RISK_CHECK_TIMES:
         run_daily(handle_risk_management, time=risk_time, reference_security='000300.XSHG')
-    # 14:55 尾盘快照；QMT_REMOTE由统一门面读取StrategyLedger真实组合。
+    # 14:55 尾盘快照；统一门面分别读取所有已启用账户。
     run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
     log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | '
              '风控: {} | 14:55 尾盘快照'.format('/'.join(RISK_CHECK_TIMES)))
@@ -154,8 +150,6 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
-    if _runtime.mode is ExecutionMode.QMT_REMOTE:
-        _runtime.ensure_ready(INITIAL_CAPITAL, context)
     log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
 
 
@@ -238,8 +232,6 @@ def market_open(context: 'Context') -> None:
     """开盘执行：选股并按当前执行模式处理目标权重。"""
     log.info('===== 开盘选股下单开始 =====')
     try:
-        if not _runtime.advance_targets(context):
-            return
         # 若盘前预处理未执行（聚宽在 09:20~09:30 间重启会错过），现场补跑一次
         if g.fund_list is None:
             log.warn('盘前预处理数据缺失，现场补跑 before_market_open')
@@ -289,232 +281,54 @@ def market_open(context: 'Context') -> None:
         if order_fund_codes:
             _notify(f'选中折价ETF {len(order_fund_codes)} 只: {order_fund_codes}')
 
-        # 撤销昨日遗留未成交挂单，避免干扰今日目标委托。
-        cancelled = _runtime.cancel_orders()
-        if cancelled:
-            log.info(f'已撤销 {cancelled} 笔遗留挂单')
-
-        # 第一步：对不在选定列表中的持仓提交清仓目标。
-        # 注意：迭代持仓列表副本，避免下单过程中持仓变化影响遍历
-        portfolio = _runtime.portfolio(context)
-        hold_codes = list(portfolio.positions.keys())
-        log.info(f'当前持仓 {len(hold_codes)} 只: {hold_codes}')
-
+        # 策略只生成一份目标权重和参考价；helper使用两个账户各自的
+        # 总资产、持仓和可用资金独立执行，不在策略层混用账户状态。
         raw_weights = selected_funds['premium'].abs().tolist()
         total_weight = sum(raw_weights) if sum(raw_weights) else 1.0
-        # 固定计划生成时的组合快照。聚宽会在后续卖单成交后原地更新
-        # context.portfolio；若再次读取 total_value，日志会把卖出后的资产
-        # 与卖出前计算的目标部署金额混在一起。
-        planning_total_value = float(portfolio.total_value)
-        investable_value = planning_total_value * DEPLOY_RATIO
-        target_values = {
-            code: float(investable_value * weight / total_weight)
+        target_weights = {
+            code: float(weight / total_weight * DEPLOY_RATIO)
             for code, weight in zip(order_fund_codes, raw_weights)
         }
-        buy_plan_items: List[Dict[str, object]] = []
-        for code in order_fund_codes:
-            position = portfolio.positions[code] if code in portfolio.positions else None
-            current_value = getattr(position, 'value', None) if position is not None else 0.0
-            if current_value is None:
-                current_value = (
-                    getattr(position, 'total_amount', 0)
-                    * selected_funds.loc[code, 'last_price']
-                )
-            item = _runtime.target_buy_plan_item(
-                code,
-                target_values[code],
-                float(current_value),
-                float(selected_funds.loc[code, 'last_price']),
-            )
-            if item is not None:
-                buy_plan_items.append(item)
-        if _runtime.mode is ExecutionMode.QMT_REMOTE:
-            target_weights = {
-                code: float(weight / total_weight * DEPLOY_RATIO)
-                for code, weight in zip(order_fund_codes, raw_weights)
-            }
-            if not target_weights:
-                target_weights = {code: 0.0 for code in hold_codes}
-            if not target_weights:
-                log.info('真实组合无持仓且无新目标，本轮无需提交')
-                return
-            marks = {
-                code: float(selected_funds.loc[code, 'last_price'])
-                for code in order_fund_codes
-            }
-            for code, position in portfolio.positions.items():
-                marks.setdefault(code, float(position.price))
-            key = 'open-{}'.format(context.current_dt.strftime('%Y%m%d'))
-            result = _runtime.submit_targets(
-                context,
-                target_weights,
-                marks,
-                key,
-                _rebalance_execution(),
-            )
-            log.info('真实组合目标已提交 | intent_id={} state={} weights={}'.format(
-                result['intent']['intent_id'], result['intent']['state'], target_weights))
-            # 通知是旁路能力，必须排在真实目标提交之后，不能延迟QMT执行。
-            _runtime.send_target_buy_plan(
-                buy_plan_items, occurred_at=context.current_dt)
-            return
-
-        _runtime.send_target_buy_plan(
-            buy_plan_items, occurred_at=context.current_dt)
-
-        for hold_code in hold_codes:
-            if hold_code not in order_fund_codes:
-                pos = portfolio.positions[hold_code]
-                log.info(f'调仓卖出 | {hold_code} 数量={pos.total_amount} 成本={pos.avg_cost:.4f}')
-                order_result = _runtime.order_target(hold_code, 0)
-                log.info('清仓目标已提交 | {} order_id={}'.format(
-                    hold_code, getattr(order_result, 'order_id', None)))
-
-        # 第二步：按折价率绝对值权重分配“组合目标市值”。
-        # 目标金额必须基于组合总资产，而不是可用现金；否则已有持仓会被重复缩小，
-        # 且卖单尚未成交时可用现金也不能代表本轮可部署资金。
-        if not selected_funds.empty:
-            # 计算权重（折价率绝对值占比）
-            log.info(f'计划时组合总资产={planning_total_value:.2f} '
-                     f'目标部署={investable_value:.2f} '
-                     f'计划现金缓冲={planning_total_value - investable_value:.2f}')
-
-            # 按权重处理目标市值；成交归属聚宽撮合或StrategyLedger。
-            for code, weight in zip(order_fund_codes, raw_weights):
-                normalized_weight = weight / total_weight
-                target_value = target_values[code]
-                position = portfolio.positions[code] if code in portfolio.positions else None
-                current_value = getattr(position, 'value', None) if position is not None else 0.0
-                if current_value is None:
-                    current_value = getattr(position, 'total_amount', 0) * selected_funds.loc[code, 'last_price']
-                target_delta = target_value - current_value
-                if abs(target_delta) < 0.01:
-                    action = '不变'
-                elif target_delta > 0:
-                    action = '增持'
-                else:
-                    action = '减持'
-                log.info(f'调仓{action} | {code} 权重={normalized_weight:.1%} '
-                         f'当前市值={current_value:.2f} 目标市值={target_value:.2f}')
-                # JQ模式完全交给聚宽原生目标市值撮合，不叠加实盘价格保护。
-                order_result = _runtime.order_target_value(code, target_value)
-                log.info('目标市值已提交 | {} order_id={}'.format(
-                    code, getattr(order_result, 'order_id', None)))
-            log.info('===== 开盘选股下单完成 =====')
-        else:
+        marks = {
+            code: float(selected_funds.loc[code, 'last_price'])
+            for code in order_fund_codes
+        }
+        key = 'open-{}'.format(context.current_dt.strftime('%Y%m%d'))
+        _runtime.execute_rebalance(
+            context,
+            target_weights,
+            marks,
+            key,
+            _rebalance_execution(),
+        )
+        if selected_funds.empty:
             message = '无折价ETF可选，已提交全部卖出目标，今日不再买入'
             log.warn(message)
             _notify(message)
+        else:
+            log.info('===== 开盘选股下单完成 =====')
 
     except Exception as e:
         log.error(f"开盘执行异常：{e}")
 
 
 def handle_risk_management(context: 'Context') -> None:
-    """止盈止损；QMT_REMOTE一次提交完整组合目标，避免同轮多个intent。"""
+    """同一风控规则分别检查JQ和QMT账户自己的持仓与成本。"""
     try:
-        remote_intent_idle = _runtime.advance_targets(context)
-        portfolio = _runtime.portfolio(context)
-        hold_codes = list(portfolio.positions.keys())
-        if not hold_codes:
-            log.info('风控检查 | 当前无持仓')
-            return
-        log.info(f'风控检查开始 | 持仓 {len(hold_codes)} 只 | {context.current_dt}')
-        stop_loss_exits: List[str] = []
-        take_profit_exits: List[str] = []
-        # 遍历所有持仓ETF（迭代列表副本）
-        for hold_code in hold_codes:
-            # 关键修复：用聚宽官方无未来函数的实时价格
-            position = portfolio.positions[hold_code]
-            current_price = position.price  # 实时最新价（回测/实盘一致）
-            cost_basis = position.avg_cost  # 持仓成本价
-            pnl = (current_price / cost_basis - 1) if cost_basis else 0.0
-            log.info(f'持仓检查 | {hold_code} 成本={cost_basis:.4f} 现价={current_price:.4f} 盈亏={pnl:.2%}')
-
-            # 止损逻辑：跌破成本价95%（5%止损）
-            if current_price < cost_basis * STOP_LOSS_RATIO:
-                msg = (f"止损触发 | 标的：{hold_code} | 成本价：{cost_basis:.4f} | "
-                       f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
-                log.info(msg)
-                _notify(msg)
-                if _runtime.mode is ExecutionMode.QMT_REMOTE:
-                    stop_loss_exits.append(hold_code)
-                else:
-                    order_result = _runtime.order_target(hold_code, 0)
-                    log.info('止损清仓目标已提交 | {} order_id={}'.format(
-                        hold_code, getattr(order_result, 'order_id', None)))
-
-            # 止盈逻辑：涨超成本价110%（10%止盈）
-            elif current_price > cost_basis * TAKE_PROFIT_RATIO:
-                msg = (f"止盈触发 | 标的：{hold_code} | 成本价：{cost_basis:.4f} | "
-                       f"当前价：{current_price:.4f} | 时间：{context.current_dt}")
-                log.info(msg)
-                _notify(msg)
-                if _runtime.mode is ExecutionMode.QMT_REMOTE:
-                    take_profit_exits.append(hold_code)
-                else:
-                    order_result = _runtime.order_target(hold_code, 0)
-                    log.info('止盈清仓目标已提交 | {} order_id={}'.format(
-                        hold_code, getattr(order_result, 'order_id', None)))
-
-        exits = stop_loss_exits + take_profit_exits
-        if exits and _runtime.mode is ExecutionMode.QMT_REMOTE:
-            if not remote_intent_idle and not _runtime.cancel_targets():
-                log.warn('风控目标等待旧调仓订单撤销确认 | exits={}'.format(exits))
-                return
-            total = portfolio.total_value or 1.0
-            target_weights = {
-                code: (0.0 if code in exits else position.value / total)
-                for code, position in portfolio.positions.items()
-            }
-            marks = {
-                code: float(position.price)
-                for code, position in portfolio.positions.items()
-            }
-            key = 'risk-{}'.format(context.current_dt.strftime('%Y%m%d-%H%M'))
-            execution = (
-                _stop_loss_execution()
-                if stop_loss_exits
-                else _take_profit_execution()
-            )
-            result = _runtime.submit_targets(
-                context, target_weights, marks, key, execution)
-            log.info('真实风控目标已提交 | intent_id={} exits={}'.format(
-                result['intent']['intent_id'], exits))
+        key = 'risk-{}'.format(context.current_dt.strftime('%Y%m%d-%H%M'))
+        _runtime.execute_risk_management(
+            context,
+            STOP_LOSS_RATIO,
+            TAKE_PROFIT_RATIO,
+            key,
+            _stop_loss_execution(),
+            _take_profit_execution(),
+        )
 
     except Exception as e:
         log.error(f"风控执行异常：{e}")
 
 
 def after_market_check(context: 'Context') -> None:
-    """记录聚宽组合或QMT_REMOTE真实StrategyLedger组合。"""
-    portfolio = _runtime.portfolio(context)
-    positions = portfolio.positions
-    log.info('===== 尾盘组合快照 =====')
-    log.info('组合资金 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}'.format(
-        portfolio.available_cash,
-        portfolio.total_value,
-        portfolio.positions_value))
-    for code in sorted(positions.keys()):
-        position = positions[code]
-        log.info('组合持仓 | {} 数量={} 可卖={} 成本={:.4f} 现价={:.4f}'.format(
-            code,
-            position.total_amount,
-            getattr(position, 'closeable_amount', 0),
-            position.avg_cost,
-            position.price))
-    if _runtime.mode is ExecutionMode.QMT_REMOTE:
-        if portfolio.performance_ready:
-            assert portfolio.nav is not None
-            assert portfolio.returns is not None
-            assert portfolio.fees is not None
-            log.info('真实指标 | NAV={:.6f} 收益={:.2%} 费用={:.2f}'.format(
-                portfolio.nav, portfolio.returns, portfolio.fees))
-        else:
-            fee_display = '未知'
-            if portfolio.fees_known:
-                assert portfolio.fees is not None
-                fee_display = '{:.2f}'.format(portfolio.fees)
-            log.info('真实指标 | 暂不可用 | 费用={} | 原因={}'.format(
-                fee_display,
-                ','.join(portfolio.performance_blockers)))
+    """由运行时统一记录所有已启用账户的组合快照。"""
+    _runtime.log_account_snapshots(context)

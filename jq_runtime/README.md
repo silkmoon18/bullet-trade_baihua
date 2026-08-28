@@ -4,10 +4,9 @@
 
 ## 准备配置
 
-1. 在仓库外的受限目录中复制 `jq_runtime_config.example.py` 并命名为 `jq_runtime_config.py`；不要在本目录
-   创建或维护真实配置。
-2. 在私有文件的`PROFILES`中填写服务器地址、token，以及可选的账户定位和TLS证书名；在`STRATEGIES`中按`strategy_id`选择连接和执行模式。
-3. 保持`PROFILE_SCHEMA_VERSION = 2`；策略脚本只声明唯一`STRATEGY_ID`，不再声明profile。
+1. 复制`jq_runtime_config.example.py`并命名为`jq_runtime_config.py`；可保存在本目录（已被Git忽略）或仓库外受限目录。
+2. 在私有文件的`PROFILES`中填写服务器地址、token，以及可选的账户定位和TLS证书名；在`STRATEGIES`中按`strategy_id`选择连接并分别开关JQ/QMT账户。
+3. 保持`PROFILE_SCHEMA_VERSION = 3`；策略脚本只声明唯一`STRATEGY_ID`，不再声明profile或模式。
 4. 从仓库根运行 `python -X utf8 scripts/export_joinquant.py --validate-only --private-profile <仓库外文件>`；
    该校验不执行、不复制且不输出其中的秘密。
 5. 将已校验私有文件以 `jq_runtime_config.py` 的名字上传到聚宽研究根目录。
@@ -17,9 +16,9 @@
 
 `jq_runtime_config.py`是会被Python导入执行的可信配置代码，不是沙箱。helper能在安装时把策略namespace中的聚宽交易函数替换为抛错guard，但无法阻止配置文件自行`import socket`或执行其他任意Python代码。因此该文件只能由策略维护者生成和上传，不得接受外部内容，也不应包含网络调用或业务逻辑。
 
-## Profile schema v2
+## Profile schema v3
 
-配置分成两层：`PROFILES`只描述可复用的服务器/账户连接，`STRATEGIES`把策略ID映射到profile和执行模式。
+配置分成两层：`PROFILES`只描述可复用的服务器/账户连接，`STRATEGIES`把策略ID映射到profile和两个账户开关。
 
 每个profile的必填字段是：
 
@@ -28,7 +27,7 @@
 
 可选字段仅为 `port`、`account_key`、`tls_cert` 和 `rpc_timeout`。`PROFILES`和单个profile必须是普通`dict`，字段名和字符串值必须是普通`str`。未知字段会被拒绝且不会回显字段名；配置导入或属性读取的意外异常使用固定消息且不保留异常链，避免日志/异常采集器通过错误文本或`__context__`取回 token。
 
-为避免配置笔误造成无限等待，schema v2限制`rpc_timeout`为5至300秒。一个profile可以被多个不同策略复用；每个独立策略的`STRATEGY_ID`仍必须全局唯一。
+为避免配置笔误造成无限等待，schema v3限制`rpc_timeout`为5至300秒。一个profile可以被多个不同策略复用；每个独立策略的`STRATEGY_ID`仍必须全局唯一。
 
 ## 模式边界
 
@@ -37,19 +36,21 @@
 | 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
 | `simple_backtest`、`full_backtest` | `ExecutionMode.BACKTEST` | 需要helper；仅远程预检开启时读取profile | 聚宽历史撮合；远程快照只写日志，不参与历史决策，也不提交远程目标 |
-| `sim_trade` + 配置`JQ` | `JQ` | 需要helper/profile | 聚宽原生下单、撤单、模拟撮合和指标；同时发送目标计划卡片，绝不提交QMT目标 |
-| `sim_trade` + 配置`QMT_REMOTE` | `QMT_REMOTE` | 需要helper/profile | 读取StrategyLedger组合并提交远程目标；是否下QMT订单取决于服务器交易开关 |
+| `sim_trade` + JQ开、QMT关 | `JQ` | 需要helper/profile | 聚宽原生下单、撤单、模拟撮合和指标；维持现有JQ目标计划通知 |
+| `sim_trade` + JQ关、QMT开 | `QMT_REMOTE` | 需要helper/profile | 只读取StrategyLedger并提交QMT目标；阻断聚宽原生交易函数 |
+| `sim_trade` + JQ开、QMT开 | `JQ_QMT_PARALLEL` | 需要helper/profile | 同一决策分别按两个账户自己的资产、持仓和成本执行；只发送QMT通知 |
 
-模式和连接在私有配置中按策略独立设置。找不到策略键时使用`DEFAULT_PROFILE`并默认`JQ`，不会静默进入真实下单：
+账户开关和连接在私有配置中按策略独立设置。找不到策略键时使用`DEFAULT_PROFILE`并默认JQ开、QMT关，不会静默进入QMT下单：
 
 ```python
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 DEFAULT_PROFILE = "qmt-main"
 
 STRATEGIES = {
     "good_etf_remote": {
         "profile": "qmt-main",
-        "mode": "JQ",  # 完成前置测试后再改为 QMT_REMOTE
+        "jq_account_enabled": True,
+        "qmt_account_enabled": False,
     },
 }
 
@@ -62,7 +63,7 @@ PROFILES = {
 }
 ```
 
-从v1迁移时：删除profile中的`strategy_id`，删除`EXECUTION_MODES`，增加`DEFAULT_PROFILE`和`STRATEGIES`。旧v1配置会被v9 helper明确拒绝，不能与新策略混用。
+从schema v2迁移时：删除每个策略的`mode`，改为两个显式bool开关。两者可同时为`True`，但不能同时为`False`。旧schema会被helper明确拒绝。
 
 `VALIDATE_REMOTE_DURING_BACKTEST`仍位于策略顶部，因为它属于该策略的回测行为。
 
@@ -70,7 +71,7 @@ PROFILES = {
 
 helper是策略的必需研究文件，缺失时策略在导入阶段直接中止并报告`ModuleNotFoundError`。模式解析、API版本校验、profile加载、状态发布、远程预检展示、通知容错和订单门面都在helper内完成，策略只传入稳定的期望API版本。
 
-策略通过helper的`JoinQuantRuntime`门面安装模式并调用组合、下单、撤单和查询；配置和网络边界才使用字符串。订单执行使用helper中的不可变`ExecutionRequest`、执行类型、追单和改价枚举，进入TCP/JSON边界时才显式编码。服务器内部结构继续使用`dataclass`；上传聚宽的helper使用等价的轻量不可变值对象，因为聚宽运行环境不提供`dataclasses`模块。`BACKTEST`和`JQ`保持聚宽原生交易函数不变；只有`QMT_REMOTE`把namespace中的七个聚宽交易函数替换为抛错guard，并只允许经StrategyLedger提交目标。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
+策略通过helper的`JoinQuantRuntime`门面提交账户无关的目标权重和风控阈值。helper分别读取两个账户并执行；配置和网络边界才使用字符串。订单执行使用helper中的不可变`ExecutionRequest`、执行类型、追单和改价枚举，进入TCP/JSON边界时才显式编码。服务器内部结构继续使用`dataclass`；上传聚宽的helper使用等价的轻量不可变值对象，因为聚宽运行环境不提供`dataclasses`模块。仅QMT账户启用时把namespace中的七个聚宽交易函数替换为抛错guard；JQ启用时保留原生函数。helper不会替换`context.portfolio`，真实组合通过`PortfolioView`返回。
 
 门禁只覆盖策略namespace中上述七个标准交易函数名。helper按D021不防御同进程恶意Python代码、monkey patch或热重载；策略与profile必须是维护者可信代码，并在任何回调或工作线程启动前完成runtime安装。同一进程内同签名重装幂等返回；签名漂移、上一代helper遗留namespace记录（`__bt_strategy_runtime_state__` token不符）或记录缺失均失败关闭。任一安装或校验失败后，必须用干净进程重启，不在同一进程重试或切回BACKTEST。
 

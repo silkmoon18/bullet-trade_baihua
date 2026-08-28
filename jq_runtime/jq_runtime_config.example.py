@@ -5,22 +5,26 @@ upload that private file to the JoinQuant research root.  The private filename
 is ignored by Git; never commit credentials.
 """
 
-# 固定为2；这是helper校验的配置结构版本，不是用户可选的运行模式。
-PROFILE_SCHEMA_VERSION = 2
+# 固定为3；这是helper校验的配置结构版本，不是用户可选的运行模式。
+PROFILE_SCHEMA_VERSION = 3
 
 # 必须填写下方PROFILES中已经存在的profile名称，例如"qmt-main"。
-# 未在STRATEGIES中声明的策略使用该连接，并安全地默认为JQ模式。
+# 未在STRATEGIES中声明的策略使用该连接，并安全地默认只启用JQ账户。
 DEFAULT_PROFILE = "qmt-main"
 
 # STRATEGIES的key必须与各策略脚本顶部的STRATEGY_ID完全一致：
 # - 允许字符：字母、数字、点、下划线、连字符；长度1~128；必须唯一。
 # - profile：填写PROFILES中存在的名称；省略时使用DEFAULT_PROFILE。
-# - mode：只能填"JQ"或"QMT_REMOTE"；省略或找不到策略key时为"JQ"。
-# - BACKTEST不能写在这里，聚宽回测会根据run_type自动选择BACKTEST。
+# - jq_account_enabled：bool；True时维护聚宽模拟账户。
+# - qmt_account_enabled：bool；True时维护QMT StrategyLedger账户。
+# - 两者可同时为True，但不能同时为False。
+# - 省略或找不到策略key时默认为JQ=True、QMT=False。
+# - 回测始终由run_type自动识别，只运行聚宽账户；无需额外配置。
 STRATEGIES = {
     "good_etf_remote": {
         "profile": "qmt-main",
-        "mode": "JQ",
+        "jq_account_enabled": True,
+        "qmt_account_enabled": False,
     },
 }
 

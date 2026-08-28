@@ -38,7 +38,7 @@ def _valid_profile(**overrides):
 
 
 def _profile_module(
-    monkeypatch, *, version=2, profiles=None, strategies=None,
+    monkeypatch, *, version=3, profiles=None, strategies=None,
     default_profile=PROFILE
 ):
     module = types.ModuleType(PROFILE_MODULE)
@@ -47,17 +47,30 @@ def _profile_module(
     module.PROFILES = {PROFILE: _valid_profile()} if profiles is None else profiles
     module.STRATEGIES = {} if strategies is None else strategies
     monkeypatch.setitem(sys.modules, PROFILE_MODULE, module)
+    monkeypatch.setattr(
+        _helper,
+        "ensure_runtime_ready",
+        lambda initial_capital, context: getattr(context, "portfolio", None),
+    )
 
 
 def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
     kwargs.setdefault("strategy_id", STRATEGY_ID)
     kwargs.setdefault("profile_module", PROFILE_MODULE)
-    if type(mode) is str and mode.strip().upper() in ("JQ", "QMT_REMOTE"):
+    if type(mode) is str and mode.strip().upper() in (
+        "JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL"
+    ):
         module = sys.modules.get(kwargs["profile_module"])
         if module is not None and type(getattr(module, "STRATEGIES", None)) is dict:
             settings = module.STRATEGIES.setdefault(STRATEGY_ID, {})
             if type(settings) is dict:
-                settings["mode"] = mode.strip().upper()
+                selected_mode = mode.strip().upper()
+                settings["jq_account_enabled"] = selected_mode in (
+                    "JQ", "JQ_QMT_PARALLEL"
+                )
+                settings["qmt_account_enabled"] = selected_mode in (
+                    "QMT_REMOTE", "JQ_QMT_PARALLEL"
+                )
     return helper.install_strategy_runtime(
         {} if namespace is None else namespace,
         context=_context("sim_trade") if context is None else context,
@@ -65,15 +78,19 @@ def _install(helper, namespace=None, context=None, *, mode="JQ", **kwargs):
 
 
 def _state(mode, run_type, **extra):
+    jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
+    qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 11,
-        "profile_schema_version": 2,
+        "api_version": 14,
+        "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
         "run_type": run_type,
         "strategy_id": STRATEGY_ID,
-        "enabled": mode in ("JQ", "QMT_REMOTE"),
-        "orders_enabled": mode in ("BACKTEST", "JQ", "QMT_REMOTE"),
+        "jq_account_enabled": jq_enabled,
+        "qmt_account_enabled": qmt_enabled,
+        "enabled": mode != "BACKTEST",
+        "orders_enabled": True,
         "production_ready": False,
         "reason": "backtest",
     }
@@ -99,14 +116,15 @@ def test_public_contract_exports_and_constants(helper):
         "ConditionalLimitExecution",
         "MarketExecution",
         "get_configured_execution_mode",
+        "get_configured_account_switches",
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 11
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 14
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v11"
+        "bullet-trade-joinquant-runtime-helper-v14"
     )
-    assert helper.PROFILE_SCHEMA_VERSION == 2
+    assert helper.PROFILE_SCHEMA_VERSION == 3
 
 
 def test_execution_value_objects_are_typed_and_immutable(helper):
@@ -128,7 +146,10 @@ def test_strategy_mode_is_per_strategy_and_missing_key_defaults_to_jq(
 ):
     _profile_module(
         monkeypatch,
-        strategies={"other": {"mode": "QMT_REMOTE"}},
+        strategies={"other": {
+            "jq_account_enabled": False,
+            "qmt_account_enabled": True,
+        }},
     )
 
     assert helper.get_configured_execution_mode(
@@ -136,7 +157,8 @@ def test_strategy_mode_is_per_strategy_and_missing_key_defaults_to_jq(
     ) == "JQ"
 
     sys.modules[PROFILE_MODULE].STRATEGIES[STRATEGY_ID] = {
-        "mode": "QMT_REMOTE"
+        "jq_account_enabled": False,
+        "qmt_account_enabled": True,
     }
     assert helper.get_configured_execution_mode(
         STRATEGY_ID, PROFILE_MODULE
@@ -148,7 +170,10 @@ def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
 ):
     _profile_module(
         monkeypatch,
-        strategies={STRATEGY_ID: {"mode": "QMT_REMOTE"}},
+        strategies={STRATEGY_ID: {
+            "jq_account_enabled": False,
+            "qmt_account_enabled": True,
+        }},
     )
     namespace = {
         name: lambda *args, **kwargs: None for name in BLOCKED_MUTATIONS
@@ -158,26 +183,29 @@ def test_joinquant_runtime_facade_resolves_sim_mode_from_strategy_config(
         namespace,
         context=_context("sim_trade"),
         strategy_id=STRATEGY_ID,
-        initial_capital="10000",
+        qmt_initial_capital="10000",
         profile_module=PROFILE_MODULE,
     )
 
     assert runtime.mode is helper.RuntimeMode.QMT_REMOTE
     assert runtime.state["mode"] == "QMT_REMOTE"
-    assert runtime.state["production_ready"] is False
+    assert runtime.state["production_ready"] is True
 
 
 def test_missing_strategy_uses_default_profile_and_jq(helper, monkeypatch):
     _profile_module(
         monkeypatch,
-        strategies={"other": {"mode": "QMT_REMOTE"}},
+        strategies={"other": {
+            "jq_account_enabled": False,
+            "qmt_account_enabled": True,
+        }},
     )
 
     runtime = helper.install_joinquant_runtime(
         {},
         context=_context("sim_trade"),
         strategy_id=STRATEGY_ID,
-        initial_capital="10000",
+        qmt_initial_capital="10000",
         profile_module=PROFILE_MODULE,
     )
 
@@ -193,7 +221,11 @@ def test_strategy_can_override_reusable_connection_profile(helper, monkeypatch):
             "qmt-backup": _valid_profile(host="127.0.0.2"),
         },
         strategies={
-            STRATEGY_ID: {"profile": "qmt-backup", "mode": "JQ"}
+            STRATEGY_ID: {
+                "profile": "qmt-backup",
+                "jq_account_enabled": True,
+                "qmt_account_enabled": False,
+            }
         },
     )
 
@@ -201,7 +233,7 @@ def test_strategy_can_override_reusable_connection_profile(helper, monkeypatch):
         {},
         context=_context("sim_trade"),
         strategy_id=STRATEGY_ID,
-        initial_capital="10000",
+        qmt_initial_capital="10000",
         profile_module=PROFILE_MODULE,
     )
 
@@ -216,7 +248,7 @@ def test_joinquant_runtime_facade_backtest_does_not_load_profile_by_default(
         {},
         context=_context("full_backtest"),
         strategy_id=STRATEGY_ID,
-        initial_capital="10000",
+        qmt_initial_capital="10000",
         profile_module="module_that_does_not_exist",
         validate_remote_during_backtest=False,
     )
@@ -272,7 +304,7 @@ def test_backtest_remote_validation_is_reused_after_runtime_reinstall(
     kwargs = {
         "context": _context("full_backtest"),
         "strategy_id": STRATEGY_ID,
-        "initial_capital": "10000",
+        "qmt_initial_capital": "10000",
         "profile_module": PROFILE_MODULE,
         "validate_remote_during_backtest": True,
     }
@@ -310,13 +342,29 @@ def test_portfolio_view_preserves_unknown_remote_performance(helper):
         "returns": None,
         "performance_blockers": ["unknown_fill_fees"],
         "performance_ready": False,
-        "positions": {},
+        "positions": {
+            "510050.XSHG": {
+                "security": "510050.XSHG",
+                "total_amount": 200,
+                "closeable_amount": 200,
+                "avg_cost": 10.0,
+                "price": 10.1,
+                "mark_as_of": "2026-08-20T09:29:59+08:00",
+                "mark_source": "qmt",
+                "value": 2020,
+                "unrealized_pnl": 20,
+            }
+        },
     })
 
     assert portfolio.fees is None
     assert portfolio.fees_known is False
     assert portfolio.nav is None
     assert portfolio.performance_blockers == ("unknown_fill_fees",)
+    assert portfolio.positions["510050.XSHG"].mark_as_of == (
+        "2026-08-20T09:29:59+08:00"
+    )
+    assert portfolio.positions["510050.XSHG"].mark_source == "qmt"
 
 
 def test_portfolio_view_rejects_inconsistent_fee_status(helper):
@@ -514,9 +562,9 @@ def test_namespace_must_be_plain_dict(helper):
 
 
 @pytest.mark.parametrize(
-    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "11", True, None]
+    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "14", True, None]
 )
-def test_expected_api_version_must_equal_eleven(helper, version):
+def test_expected_api_version_must_equal_fourteen(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 
@@ -635,8 +683,8 @@ def test_multiple_strategies_can_share_one_connection_profile(helper, monkeypatc
     _profile_module(
         monkeypatch,
         strategies={
-            STRATEGY_ID: {"profile": PROFILE, "mode": "JQ"},
-            "another_strategy": {"profile": PROFILE, "mode": "JQ"},
+            STRATEGY_ID: {"profile": PROFILE},
+            "another_strategy": {"profile": PROFILE},
         },
     )
     assert _install(helper)["profile"] == PROFILE
@@ -860,7 +908,7 @@ def test_jq_cannot_submit_qmt_targets(helper, monkeypatch):
     _profile_module(monkeypatch)
     _install(helper, mode="JQ")
 
-    with pytest.raises(RuntimeError, match="只有QMT_REMOTE模式"):
+    with pytest.raises(RuntimeError, match="只有启用QMT账户"):
         helper.submit_targets({"510300.XSHG": 1}, "jq-must-not-submit")
 
 

@@ -86,7 +86,11 @@ _PROFILE_OPTIONAL_FIELDS = {
     "rpc_timeout",
 }
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
-_STRATEGY_ALLOWED_FIELDS = {"profile", "mode"}
+_STRATEGY_ALLOWED_FIELDS = {
+    "profile",
+    "jq_account_enabled",
+    "qmt_account_enabled",
+}
 
 _SENSITIVE_NAME_SUFFIXES = (
     "_account_key",
@@ -237,7 +241,7 @@ def _validate_profile_shape(
 ) -> Mapping[str, object]:
     if (
         type(assignments.get("PROFILE_SCHEMA_VERSION")) is not int
-        or assignments.get("PROFILE_SCHEMA_VERSION") != 2
+        or assignments.get("PROFILE_SCHEMA_VERSION") != 3
     ):
         raise ValidationError("{} has unsupported profile schema".format(source_name))
     profiles = assignments.get("PROFILES")
@@ -277,9 +281,16 @@ def _validate_profile_shape(
         profile_name = settings.get("profile", default_profile)
         if type(profile_name) is not str or profile_name not in profiles:
             raise ValidationError("{} strategy has invalid profile".format(source_name))
-        mode = settings.get("mode", "JQ")
-        if type(mode) is not str or mode not in ("JQ", "QMT_REMOTE"):
-            raise ValidationError("{} strategy has invalid mode".format(source_name))
+        jq_enabled = settings.get("jq_account_enabled", True)
+        qmt_enabled = settings.get("qmt_account_enabled", False)
+        if type(jq_enabled) is not bool or type(qmt_enabled) is not bool:
+            raise ValidationError(
+                "{} strategy account switches must be bool".format(source_name)
+            )
+        if not jq_enabled and not qmt_enabled:
+            raise ValidationError(
+                "{} strategy must enable at least one account".format(source_name)
+            )
     for profile_name, profile in profiles.items():
         if (
             type(profile_name) is not str
@@ -463,16 +474,18 @@ def validate_private_profile(
             "private profile is not Python 3.8 compatible: {}".format(exc)
         )
     assignments = _profile_assignments(tree, "private profile")
-    profiles = _validate_profile_shape(assignments, "private profile", True)
+    _validate_profile_shape(assignments, "private profile", True)
     strategy_id = identity["strategy_id"]
     settings = assignments["STRATEGIES"].get(strategy_id, {})
     profile_name = settings.get("profile", assignments["DEFAULT_PROFILE"])
-    mode = settings.get("mode", "JQ")
+    jq_enabled = settings.get("jq_account_enabled", True)
+    qmt_enabled = settings.get("qmt_account_enabled", False)
     return {
         "profile": profile_name,
         "profile_schema_version": assignments["PROFILE_SCHEMA_VERSION"],
         "strategy_id": strategy_id,
-        "mode": mode,
+        "jq_account_enabled": jq_enabled,
+        "qmt_account_enabled": qmt_enabled,
     }
 
 

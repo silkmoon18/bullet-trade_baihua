@@ -17,9 +17,9 @@
 
 - 版本校验：helper marker、运行时 API 版本和 profile schema 版本固定校验，
   不匹配即失败关闭。
-- 模式校验：BACKTEST保留聚宽历史回测；JQ在聚宽模拟盘调用原生下单
-  并通过服务器发送计划通知；QMT_REMOTE阻断聚宽原生交易函数，真实目标只
-  允许经StrategyLedger接口提交。
+- 账户开关：BACKTEST保留聚宽历史回测；模拟交易由jq_account_enabled和
+  qmt_account_enabled独立控制。仅QMT账户启用时阻断聚宽原生交易函数；
+  两个账户同时启用时分别读取、分别执行，互不复用资金和持仓。
 - 冷启动升级：helper/config/策略文件变更必须先停止聚宽策略、确认旧进程
   退出，再由平台启动全新进程。同一进程内重复安装仅在签名完全一致时幂等
   返回；签名漂移或检测到上一代 helper 遗留记录即失败关闭。
@@ -54,6 +54,7 @@ __all__ = [
     "ExecutionRequest",
     "PortfolioView",
     "PositionView",
+    "AccountPortfolioView",
     "JoinQuantRuntime",
     "install_joinquant_runtime",
     "install_strategy_runtime",
@@ -64,6 +65,7 @@ __all__ = [
     "get_intent",
     "get_reconciliation",
     "get_configured_execution_mode",
+    "get_configured_account_switches",
     "runtime_portfolio",
     "ensure_runtime_ready",
     "submit_runtime_targets",
@@ -74,9 +76,9 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 11
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v11"
-PROFILE_SCHEMA_VERSION = 2
+STRATEGY_RUNTIME_API_VERSION = 14
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v14"
+PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
@@ -108,7 +110,9 @@ _PROFILE_OPTIONAL_FIELDS = frozenset(
     }
 )
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
-_STRATEGY_ALLOWED_FIELDS = frozenset({"profile", "mode"})
+_STRATEGY_ALLOWED_FIELDS = frozenset(
+    {"profile", "jq_account_enabled", "qmt_account_enabled"}
+)
 
 # 本代 helper 实例标记；namespace 记录中的 token 不同即为上一代遗留。
 _MODULE_TOKEN = object()
@@ -133,6 +137,7 @@ class RuntimeMode(str, Enum):
     BACKTEST = "BACKTEST"
     JQ = "JQ"
     QMT_REMOTE = "QMT_REMOTE"
+    JQ_QMT_PARALLEL = "JQ_QMT_PARALLEL"
 
 
 class FollowUpPolicy(str, Enum):
@@ -367,6 +372,8 @@ class PositionView(object):
         self.closeable_amount = int(payload["closeable_amount"])
         self.avg_cost = float(payload["avg_cost"])
         self.price = float(payload["price"])
+        self.mark_as_of = payload.get("mark_as_of")
+        self.mark_source = payload.get("mark_source")
         self.value = float(payload["value"])
         self.unrealized_pnl = float(payload.get("unrealized_pnl", 0.0))
 
@@ -412,6 +419,11 @@ class PortfolioView(object):
             security: PositionView(item)
             for security, item in payload.get("positions", {}).items()
         }
+
+
+AccountPortfolioView = namedtuple(
+    "AccountPortfolioView", ("account", "portfolio")
+)
 
 
 def _optional_float(value: Any) -> Optional[float]:
@@ -598,8 +610,8 @@ def submit_targets(
     as_of: Any = None,
     execution: Optional[ExecutionRequest] = None,
 ) -> Dict[str, Any]:
-    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
-        raise RuntimeError("只有QMT_REMOTE模式可以提交真实组合目标")
+    if _active_state is None or not _active_state.get("qmt_account_enabled"):
+        raise RuntimeError("只有启用QMT账户后才可以提交真实组合目标")
     payload = {"weights": weights, "idempotency_key": idempotency_key}
     if execution is not None:
         payload["execution"] = _execution_to_wire(execution)
@@ -616,14 +628,16 @@ def notify_target_buy_plan(
 ) -> Dict[str, Any]:
     """发送策略目标买入计划；只通知，不提交订单或修改账本。"""
 
-    if _active_state is None or _active_state.get("mode") not in (
-        "JQ", "QMT_REMOTE"
-    ):
-        raise RuntimeError(
-            "只有JQ或QMT_REMOTE模式可以发送策略目标计划"
-        )
+    if _active_state is None or _active_state.get("mode") == "BACKTEST":
+        raise RuntimeError("只有聚宽模拟交易可以发送策略目标计划")
     payload = {
-        "mode": _active_state.get("mode"),
+        # 服务器通知协议只区分通知归属：QMT启用时只发送QMT计划，
+        # 否则维持原有JQ计划通知；并行运行不重复发送两份卡片。
+        "mode": (
+            "QMT_REMOTE"
+            if _active_state.get("qmt_account_enabled")
+            else "JQ"
+        ),
         "items": items,
     }
     if occurred_at is not None:
@@ -668,11 +682,11 @@ def _record_runtime_portfolio(portfolio: PortfolioView) -> None:
 
 
 def runtime_portfolio(context: Any) -> Any:
-    """Return the native JQ portfolio or the StrategyLedger real view."""
+    """Return the primary account view for backwards-compatible callers."""
 
     if _active_state is None:
         raise RuntimeError("策略运行时尚未安装")
-    if _active_state.get("mode") != "QMT_REMOTE":
+    if not _active_state.get("qmt_account_enabled"):
         return context.portfolio
     portfolio = get_portfolio(as_of=getattr(context, "current_dt", None))
     _record_runtime_portfolio(portfolio)
@@ -681,7 +695,7 @@ def runtime_portfolio(context: Any) -> Any:
 
 def _restore_runtime_targets() -> None:
     global _runtime_target_state
-    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+    if _active_state is None or not _active_state.get("qmt_account_enabled"):
         _runtime_target_state = None
         return
     intent = get_intent()
@@ -706,8 +720,12 @@ def _restore_runtime_targets() -> None:
 def ensure_runtime_ready(initial_capital: Any, context: Any) -> Any:
     """Validate the remote account and restore the current daily intent."""
 
-    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+    if _active_state is None or not _active_state.get("qmt_account_enabled"):
         return runtime_portfolio(context)
+    # READY is evidence from the latest successful broker reconciliation, not
+    # a process-lifetime latch.  Clear it before every refresh so a later QMT
+    # failure cannot leave a stale True value in the published runtime state.
+    _active_state["production_ready"] = False
     ensured = ensure_account(initial_capital)
     reconciliation = ensured.get("reconciliation", {})
     if reconciliation.get("state") != "READY":
@@ -760,7 +778,7 @@ def advance_runtime_targets(context: Any) -> bool:
     """Advance the restored daily intent; return False while it is active."""
 
     global _runtime_target_state
-    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+    if _active_state is None or not _active_state.get("qmt_account_enabled"):
         return True
     if _runtime_target_state is None:
         _restore_runtime_targets()
@@ -787,7 +805,7 @@ def cancel_runtime_targets() -> bool:
     """Cancel the active remote target; return True after it is terminal."""
 
     global _runtime_target_state
-    if _active_state is None or _active_state.get("mode") != "QMT_REMOTE":
+    if _active_state is None or not _active_state.get("qmt_account_enabled"):
         return True
     if _runtime_target_state is None:
         _restore_runtime_targets()
@@ -806,7 +824,7 @@ def cancel_runtime_targets() -> bool:
 def cancel_runtime_orders() -> int:
     if _active_state is None:
         raise RuntimeError("策略运行时尚未安装")
-    if _active_state.get("mode") == "QMT_REMOTE":
+    if not _active_state.get("jq_account_enabled"):
         return 0
     if _active_namespace is None:
         raise RuntimeError("策略namespace不可用")
@@ -856,14 +874,43 @@ def _run_type_from_context(context: Any) -> Optional[str]:
 def _normalise_runtime_mode(mode: Any) -> str:
     if type(mode) is not str:
         raise RuntimeError(
-            "运行模式必须是普通字符串BACKTEST、JQ或QMT_REMOTE"
+            "运行模式必须是普通字符串BACKTEST、JQ、QMT_REMOTE或JQ_QMT_PARALLEL"
         )
     value = str.upper(str.strip(mode))
-    if value not in ("BACKTEST", "JQ", "QMT_REMOTE"):
+    if value not in ("BACKTEST", "JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL"):
         raise RuntimeError(
-            "运行模式必须是BACKTEST、JQ或QMT_REMOTE"
+            "运行模式必须是BACKTEST、JQ、QMT_REMOTE或JQ_QMT_PARALLEL"
         )
     return value
+
+
+def _mode_from_account_switches(
+    jq_account_enabled: bool,
+    qmt_account_enabled: bool,
+) -> str:
+    if type(jq_account_enabled) is not bool:
+        raise RuntimeError("STRATEGIES.jq_account_enabled必须是bool")
+    if type(qmt_account_enabled) is not bool:
+        raise RuntimeError("STRATEGIES.qmt_account_enabled必须是bool")
+    if not jq_account_enabled and not qmt_account_enabled:
+        raise RuntimeError("至少启用一个账户")
+    if jq_account_enabled and qmt_account_enabled:
+        return RuntimeMode.JQ_QMT_PARALLEL.value
+    if qmt_account_enabled:
+        return RuntimeMode.QMT_REMOTE.value
+    return RuntimeMode.JQ.value
+
+
+def _account_switches_from_mode(mode: str) -> Dict[str, bool]:
+    if mode == RuntimeMode.BACKTEST.value:
+        return {"jq_account_enabled": True, "qmt_account_enabled": False}
+    if mode == RuntimeMode.JQ.value:
+        return {"jq_account_enabled": True, "qmt_account_enabled": False}
+    if mode == RuntimeMode.QMT_REMOTE.value:
+        return {"jq_account_enabled": False, "qmt_account_enabled": True}
+    if mode == RuntimeMode.JQ_QMT_PARALLEL.value:
+        return {"jq_account_enabled": True, "qmt_account_enabled": True}
+    raise RuntimeError("未知运行模式")
 
 
 def _validate_runtime_identifier(value: Any, field: str) -> str:
@@ -890,7 +937,7 @@ def _load_runtime_configuration(
     profile_module: str,
     strategy_id: str,
 ) -> Dict[str, Any]:
-    """Resolve one strategy to its mode and reusable connection profile."""
+    """Resolve one strategy to its account switches and connection profile."""
 
     strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
@@ -942,16 +989,18 @@ def _load_runtime_configuration(
         )
         if configured_profile not in profiles:
             raise RuntimeError("STRATEGIES引用的profile在PROFILES中不存在")
-        configured_mode = settings.get("mode", "JQ")
-        if type(configured_mode) is not str:
-            raise RuntimeError("STRATEGIES.mode必须是普通字符串")
-        configured_mode = configured_mode.strip().upper()
-        if configured_mode not in ("JQ", "QMT_REMOTE"):
-            raise RuntimeError("STRATEGIES.mode必须是JQ或QMT_REMOTE")
+        _mode_from_account_switches(
+            settings.get("jq_account_enabled", True),
+            settings.get("qmt_account_enabled", False),
+        )
 
     selected = strategies.get(strategy_id, {})
     profile = selected.get("profile", default_profile)
-    mode = selected.get("mode", "JQ").strip().upper()
+    jq_account_enabled = selected.get("jq_account_enabled", True)
+    qmt_account_enabled = selected.get("qmt_account_enabled", False)
+    mode = _mode_from_account_switches(
+        jq_account_enabled, qmt_account_enabled
+    )
     raw = profiles[profile]
     if type(raw) is not dict:
         raise RuntimeError("profile {} 必须是字典".format(profile))
@@ -1013,6 +1062,8 @@ def _load_runtime_configuration(
 
     return {
         "mode": mode,
+        "jq_account_enabled": jq_account_enabled,
+        "qmt_account_enabled": qmt_account_enabled,
         "profile": profile,
         "connection": {
             "host": host,
@@ -1029,9 +1080,22 @@ def get_configured_execution_mode(
     strategy_id: str,
     profile_module: str = "jq_runtime_config",
 ) -> str:
-    """Read the per-strategy mode; an absent entry deliberately defaults to JQ."""
+    """Return the internal mode derived from the two public account switches."""
 
     return _load_runtime_configuration(profile_module, strategy_id)["mode"]
+
+
+def get_configured_account_switches(
+    strategy_id: str,
+    profile_module: str = "jq_runtime_config",
+) -> Dict[str, bool]:
+    """Read public account switches; an absent strategy defaults to JQ only."""
+
+    config = _load_runtime_configuration(profile_module, strategy_id)
+    return {
+        "jq_account_enabled": config["jq_account_enabled"],
+        "qmt_account_enabled": config["qmt_account_enabled"],
+    }
 
 
 def _runtime_mutation_guard(name: str, active_mode: str) -> Callable[..., Any]:
@@ -1064,6 +1128,7 @@ def _build_strategy_runtime_state(
     blocked_mutations: Tuple[str, ...] = (),
     validate_remote: bool = False,
 ) -> Dict[str, Any]:
+    switches = _account_switches_from_mode(mode)
     state = {
         "api_version": STRATEGY_RUNTIME_API_VERSION,
         "profile_schema_version": PROFILE_SCHEMA_VERSION,
@@ -1071,8 +1136,10 @@ def _build_strategy_runtime_state(
         "mode": mode,
         "run_type": run_type,
         "strategy_id": strategy_id,
+        "jq_account_enabled": switches["jq_account_enabled"],
+        "qmt_account_enabled": switches["qmt_account_enabled"],
         "enabled": False,
-        "orders_enabled": mode in ("BACKTEST", "JQ"),
+        "orders_enabled": True,
         "production_ready": False,
         "reason": "backtest",
     }
@@ -1103,6 +1170,17 @@ def _build_strategy_runtime_state(
                 "reason": "qmt_remote_profile_validated",
                 "mirror_jq_orders": False,
                 "blocked_mutations": blocked_mutations,
+            }
+        )
+    elif mode == "JQ_QMT_PARALLEL":
+        state.update(
+            {
+                "profile_module": profile_module,
+                "enabled": True,
+                "orders_enabled": True,
+                "production_ready": False,
+                "reason": "jq_qmt_parallel_profile_validated",
+                "mirror_jq_orders": False,
             }
         )
     return state
@@ -1154,11 +1232,11 @@ def install_strategy_runtime(
 
     run_type = str(_run_type_from_context(context) or "").strip().lower()
     runtime_config = None  # type: Optional[Dict[str, Any]]
-    if mode in ("JQ", "QMT_REMOTE") or validate_remote:
+    if mode in ("JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL") or validate_remote:
         runtime_config = _load_runtime_configuration(
             profile_module, strategy_id
         )
-        if mode in ("JQ", "QMT_REMOTE") and runtime_config["mode"] != mode:
+        if mode in ("JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL") and runtime_config["mode"] != mode:
             raise RuntimeError("安装模式与STRATEGIES配置不一致")
         profile = runtime_config["profile"]  # type: Optional[str]
     else:
@@ -1190,7 +1268,7 @@ def install_strategy_runtime(
                 "MODE=BACKTEST仅允许聚宽回测，当前run_type={}".format(
                     run_type or "<empty>"
                 )
-        )
+            )
         if validate_remote:
             runtime_profile = runtime_config["connection"]
         state = _build_strategy_runtime_state(
@@ -1216,7 +1294,7 @@ def install_strategy_runtime(
             profile=profile,
             profile_module=profile_module,
         )
-    else:
+    elif mode == "QMT_REMOTE":
         if run_type != "sim_trade":
             raise RuntimeError(
                 "MODE={} 仅允许聚宽模拟交易，当前run_type={}".format(
@@ -1233,27 +1311,71 @@ def install_strategy_runtime(
             profile_module=profile_module,
             blocked_mutations=blocked_mutations,
         )
+    else:
+        if run_type != "sim_trade":
+            raise RuntimeError(
+                "MODE={} 仅允许聚宽模拟交易，当前run_type={}".format(
+                    mode, run_type or "<empty>"
+                )
+            )
+        runtime_profile = runtime_config["connection"]
+        state = _build_strategy_runtime_state(
+            mode=mode,
+            run_type=run_type,
+            strategy_id=strategy_id,
+            profile=profile,
+            profile_module=profile_module,
+        )
 
     _active_signature = signature
     _active_state = dict(state)
     _active_namespace = namespace
-    if mode in ("JQ", "QMT_REMOTE") or validate_remote:
+    if mode in ("JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL") or validate_remote:
         _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
     return dict(state)
 
 
 class JoinQuantRuntime:
-    """Small strategy-facing facade shared by JQ and QMT_REMOTE modes."""
+    """Small strategy-facing facade shared by all account combinations."""
 
     def __init__(
         self,
         state: Dict[str, Any],
         namespace: Optional[Dict[str, Any]] = None,
+        qmt_initial_capital: Any = None,
     ) -> None:
         self.state = dict(state)
         self.mode = RuntimeMode(self.state["mode"])
+        self.jq_account_enabled = bool(
+            self.state.get("jq_account_enabled")
+        )
+        self.qmt_account_enabled = bool(
+            self.state.get("qmt_account_enabled")
+        )
         self._namespace = namespace
+        self._qmt_initial_capital = qmt_initial_capital
+        self._qmt_readiness_attempted = False
+
+    def _set_qmt_ready(self, ready: bool) -> None:
+        global _active_state
+        self.state["production_ready"] = ready
+        if _active_state is not None:
+            _active_state["production_ready"] = ready
+        self._publish_state()
+
+    def _retry_qmt_readiness(self, context: Any) -> None:
+        """Retry a failed startup check immediately before QMT execution."""
+
+        if (
+            not self.qmt_account_enabled
+            or not self._qmt_readiness_attempted
+            or self.state.get("production_ready") is True
+        ):
+            return
+        ensure_runtime_ready(self._qmt_initial_capital, context)
+        self._set_qmt_ready(True)
+        self._log("info", "QMT账户重新对账通过，恢复QMT执行")
 
     def _publish_state(self) -> None:
         if self._namespace is None:
@@ -1273,14 +1395,106 @@ class JoinQuantRuntime:
     def portfolio(self, context: Any) -> Any:
         return runtime_portfolio(context)
 
-    def ensure_ready(self, initial_capital: Any, context: Any) -> Any:
-        global _active_state
-        portfolio = ensure_runtime_ready(initial_capital, context)
-        if self.mode is RuntimeMode.QMT_REMOTE:
-            self.state["production_ready"] = True
-            if _active_state is not None:
-                _active_state["production_ready"] = True
-            self._publish_state()
+    def account_portfolios(self, context: Any) -> Tuple[Any, ...]:
+        """Return independent enabled-account snapshots, QMT first."""
+
+        views = []
+        if self.qmt_account_enabled:
+            try:
+                portfolio = get_portfolio(
+                    as_of=getattr(context, "current_dt", None)
+                )
+                _record_runtime_portfolio(portfolio)
+                views.append(AccountPortfolioView("QMT", portfolio))
+            except Exception as exc:
+                self._set_qmt_ready(False)
+                if not self.jq_account_enabled:
+                    raise
+                self._log(
+                    "error",
+                    "QMT组合快照读取失败，JQ组合快照继续：{}".format(exc),
+                )
+        if self.jq_account_enabled:
+            views.append(AccountPortfolioView("JQ", context.portfolio))
+        return tuple(views)
+
+    def log_account_snapshots(self, context: Any) -> None:
+        """Read and log enabled accounts without leaking account branches."""
+
+        views = self.account_portfolios(context)
+        self._log("info", "===== 尾盘组合快照 =====")
+        for view in views:
+            account = view.account
+            portfolio = view.portfolio
+            self._log(
+                "info",
+                "{}组合资金 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}".format(
+                    account,
+                    portfolio.available_cash,
+                    portfolio.total_value,
+                    portfolio.positions_value,
+                ),
+            )
+            for security in sorted(portfolio.positions):
+                position = portfolio.positions[security]
+                market_detail = ""
+                if account == "QMT":
+                    market_detail = " 行情时间={} 来源={}".format(
+                        getattr(position, "mark_as_of", None) or "未知",
+                        getattr(position, "mark_source", None) or "未知",
+                    )
+                self._log(
+                    "info",
+                    "{}组合持仓 | {} 数量={} 可卖={} 成本={:.4f} 现价={:.4f}{}".format(
+                        account,
+                        security,
+                        position.total_amount,
+                        getattr(position, "closeable_amount", 0),
+                        position.avg_cost,
+                        position.price,
+                        market_detail,
+                    ),
+                )
+            if account == "QMT":
+                fee_display = "未知"
+                if portfolio.fees_known:
+                    fee_display = "{:.2f}".format(portfolio.fees)
+                if portfolio.performance_ready:
+                    self._log(
+                        "info",
+                        "真实指标 | NAV={:.6f} 收益={:.2%} 费用={}".format(
+                            portfolio.nav,
+                            portfolio.returns,
+                            fee_display,
+                        ),
+                    )
+                else:
+                    self._log(
+                        "info",
+                        "真实指标 | 暂不可用 | 费用={} | 原因={}".format(
+                            fee_display,
+                            ",".join(portfolio.performance_blockers),
+                        ),
+                    )
+
+    def ensure_ready(self, qmt_initial_capital: Any, context: Any) -> Any:
+        self._qmt_initial_capital = qmt_initial_capital
+        self._qmt_readiness_attempted = self.qmt_account_enabled
+        try:
+            portfolio = ensure_runtime_ready(qmt_initial_capital, context)
+        except Exception as exc:
+            self._set_qmt_ready(False)
+            if not self.jq_account_enabled:
+                raise
+            self._log(
+                "warn",
+                "QMT账户暂未就绪，JQ账户继续运行；QMT将在实际执行前重新对账：{}".format(
+                    exc
+                ),
+            )
+            return context.portfolio
+        if self.qmt_account_enabled:
+            self._set_qmt_ready(True)
         return portfolio
 
     def submit_targets(
@@ -1345,6 +1559,353 @@ class JoinQuantRuntime:
             "reference_price": reference_price,
         }
 
+    @staticmethod
+    def _position_value(position: Any, reference_price: float) -> float:
+        if position is None:
+            return 0.0
+        value = getattr(position, "value", None)
+        if value is not None:
+            return float(value)
+        return float(getattr(position, "total_amount", 0)) * reference_price
+
+    def _target_buy_plan_items(
+        self,
+        portfolio: Any,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+    ) -> Any:
+        total_value = float(portfolio.total_value)
+        items = []
+        for security, raw_weight in weights.items():
+            weight = float(raw_weight)
+            reference_price = float(marks.get(security, 0.0))
+            position = portfolio.positions.get(security)
+            item = self.target_buy_plan_item(
+                security,
+                total_value * weight,
+                self._position_value(position, reference_price),
+                reference_price,
+            )
+            if item is not None:
+                items.append(item)
+        return items
+
+    def execute_rebalance(
+        self,
+        context: Any,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        execution: ExecutionRequest,
+    ) -> Dict[str, Any]:
+        """Apply one decision independently to QMT and JQ enabled accounts."""
+
+        result = {"qmt": None, "jq_orders": [], "errors": []}
+        notification_items = []
+        qmt_submitted = False
+
+        if self.qmt_account_enabled:
+            try:
+                self._retry_qmt_readiness(context)
+                if not self.advance_targets(context):
+                    result["qmt"] = {"skipped_active_intent": True}
+                else:
+                    qmt_portfolio = get_portfolio(
+                        as_of=getattr(context, "current_dt", None)
+                    )
+                    _record_runtime_portfolio(qmt_portfolio)
+                    qmt_weights = dict(weights)
+                    if not qmt_weights:
+                        qmt_weights = {
+                            security: 0.0
+                            for security in qmt_portfolio.positions
+                        }
+                    qmt_marks = dict(marks)
+                    for security, position in qmt_portfolio.positions.items():
+                        qmt_marks.setdefault(security, float(position.price))
+                    notification_items = self._target_buy_plan_items(
+                        qmt_portfolio, weights, marks
+                    )
+                    if qmt_weights:
+                        result["qmt"] = self.submit_targets(
+                            context,
+                            qmt_weights,
+                            qmt_marks,
+                            idempotency_key,
+                            execution,
+                        )
+                        qmt_submitted = True
+            except Exception as exc:
+                result["errors"].append(("QMT", str(exc)))
+                self._log(
+                    "error",
+                    "QMT调仓执行异常：{}".format(exc),
+                )
+
+        if qmt_submitted:
+            self.send_target_buy_plan(
+                notification_items,
+                occurred_at=getattr(context, "current_dt", None),
+            )
+
+        if self.jq_account_enabled:
+            try:
+                jq_portfolio = context.portfolio
+                if not self.qmt_account_enabled:
+                    notification_items = self._target_buy_plan_items(
+                        jq_portfolio, weights, marks
+                    )
+                    self.send_target_buy_plan(
+                        notification_items,
+                        occurred_at=getattr(context, "current_dt", None),
+                    )
+                self.cancel_orders()
+                selected = set(weights)
+                for security in list(jq_portfolio.positions.keys()):
+                    if security not in selected:
+                        order_obj = self.order_target(security, 0)
+                        result["jq_orders"].append(
+                            (security, 0.0, order_obj)
+                        )
+                planning_total = float(jq_portfolio.total_value)
+                for security, raw_weight in weights.items():
+                    target_value = planning_total * float(raw_weight)
+                    order_obj = self.order_target_value(
+                        security, target_value
+                    )
+                    result["jq_orders"].append(
+                        (security, target_value, order_obj)
+                    )
+            except Exception as exc:
+                result["errors"].append(("JQ", str(exc)))
+                self._log(
+                    "error",
+                    "JQ调仓执行异常：{}".format(exc),
+                )
+        qmt_result = result.get("qmt")
+        if qmt_result is not None and "intent" in qmt_result:
+            self._log(
+                "info",
+                "QMT组合目标已提交 | intent_id={} state={} weights={}".format(
+                    qmt_result["intent"]["intent_id"],
+                    qmt_result["intent"]["state"],
+                    weights,
+                ),
+            )
+        elif qmt_result is not None and qmt_result.get(
+            "skipped_active_intent"
+        ):
+            self._log("info", "QMT仍有活动目标，本轮仅继续推进原目标")
+        for security, target_value, order_result in result["jq_orders"]:
+            self._log(
+                "info",
+                "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
+                    security,
+                    target_value,
+                    getattr(order_result, "order_id", None),
+                ),
+            )
+        if result["errors"]:
+            self._log(
+                "warn",
+                "目标权重部分执行失败 | accounts={}".format(
+                    [account for account, _ in result["errors"]]
+                ),
+            )
+        else:
+            self._log(
+                "info",
+                "目标权重已提交 | {} | 部署比例={:.1%}".format(
+                    weights, sum(float(value) for value in weights.values())
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _risk_exits(
+        portfolio: Any,
+        stop_loss_ratio: float,
+        take_profit_ratio: float,
+    ) -> Tuple[Any, Any, Any]:
+        checks = []
+        stop_loss = []
+        take_profit = []
+        for security, position in portfolio.positions.items():
+            price = float(position.price)
+            avg_cost = float(position.avg_cost)
+            pnl = price / avg_cost - 1.0 if avg_cost else 0.0
+            action = "HOLD"
+            if avg_cost and price < avg_cost * stop_loss_ratio:
+                action = "STOP_LOSS"
+                stop_loss.append(security)
+            elif avg_cost and price > avg_cost * take_profit_ratio:
+                action = "TAKE_PROFIT"
+                take_profit.append(security)
+            checks.append(
+                {
+                    "security": security,
+                    "price": price,
+                    "avg_cost": avg_cost,
+                    "pnl": pnl,
+                    "action": action,
+                    "mark_as_of": getattr(position, "mark_as_of", None),
+                    "mark_source": getattr(position, "mark_source", None),
+                }
+            )
+        return checks, stop_loss, take_profit
+
+    def execute_risk_management(
+        self,
+        context: Any,
+        stop_loss_ratio: float,
+        take_profit_ratio: float,
+        idempotency_key: str,
+        stop_loss_execution: ExecutionRequest,
+        take_profit_execution: ExecutionRequest,
+    ) -> Dict[str, Any]:
+        """Evaluate each account against its own positions and cost basis."""
+
+        result = {"accounts": [], "errors": []}
+        if self.qmt_account_enabled:
+            try:
+                self._retry_qmt_readiness(context)
+                intent_idle = self.advance_targets(context)
+                portfolio = get_portfolio(
+                    as_of=getattr(context, "current_dt", None)
+                )
+                _record_runtime_portfolio(portfolio)
+                checks, stop_loss, take_profit = self._risk_exits(
+                    portfolio, stop_loss_ratio, take_profit_ratio
+                )
+                account_result = {
+                    "account": "QMT",
+                    "portfolio": portfolio,
+                    "checks": checks,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "intent": None,
+                }
+                exits = stop_loss + take_profit
+                if exits:
+                    if not intent_idle and not self.cancel_targets():
+                        account_result["waiting_for_cancel"] = True
+                    else:
+                        total = float(portfolio.total_value) or 1.0
+                        target_weights = {
+                            security: (
+                                0.0
+                                if security in exits
+                                else float(position.value) / total
+                            )
+                            for security, position in portfolio.positions.items()
+                        }
+                        risk_marks = {
+                            security: float(position.price)
+                            for security, position in portfolio.positions.items()
+                        }
+                        account_result["intent"] = self.submit_targets(
+                            context,
+                            target_weights,
+                            risk_marks,
+                            idempotency_key,
+                            (
+                                stop_loss_execution
+                                if stop_loss
+                                else take_profit_execution
+                            ),
+                        )
+                result["accounts"].append(account_result)
+            except Exception as exc:
+                result["errors"].append(("QMT", str(exc)))
+                self._log("error", "QMT风控执行异常：{}".format(exc))
+
+        if self.jq_account_enabled:
+            try:
+                portfolio = context.portfolio
+                checks, stop_loss, take_profit = self._risk_exits(
+                    portfolio, stop_loss_ratio, take_profit_ratio
+                )
+                account_result = {
+                    "account": "JQ",
+                    "portfolio": portfolio,
+                    "checks": checks,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "orders": [],
+                }
+                for security in stop_loss + take_profit:
+                    order_obj = self.order_target(security, 0)
+                    account_result["orders"].append(
+                        (security, order_obj)
+                    )
+                result["accounts"].append(account_result)
+            except Exception as exc:
+                result["errors"].append(("JQ", str(exc)))
+                self._log("error", "JQ风控执行异常：{}".format(exc))
+        for account_result in result["accounts"]:
+            account = account_result["account"]
+            checks = account_result["checks"]
+            if not checks:
+                self._log("info", "{}风控检查 | 当前无持仓".format(account))
+                continue
+            self._log(
+                "info",
+                "{}风控检查开始 | 持仓 {} 只 | {}".format(
+                    account, len(checks), getattr(context, "current_dt", None)
+                ),
+            )
+            for check in checks:
+                market_detail = ""
+                if account == "QMT":
+                    market_detail = " 行情时间={} 来源={}".format(
+                        check.get("mark_as_of") or "未知",
+                        check.get("mark_source") or "未知",
+                    )
+                self._log(
+                    "info",
+                    "{}持仓检查 | {} 成本={:.4f} 现价={:.4f} 盈亏={:.2%}{}".format(
+                        account,
+                        check["security"],
+                        check["avg_cost"],
+                        check["price"],
+                        check["pnl"],
+                        market_detail,
+                    ),
+                )
+                if check["action"] != "HOLD":
+                    action = (
+                        "止损"
+                        if check["action"] == "STOP_LOSS"
+                        else "止盈"
+                    )
+                    self._log(
+                        "info",
+                        "[策略通知] {}触发 | 账户：{} | 标的：{} | "
+                        "成本价：{:.4f} | 当前价：{:.4f} | 时间：{}".format(
+                            action,
+                            account,
+                            check["security"],
+                            check["avg_cost"],
+                            check["price"],
+                            getattr(context, "current_dt", None),
+                        ),
+                    )
+            intent = account_result.get("intent")
+            if intent is not None:
+                exits = (
+                    account_result["stop_loss"]
+                    + account_result["take_profit"]
+                )
+                self._log(
+                    "info",
+                    "QMT风控目标已提交 | intent_id={} exits={}".format(
+                        intent["intent"]["intent_id"], exits
+                    ),
+                )
+            if account_result.get("waiting_for_cancel"):
+                self._log("warn", "QMT风控目标等待旧调仓订单撤销确认")
+        return result
+
     def send_target_buy_plan(
         self, items: Any, occurred_at: Any = None
     ) -> Optional[Dict[str, Any]]:
@@ -1384,7 +1945,7 @@ def install_joinquant_runtime(
     *,
     context: Any,
     strategy_id: str,
-    initial_capital: Any,
+    qmt_initial_capital: Any,
     profile_module: str = "jq_runtime_config",
     validate_remote_during_backtest: bool = False,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
@@ -1396,8 +1957,14 @@ def install_joinquant_runtime(
         mode = RuntimeMode.BACKTEST
         validate_remote = validate_remote_during_backtest
     elif run_type == "sim_trade":
+        switches = get_configured_account_switches(
+            strategy_id, profile_module
+        )
         mode = RuntimeMode(
-            get_configured_execution_mode(strategy_id, profile_module)
+            _mode_from_account_switches(
+                switches["jq_account_enabled"],
+                switches["qmt_account_enabled"],
+            )
         )
         validate_remote = False
     else:
@@ -1413,9 +1980,18 @@ def install_joinquant_runtime(
         profile_module=profile_module,
         validate_remote=validate_remote,
     )
-    runtime = JoinQuantRuntime(state, namespace)
+    runtime = JoinQuantRuntime(
+        state, namespace, qmt_initial_capital=qmt_initial_capital
+    )
     runtime._publish_state()
     if not validate_remote:
+        # Account initialization and reconciliation are runtime concerns.
+        # Strategy code installs one facade and never calls readiness APIs or
+        # branches on account type.  Parallel mode isolates a temporary QMT
+        # failure inside JoinQuantRuntime.ensure_ready; QMT-only remains
+        # fail-closed.
+        if runtime.qmt_account_enabled:
+            runtime.ensure_ready(qmt_initial_capital, context)
         return runtime
     if runtime.state.get("remote_validation"):
         validation = runtime.state["remote_validation"]
@@ -1423,7 +1999,7 @@ def install_joinquant_runtime(
         if global_state is not None:
             setattr(global_state, "bt_remote_validation", validation)
         return runtime
-    ensured = ensure_account(initial_capital)
+    ensured = ensure_account(qmt_initial_capital)
     reconciliation = ensured.get("reconciliation", {})
     if reconciliation.get("state") != "READY":
         raise RuntimeError(

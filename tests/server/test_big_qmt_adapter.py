@@ -116,7 +116,12 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     assert history["records"] == [[1.0, 2.0]]
 
     snapshot = await adapter.get_snapshot({"security": "000001.XSHE"})
-    assert snapshot == {"sid": "000001.XSHE", "last_price": 12.3, "dt": 1783043331000}
+    assert snapshot == {
+        "sid": "000001.XSHE",
+        "last_price": 12.3,
+        "dt": 1783043331000,
+        "bidPrice": [12.2],
+    }
 
     live_current = await adapter.get_live_current({"security": "000001.XSHE"})
     assert live_current == {

@@ -8,13 +8,13 @@
 - 本地可通过`jqdata.pyi`、helper类型声明和严格mypy/pyright配置获得代码提示及静态检查。
 - `good_etf.py`是仓库内唯一受控策略源码；导出器原样复制策略、helper和示例profile，并生成确定性manifest。
 - 私有profile只读校验不会执行、复制、hash或输出其中的host/token等值。
-- BACKTEST使用聚宽历史撮合；JQ使用聚宽模拟账户和原生订单，同时发送目标计划通知；QMT_REMOTE使用服务器真实PortfolioView和一次组合目标。
+- BACKTEST使用聚宽历史撮合；模拟交易可独立启用JQ、QMT或两者。两者同时启用时共享选股决策，但资金、持仓、成本和风控分别计算。
 - 已具备真实券商可用现金校准、初始1万元单次分配、按订单冻结/释放和显式增减资的事务服务。
 - 已具备按真实买卖成交更新现金、订单冻结、持仓lot、费用和已实现盈亏的事务服务，重复fill不会重复入账；费用字段缺失时保留`UNKNOWN`，不伪造为0。
 - 已具备基于新鲜行情的现金、持仓市值、总资产、NAV、费用和盈亏原子快照，可作为后续聚宽组合视图数据源。
 - MiniQMT包装账户快照已统一解包；提交响应未知的订单可按完整`client_tag`自动认领。
 - 目标权重按总资产计算，现金缓冲只在实际买入检查时执行；QMT_REMOTE每次调用明确携带买卖两侧的执行类型、追单和改价策略。GoodETF调仓卖出使用交易所市价IOC，买入使用0.2%条件边界限价。
-- 直连xtquant时，QMT tick先在本地账本判断价格条件，命中后才查询真实账户并下单；兼容`subscribe_quote`真实返回的`{证券: [tick, ...]}`批量结构，批内短暂触发不会被后续价格覆盖，并为每个标的记录一次“首次收到执行行情”。活动意图结束后自动退订不再需要的标的。订单、成交、错误和断连由QMT原生回调推进，不增加固定1秒轮询。BigQMT HTTP gateway尚未桥接这些原生回调，不能把该适配器视为同等完成。
+- 直连xtquant时，QMT快照优先使用`get_full_tick`并保留交易端原始行情时间；`get_last_quote`和1分钟K线只作回退，不得用服务器当前时间冒充行情时间。缺少时间、超过`QMT_STRATEGY_MAX_AGE_SECONDS`或异常来自未来的QMT mark/tick均不可用于估值、风控或条件下单；QMT持仓和风控日志同时打印行情时间与来源。QMT tick先在本地账本判断价格条件，命中后才查询真实账户并下单；兼容`subscribe_quote`真实返回的`{证券: [tick, ...]}`批量结构，批内短暂触发不会被后续价格覆盖，并为每个标的记录一次“首次收到执行行情”。活动意图结束后自动退订不再需要的标的。订单、成交、错误和断连由QMT原生回调推进，不增加固定1秒轮询。BigQMT HTTP gateway尚未桥接这些原生回调，不能把该适配器视为同等完成。
 
 ## 2. 还缺什么
 
@@ -46,7 +46,7 @@ VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf_remote'
 ```
 
-v11 helper在所有模式均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
+v14 helper在所有账户组合均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
 
 先运行校验：
 
@@ -62,15 +62,15 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 按[聚宽校验与导出](06-joinquant-export.md)上传产物。上传后不得手工修改；否则聚宽文件已不再对应manifest和已审查源码。
 
-### JQ
+### 账户开关
 
-在私有`jq_runtime_config.py`的`STRATEGIES["good_etf_remote"]`中设置`{"profile": "qmt-main", "mode": "JQ"}`后，聚宽模拟交易会正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标。产生新增买入目标时还会通过BulletTrade发送目标计划卡片；通知接口不写StrategyLedger、不受交易开关影响，也绝不提交QMT目标。缺少策略键时使用`DEFAULT_PROFILE`并默认`JQ`。
+私有`jq_runtime_config.py`使用两个bool：`jq_account_enabled`和`qmt_account_enabled`。仅JQ开启时，聚宽正常原生下单、撤单和模拟撮合，不叠加QMT的0.2%价格边界，并维持现有JQ目标计划通知。缺少策略键时默认JQ开、QMT关。
 
-### QMT_REMOTE
+仅QMT开启时，聚宽原生交易函数被阻断，策略只提交StrategyLedger目标。两者同时开启时，helper把同一目标权重分别乘各账户自己的总资产；止盈止损也分别读取两个账户自己的持仓成本。QMT开启后通知归属固定为QMT，只发送QMT计划、委托和成交卡片，不重复发送JQ计划卡片。
 
-把私有配置中的`STRATEGIES["good_etf_remote"]["mode"]`改为`"QMT_REMOTE"`并冷启动后，只有聚宽模拟交易会进入远程执行；回测仍固定BACKTEST。人工验收前保持`QMT_STRATEGY_TRADING_ENABLED=false`，启用时还必须把精确策略ID加入`QMT_STRATEGY_ENABLED_IDS`。必须上传v11 helper和私有配置；启动时真实资金不足、订单归属能力未证明、账实差异或对账不新鲜都会失败关闭。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+回测仍固定BACKTEST，不受两个开关影响。QMT实际下单还受服务器`QMT_STRATEGY_TRADING_ENABLED`和`QMT_STRATEGY_ENABLED_IDS`控制。必须同时上传v14 helper、schema v3私有配置和策略。helper安装时自动完成QMT账户初始化和对账触发，策略不再显式调用readiness接口。仅QMT模式下，启动时QMT分配资金不足、账实差异或对账不新鲜仍会失败关闭；JQ+QMT并行模式下，QMT暂未就绪只暂停QMT分支，JQ继续运行，QMT会在实际调仓或风控前重新对账，通过后才恢复执行。总持仓不足等差异不会被绕过。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
-`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT_REMOTE在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。任一成交的佣金或税费缺失时，账本继续维护现金、持仓与订单，但`fees/NAV/returns/PnL`明确为未知，聚宽只记录真实现金、总资产和持仓市值；待费用可证明前不能把这些暂估资产解释为精确绩效。迅投官方标准股票`XtTrade`结构没有佣金字段，部分柜台或扩展版本可能补充`commission_fee`、`commission`或`used_commission`。
+`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。费用缺失时显示为未知，不伪造为0。
 
 ### 每次调用的执行参数
 
@@ -104,11 +104,11 @@ GoodETF当前逐类委托如下：
 
 执行与配置并非原样保留，修改是有意的：
 
-- 删除策略内硬编码host、token、Webhook、账户定位和模式变量；模式由私有配置按`strategy_id`选择。
+- 删除策略内硬编码host、token、Webhook、账户定位和模式变量；两个账户开关由私有配置按`strategy_id`选择。
 - 删除旧同步追单扩展；持久幂等已在S07完成，异步执行状态机由L02实现。
-- JQ走聚宽模拟账户并发送目标计划通知，但不碰QMT；QMT_REMOTE通过StrategyLedger执行，人工验收前服务端交易开关保持关闭。
+- JQ与QMT可单独或同时启用；并行时共享策略决策但不共享账户状态。
 - 组合目标由`available_cash * weight`改为`total_value * DEPLOY_RATIO * normalized_weight`，避免把目标仓位误当成本轮新增买入额并在每轮缩小已有持仓。
-- QMT_REMOTE尾盘读取真实PortfolioView并通过自定义`record()`指标展示；聚宽内置模拟账户和内置收益曲线仍不代表真实券商账户。
+- QMT尾盘读取真实PortfolioView并通过自定义`record()`指标展示；聚宽内置收益曲线只代表JQ账户。
 
 因此可以说“策略思想和选股规则基本一致”，不能说“执行、资金和持仓语义与原版完全一样”。
 

@@ -2,9 +2,9 @@
 
 ## 结论
 
-L03复用BulletTrade现有TCP协议和token，提供六个动作：`strategy.ensure_account`、`strategy.get_snapshot`、`strategy.submit_targets`、`strategy.get_intent`、`strategy.get_reconciliation`和`strategy.notify_target_buy_plan`。最后一个动作只把JQ/QMT_REMOTE目标买入计划送入飞书队列，不访问券商、不提交订单也不写账本。没有新增HTTP服务、角色系统或第二套鉴权。账本事件保留在服务器SQLite中用于审计，不再暴露当前策略未使用的远程事件接口。
+L03复用BulletTrade现有TCP协议和token，提供六个动作：`strategy.ensure_account`、`strategy.get_snapshot`、`strategy.submit_targets`、`strategy.get_intent`、`strategy.get_reconciliation`和`strategy.notify_target_buy_plan`。最后一个动作只发送目标买入计划，不访问券商、不提交订单也不写账本。
 
-聚宽`BACKTEST`和`JQ`使用原生`context.portfolio`与原生下单接口；其中`JQ`额外发送目标计划通知。`QMT_REMOTE`不改写聚宽模拟账户，而是读取服务器`PortfolioView`、一次提交完整目标权重，并用`record()`记录真实现金、总资产、持仓市值、NAV、收益和费用。
+聚宽回测只使用原生账户。模拟交易可独立启用JQ和QMT：JQ使用原生`context.portfolio`与原生下单接口；QMT读取服务器`PortfolioView`并提交完整目标权重。两者同时启用时分别按自己的总资产、持仓和成本执行。QMT启用后只发送QMT通知，否则维持JQ目标计划通知。
 
 必须准确理解这个边界：聚宽不提供把外部真实成交写回原生模拟账户的公开接口，因此平台内置模拟持仓和内置收益曲线不能变成券商实盘事实。当前实现提供聚宽自定义指标`real_cash`、`real_total`、`real_positions`、`real_nav`、`real_return`和`real_fees`；实盘权威数据仍在StrategyLedger。
 
@@ -41,18 +41,18 @@ QMT_STRATEGY_BUY_FEE_BUFFER=5
 
 ## 聚宽运行时
 
-当前helper契约为`v11`。旧helper会因marker/API版本不匹配而失败，避免模式名称或执行语义不一致。
+当前helper契约为`v14`，私有配置为schema v3。helper安装时自动触发账户初始化和启动对账；策略层不再调用`ensure_ready`。权威账本、QMT成交入账和账实对账算法仍在服务器StrategyLedger，helper只负责聚宽生命周期与RPC门面。旧helper/config会因marker、API或schema版本不匹配而失败。
 
-`good_etf_remote`的QMT_REMOTE路径：
+`good_etf_remote`的QMT账户路径：
 
-1. 初始化调用`ensure_account(INITIAL_CAPITAL)`并要求对账`READY`；
+1. 初始化调用`ensure_account(QMT_INITIAL_CAPITAL)`并要求对账`READY`；该资金只分配给QMT StrategyLedger，不影响聚宽初始资金；
 2. 从`PortfolioView`读取真实现金、持仓和总资产；
 3. 选股规则不变，把折价权重乘`DEPLOY_RATIO`后一次提交；
 4. 后续回调推进同一intent，卖单完成并真实入账后才规划买单；
 5. 聚宽重启时恢复服务器中的活跃intent，同一日期调仓key复用已保存权重；
-6. 10:30、13:30、14:50风控一次提交完整组合目标，避免一个回调创建多个intent。
+6. 10:30、13:30、14:50风控读取QMT自己的成本和持仓；若JQ同时启用，再独立读取聚宽账户并判断。
 
-生产默认`mirror_jq_orders=False`：聚宽原生订单和模拟持仓不参与QMT_REMOTE决策。
+聚宽与QMT账户互不镜像订单、现金和持仓；共享的只有选股结果、目标权重和风控参数。
 
 ## L03验证
 

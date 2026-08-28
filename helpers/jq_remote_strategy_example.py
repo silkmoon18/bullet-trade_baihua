@@ -19,7 +19,7 @@ import bullet_trade_jq_remote_helper as bt
 
 # ===== 部署契约 =====
 STRATEGY_ID = 'demo_jq'       # 对应 jq_runtime_config.STRATEGIES 中的键
-INITIAL_CAPITAL = 10000
+QMT_INITIAL_CAPITAL = 10000   # 仅QMT开关启用时使用
 
 
 def initialize(context):
@@ -28,7 +28,7 @@ def initialize(context):
         globals(),
         context=context,
         strategy_id=STRATEGY_ID,
-        initial_capital=INITIAL_CAPITAL,
+        qmt_initial_capital=QMT_INITIAL_CAPITAL,
     )
     state = runtime.state
     log.info('运行时已安装 | mode={} reason={}'.format(state['mode'], state['reason']))
@@ -45,7 +45,7 @@ def process_initialize(context):
         globals(),
         context=context,
         strategy_id=STRATEGY_ID,
-        initial_capital=INITIAL_CAPITAL,
+        qmt_initial_capital=QMT_INITIAL_CAPITAL,
     )
     state = runtime.state
     log.info('运行时已恢复 | mode={} reason={}'.format(state['mode'], state['reason']))

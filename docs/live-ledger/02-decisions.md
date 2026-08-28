@@ -130,6 +130,6 @@ MiniQMT和BigQMT版本、券商柜台及网关返回字段并不完全一致。S
 
 ## D024：策略身份与连接profile解耦
 
-聚宽策略脚本只声明全局唯一且稳定的`STRATEGY_ID`。私有配置schema v2使用`PROFILES`保存可复用连接，使用`STRATEGIES[strategy_id]`选择profile和JQ/QMT_REMOTE模式；profile不再重复保存strategy ID。缺少策略条目时固定使用`DEFAULT_PROFILE + JQ`，QMT_REMOTE必须显式配置。
+聚宽策略脚本只声明全局唯一且稳定的`STRATEGY_ID`。私有配置schema v3使用`PROFILES`保存可复用连接，使用`STRATEGIES[strategy_id]`选择profile、`jq_account_enabled`和`qmt_account_enabled`；profile不再重复保存strategy ID。缺少策略条目时固定使用`DEFAULT_PROFILE`、JQ开、QMT关。两个账户可同时启用但不能同时关闭；共享策略决策，不共享资金、持仓、成本或风控结果。
 
 同一个profile可供多个不同策略复用，但两个独立策略不得共用`STRATEGY_ID`。服务端账本、持仓归属、活动意图和幂等作用域均以strategy ID为键；相同ID表示同一逻辑策略账户，不提供多实例领导者选举。

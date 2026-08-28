@@ -799,7 +799,18 @@ def _normalize_snapshot_tick(tick: Dict[str, Any], security: Optional[str]) -> D
         or ""
     )
     dt = _first_present(tick, "dt", "timetag", "datetime", "time")
-    return {"sid": sid, "last_price": last_price, "dt": dt}
+    result = {"sid": sid, "last_price": last_price, "dt": dt}
+    for name in (
+        "bidPrice",
+        "askPrice",
+        "bid_price1",
+        "ask_price1",
+        "bid1",
+        "ask1",
+    ):
+        if tick.get(name) is not None:
+            result[name] = tick[name]
+    return result
 
 
 def _normalize_live_current_tick(tick: Dict[str, Any]) -> Dict:

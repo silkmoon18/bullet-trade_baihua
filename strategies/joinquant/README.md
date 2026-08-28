@@ -17,15 +17,18 @@
 
 ## 当前使用限制
 
-`good_etf.py`已经不再保存host、token、profile、Webhook或账户配置，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或下单包装代码。策略文件只保留唯一`STRATEGY_ID`、回测开关、策略/执行参数、一次门面安装，以及ETF选股、权重、调仓、止盈止损和尾盘记录。`JoinQuantRuntime`门面对三种模式提供统一组合、下单、撤单、通知和查询入口。组合目标金额按`组合总资产 × DEPLOY_RATIO × 归一化权重`计算，避免把某一时刻的可用现金误当成整个组合的目标基数。
+`good_etf.py`已经不再保存host、token、profile、Webhook或账户开关，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或账户下单分支。策略文件只保留唯一`STRATEGY_ID`、回测开关、策略/执行参数、一次门面安装，以及ETF选股、目标权重、止盈止损阈值和结果日志。`JoinQuantRuntime`按配置分别驱动JQ和QMT账户；每个账户的目标金额均按其自己的`组合总资产 × DEPLOY_RATIO × 归一化权重`计算。
 
-当前三种模式的边界是：
+当前账户组合的边界是：
 
 - `BACKTEST`：始终使用聚宽原生回测接口；helper必须与策略一起上传，关闭远程预检时不读取私有profile；
-- `JQ`：只允许聚宽模拟交易，正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT_REMOTE的0.2%价格边界，由聚宽维护资金、持仓和指标；同时通过helper/profile发送目标买入计划卡片，但绝不提交QMT目标；
-- `QMT_REMOTE`：使用StrategyLedger真实组合与目标接口；聚宽原生交易函数保持阻断，只有真实账户对账READY后才把`production_ready`标记为true。GoodETF调仓先以沪深市价IOC卖出，收到终态回报后再按0.2%条件限价买入；止损使用市价IOC，止盈继续使用0.2%条件限价。服务端交易总开关默认仍为关闭。
+- 仅JQ：正常调用聚宽原生下单、撤单和模拟撮合，不叠加QMT的0.2%价格边界，由聚宽维护资金、持仓和指标；维持现有JQ目标买入计划通知；
+- 仅QMT：使用StrategyLedger真实组合与目标接口并阻断聚宽原生交易函数；
+- JQ+QMT：同一组选股权重分别按两个账户自己的资金和持仓执行，止盈止损也分别使用各自成本；QMT开启时只发送QMT计划、订单和成交通知，不再重复发送JQ计划卡片。
 
-当前仓库代码已经具备回测、JQ模拟和QMT_REMOTE链路；服务端交易开关默认关闭。真实资金启用前仍必须在目标QMT环境完成模拟与小额人工验收，并由用户明确放行。
+QMT调仓先以沪深市价IOC卖出，收到终态回报后再按0.2%条件限价买入；止损使用市价IOC，止盈继续使用0.2%条件限价。服务端交易总开关仍独立控制是否实际下QMT订单。
+
+当前仓库代码具备回测、JQ模拟、QMT远程和JQ+QMT并行链路。真实资金启用前仍必须在目标QMT环境完成模拟与小额人工验收，并由用户明确放行。
 
 helper按D021不防御同进程恶意Python代码；旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）与全部同进程对抗机制已在L00删除。同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留记录即失败关闭，必须使用干净进程重启，禁止reload或热补丁。
 
@@ -36,7 +39,7 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
 2. 本目录策略源码保持 `from jqdata import *` 和顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
-3. 在仓库源码中审查顶部的`VALIDATE_REMOTE_DURING_BACKTEST`和`STRATEGY_ID`；回测自动使用`BACKTEST`。模拟交易的profile和模式在私有`jq_runtime_config.py`的`STRATEGIES[strategy_id]`中选择，缺少策略键时使用`DEFAULT_PROFILE`并安全地默认为`JQ`。
+3. 在仓库源码中审查顶部的`VALIDATE_REMOTE_DURING_BACKTEST`、`STRATEGY_ID`和`QMT_INITIAL_CAPITAL`；回测自动使用`BACKTEST`。模拟交易在私有`jq_runtime_config.py`中通过`jq_account_enabled`和`qmt_account_enabled`选择账户，缺少策略键时默认只启用JQ。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
    profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。

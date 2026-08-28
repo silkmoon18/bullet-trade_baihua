@@ -401,39 +401,117 @@ class MiniQMTProvider(DataProvider):
         df: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
-        返回简化 tick：last_price + 时间戳。优先调用 xtdata.get_last_quote，失败则回退到 1m K 线最新价。
+        返回带真实行情时间的当前 tick。
+
+        优先使用 ``get_full_tick`` 获取实时盘口。``get_last_quote``
+        和 1m K 线仅作兼容回退。任何路径都不会用本机当前时间
+        冒充行情时间，以便上层能够识别缓存或过期行情。
         """
         _ = dt, df
+        xtdata = None
+        code = self._normalize_security_code(security)
         try:
             xtdata = self._ensure_xtdata()
-            code = self._normalize_security_code(security)
+            tick_map = xtdata.get_full_tick([code])  # type: ignore[attr-defined]
+            tick = tick_map.get(code) if isinstance(tick_map, dict) else None
+            normalized = self._normalize_current_tick(code, tick)
+            if normalized is not None:
+                return normalized
+        except Exception:
+            pass
+        try:
+            if xtdata is None:
+                xtdata = self._ensure_xtdata()
             quote = xtdata.get_last_quote(code)  # type: ignore[attr-defined]
-            if quote:
-                if isinstance(quote, dict):
-                    last = quote.get("lastPrice") or quote.get("last_price") or quote.get("price")
-                    ts = quote.get("time") or quote.get("datetime")
-                else:
-                    last = (
-                        getattr(quote, "lastPrice", None)
-                        or getattr(quote, "last_price", None)
-                        or getattr(quote, "price", None)
-                    )
-                    ts = getattr(quote, "time", None) or getattr(quote, "datetime", None)
-                if ts is None:
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if last is not None:
-                    return {"sid": self._to_jq_code(code), "last_price": float(last), "dt": ts}
+            normalized = self._normalize_current_tick(code, quote)
+            if normalized is not None:
+                return normalized
         except Exception:
             pass
         try:
             df = self.get_price(security, count=1, frequency="1m")
             if df is not None and not df.empty:
                 last = df.iloc[-1]["close"]
-                dt = df.index[-1] if df.index.name else df.iloc[-1].get("datetime", datetime.now())
-                return {"sid": security, "last_price": float(last), "dt": str(dt)}
+                market_dt = (
+                    df.index[-1]
+                    if isinstance(df.index, pd.DatetimeIndex)
+                    else df.iloc[-1].get("datetime")
+                )
+                if market_dt is not None:
+                    return {
+                        "sid": self._to_jq_code(code),
+                        "last_price": float(last),
+                        "dt": self._normalize_tick_time(market_dt, code),
+                    }
         except Exception:
             return None
         return None
+
+    @classmethod
+    def _normalize_current_tick(
+        cls, code: str, tick: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize one xtdata tick without inventing a market timestamp."""
+
+        if not tick:
+            return None
+        if isinstance(tick, dict):
+            value = tick.get
+        else:
+            def value(name, default=None):
+                return getattr(tick, name, default)
+
+        last = None
+        for name in ("lastPrice", "last_price", "price", "last"):
+            candidate = value(name)
+            if candidate is not None:
+                try:
+                    if float(candidate) > 0:
+                        last = float(candidate)
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if last is None:
+            return None
+
+        raw_time = None
+        for name in ("dt", "timetag", "datetime", "time", "timestamp"):
+            candidate = value(name)
+            if candidate not in (None, ""):
+                raw_time = candidate
+                break
+        if raw_time is None:
+            return None
+
+        result: Dict[str, Any] = {
+            "sid": cls._to_jq_code(code),
+            "last_price": last,
+            "dt": cls._normalize_tick_time(raw_time, code),
+        }
+        for name in (
+            "bidPrice",
+            "askPrice",
+            "bid_price1",
+            "ask_price1",
+            "bid1",
+            "ask1",
+        ):
+            quote_value = value(name)
+            if quote_value is not None:
+                if hasattr(quote_value, "tolist"):
+                    quote_value = quote_value.tolist()
+                result[name] = quote_value
+        return result
+
+    @classmethod
+    def _normalize_tick_time(cls, value: Any, security: str) -> str:
+        parsed = cls._parse_qmt_time_values(
+            [value],
+            source="tick",
+            security=security,
+            period="tick",
+        )
+        return parsed[0].isoformat()
 
     @staticmethod
     def _normalize_period(frequency: Optional[str]) -> str:

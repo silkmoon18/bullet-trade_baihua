@@ -1,5 +1,5 @@
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -21,6 +21,7 @@ from bullet_trade.server.strategy import (
 )
 from bullet_trade.server.strategy.schema import connect_database
 from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
+from bullet_trade.server.strategy.domain import SHANGHAI_TZ
 
 
 SECURITY = "510050.XSHG"
@@ -116,6 +117,7 @@ class CallbackData(FakeData):
             "last_price": 10.0,
             "bidPrice": [9.99],
             "askPrice": [self.ask_price],
+            "dt": datetime.now(SHANGHAI_TZ).isoformat(),
         }
 
     def emit(self, payload):
@@ -432,6 +434,18 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
     assert broker.order_calls == 0
     assert data.subscriptions == [(SECURITY,)]
 
+    data.emit(
+        {
+            "510050.SH": {
+                "lastPrice": 10.0,
+                "bidPrice": [9.99],
+                "askPrice": [10.01],
+            }
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert broker.order_calls == 0
+
     # xtdata.subscribe_quote sends {stock: [tick, ...]}.  The first tick
     # reaches the fixed boundary while the later tick moves back outside it;
     # the crossing must not be lost when the callback contains a batch.
@@ -442,11 +456,13 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
                     "lastPrice": 10.0,
                     "bidPrice": [9.99],
                     "askPrice": [10.01],
+                    "time": int(datetime.now(SHANGHAI_TZ).timestamp() * 1000),
                 },
                 {
                     "lastPrice": 10.03,
                     "bidPrice": [10.02],
                     "askPrice": [10.03],
+                    "time": int(datetime.now(SHANGHAI_TZ).timestamp() * 1000),
                 },
             ]
         }
@@ -460,6 +476,35 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
     assert log_messages == [
         "StrategyLedger 首次收到执行行情 | 510050.XSHG"
     ]
+
+
+@pytest.mark.asyncio
+async def test_qmt_mark_preserves_timestamp_and_rejects_stale_tick(api):
+    service, _, _, _ = api
+    request_time = datetime.now(SHANGHAI_TZ).replace(microsecond=0)
+
+    class TimestampedData:
+        def __init__(self, tick_time):
+            self.tick_time = tick_time
+
+        async def get_current_tick(self, security):
+            return {"last_price": 10.0, "time": self.tick_time}
+
+    fresh_time = request_time - timedelta(seconds=30)
+    service.data_provider = TimestampedData(
+        int(fresh_time.timestamp() * 1000)
+    )
+    marks = await service._marks(
+        None, request_time, "good_etf", (SECURITY,)
+    )
+    assert marks[SECURITY].as_of == fresh_time
+
+    stale_time = request_time - timedelta(minutes=6)
+    service.data_provider = TimestampedData(stale_time.isoformat())
+    with pytest.raises(ValueError, match="QMT mark is stale"):
+        await service._marks(
+            None, request_time, "good_etf", (SECURITY,)
+        )
 
 
 @pytest.mark.asyncio
