@@ -185,6 +185,9 @@ class SQLiteFillBookingService:
                         event="ORDER_SUBMITTED",
                         strategy_id=account.strategy_id,
                         security=order.security,
+                        security_name=self._security_name(
+                            connection, order.intent_id, order.security
+                        ),
                         side=order.side.value,
                         status=order.state.value,
                         quantity=order.requested_qty,
@@ -266,6 +269,9 @@ class SQLiteFillBookingService:
                     event="ORDER_SUBMITTED",
                     strategy_id=account.strategy_id,
                     security=current.security,
+                    security_name=self._security_name(
+                        connection, current.intent_id, current.security
+                    ),
                     side=current.side.value,
                     status=current.state.value,
                     quantity=current.requested_qty,
@@ -332,6 +338,9 @@ class SQLiteFillBookingService:
                     event="ERROR",
                     strategy_id=account.strategy_id,
                     security=current.security,
+                    security_name=self._security_name(
+                        connection, current.intent_id, current.security
+                    ),
                     side=current.side.value,
                     status=current.state.value,
                     quantity=current.requested_qty,
@@ -571,6 +580,9 @@ class SQLiteFillBookingService:
                     event=order_state.value,
                     strategy_id=updated_account.strategy_id,
                     security=fill.security,
+                    security_name=self._security_name(
+                        connection, order["intent_id"], fill.security
+                    ),
                     side=fill.side.value,
                     status=order_state.value,
                     quantity=fill.quantity,
@@ -702,6 +714,9 @@ class SQLiteFillBookingService:
                     event=terminal_state.value,
                     strategy_id=updated_account.strategy_id,
                     security=order["security"],
+                    security_name=self._security_name(
+                        connection, order["intent_id"], order["security"]
+                    ),
                     side=order["side"],
                     status=terminal_state.value,
                     quantity=order["requested_qty"] - order["filled_qty"],
@@ -1020,6 +1035,24 @@ class SQLiteFillBookingService:
         if row is None:
             raise FillBookingError("strategy position not found")
         return _position_from_row(cast(sqlite3.Row, row))
+
+    @staticmethod
+    def _security_name(
+        connection: sqlite3.Connection,
+        intent_id: str,
+        security: str,
+    ) -> str:
+        row = connection.execute(
+            "SELECT targets_json FROM portfolio_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        try:
+            payload = json.loads(row["targets_json"])
+            return str(payload.get("security_names", {}).get(security, ""))
+        except (TypeError, ValueError, KeyError):
+            return ""
 
     @staticmethod
     def _order_from_row(row: sqlite3.Row) -> BrokerOrder:

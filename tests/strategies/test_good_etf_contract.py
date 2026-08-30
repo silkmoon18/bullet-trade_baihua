@@ -3,7 +3,7 @@
 
 Runtime protocol, RPC and mode validation are tested in
 ``tests/test_jq_strategy_runtime.py``. This module verifies that the strategy
-keeps only deployment declarations, execution policy and ETF business logic.
+keeps only deployment declarations and ETF decision logic.
 """
 
 import ast
@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from helpers import bullet_trade_jq_remote_helper as real_helper
 
@@ -57,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 14,
+            "api_version": 15,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -69,6 +70,42 @@ class _Runtime:
         self.order_calls = []
         self.notifications = []
         self.rebalances = []
+        self.platform_configured = False
+        self.schedules = []
+        self.strategy_events = []
+
+    def configure_platform(self, benchmark="000300.XSHG"):
+        self.platform_configured = True
+
+    def schedule_daily(
+        self,
+        before_market_open,
+        market_open,
+        risk_management,
+        risk_check_times,
+        after_market_check,
+        reference_security="000300.XSHG",
+    ):
+        self.schedules.append(
+            (
+                before_market_open,
+                market_open,
+                risk_management,
+                risk_check_times,
+                after_market_check,
+                reference_security,
+            )
+        )
+
+    def log_process_initialize(self):
+        return None
+
+    def log_strategy_event(self, message):
+        self.strategy_events.append(message)
+
+    @staticmethod
+    def security_label(security, known_name=""):
+        return security
 
     def portfolio(self, context):
         return self._portfolio or context.portfolio
@@ -102,7 +139,8 @@ class _Runtime:
         self.submissions.append((context, weights, marks, key, execution))
         return {"intent": {"intent_id": "intent-1", "state": "PLANNED"}}
 
-    def execute_rebalance(self, context, weights, marks, key, execution):
+    def execute_rebalance(self, context, weights, marks, key, execution=None):
+        execution = execution or real_helper.default_etf_rebalance_execution()
         self.rebalances.append((context, weights, marks, key, execution))
         result = {"qmt": None, "jq_orders": [], "errors": []}
         if self.qmt_account_enabled:
@@ -124,9 +162,17 @@ class _Runtime:
         stop_loss_ratio,
         take_profit_ratio,
         key,
-        stop_loss_execution,
-        take_profit_execution,
+        stop_loss_execution=None,
+        take_profit_execution=None,
     ):
+        stop_loss_execution = (
+            stop_loss_execution
+            or real_helper.default_etf_stop_loss_execution()
+        )
+        take_profit_execution = (
+            take_profit_execution
+            or real_helper.default_etf_take_profit_execution()
+        )
         checks = []
         stop_loss = []
         take_profit = []
@@ -179,6 +225,7 @@ def _helper_with_install(runtime, calls):
         "MarketExecution",
         "FollowUpPolicy",
         "RepricingPolicy",
+        "is_hong_kong_etf",
     ):
         setattr(helper, name, getattr(real_helper, name))
 
@@ -218,15 +265,36 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
     functions = {
         node.name for node in tree.body if isinstance(node, ast.FunctionDef)
     }
+    direct_calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
 
     assert not ({"socket", "ssl", "json", "sqlite3"} & imports)
+    assert not ({
+        "set_option",
+        "set_benchmark",
+        "set_order_cost",
+        "set_slippage",
+        "run_daily",
+        "OrderCost",
+        "FixedSlippage",
+    } & direct_calls)
+    assert all(
+        execution_name not in source
+        for execution_name in (
+            "ExecutionRequest",
+            "ConditionalLimitExecution",
+            "MarketExecution",
+            "FollowUpPolicy",
+            "RepricingPolicy",
+        )
+    )
     assert len(source.splitlines()) <= 520
     assert functions == {
         "_install_runtime",
-        "_notify",
-        "_rebalance_execution",
-        "_stop_loss_execution",
-        "_take_profit_execution",
+        "_load_tracked_index_names",
         "initialize",
         "process_initialize",
         "before_market_open",
@@ -239,30 +307,6 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
 def test_risk_check_times_are_top_level_configuration(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
-
-
-def test_good_etf_declares_execution_policy_per_call(monkeypatch):
-    strategy = _load_strategy(monkeypatch)
-    rebalance = strategy._rebalance_execution()
-    stop_loss = strategy._stop_loss_execution()
-    take_profit = strategy._take_profit_execution()
-
-    assert isinstance(rebalance.style, real_helper.ConditionalLimitExecution)
-    assert rebalance.style.price_band_ppm == 2_000
-    assert (
-        rebalance.style.price_mode
-        is real_helper.ConditionalLimitPriceMode.BOUNDARY
-    )
-    assert isinstance(rebalance.sell_style, real_helper.MarketExecution)
-    assert rebalance.sell_style.protect_price_band_ppm == 15_000
-    assert isinstance(stop_loss.style, real_helper.MarketExecution)
-    assert stop_loss.style.protect_price_band_ppm == 15_000
-    assert isinstance(take_profit.style, real_helper.ConditionalLimitExecution)
-    assert take_profit.sell_style is None
-    assert (
-        stop_loss.follow_up
-        is real_helper.FollowUpPolicy.UNTIL_FILLED_TODAY
-    )
 
 
 def test_runtime_install_is_one_thin_helper_call(monkeypatch):
@@ -283,10 +327,23 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf_remote",
         "qmt_initial_capital": 10000,
-        "expected_api_version": 14,
+        "expected_api_version": 15,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
+
+
+def test_good_etf_uses_public_hong_kong_etf_filter(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+
+    assert "bt.is_hong_kong_etf(" in STRATEGY_PATH.read_text(encoding="utf-8")
+    assert strategy.bt.is_hong_kong_etf("520590.XSHG", "恒科") is True
+    assert strategy.bt.is_hong_kong_etf(
+        "510001.XSHG", "科技ETF", "恒生科技指数"
+    ) is True
+    assert strategy.bt.is_hong_kong_etf(
+        "510002.XSHG", "央企ETF", "中证中央企业指数"
+    ) is False
 
 
 def test_lifecycle_installs_runtime_before_platform_calls():
@@ -325,6 +382,30 @@ def test_strategy_does_not_manage_account_readiness_or_reconciliation():
     assert ".account_portfolios(" not in source
 
 
+def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
+    monkeypatch,
+):
+    calls = []
+    runtime = _Runtime(real_helper.RuntimeMode.JQ)
+    strategy = _load_strategy(
+        monkeypatch, _helper_with_install(runtime, calls)
+    )
+    context = _Context()
+
+    strategy.initialize(context)
+
+    assert runtime.platform_configured is True
+    assert len(runtime.schedules) == 1
+    before, market, risk, times, after, reference = runtime.schedules[0]
+    assert before is strategy.before_market_open
+    assert market is strategy.market_open
+    assert risk is strategy.handle_risk_management
+    assert times == strategy.RISK_CHECK_TIMES
+    assert after is strategy.after_market_check
+    assert reference == "000300.XSHG"
+    assert strategy.g.fund_list is None
+
+
 def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     strategy.g.fund_list = pd.DataFrame(
@@ -345,7 +426,6 @@ def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
     monkeypatch.setattr(
         strategy, "get_current_data", lambda: current_data, raising=False
     )
-    monkeypatch.setattr(strategy, "_notify", lambda message: None)
 
     strategy.market_open(
         types.SimpleNamespace(
@@ -357,6 +437,68 @@ def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
     _, weights, marks, key, _ = runtime.rebalances[0]
     assert weights == {"510001.XSHG": 0.95}
     assert marks == {"510001.XSHG": 1.0}
+    assert key == "open-20260819"
+
+
+def test_market_open_preserves_discount_ranking_filters_and_weights(
+    monkeypatch,
+):
+    strategy = _load_strategy(monkeypatch)
+    codes = [
+        "510001.XSHG",
+        "510002.XSHG",
+        "510003.XSHG",
+        "510004.XSHG",
+        "510005.XSHG",
+    ]
+    strategy.g.fund_list = pd.DataFrame(
+        {"unit_net_value": [2.0] * len(codes)}, index=codes
+    )
+    current_data = {
+        "510001.XSHG": types.SimpleNamespace(
+            last_price=1.0, paused=False, high_limit=1.1
+        ),
+        "510002.XSHG": types.SimpleNamespace(
+            last_price=1.5, paused=False, high_limit=1.6
+        ),
+        "510003.XSHG": types.SimpleNamespace(
+            last_price=1.8, paused=False, high_limit=1.9
+        ),
+        # 溢价标的必须排除。
+        "510004.XSHG": types.SimpleNamespace(
+            last_price=2.1, paused=False, high_limit=2.2
+        ),
+        # 即使折价更深，停牌标的也必须在折价排序前排除。
+        "510005.XSHG": types.SimpleNamespace(
+            last_price=0.5, paused=True, high_limit=0.6
+        ),
+    }
+    portfolio = types.SimpleNamespace(total_value=10000.0, positions={})
+    runtime = _Runtime(real_helper.RuntimeMode.JQ, portfolio)
+    strategy._runtime = runtime
+    monkeypatch.setattr(
+        strategy, "get_current_data", lambda: current_data, raising=False
+    )
+
+    strategy.market_open(
+        types.SimpleNamespace(
+            current_dt=pd.Timestamp("2026-08-19 09:30:00")
+        )
+    )
+
+    assert len(runtime.rebalances) == 1
+    _, weights, marks, key, _ = runtime.rebalances[0]
+    assert list(weights) == codes[:3]
+    assert weights == pytest.approx({
+        "510001.XSHG": 50.0 / 85.0 * 0.95,
+        "510002.XSHG": 25.0 / 85.0 * 0.95,
+        "510003.XSHG": 10.0 / 85.0 * 0.95,
+    })
+    assert marks == {
+        "510001.XSHG": 1.0,
+        "510002.XSHG": 1.5,
+        "510003.XSHG": 1.8,
+    }
     assert key == "open-20260819"
 
 
@@ -372,7 +514,6 @@ def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):
     runtime = _Runtime(real_helper.RuntimeMode.QMT_REMOTE, portfolio)
     runtime.advance_result = False
     strategy._runtime = runtime
-    monkeypatch.setattr(strategy, "_notify", lambda message: None)
 
     strategy.handle_risk_management(
         types.SimpleNamespace(
@@ -398,7 +539,6 @@ def test_remote_take_profit_keeps_conditional_limit_execution(monkeypatch):
     )
     runtime = _Runtime(real_helper.RuntimeMode.QMT_REMOTE, portfolio)
     strategy._runtime = runtime
-    monkeypatch.setattr(strategy, "_notify", lambda message: None)
 
     strategy.handle_risk_management(
         types.SimpleNamespace(

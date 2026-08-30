@@ -38,6 +38,7 @@ class TradeNotification:
     occurred_at: Optional[datetime] = None
     title: Optional[str] = None
     strategy_id: str = "-"
+    security_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class TargetBuyPlanItem:
     quantity: int
     amount: Number
     reference_price: Optional[Number] = None
+    security_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,10 @@ class FeishuTradeNotifier:
         lines = [
             "**策略ID：** `{}`".format(notification.strategy_id or "-"),
             "**标的：** `{}`".format(notification.security or "-"),
+        ]
+        if notification.security_name:
+            lines.append("**名称：** {}".format(notification.security_name))
+        lines.extend([
             "**方向：** {}".format(notification.side or "-"),
             "**状态：** {}".format(notification.status or "-"),
             "**数量：** {}".format(
@@ -136,7 +142,7 @@ class FeishuTradeNotifier:
             "**金额：** ¥{}".format(_display(notification.amount, 2)),
             "**单价：** ¥{}".format(_display(notification.price, 4)),
             "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
-        ]
+        ])
         if notification.order_id:
             lines.append("**订单号：** `{}`".format(notification.order_id))
         if notification.trade_id:
@@ -179,9 +185,13 @@ class FeishuTradeNotifier:
         for item in notification.items:
             item_lines = [
                 "**标的：** `{}`".format(item.security),
+            ]
+            if item.security_name:
+                item_lines.append("**名称：** {}".format(item.security_name))
+            item_lines.extend([
                 "**目标数量：** {} 股".format(item.quantity),
                 "**目标金额：** ¥{}".format(_display(item.amount, 2)),
-            ]
+            ])
             if item.reference_price is not None:
                 item_lines.append(
                     "**单价：** ¥{}".format(

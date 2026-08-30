@@ -1,13 +1,23 @@
 """Type contract for the standalone JoinQuant strategy runtime helper."""
 
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, Tuple, TypedDict, Union
+from typing import Any, Callable, Dict, FrozenSet, Literal, Optional, Tuple, TypedDict, Union
 
 from joinquant_typing import Context
 
 STRATEGY_RUNTIME_API_VERSION: int
 STRATEGY_RUNTIME_HELPER_MARKER: str
 PROFILE_SCHEMA_VERSION: int
+HONG_KONG_ETF_KEYWORDS: Tuple[str, ...]
+HONG_KONG_ETF_CODE_DENYLIST: FrozenSet[str]
+
+def is_hong_kong_etf(
+    security: str,
+    display_name: Any = ...,
+    traced_index_name: Any = ...,
+    keywords: Optional[Tuple[str, ...]] = ...,
+    code_denylist: Optional[Any] = ...,
+) -> bool: ...
 
 _RuntimeMode = Literal["BACKTEST", "JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL"]
 
@@ -94,6 +104,11 @@ class ExecutionRequest:
     follow_up: FollowUpPolicy
     repricing: RepricingPolicy
     sell_style: Optional[_ExecutionStyle]
+
+
+def default_etf_rebalance_execution() -> ExecutionRequest: ...
+def default_etf_stop_loss_execution() -> ExecutionRequest: ...
+def default_etf_take_profit_execution() -> ExecutionRequest: ...
 
 
 class PositionView:
@@ -191,6 +206,18 @@ class JoinQuantRuntime:
     jq_account_enabled: bool
     qmt_account_enabled: bool
 
+    def configure_platform(self, benchmark: str = ...) -> None: ...
+    def schedule_daily(
+        self,
+        before_market_open: Callable[[Any], Any],
+        market_open: Callable[[Any], Any],
+        risk_management: Callable[[Any], Any],
+        risk_check_times: Tuple[str, ...],
+        after_market_check: Callable[[Any], Any],
+        reference_security: str = ...,
+    ) -> None: ...
+    def log_process_initialize(self) -> None: ...
+    def log_strategy_event(self, message: str) -> None: ...
     def portfolio(self, context: Context) -> Any: ...
     def account_portfolios(self, context: Context) -> Tuple[AccountPortfolioView, ...]: ...
     def log_account_snapshots(self, context: Context) -> None: ...
@@ -201,8 +228,13 @@ class JoinQuantRuntime:
         weights: Dict[str, Any],
         marks: Dict[str, Any],
         idempotency_key: str,
-        execution: ExecutionRequest,
+        execution: Optional[ExecutionRequest] = ...,
+        security_names: Optional[Dict[str, str]] = ...,
     ) -> Dict[str, Any]: ...
+    @staticmethod
+    def security_name(security: str, known_name: Any = ...) -> str: ...
+    @staticmethod
+    def security_label(security: str, known_name: Any = ...) -> str: ...
     def advance_targets(self, context: Context) -> bool: ...
     def cancel_targets(self) -> bool: ...
     def cancel_orders(self) -> int: ...
@@ -223,6 +255,7 @@ class JoinQuantRuntime:
         current_value: float,
         reference_price: float,
         lot_size: int = ...,
+        security_name: str = ...,
     ) -> Optional[Dict[str, Any]]: ...
     def send_target_buy_plan(
         self, items: Any, occurred_at: Any = ...
@@ -241,8 +274,8 @@ class JoinQuantRuntime:
         stop_loss_ratio: float,
         take_profit_ratio: float,
         idempotency_key: str,
-        stop_loss_execution: ExecutionRequest,
-        take_profit_execution: ExecutionRequest,
+        stop_loss_execution: Optional[ExecutionRequest] = ...,
+        take_profit_execution: Optional[ExecutionRequest] = ...,
     ) -> Dict[str, Any]: ...
 
 
@@ -269,6 +302,7 @@ def submit_targets(
     marks: Optional[Dict[str, Any]] = ...,
     as_of: Any = ...,
     execution: Optional[ExecutionRequest] = ...,
+    security_names: Optional[Dict[str, str]] = ...,
 ) -> Dict[str, Any]: ...
 def notify_target_buy_plan(
     items: Any,
@@ -295,6 +329,7 @@ def submit_runtime_targets(
     marks: Dict[str, Any],
     idempotency_key: str,
     execution: ExecutionRequest,
+    security_names: Optional[Dict[str, str]] = ...,
 ) -> Dict[str, Any]: ...
 def advance_runtime_targets(context: Context) -> bool: ...
 def cancel_runtime_targets() -> bool: ...

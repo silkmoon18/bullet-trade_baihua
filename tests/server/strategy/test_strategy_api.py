@@ -310,6 +310,7 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
         "idempotency_key": "jq-20260811-open",
         "weights": {SECURITY: "0.5"},
         "marks": {SECURITY: "10"},
+        "security_names": {SECURITY: "测试ETF"},
     }
 
     first = await service.submit_targets(account, "default", request)
@@ -330,6 +331,10 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     assert broker.cancel_calls == []
     assert second["cancel_requested_order_ids"] == []
     assert any(item.event == "ORDER_SUBMITTED" for item in notifications)
+    assert any(
+        item.event == "ORDER_SUBMITTED" and item.security_name == "测试ETF"
+        for item in notifications
+    )
     assert first["intent"]["intent_id"] == second["intent"]["intent_id"]
     assert restored["intent_id"] == intent_id
     assert restored["weights"] == {SECURITY: 0.5}
@@ -354,6 +359,7 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
             "items": [
                 {
                     "security": "510050.XSHG",
+                    "security_name": "上证50ETF",
                     "quantity": 1000,
                     "amount": "2500.00",
                     "reference_price": "2.5000",
@@ -379,6 +385,7 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     assert isinstance(notification, TargetBuyPlanNotification)
     assert notification.mode == "JQ"
     assert notification.items[0].quantity == 1000
+    assert notification.items[0].security_name == "上证50ETF"
     with pytest.raises(Exception, match="not found"):
         service.repository.get_strategy_account("good_etf")
 

@@ -18,6 +18,13 @@ from typing import Any, Dict, List, TYPE_CHECKING
 from jqdata import *
 import bullet_trade_jq_remote_helper as bt
 
+try:
+    # 聚宽基金数据库；本地兼容层没有该对象时自动使用轻量降级逻辑。
+    from jqdata import finance, query
+except ImportError:  # pragma: no cover - 仅本地IDE/单测环境
+    finance = None
+    query = None
+
 if TYPE_CHECKING:
     # 仅供本地IDE使用；聚宽运行时不会导入该本地类型模块。
     from joinquant_typing import Context  # noqa: F401
@@ -26,7 +33,7 @@ if TYPE_CHECKING:
 STRATEGY_ID = 'good_etf_remote'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 14
+_EXPECTED_RUNTIME_API_VERSION = 15
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -36,12 +43,6 @@ MAX_MONEY = 2e7            # 流动性上限：前一日成交额 < 2000 万
 STOP_LOSS_RATIO = 0.95     # 止损线：现价跌破成本价 95%
 TAKE_PROFIT_RATIO = 1.10   # 止盈线：现价涨超成本价 110%
 DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、费用和价格波动
-# 港股类 ETF 过滤关键词（名称包含任一关键词即剔除）
-HK_KEYWORDS = ['港股', '恒生', 'H股', '国企', '香港', '恒生科技', '港股通', '恒生互联网']
-
-# ===== QMT执行参数 =====
-REMOTE_PRICE_BAND_PCT = 0.002  # 真实调仓价格边界：聚宽参考价上下0.2%；JQ模式不使用该参数
-REMOTE_MARKET_RESERVATION_BAND_PCT = 0.015  # 市价执行估值/资金预留边界，不限制QMT真实市价成交
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 QMT_INITIAL_CAPITAL = 10000     # 分配给QMT策略虚拟账户的固定初始资金；不影响聚宽账户资金
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
@@ -64,85 +65,57 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
     return dict(_runtime.state)
 
 
-def _notify(message: str) -> None:
-    # 聚宽侧只记录策略事件；飞书交易卡片由服务器统一发送。
-    log.info('[策略通知] {}'.format(message))
-
-
-def _rebalance_execution() -> Any:
-    return bt.ExecutionRequest(
-        style=bt.ConditionalLimitExecution(
-            int(REMOTE_PRICE_BAND_PCT * 1_000_000),
-            bt.ConditionalLimitPriceMode.BOUNDARY,
-        ),
-        # 调仓先以QMT真实市价卖出，成交回报释放资金后，再执行条件限价买入。
-        sell_style=bt.MarketExecution(
-            int(REMOTE_MARKET_RESERVATION_BAND_PCT * 1_000_000)
-        ),
-        follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
-        repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
-    )
-
-
-def _stop_loss_execution() -> Any:
-    return bt.ExecutionRequest(
-        style=bt.MarketExecution(
-            int(REMOTE_MARKET_RESERVATION_BAND_PCT * 1_000_000)
-        ),
-        follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
-        repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
-    )
-
-
-def _take_profit_execution() -> Any:
-    # 止盈不承担为新仓筹资的职责，继续等待0.2%价格边界后限价卖出。
-    return bt.ExecutionRequest(
-        style=bt.ConditionalLimitExecution(
-            int(REMOTE_PRICE_BAND_PCT * 1_000_000),
-            bt.ConditionalLimitPriceMode.BOUNDARY,
-        ),
-        follow_up=bt.FollowUpPolicy.UNTIL_FILLED_TODAY,
-        repricing=bt.RepricingPolicy.KEEP_ORIGINAL,
-    )
+def _load_tracked_index_names(codes: List[str], as_of: Any) -> Dict[str, str]:
+    """批量读取ETF跟踪指数名称；失败时返回空映射，不阻塞开盘。"""
+    if finance is None or query is None or not codes:
+        return {}
+    try:
+        table = finance.FUND_INVEST_TARGET
+        statement = query(
+            table.code,
+            table.traced_index_name,
+            table.pub_date,
+            table.start_date,
+            table.end_date,
+        ).filter(
+            table.code.in_(codes),
+            table.pub_date <= as_of,
+            table.start_date <= as_of,
+            (table.end_date == None) | (table.end_date > as_of),  # noqa: E711
+        )
+        rows = finance.run_query(statement)
+        names = {}  # type: Dict[str, str]
+        for _, row in rows.iterrows():
+            code = str(row['code'])
+            index_name = row.get('traced_index_name')
+            if not isinstance(index_name, str) or not index_name:
+                continue
+            previous = names.get(code, '')
+            names[code] = '{} {}'.format(previous, index_name).strip()
+        return names
+    except Exception as exc:
+        log.warn('ETF跟踪指数读取失败，港股过滤降级为简称和代码排除表：{}'.format(exc))
+        return {}
 
 
 def initialize(context: 'Context') -> None:
     # 安全门必须是第一条可执行语句；门前不得访问任何聚宽平台对象。
     _install_runtime(context)
 
-    # 设置日志级别
-    log.set_level('system', 'error')
-    # 避免使用未来数据（聚宽平台级未来数据防护）
-    set_option("avoid_future_data", True)
-    # 设定沪深300作为基准
-    set_benchmark('000300.XSHG')
-    # 开启动态复权模式（真实价格）
-    set_option('use_real_price', True)
-    # 设置聚宽账户的模拟交易成本；QMT账户只使用服务器确认的真实费用证据。
-    set_order_cost(
-        OrderCost(close_tax=0.000, open_commission=0.00025, close_commission=0.00025, min_commission=5),
-        type='fund'
-    )
-    # 设置滑点（固定滑点0.1%）
-    set_slippage(FixedSlippage(0.002))
+    _runtime.configure_platform()
 
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
     log.info(f'策略初始化完成 | 最大持仓={MAX_HOLD_NUM} 流动性=({MIN_MONEY / 1e4:.0f}万,{MAX_MONEY / 1e4:.0f}万) '
              f'止损线={STOP_LOSS_RATIO:.0%} 止盈线={TAKE_PROFIT_RATIO:.0%}')
 
-    # 每日运行函数调度
-    # 9:20 预处理选股数据（前一日数据，无未来函数）
-    run_daily(before_market_open, '09:20', reference_security='000300.XSHG')
-    # 9:30 执行开盘选股+下单
-    run_daily(market_open, '09:30', reference_security='000300.XSHG')
-    # 按顶部配置注册盘中和尾盘止盈止损检查。
-    for risk_time in RISK_CHECK_TIMES:
-        run_daily(handle_risk_management, time=risk_time, reference_security='000300.XSHG')
-    # 14:55 尾盘快照；统一门面分别读取所有已启用账户。
-    run_daily(after_market_check, time='14:55', reference_security='000300.XSHG')
-    log.info('任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | '
-             '风控: {} | 14:55 尾盘快照'.format('/'.join(RISK_CHECK_TIMES)))
+    _runtime.schedule_daily(
+        before_market_open,
+        market_open,
+        handle_risk_management,
+        RISK_CHECK_TIMES,
+        after_market_check,
+    )
 
 
 def process_initialize(context: 'Context') -> None:
@@ -150,7 +123,7 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
-    log.info(f"process_initialize 重建配置 {datetime.datetime.now()}")
+    _runtime.log_process_initialize()
 
 
 def before_market_open(context: 'Context') -> None:
@@ -162,26 +135,36 @@ def before_market_open(context: 'Context') -> None:
         all_etf = get_all_securities(['etf'], context.previous_date)
         log.info(f'全市场ETF数量: {len(all_etf)}')
 
-        # 过滤港股类ETF（名称为空时保留，避免 NaN 导致整体预处理失败）
+        # 过滤港股类ETF：场内简称 + 跟踪指数 + 显式代码兜底。
         # 注意：必须用列表推导式 any([...])，不能用生成器 any(...)。
         # 聚宽环境中 any 可能被 numpy 的 np.any 覆盖，np.any(生成器) 恒为 True，
         # 会导致全部标的被误判为港股ETF而过滤掉（np.any(列表) 则行为正常）。
         fund_list: List[str] = []
         hk_samples: List[str] = []
         hk_count = 0
+        tracked_index_names = _load_tracked_index_names(
+            [str(code) for code in all_etf.index], context.previous_date
+        )
         for code, name in zip(all_etf.index, all_etf['display_name']):
-            safe_code: str = code
-            if isinstance(name, str) and any([kw in name for kw in HK_KEYWORDS]):
+            safe_code: str = str(code)
+            safe_label = _runtime.security_label(safe_code, name)
+            if bt.is_hong_kong_etf(
+                safe_code, name, tracked_index_names.get(safe_code, '')
+            ):
                 hk_count += 1
                 if len(hk_samples) < 5:
-                    hk_samples.append(f'{safe_code}({name})')
+                    detail = tracked_index_names.get(safe_code, '')
+                    sample = safe_label
+                    if detail:
+                        sample += '[跟踪:{}]'.format(detail)
+                    hk_samples.append(sample)
                 continue
             fund_list.append(safe_code)
         log.info(f'过滤港股ETF {hk_count} 只 | 剩余 {len(fund_list)} 只')
         if hk_samples:
             log.info(f'被过滤ETF样例: {hk_samples}')
         if fund_list:
-            log.info(f'保留ETF样例: {fund_list[:5]}')
+            log.info(f'保留ETF样例: {[_runtime.security_label(code) for code in fund_list[:5]]}')
 
         if not fund_list:
             log.warn('过滤后无ETF标的')
@@ -273,13 +256,16 @@ def market_open(context: 'Context') -> None:
         # 选择折价最深的前 N 支
         selected_funds = df.head(MAX_HOLD_NUM)
         order_fund_codes = selected_funds.index.tolist()
-        log.info(f'选中折价ETF {len(order_fund_codes)} 只: {order_fund_codes}')
+        selected_labels = [_runtime.security_label(code) for code in order_fund_codes]
+        log.info(f'选中折价ETF {len(order_fund_codes)} 只: {selected_labels}')
         for code in order_fund_codes:
             row = selected_funds.loc[code]
-            log.info(f'候选明细 | {code} 折价率={row["premium"]:.2f}% '
+            log.info(f'候选明细 | {_runtime.security_label(code)} 折价率={row["premium"]:.2f}% '
                      f'最新价={row["last_price"]:.3f} 净值={row["unit_net_value"]:.4f}')
         if order_fund_codes:
-            _notify(f'选中折价ETF {len(order_fund_codes)} 只: {order_fund_codes}')
+            _runtime.log_strategy_event(
+                f'选中折价ETF {len(order_fund_codes)} 只: {selected_labels}'
+            )
 
         # 策略只生成一份目标权重和参考价；helper使用两个账户各自的
         # 总资产、持仓和可用资金独立执行，不在策略层混用账户状态。
@@ -299,12 +285,11 @@ def market_open(context: 'Context') -> None:
             target_weights,
             marks,
             key,
-            _rebalance_execution(),
         )
         if selected_funds.empty:
             message = '无折价ETF可选，已提交全部卖出目标，今日不再买入'
             log.warn(message)
-            _notify(message)
+            _runtime.log_strategy_event(message)
         else:
             log.info('===== 开盘选股下单完成 =====')
 
@@ -321,8 +306,6 @@ def handle_risk_management(context: 'Context') -> None:
             STOP_LOSS_RATIO,
             TAKE_PROFIT_RATIO,
             key,
-            _stop_loss_execution(),
-            _take_profit_execution(),
         )
 
     except Exception as e:

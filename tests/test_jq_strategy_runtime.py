@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 14,
+        "api_version": 15,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -105,6 +105,9 @@ def test_public_contract_exports_and_constants(helper):
         "PositionView",
         "STRATEGY_RUNTIME_API_VERSION",
         "STRATEGY_RUNTIME_HELPER_MARKER",
+        "HONG_KONG_ETF_KEYWORDS",
+        "HONG_KONG_ETF_CODE_DENYLIST",
+        "is_hong_kong_etf",
         "ensure_account",
         "get_intent",
         "get_portfolio",
@@ -115,16 +118,128 @@ def test_public_contract_exports_and_constants(helper):
         "ExecutionRequest",
         "ConditionalLimitExecution",
         "MarketExecution",
+        "default_etf_rebalance_execution",
+        "default_etf_stop_loss_execution",
+        "default_etf_take_profit_execution",
         "get_configured_execution_mode",
         "get_configured_account_switches",
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 14
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 15
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v14"
+        "bullet-trade-joinquant-runtime-helper-v15"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
+
+
+def test_public_hong_kong_etf_filter_supports_defaults_and_overrides(helper):
+    assert helper.is_hong_kong_etf("520590.XSHG", "恒科") is True
+    assert helper.is_hong_kong_etf(
+        "510001.XSHG", "科技ETF", "恒生科技指数"
+    ) is True
+    assert helper.is_hong_kong_etf(
+        "510002.XSHG", "央企ETF", "中证中央企业指数"
+    ) is False
+    assert helper.is_hong_kong_etf(
+        "510002.XSHG",
+        "央企ETF",
+        keywords=("央企",),
+        code_denylist=(),
+    ) is True
+
+
+def test_default_etf_execution_policies_preserve_strategy_behavior(helper):
+    rebalance = helper.default_etf_rebalance_execution()
+    stop_loss = helper.default_etf_stop_loss_execution()
+    take_profit = helper.default_etf_take_profit_execution()
+
+    assert isinstance(rebalance.style, helper.ConditionalLimitExecution)
+    assert rebalance.style.price_band_ppm == 2_000
+    assert rebalance.style.price_mode is helper.ConditionalLimitPriceMode.BOUNDARY
+    assert isinstance(rebalance.sell_style, helper.MarketExecution)
+    assert rebalance.sell_style.protect_price_band_ppm == 15_000
+    assert isinstance(stop_loss.style, helper.MarketExecution)
+    assert stop_loss.style.protect_price_band_ppm == 15_000
+    assert isinstance(take_profit.style, helper.ConditionalLimitExecution)
+    assert take_profit.style.price_band_ppm == 2_000
+    assert take_profit.sell_style is None
+    assert stop_loss.follow_up is helper.FollowUpPolicy.UNTIL_FILLED_TODAY
+
+
+def test_runtime_owns_platform_setup_and_schedule(helper):
+    calls = []
+
+    class Value:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    logger = types.SimpleNamespace(
+        set_level=lambda *args: calls.append(("set_level", args)),
+        info=lambda message: calls.append(("log", message)),
+    )
+    namespace = {
+        "log": logger,
+        "set_option": lambda *args: calls.append(("set_option", args)),
+        "set_benchmark": lambda value: calls.append(("benchmark", value)),
+        "OrderCost": Value,
+        "set_order_cost": lambda value, **kwargs: calls.append(
+            ("order_cost", value.kwargs, kwargs)
+        ),
+        "FixedSlippage": Value,
+        "set_slippage": lambda value: calls.append(
+            ("slippage", value.args)
+        ),
+        "run_daily": lambda callback, *args, **kwargs: calls.append(
+            ("run_daily", callback, args, kwargs)
+        ),
+    }
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ", "sim_trade"), namespace
+    )
+    callbacks = [lambda context: None for _ in range(4)]
+
+    runtime.configure_platform()
+    runtime.schedule_daily(
+        callbacks[0],
+        callbacks[1],
+        callbacks[2],
+        ("10:30", "13:30", "14:50"),
+        callbacks[3],
+    )
+
+    assert ("set_option", ("avoid_future_data", True)) in calls
+    assert ("set_option", ("use_real_price", True)) in calls
+    assert ("benchmark", "000300.XSHG") in calls
+    assert (
+        "order_cost",
+        {
+            "close_tax": 0.0,
+            "open_commission": 0.00025,
+            "close_commission": 0.00025,
+            "min_commission": 5,
+        },
+        {"type": "fund"},
+    ) in calls
+    assert ("slippage", (0.002,)) in calls
+    schedules = [call for call in calls if call[0] == "run_daily"]
+    assert [call[2] for call in schedules] == [
+        ("09:20",),
+        ("09:30",),
+        (),
+        (),
+        (),
+        (),
+    ]
+    assert [call[3].get("time") for call in schedules] == [
+        None,
+        None,
+        "10:30",
+        "13:30",
+        "14:50",
+        "14:55",
+    ]
 
 
 def test_execution_value_objects_are_typed_and_immutable(helper):
@@ -562,9 +677,9 @@ def test_namespace_must_be_plain_dict(helper):
 
 
 @pytest.mark.parametrize(
-    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "14", True, None]
+    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, "15", True, None]
 )
-def test_expected_api_version_must_equal_fourteen(helper, version):
+def test_expected_api_version_must_equal_current(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):
         _install(helper, expected_api_version=version)
 

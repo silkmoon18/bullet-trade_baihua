@@ -176,6 +176,7 @@ class SQLiteTargetExecutionService:
         now: Optional[datetime] = None,
         execution_request: Optional[ExecutionRequest] = None,
         quotes: Optional[Mapping[str, MarketQuote]] = None,
+        security_names: Optional[Mapping[str, str]] = None,
     ) -> IntentAdvanceResult:
         request = execution_request or ExecutionRequest(
             style=LimitExecution(self.config.limit_price_offset_ppm)
@@ -224,6 +225,7 @@ class SQLiteTargetExecutionService:
             marks,
             request,
             current,
+            security_names or {},
         )
         return self.advance_intent(
             intent.intent_id, snapshot, marks, current, quotes=quotes
@@ -444,7 +446,16 @@ class SQLiteTargetExecutionService:
         return tuple(result)
 
     def _create_intent(
-        self, account_id, key, version, weights, quantities, marks, request, now
+        self,
+        account_id,
+        key,
+        version,
+        weights,
+        quantities,
+        marks,
+        request,
+        now,
+        security_names,
     ):
         if not key:
             raise TargetPlanningError("idempotency key cannot be empty")
@@ -457,6 +468,11 @@ class SQLiteTargetExecutionService:
             },
             "trading_day": now.date().isoformat(),
             "execution_request": execution_request_to_wire(request),
+            "security_names": {
+                str(security): str(name)
+                for security, name in sorted(security_names.items())
+                if name
+            },
         }
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         connection = connect_database(self.database_path)

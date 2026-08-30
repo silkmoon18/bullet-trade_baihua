@@ -17,7 +17,7 @@
 
 ## 当前使用限制
 
-`good_etf.py`已经不再保存host、token、profile、Webhook或账户开关，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理或账户下单分支。策略文件只保留唯一`STRATEGY_ID`、回测开关、策略/执行参数、一次门面安装，以及ETF选股、目标权重、止盈止损阈值和结果日志。`JoinQuantRuntime`按配置分别驱动JQ和QMT账户；每个账户的目标金额均按其自己的`组合总资产 × DEPLOY_RATIO × 归一化权重`计算。
+`good_etf.py`已经不再保存host、token、profile、Webhook或账户开关，也不再包含TCP、QMT回调、意图恢复、模式解析、通知异常处理、账户下单分支、下单类型实现、平台参数设置或调度注册。策略文件只保留最薄的聚宽入口和运行时安装声明，以及ETF选股、目标权重、止盈止损阈值等决策代码。`JoinQuantRuntime`按配置分别驱动JQ和QMT账户；每个账户的目标金额均按其自己的`组合总资产 × DEPLOY_RATIO × 归一化权重`计算。详细边界以仓库根目录[`AGENTS.md`](../../AGENTS.md)为准。
 
 当前账户组合的边界是：
 

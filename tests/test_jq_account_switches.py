@@ -248,7 +248,7 @@ def test_parallel_qmt_readiness_is_retried_before_execution(helper, monkeypatch)
     monkeypatch.setattr(
         helper,
         "submit_runtime_targets",
-        lambda current, weights, marks, key, execution: {
+        lambda current, weights, marks, key, execution, security_names=None: {
             "intent": {"intent_id": "i-1", "state": "EXECUTING"}
         },
     )
@@ -339,8 +339,10 @@ def test_parallel_rebalance_sizes_each_account_from_its_own_total_and_notifies_q
     monkeypatch.setattr(helper, "advance_runtime_targets", lambda context: True)
     monkeypatch.setattr(helper, "get_portfolio", lambda **kwargs: qmt_portfolio)
 
-    def submit(context, weights, marks, key, execution):
-        submitted.append((weights, marks, key, execution))
+    def submit(
+        context, weights, marks, key, execution, security_names=None
+    ):
+        submitted.append((weights, marks, key, execution, security_names))
         return {"intent": {"intent_id": "i-1", "state": "EXECUTING"}}
 
     monkeypatch.setattr(helper, "submit_runtime_targets", submit)
@@ -536,7 +538,7 @@ def test_parallel_risk_uses_each_accounts_own_cost_basis(helper, monkeypatch):
     monkeypatch.setattr(
         helper,
         "submit_runtime_targets",
-        lambda context, weights, marks, key, execution: (
+        lambda context, weights, marks, key, execution, security_names=None: (
             submitted.append((weights, key, execution))
             or {"intent": {"intent_id": "risk-1", "state": "EXECUTING"}}
         ),

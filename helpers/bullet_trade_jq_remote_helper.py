@@ -42,6 +42,9 @@ __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
     "PROFILE_SCHEMA_VERSION",
+    "HONG_KONG_ETF_KEYWORDS",
+    "HONG_KONG_ETF_CODE_DENYLIST",
+    "is_hong_kong_etf",
     "ExecutionType",
     "RuntimeMode",
     "FollowUpPolicy",
@@ -52,6 +55,9 @@ __all__ = [
     "MarketExecution",
     "MarketableLimitExecution",
     "ExecutionRequest",
+    "default_etf_rebalance_execution",
+    "default_etf_stop_loss_execution",
+    "default_etf_take_profit_execution",
     "PortfolioView",
     "PositionView",
     "AccountPortfolioView",
@@ -76,10 +82,20 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 14
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v14"
+STRATEGY_RUNTIME_API_VERSION = 15
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v15"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
+HONG_KONG_ETF_KEYWORDS = (
+    "港股",
+    "恒生",
+    "H股",
+    "香港",
+    "港股通",
+    "沪港深",
+    "恒科",
+)
+HONG_KONG_ETF_CODE_DENYLIST = frozenset({"520590.XSHG"})
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _RPC_ATTEMPTS = 3
@@ -123,7 +139,80 @@ _active_state = None  # type: Optional[Dict[str, Any]]
 _active_profile = None  # type: Optional[Dict[str, Any]]
 _active_namespace = None  # type: Optional[Dict[str, Any]]
 _runtime_target_state = None  # type: Optional[Dict[str, Any]]
+_security_name_cache = {}  # type: Dict[str, str]
 _TERMINAL_INTENT_STATES = frozenset({"COMPLETED", "CANCELED", "FAILED"})
+
+
+def is_hong_kong_etf(
+    security: str,
+    display_name: Any = "",
+    traced_index_name: Any = "",
+    keywords: Optional[Tuple[str, ...]] = None,
+    code_denylist: Optional[Any] = None,
+) -> bool:
+    """Return whether an ETF belongs to the configured Hong Kong universe."""
+
+    active_keywords = (
+        HONG_KONG_ETF_KEYWORDS if keywords is None else keywords
+    )
+    active_denylist = (
+        HONG_KONG_ETF_CODE_DENYLIST
+        if code_denylist is None
+        else code_denylist
+    )
+    if security in active_denylist:
+        return True
+    text_parts = [
+        value
+        for value in (display_name, traced_index_name)
+        if isinstance(value, str)
+    ]
+    haystack = " ".join(text_parts).lower()
+    return any([
+        keyword.lower() in haystack
+        for keyword in active_keywords
+        if isinstance(keyword, str) and keyword
+    ])
+
+
+def _security_name(security: str, known_name: Any = "") -> str:
+    if isinstance(known_name, str) and known_name.strip():
+        normalized = known_name.strip()
+        _security_name_cache[security] = normalized
+        return normalized
+    cached = _security_name_cache.get(security)
+    if cached is not None:
+        return cached
+    name = ""
+    if _active_namespace is not None:
+        getter = _active_namespace.get("get_security_info")
+        if callable(getter):
+            try:
+                info = getter(security)
+                name = (
+                    getattr(info, "display_name", None)
+                    or getattr(info, "name", None)
+                    or ""
+                )
+            except Exception:
+                name = ""
+    name = str(name).strip() if name else ""
+    _security_name_cache[security] = name
+    return name
+
+
+def _security_label(security: str, known_name: Any = "") -> str:
+    name = _security_name(security, known_name)
+    return "{}({})".format(security, name) if name else security
+
+
+def _security_names(securities: Any) -> Dict[str, str]:
+    result = {}
+    for security in securities:
+        name = _security_name(str(security))
+        if name:
+            result[str(security)] = name
+    return result
 
 
 class ExecutionType(str, Enum):
@@ -283,6 +372,41 @@ class ExecutionRequest(_ExecutionRequestTuple):
         return _ExecutionRequestTuple.__new__(
             cls, style, follow_up, repricing, sell_style
         )
+
+
+def default_etf_rebalance_execution() -> ExecutionRequest:
+    """Default ETF rebalance: market sells, then conditional-limit buys."""
+
+    return ExecutionRequest(
+        style=ConditionalLimitExecution(
+            2_000, ConditionalLimitPriceMode.BOUNDARY
+        ),
+        sell_style=MarketExecution(15_000),
+        follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing=RepricingPolicy.KEEP_ORIGINAL,
+    )
+
+
+def default_etf_stop_loss_execution() -> ExecutionRequest:
+    """Default ETF stop loss: protected market sell until filled today."""
+
+    return ExecutionRequest(
+        style=MarketExecution(15_000),
+        follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing=RepricingPolicy.KEEP_ORIGINAL,
+    )
+
+
+def default_etf_take_profit_execution() -> ExecutionRequest:
+    """Default ETF take profit: wait inside the original 0.2% boundary."""
+
+    return ExecutionRequest(
+        style=ConditionalLimitExecution(
+            2_000, ConditionalLimitPriceMode.BOUNDARY
+        ),
+        follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
+        repricing=RepricingPolicy.KEEP_ORIGINAL,
+    )
 
 
 def _style_to_wire(style: Any) -> Dict[str, Any]:
@@ -609,6 +733,7 @@ def submit_targets(
     marks: Optional[Dict[str, Any]] = None,
     as_of: Any = None,
     execution: Optional[ExecutionRequest] = None,
+    security_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     if _active_state is None or not _active_state.get("qmt_account_enabled"):
         raise RuntimeError("只有启用QMT账户后才可以提交真实组合目标")
@@ -619,6 +744,8 @@ def submit_targets(
         payload["marks"] = marks
     if as_of is not None:
         payload["as_of"] = as_of
+    if security_names:
+        payload["security_names"] = security_names
     return _strategy_request("strategy.submit_targets", payload)
 
 
@@ -713,6 +840,7 @@ def _restore_runtime_targets() -> None:
         "idempotency_key": intent["idempotency_key"],
         "weights": dict(intent.get("weights", {})),
         "marks": {},
+        "security_names": _security_names(intent.get("weights", {})),
         "execution": execution,
     }
 
@@ -746,6 +874,7 @@ def submit_runtime_targets(
     marks: Dict[str, Any],
     idempotency_key: str,
     execution: ExecutionRequest,
+    security_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Submit one typed daily target and retain only restart state."""
 
@@ -761,12 +890,14 @@ def submit_runtime_targets(
         marks=marks,
         as_of=getattr(context, "current_dt", None),
         execution=execution,
+        security_names=security_names,
     )
     _runtime_target_state = {
         "intent_id": result["intent"]["intent_id"],
         "idempotency_key": idempotency_key,
         "weights": dict(weights),
         "marks": dict(marks),
+        "security_names": dict(security_names or {}),
         "execution": execution,
     }
     portfolio = PortfolioView(result["snapshot"])
@@ -794,6 +925,7 @@ def advance_runtime_targets(context: Any) -> bool:
         _runtime_target_state["marks"],
         _runtime_target_state["idempotency_key"],
         _runtime_target_state["execution"],
+        _runtime_target_state.get("security_names"),
     )
     if result["intent"]["state"] in _TERMINAL_INTENT_STATES:
         _runtime_target_state = None
@@ -1330,6 +1462,7 @@ def install_strategy_runtime(
     _active_signature = signature
     _active_state = dict(state)
     _active_namespace = namespace
+    _security_name_cache.clear()
     if mode in ("JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL") or validate_remote:
         _active_profile = runtime_profile
     namespace[_RUNTIME_STATE_KEY] = {"token": _MODULE_TOKEN, "mode": mode}
@@ -1392,6 +1525,87 @@ class JoinQuantRuntime:
         if callable(entry):
             entry(message)
 
+    def _platform_api(self, name: str) -> Callable[..., Any]:
+        if self._namespace is None:
+            raise RuntimeError("策略namespace不可用")
+        api = self._namespace.get(name)
+        if not callable(api):
+            raise RuntimeError("聚宽{}不可用".format(name))
+        return api
+
+    def configure_platform(self, benchmark: str = "000300.XSHG") -> None:
+        """Apply the shared JoinQuant runtime settings used by ETF strategies."""
+
+        if self._namespace is None:
+            raise RuntimeError("策略namespace不可用")
+        logger = self._namespace.get("log")
+        set_level = getattr(logger, "set_level", None)
+        if callable(set_level):
+            set_level("system", "error")
+        set_option = self._platform_api("set_option")
+        set_option("avoid_future_data", True)
+        self._platform_api("set_benchmark")(benchmark)
+        set_option("use_real_price", True)
+        order_cost = self._platform_api("OrderCost")(
+            close_tax=0.000,
+            open_commission=0.00025,
+            close_commission=0.00025,
+            min_commission=5,
+        )
+        self._platform_api("set_order_cost")(order_cost, type="fund")
+        slippage = self._platform_api("FixedSlippage")(0.002)
+        self._platform_api("set_slippage")(slippage)
+
+    def schedule_daily(
+        self,
+        before_market_open: Callable[[Any], Any],
+        market_open: Callable[[Any], Any],
+        risk_management: Callable[[Any], Any],
+        risk_check_times: Tuple[str, ...],
+        after_market_check: Callable[[Any], Any],
+        reference_security: str = "000300.XSHG",
+    ) -> None:
+        """Register the common ETF strategy schedule on JoinQuant."""
+
+        run_daily = self._platform_api("run_daily")
+        run_daily(
+            before_market_open,
+            "09:20",
+            reference_security=reference_security,
+        )
+        run_daily(
+            market_open,
+            "09:30",
+            reference_security=reference_security,
+        )
+        for risk_time in risk_check_times:
+            run_daily(
+                risk_management,
+                time=risk_time,
+                reference_security=reference_security,
+            )
+        run_daily(
+            after_market_check,
+            time="14:55",
+            reference_security=reference_security,
+        )
+        self._log(
+            "info",
+            "任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | "
+            "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times)),
+        )
+
+    def log_process_initialize(self) -> None:
+        self._log(
+            "info",
+            "process_initialize 重建配置 {}".format(
+                time.strftime("%Y-%m-%d %H:%M:%S")
+            ),
+        )
+
+    def log_strategy_event(self, message: str) -> None:
+        self._log("info", "[策略通知] {}".format(message))
+
     def portfolio(self, context: Any) -> Any:
         return runtime_portfolio(context)
 
@@ -1447,7 +1661,7 @@ class JoinQuantRuntime:
                     "info",
                     "{}组合持仓 | {} 数量={} 可卖={} 成本={:.4f} 现价={:.4f}{}".format(
                         account,
-                        security,
+                        _security_label(security),
                         position.total_amount,
                         getattr(position, "closeable_amount", 0),
                         position.avg_cost,
@@ -1504,10 +1718,24 @@ class JoinQuantRuntime:
         marks: Dict[str, Any],
         idempotency_key: str,
         execution: ExecutionRequest,
+        security_names: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         return submit_runtime_targets(
-            context, weights, marks, idempotency_key, execution
+            context,
+            weights,
+            marks,
+            idempotency_key,
+            execution,
+            security_names,
         )
+
+    @staticmethod
+    def security_name(security: str, known_name: Any = "") -> str:
+        return _security_name(security, known_name)
+
+    @staticmethod
+    def security_label(security: str, known_name: Any = "") -> str:
+        return _security_label(security, known_name)
 
     def advance_targets(self, context: Any) -> bool:
         return advance_runtime_targets(context)
@@ -1543,6 +1771,7 @@ class JoinQuantRuntime:
         current_value: float,
         reference_price: float,
         lot_size: int = 100,
+        security_name: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Build one round-lot incremental buy-plan item for notification."""
 
@@ -1552,12 +1781,15 @@ class JoinQuantRuntime:
         quantity = int(target_delta / reference_price) // lot_size * lot_size
         if quantity <= 0:
             return None
-        return {
+        item = {
             "security": security,
             "quantity": quantity,
             "amount": round(quantity * reference_price, 2),
             "reference_price": reference_price,
         }
+        if security_name:
+            item["security_name"] = security_name
+        return item
 
     @staticmethod
     def _position_value(position: Any, reference_price: float) -> float:
@@ -1585,6 +1817,7 @@ class JoinQuantRuntime:
                 total_value * weight,
                 self._position_value(position, reference_price),
                 reference_price,
+                security_name=_security_name(security),
             )
             if item is not None:
                 items.append(item)
@@ -1596,10 +1829,11 @@ class JoinQuantRuntime:
         weights: Dict[str, Any],
         marks: Dict[str, Any],
         idempotency_key: str,
-        execution: ExecutionRequest,
+        execution: Optional[ExecutionRequest] = None,
     ) -> Dict[str, Any]:
         """Apply one decision independently to QMT and JQ enabled accounts."""
 
+        execution = execution or default_etf_rebalance_execution()
         result = {"qmt": None, "jq_orders": [], "errors": []}
         notification_items = []
         qmt_submitted = False
@@ -1623,6 +1857,9 @@ class JoinQuantRuntime:
                     qmt_marks = dict(marks)
                     for security, position in qmt_portfolio.positions.items():
                         qmt_marks.setdefault(security, float(position.price))
+                    qmt_security_names = _security_names(
+                        set(qmt_weights) | set(qmt_portfolio.positions)
+                    )
                     notification_items = self._target_buy_plan_items(
                         qmt_portfolio, weights, marks
                     )
@@ -1633,6 +1870,7 @@ class JoinQuantRuntime:
                             qmt_marks,
                             idempotency_key,
                             execution,
+                            qmt_security_names,
                         )
                         qmt_submitted = True
             except Exception as exc:
@@ -1689,7 +1927,10 @@ class JoinQuantRuntime:
                 "QMT组合目标已提交 | intent_id={} state={} weights={}".format(
                     qmt_result["intent"]["intent_id"],
                     qmt_result["intent"]["state"],
-                    weights,
+                    {
+                        _security_label(security): value
+                        for security, value in weights.items()
+                    },
                 ),
             )
         elif qmt_result is not None and qmt_result.get(
@@ -1700,7 +1941,7 @@ class JoinQuantRuntime:
             self._log(
                 "info",
                 "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
-                    security,
+                    _security_label(security),
                     target_value,
                     getattr(order_result, "order_id", None),
                 ),
@@ -1716,7 +1957,11 @@ class JoinQuantRuntime:
             self._log(
                 "info",
                 "目标权重已提交 | {} | 部署比例={:.1%}".format(
-                    weights, sum(float(value) for value in weights.values())
+                    {
+                        _security_label(security): value
+                        for security, value in weights.items()
+                    },
+                    sum(float(value) for value in weights.values()),
                 ),
             )
         return result
@@ -1760,11 +2005,17 @@ class JoinQuantRuntime:
         stop_loss_ratio: float,
         take_profit_ratio: float,
         idempotency_key: str,
-        stop_loss_execution: ExecutionRequest,
-        take_profit_execution: ExecutionRequest,
+        stop_loss_execution: Optional[ExecutionRequest] = None,
+        take_profit_execution: Optional[ExecutionRequest] = None,
     ) -> Dict[str, Any]:
         """Evaluate each account against its own positions and cost basis."""
 
+        stop_loss_execution = (
+            stop_loss_execution or default_etf_stop_loss_execution()
+        )
+        take_profit_execution = (
+            take_profit_execution or default_etf_take_profit_execution()
+        )
         result = {"accounts": [], "errors": []}
         if self.qmt_account_enabled:
             try:
@@ -1813,6 +2064,7 @@ class JoinQuantRuntime:
                                 if stop_loss
                                 else take_profit_execution
                             ),
+                            _security_names(portfolio.positions),
                         )
                 result["accounts"].append(account_result)
             except Exception as exc:
@@ -1865,7 +2117,7 @@ class JoinQuantRuntime:
                     "info",
                     "{}持仓检查 | {} 成本={:.4f} 现价={:.4f} 盈亏={:.2%}{}".format(
                         account,
-                        check["security"],
+                        _security_label(check["security"]),
                         check["avg_cost"],
                         check["price"],
                         check["pnl"],
@@ -1884,7 +2136,7 @@ class JoinQuantRuntime:
                         "成本价：{:.4f} | 当前价：{:.4f} | 时间：{}".format(
                             action,
                             account,
-                            check["security"],
+                            _security_label(check["security"]),
                             check["avg_cost"],
                             check["price"],
                             getattr(context, "current_dt", None),
@@ -1899,7 +2151,8 @@ class JoinQuantRuntime:
                 self._log(
                     "info",
                     "QMT风控目标已提交 | intent_id={} exits={}".format(
-                        intent["intent"]["intent_id"], exits
+                        intent["intent"]["intent_id"],
+                        [_security_label(security) for security in exits],
                     ),
                 )
             if account_result.get("waiting_for_cancel"):

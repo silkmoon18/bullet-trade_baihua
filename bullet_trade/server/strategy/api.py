@@ -239,6 +239,17 @@ class SQLiteStrategyAPI:
         weights = payload.get("weights")
         if not key or not isinstance(weights, Mapping):
             raise ValueError("idempotency_key and weights are required")
+        raw_security_names = payload.get("security_names", {})
+        if not isinstance(raw_security_names, Mapping):
+            raise ValueError("security_names must be an object")
+        security_names: Dict[str, str] = {}
+        for raw_security, raw_name in raw_security_names.items():
+            if not isinstance(raw_name, str):
+                continue
+            security = str(raw_security).strip()
+            name = raw_name.strip()
+            if security and name:
+                security_names[security] = name[:100]
         raw_execution = payload.get("execution")
         if raw_execution is None:
             execution_request = ExecutionRequest()
@@ -282,6 +293,7 @@ class SQLiteStrategyAPI:
             snapshot.as_of,
             execution_request=execution_request,
             quotes=quotes,
+            security_names=security_names,
         )
         if _uses_conditional_execution(execution_request):
             await self._sync_quote_subscriptions(strategy_id)
@@ -467,6 +479,7 @@ class SQLiteStrategyAPI:
             if not isinstance(raw, Mapping):
                 raise ValueError("target buy plan item must be a mapping")
             security = str(raw.get("security") or "").strip()
+            security_name = str(raw.get("security_name") or "").strip()[:100]
             quantity = raw.get("quantity")
             if not security or type(quantity) is not int or quantity <= 0:
                 raise ValueError("security and positive integer quantity are required")
@@ -482,6 +495,7 @@ class SQLiteStrategyAPI:
                     quantity=quantity,
                     amount=amount,
                     reference_price=reference_price,
+                    security_name=security_name,
                 )
             )
             total += amount

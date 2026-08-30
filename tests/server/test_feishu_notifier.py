@@ -17,6 +17,7 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
             event="FILLED",
             strategy_id="good_etf",
             security="510050.XSHG",
+            security_name="上证50ETF",
             side="BUY",
             status="FILLED",
             quantity=1000,
@@ -35,9 +36,10 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
     )
     content = payload["card"]["elements"][0]["text"]["content"]
     lines = content.splitlines()
-    assert lines[:8] == [
+    assert lines[:9] == [
         "**策略ID：** `good_etf`",
         "**标的：** `510050.XSHG`",
+        "**名称：** 上证50ETF",
         "**方向：** BUY",
         "**状态：** FILLED",
         "**数量：** 1000",
@@ -79,7 +81,9 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
             strategy_id="good_etf",
             mode="JQ",
             items=(
-                TargetBuyPlanItem("510050.XSHG", 1000, "2500.00", "2.5000"),
+                TargetBuyPlanItem(
+                    "510050.XSHG", 1000, "2500.00", "2.5000", "上证50ETF"
+                ),
                 TargetBuyPlanItem("159915.XSHE", 500, "750.00", "1.5000"),
             ),
             occurred_at=datetime(2026, 8, 13, 9, 30, tzinfo=SHANGHAI_TZ),
@@ -101,6 +105,7 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
     ]
     assert elements[2]["text"]["content"].splitlines() == [
         "**标的：** `510050.XSHG`",
+        "**名称：** 上证50ETF",
         "**目标数量：** 1000 股",
         "**目标金额：** ¥2500.00",
         "**单价：** ¥2.5000",
