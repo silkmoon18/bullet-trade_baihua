@@ -45,6 +45,7 @@ from .valuation import MarketMark, SQLiteValuationService
 
 DatabasePath = Union[str, Path]
 logger = logging.getLogger(__name__)
+EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 
 
 def _uses_conditional_execution(request: ExecutionRequest) -> bool:
@@ -111,6 +112,8 @@ class SQLiteStrategyAPI:
         self._event_loop = None
         self._runtime_bindings = {}
         self._quote_cache = {}
+        self._quote_last_received_at = {}
+        self._quote_last_log_at = {}
         self._seen_tick_symbols = set()
         self._rejected_tick_symbols = set()
         self._resume_locks = {}
@@ -715,7 +718,10 @@ class SQLiteStrategyAPI:
             logger.exception("StrategyLedger callback task failed")
 
     def _accept_tick_event(self, payload: object) -> None:
+        heartbeat_quotes = {}
+        first_symbols = set()
         for security, tick in self._tick_items(payload):
+            received_at = datetime.now(SHANGHAI_TZ)
             bid = self._best_quote_price(tick, "bid")
             ask = self._best_quote_price(tick, "ask")
             last = self._tick_price_or_none(tick)
@@ -737,19 +743,55 @@ class SQLiteStrategyAPI:
                     price_to_units(str(last)) if last is not None else None
                 ),
             )
-            if not self._quote_is_fresh(quote, datetime.now(SHANGHAI_TZ)):
+            if not self._quote_is_fresh(quote, received_at):
                 self._reject_tick_once(
                     security,
                     "execution quote timestamp is stale or in the future",
                 )
                 continue
             self._quote_cache[security] = quote
+            self._quote_last_received_at[security] = received_at
             if security not in self._seen_tick_symbols:
                 self._seen_tick_symbols.add(security)
-                logger.info(
-                    "StrategyLedger 首次收到执行行情 | %s", security
-                )
+                first_symbols.add(security)
+            # One xtdata callback may contain several ticks for one symbol.
+            # Execution still evaluates every tick, while the heartbeat below
+            # reports the newest market timestamp in the callback batch.
+            heartbeat_quotes[security] = (quote, received_at)
             self._schedule_background(self._handle_quote(security, quote))
+        for security, (quote, received_at) in heartbeat_quotes.items():
+            self._log_execution_quote_heartbeat(
+                security,
+                quote,
+                received_at,
+                first=security in first_symbols,
+            )
+
+    def _log_execution_quote_heartbeat(
+        self,
+        security: str,
+        quote: MarketQuote,
+        received_at: datetime,
+        *,
+        first: bool,
+    ) -> None:
+        last_log_at = self._quote_last_log_at.get(security)
+        if (
+            not first
+            and last_log_at is not None
+            and received_at - last_log_at
+            < EXECUTION_QUOTE_HEARTBEAT_INTERVAL
+        ):
+            return
+        self._quote_last_log_at[security] = received_at
+        logger.info(
+            "StrategyLedger %s | %s | 行情时间=%s | 接收时间=%s | 延迟=%.3fs",
+            "首次收到执行行情" if first else "执行行情心跳",
+            security,
+            quote.as_of.isoformat(),
+            received_at.isoformat(),
+            (received_at - quote.as_of).total_seconds(),
+        )
 
     async def _handle_quote(
         self, security: str, quote: Optional[MarketQuote] = None

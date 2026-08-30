@@ -480,9 +480,32 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
         await asyncio.sleep(0.01)
 
     assert broker.order_calls == 1
-    assert log_messages == [
-        "StrategyLedger 首次收到执行行情 | 510050.XSHG"
-    ]
+    assert len(log_messages) == 1
+    assert log_messages[0].startswith(
+        "StrategyLedger 首次收到执行行情 | 510050.XSHG | "
+    )
+    assert "行情时间=" in log_messages[0]
+    assert "接收时间=" in log_messages[0]
+    assert "延迟=" in log_messages[0]
+
+    last_log_at = service._quote_last_log_at[SECURITY]
+    latest_quote = service._quote_cache[SECURITY]
+    service._log_execution_quote_heartbeat(
+        SECURITY,
+        latest_quote,
+        last_log_at + timedelta(seconds=59),
+        first=False,
+    )
+    assert len(log_messages) == 1
+    service._log_execution_quote_heartbeat(
+        SECURITY,
+        latest_quote,
+        last_log_at + timedelta(seconds=60),
+        first=False,
+    )
+    assert log_messages[1].startswith(
+        "StrategyLedger 执行行情心跳 | 510050.XSHG | "
+    )
 
 
 @pytest.mark.asyncio
