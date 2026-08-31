@@ -119,6 +119,27 @@ def test_qmt_broker_maps_xttrade_id_and_optional_broker_commission_extension(mon
 
 
 @pytest.mark.unit
+def test_qmt_broker_ignores_zero_order_id_and_preserves_link_fields():
+    broker = QmtBroker(account_id="demo")
+
+    class DummyTrade:
+        trade_id = "xt-trade-zero-order"
+        order_id = 0
+        entrust_id = "xt-order-fallback"
+        order_sysid = "counter-contract-1"
+        stock_code = "510050.SH"
+        traded_volume = 100
+        traded_price = 2.5
+        traded_time = "2026-08-28 09:31:00"
+
+    trade = broker.normalize_trade_event(DummyTrade())
+
+    assert trade is not None
+    assert trade["order_id"] == "xt-order-fallback"
+    assert trade["order_sysid"] == "counter-contract-1"
+
+
+@pytest.mark.unit
 def test_qmt_broker_marks_synthetic_trade_id_and_unknown_fees(monkeypatch):
     broker = QmtBroker(account_id="demo")
     broker._connected = True

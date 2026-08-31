@@ -118,6 +118,11 @@ def _text(value: object) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _broker_identifier(value: object) -> str:
+    text = _text(value)
+    return "" if text == "0" else text
+
+
 def _security(value: object) -> str:
     text = _text(value)
     if text.endswith(".SH"):
@@ -324,9 +329,10 @@ class SQLiteReconciliationService:
             all_orders_by_client_tag,
         ) = self._local_orders(account_id)
         broker_orders = {}
+        broker_order_ids_by_sysid = {}
         adopted_order_ids = []
         for row in snapshot.orders:
-            broker_order_id = _text(row.get("order_id"))
+            broker_order_id = _broker_identifier(row.get("order_id"))
             remark = _text(row.get("order_remark") or row.get("remark"))
             remark_matches = self._remark_matches(remark, all_orders_by_client_tag)
             if not broker_order_id:
@@ -336,6 +342,13 @@ class SQLiteReconciliationService:
                     ignored_broker_order_count += 1
                 continue
             broker_orders[broker_order_id] = row
+            order_sysid = _broker_identifier(
+                row.get("order_sysid") or row.get("sysid")
+            )
+            if order_sysid:
+                broker_order_ids_by_sysid.setdefault(order_sysid, set()).add(
+                    broker_order_id
+                )
             local = orders_by_broker_id.get(broker_order_id)
             if local is None:
                 matches = {
@@ -376,10 +389,41 @@ class SQLiteReconciliationService:
             snapshot.trades,
             key=lambda row: _text(row.get("time") or row.get("trade_time")),
         ):
-            broker_order_id = _text(trade.get("order_id"))
+            broker_order_id = _broker_identifier(trade.get("order_id"))
             local = orders_by_broker_id.get(broker_order_id)
             if local is None:
-                remark = _text(trade.get("order_remark") or trade.get("remark"))
+                trade_sysid = _broker_identifier(
+                    trade.get("order_sysid") or trade.get("sysid")
+                )
+                matching_order_ids = broker_order_ids_by_sysid.get(
+                    trade_sysid, set()
+                )
+                if len(matching_order_ids) == 1:
+                    candidate_id = next(iter(matching_order_ids))
+                    candidate = orders_by_broker_id.get(candidate_id)
+                    if candidate is not None:
+                        broker_order_id = candidate_id
+                        local = candidate
+            remark = _text(trade.get("order_remark") or trade.get("remark"))
+            if local is None and remark:
+                matches = {
+                    all_orders_by_client_tag[token]["order_id"]: all_orders_by_client_tag[
+                        token
+                    ]
+                    for token in (item.strip() for item in remark.split("|"))
+                    if token in all_orders_by_client_tag
+                    and _broker_identifier(
+                        all_orders_by_client_tag[token].get("broker_order_id")
+                    )
+                    in broker_orders
+                }
+                if len(matches) == 1:
+                    candidate = next(iter(matches.values()))
+                    broker_order_id = _broker_identifier(
+                        candidate.get("broker_order_id")
+                    )
+                    local = candidate
+            if local is None:
                 if self._remark_matches(remark, all_orders_by_client_tag):
                     blockers.append(
                         "owned_trade_order_missing:{}".format(broker_order_id or "<empty>")
@@ -388,7 +432,9 @@ class SQLiteReconciliationService:
                     ignored_broker_trade_count += 1
                 continue
             try:
-                evidence = normalize_trade_evidence(trade, broker_orders)
+                linked_trade = dict(trade)
+                linked_trade["order_id"] = broker_order_id
+                evidence = normalize_trade_evidence(linked_trade, broker_orders)
                 fill = BrokerFill(
                     fill_id="broker:{}".format(evidence.broker_trade_id),
                     broker_trade_id=evidence.broker_trade_id,

@@ -58,6 +58,18 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _first_broker_identifier(*values: Any) -> Any:
+    """Return the first non-empty, non-zero broker identifier."""
+
+    for value in values:
+        if value in (None, ""):
+            continue
+        if str(value).strip() == "0":
+            continue
+        return value
+    return None
+
+
 def _pick_value(obj: object, *names: str) -> Optional[Any]:
     if isinstance(obj, dict):
         for name in names:
@@ -517,7 +529,14 @@ class QmtBroker(BrokerBase):
     def normalize_trade_event(self, item: object) -> Optional[Dict[str, Any]]:
         """Normalize one native QMT trade query row or callback payload."""
 
-        oid = _pick_value(item, "order_id", "entrust_id")
+        oid = _first_broker_identifier(
+            _pick_value(item, "order_id"),
+            _pick_value(item, "entrust_id"),
+        )
+        order_sysid = _first_broker_identifier(
+            _pick_value(item, "order_sysid"),
+            _pick_value(item, "sysid"),
+        )
         raw_code = _pick_value(item, "stock_code", "code", "security")
         trade_id = _pick_value(
             item, "trade_id", "traded_id", "deal_no", "trade_no"
@@ -605,6 +624,7 @@ class QmtBroker(BrokerBase):
             "trade_id": str(trade_id),
             "trade_id_source": trade_id_source,
             "order_id": str(oid) if oid is not None else "",
+            "order_sysid": str(order_sysid) if order_sysid is not None else "",
             "security": self._map_to_jq_symbol(raw_code) if raw_code else None,
             "amount": normalized_amount,
             "price": normalized_price,

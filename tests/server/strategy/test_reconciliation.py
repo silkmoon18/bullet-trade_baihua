@@ -156,6 +156,54 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert account.cash_units == money_to_units("7995")
 
 
+def test_zero_order_id_trade_is_relinked_by_strategy_client_tag(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    trade = dict(_broker_trade())
+    trade.update({"order_id": "0", "order_remark": "bt:test:buy-1"})
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),),
+            trades=(trade,),
+        ),
+    )
+
+    assert result.state is ReconciliationState.READY
+    assert result.details["booked_trade_ids"] == ("trade-1",)
+
+
+def test_zero_order_id_trade_is_relinked_by_counter_contract_id(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    order = dict(_broker_order())
+    order["order_sysid"] = "SYS-1"
+    trade = dict(_broker_trade())
+    trade.update({"order_id": 0, "order_sysid": "SYS-1"})
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(order,),
+            trades=(trade,),
+        ),
+    )
+
+    assert result.state is ReconciliationState.READY
+    assert result.details["booked_trade_ids"] == ("trade-1",)
+
+
 def test_unknown_fee_fill_is_booked_and_small_cash_gap_is_tolerated(tmp_path):
     database, repository, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)

@@ -52,6 +52,12 @@ def _merge_payload(
 
     merged = dict(previous)
     for key, value in current.items():
+        if (
+            key in ("order_id", "trade_id", "order_sysid")
+            and str(value or "").strip() in ("", "0")
+            and str(previous.get(key) or "").strip() not in ("", "0")
+        ):
+            continue
         if value not in (None, "") or key not in merged:
             merged[key] = value
     for known_key, value_keys in (

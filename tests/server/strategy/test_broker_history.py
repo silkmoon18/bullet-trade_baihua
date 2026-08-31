@@ -63,6 +63,30 @@ def test_trade_history_preserves_known_fee_when_later_callback_omits_it(tmp_path
     assert trade["tax_known"] is False
 
 
+def test_trade_history_does_not_replace_valid_link_with_zero(tmp_path):
+    store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "T-1",
+            "order_id": "O-1",
+            "order_sysid": "SYS-1",
+        },
+    )
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "T-1",
+            "order_id": 0,
+            "order_sysid": "0",
+        },
+    )
+
+    trade = store.list_trades("default")[0]
+    assert trade["order_id"] == "O-1"
+    assert trade["order_sysid"] == "SYS-1"
+
+
 def test_history_filters_and_current_rows_win_merge(tmp_path):
     store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
     store.record_order(
