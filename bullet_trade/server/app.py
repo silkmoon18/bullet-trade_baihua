@@ -26,6 +26,7 @@ from bullet_trade.server.strategy import (
     BrokerContractError,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
+    UnpricedFillPolicy,
     money_to_units,
     load_verified_capabilities,
 )
@@ -119,6 +120,9 @@ class ServerApplication:
                     cash_buffer_units=money_to_units(str(self.config.strategy_cash_buffer)),
                     minimum_order_units=money_to_units(str(self.config.strategy_minimum_order)),
                     buy_fee_buffer_units=money_to_units(str(self.config.strategy_buy_fee_buffer)),
+                    unpriced_fill_policy=UnpricedFillPolicy(
+                        self.config.strategy_unpriced_fill_policy
+                    ),
                 ),
                 self.adapters.broker_adapter,
                 capabilities,

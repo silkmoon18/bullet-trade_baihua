@@ -144,6 +144,7 @@ class PortfolioView:
     fees: Optional[float]
     fees_known: bool
     unknown_fee_fill_count: int
+    unknown_price_fill_count: int
     nav: Optional[float]
     returns: Optional[float]
     performance_blockers: Tuple[str, ...]

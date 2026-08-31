@@ -522,6 +522,9 @@ class PortfolioView(object):
         self.fees = _optional_float(payload.get("fees"))
         self.fees_known = bool(payload.get("fees_known", self.fees is not None))
         self.unknown_fee_fill_count = int(payload.get("unknown_fee_fill_count", 0))
+        self.unknown_price_fill_count = int(
+            payload.get("unknown_price_fill_count", 0)
+        )
         self.nav = _optional_float(payload.get("nav"))
         self.returns = _optional_float(payload.get("returns"))
         self.performance_blockers = tuple(payload.get("performance_blockers", ()))

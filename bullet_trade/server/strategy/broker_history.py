@@ -58,6 +58,17 @@ def _merge_payload(
             and str(previous.get(key) or "").strip() not in ("", "0")
         ):
             continue
+        if key in ("price", "traded_price", "deal_balance"):
+            try:
+                previous_number = float(previous.get(key) or 0.0)
+            except (TypeError, ValueError):
+                previous_number = 0.0
+            try:
+                current_number = float(value) if value not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                current_number = 0.0
+            if previous_number > 0 and current_number <= 0:
+                continue
         if value not in (None, "") or key not in merged:
             merged[key] = value
     for known_key, value_keys in (

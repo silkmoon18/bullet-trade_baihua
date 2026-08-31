@@ -19,7 +19,15 @@ from ..feishu_notifier import (
     TradeNotification,
 )
 from .capital import BrokerCashMismatchError, SQLiteCapitalService
-from .domain import MONEY_SCALE, NAV_SCALE, PRICE_SCALE, SHANGHAI_TZ, money_to_units, price_to_units
+from .domain import (
+    MONEY_SCALE,
+    NAV_SCALE,
+    PRICE_SCALE,
+    SHANGHAI_TZ,
+    UnpricedFillPolicy,
+    money_to_units,
+    price_to_units,
+)
 from .execution import (
     ConditionalLimitExecution,
     ExecutionRequest,
@@ -64,6 +72,7 @@ class StrategyAPIConfig:
     cash_buffer_units: int = money_to_units("100")
     minimum_order_units: int = 0
     buy_fee_buffer_units: int = money_to_units("5")
+    unpriced_fill_policy: UnpricedFillPolicy = UnpricedFillPolicy.STRICT
 
 
 def _json_value(value: object) -> object:
@@ -128,6 +137,7 @@ class SQLiteStrategyAPI:
             require_verified_capabilities=config.trading_enabled,
             durable_broker_history=durable_broker_history,
             unknown_fee_tolerance_units_per_order=config.buy_fee_buffer_units,
+            unpriced_fill_policy=config.unpriced_fill_policy,
         )
         self.valuation = SQLiteValuationService(self.database_path)
         self.planner = SQLiteTargetExecutionService(
@@ -1188,6 +1198,7 @@ class SQLiteStrategyAPI:
             "fees": _money(snapshot.fees_units) if snapshot.fees_known else None,
             "fees_known": snapshot.fees_known,
             "unknown_fee_fill_count": snapshot.unknown_fee_fill_count,
+            "unknown_price_fill_count": snapshot.unknown_price_fill_count,
             "nav": snapshot.nav_units / NAV_SCALE if performance_ready else None,
             "returns": (
                 snapshot.nav_units / NAV_SCALE - 1.0 if performance_ready else None

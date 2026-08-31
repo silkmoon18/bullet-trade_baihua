@@ -56,6 +56,16 @@ class OrderState(str, Enum):
     REJECTED = "REJECTED"
 
 
+class FillPriceSource(str, Enum):
+    BROKER_TRADE = "BROKER_TRADE"
+    ORDER_PRICE_FALLBACK = "ORDER_PRICE_FALLBACK"
+
+
+class UnpricedFillPolicy(str, Enum):
+    STRICT = "STRICT"
+    CONSERVATIVE_ORDER_PRICE = "CONSERVATIVE_ORDER_PRICE"
+
+
 class ReconciliationState(str, Enum):
     UNKNOWN = "UNKNOWN"
     READY = "READY"
@@ -272,6 +282,8 @@ class BrokerFill:
     tax_units: Optional[int]
     traded_at: datetime
     broker_trade_id: Optional[str] = None
+    price_source: FillPriceSource = FillPriceSource.BROKER_TRADE
+    price_known: bool = True
 
     def __post_init__(self) -> None:
         _require_int(self.quantity, "quantity", minimum=1)
@@ -280,6 +292,12 @@ class BrokerFill:
             _require_int(self.commission_units, "commission_units")
         if self.tax_units is not None:
             _require_int(self.tax_units, "tax_units")
+        if not isinstance(self.price_source, FillPriceSource):
+            raise ValueError("price_source must be a FillPriceSource")
+        if type(self.price_known) is not bool:
+            raise ValueError("price_known must be boolean")
+        if self.price_known != (self.price_source is FillPriceSource.BROKER_TRADE):
+            raise ValueError("price_known does not match price_source")
         object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 

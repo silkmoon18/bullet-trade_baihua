@@ -90,6 +90,31 @@ def test_qmt_broker_get_trades_prefers_traded_price_and_preserves_zero_commissio
 
 
 @pytest.mark.unit
+def test_qmt_broker_skips_zero_primary_trade_price(monkeypatch):
+    broker = QmtBroker(account_id="demo")
+    broker._connected = True
+
+    class DummyTrade:
+        trade_id = "t-zero-primary"
+        order_id = "o-zero-primary"
+        stock_code = "510050.SH"
+        trade_volume = 100
+        traded_price = 0.0
+        trade_price = 2.5
+        trade_time = "2026-08-31 13:14:21"
+
+    class DummyTrader:
+        def query_stock_trades(self, account):
+            return [DummyTrade()]
+
+    broker._xt_trader = DummyTrader()
+    broker._xt_account = object()
+
+    trade = broker.get_trades(order_id="o-zero-primary")[0]
+    assert trade["price"] == pytest.approx(2.5)
+
+
+@pytest.mark.unit
 def test_qmt_broker_maps_xttrade_id_and_optional_broker_commission_extension(monkeypatch):
     broker = QmtBroker(account_id="demo")
     broker._connected = True

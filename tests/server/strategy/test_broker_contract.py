@@ -17,7 +17,11 @@ from bullet_trade.server.strategy.broker_contract import (
     strategy_ledger_v1_blockers,
     load_verified_capabilities,
 )
-from bullet_trade.server.strategy.domain import OrderSide
+from bullet_trade.server.strategy.domain import (
+    FillPriceSource,
+    OrderSide,
+    UnpricedFillPolicy,
+)
 
 
 def _verified_profile(profile):
@@ -233,6 +237,89 @@ def test_missing_fee_evidence_is_preserved_as_unknown():
 
     assert evidence.commission_units is None
     assert evidence.tax_units == 0
+
+
+def test_zero_trade_price_uses_positive_deal_balance():
+    evidence = normalize_trade_evidence(
+        {
+            "trade_id": "T-price-from-balance",
+            "trade_id_source": "broker",
+            "order_id": "O-1",
+            "security": "510050.XSHG",
+            "amount": 100,
+            "price": 0,
+            "traded_price": 0,
+            "deal_balance": 250.0,
+            "side": "SELL",
+            "time": "2026-08-10 10:00:00",
+        },
+        {},
+    )
+
+    assert evidence.price_units == 2_500_000
+    assert evidence.price_source is FillPriceSource.BROKER_TRADE
+    assert evidence.price_known is True
+
+
+def test_conservative_policy_uses_full_order_protection_price():
+    trade = {
+        "trade_id": "T-estimated",
+        "trade_id_source": "broker",
+        "order_id": "O-1",
+        "security": "510050.XSHG",
+        "amount": 2400,
+        "price": 0,
+        "traded_price": 0,
+        "deal_balance": 0,
+        "side": "SELL",
+        "time": "2026-08-10 10:00:00",
+    }
+    order = {
+        "order_id": "O-1",
+        "amount": 2400,
+        "filled": 2400,
+        "order_price": 0.771,
+        "is_buy": False,
+    }
+
+    with pytest.raises(BrokerContractError, match="price is invalid"):
+        normalize_trade_evidence(trade, {"O-1": order})
+
+    evidence = normalize_trade_evidence(
+        trade,
+        {"O-1": order},
+        UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
+    )
+    assert evidence.price_units == 771_000
+    assert evidence.price_source is FillPriceSource.ORDER_PRICE_FALLBACK
+    assert evidence.price_known is False
+
+
+def test_conservative_policy_rejects_partial_order_price_fallback():
+    trade = {
+        "trade_id": "T-partial",
+        "trade_id_source": "broker",
+        "order_id": "O-1",
+        "security": "510050.XSHG",
+        "amount": 100,
+        "price": 0,
+        "side": "SELL",
+        "time": "2026-08-10 10:00:00",
+    }
+    order = {
+        "order_id": "O-1",
+        "amount": 200,
+        "filled": 100,
+        "order_price": 2.5,
+        "is_buy": False,
+    }
+
+    with pytest.raises(BrokerContractError, match="price is invalid"):
+        normalize_trade_evidence(
+            trade,
+            {"O-1": order},
+            UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
+        )
 
 
 @pytest.mark.parametrize(

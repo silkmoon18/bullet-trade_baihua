@@ -87,6 +87,35 @@ def test_trade_history_does_not_replace_valid_link_with_zero(tmp_path):
     assert trade["order_sysid"] == "SYS-1"
 
 
+def test_trade_history_does_not_replace_valid_prices_with_zero(tmp_path):
+    store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "T-1",
+            "order_id": "O-1",
+            "price": 2.5,
+            "traded_price": 2.5,
+            "deal_balance": 250.0,
+        },
+    )
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "T-1",
+            "order_id": "O-1",
+            "price": 0,
+            "traded_price": 0.0,
+            "deal_balance": 0,
+        },
+    )
+
+    trade = store.list_trades("default")[0]
+    assert trade["price"] == 2.5
+    assert trade["traded_price"] == 2.5
+    assert trade["deal_balance"] == 250.0
+
+
 def test_history_filters_and_current_rows_win_merge(tmp_path):
     store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
     store.record_order(

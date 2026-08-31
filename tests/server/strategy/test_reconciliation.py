@@ -8,6 +8,7 @@ from bullet_trade.server.strategy import (
     BrokerOrder,
     BrokerPositionSnapshot,
     CapabilityState,
+    FillPriceSource,
     OrderSide,
     OrderState,
     ReconciliationState,
@@ -15,6 +16,7 @@ from bullet_trade.server.strategy import (
     SQLiteFillBookingService,
     SQLiteReconciliationService,
     SQLiteStrategyRepository,
+    UnpricedFillPolicy,
     collect_async_broker_snapshot,
     money_to_units,
     price_to_units,
@@ -48,7 +50,7 @@ def _capabilities():
     )
 
 
-def _services(tmp_path):
+def _services(tmp_path, unpriced_fill_policy=UnpricedFillPolicy.STRICT):
     database = tmp_path / "reconciliation.db"
     repository = SQLiteStrategyRepository(database)
     repository.initialize()
@@ -61,7 +63,11 @@ def _services(tmp_path):
         PHYSICAL_ID,
         money_to_units("10000"),
     )
-    reconciliation = SQLiteReconciliationService(database, _capabilities())
+    reconciliation = SQLiteReconciliationService(
+        database,
+        _capabilities(),
+        unpriced_fill_policy=unpriced_fill_policy,
+    )
     return database, repository, capital, reconciliation
 
 
@@ -202,6 +208,88 @@ def test_zero_order_id_trade_is_relinked_by_counter_contract_id(tmp_path):
 
     assert result.state is ReconciliationState.READY
     assert result.details["booked_trade_ids"] == ("trade-1",)
+
+
+def test_conservative_unpriced_fill_is_booked_and_marked_estimated(tmp_path):
+    database, _, capital, reconciliation = _services(
+        tmp_path,
+        UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
+    )
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    order = dict(_broker_order())
+    order.update({"amount": 1000, "filled": 1000, "order_price": 2.0})
+    trade = dict(_broker_trade())
+    trade.update({"price": 0, "traded_price": 0, "deal_balance": 0})
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "18000",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(order,),
+            trades=(trade,),
+        ),
+    )
+
+    assert result.state is ReconciliationState.READY
+    connection = connect_database(database)
+    try:
+        fill = connection.execute(
+            "SELECT price_units, price_source, price_known FROM fills"
+        ).fetchone()
+        assert tuple(fill) == (
+            price_to_units("2"),
+            FillPriceSource.ORDER_PRICE_FALLBACK.value,
+            0,
+        )
+    finally:
+        connection.close()
+
+
+def test_owned_working_sell_freeze_reduces_required_broker_sellable(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    assert reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),),
+            trades=(_broker_trade(),),
+        ),
+    ).state is ReconciliationState.READY
+
+    sell = replace(
+        _order("sell-1", "broker-sell-1"),
+        client_tag="bt:test:sell-1",
+        side=OrderSide.SELL,
+    )
+    booking.register_order(sell)
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(
+                {
+                    "order_id": "broker-sell-1",
+                    "security": SECURITY,
+                    "status": "open",
+                    "is_buy": False,
+                },
+            ),
+        ),
+    )
+
+    assert result.state is ReconciliationState.READY
+    assert result.details["strategy_frozen_sell_qty"] == {SECURITY: 1000}
 
 
 def test_unknown_fee_fill_is_booked_and_small_cash_gap_is_tolerated(tmp_path):

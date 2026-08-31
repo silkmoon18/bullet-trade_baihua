@@ -58,6 +58,18 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _first_positive_number(*values: Any) -> Any:
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            if float(value) > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _first_broker_identifier(*values: Any) -> Any:
     """Return the first non-empty, non-zero broker identifier."""
 
@@ -542,13 +554,13 @@ class QmtBroker(BrokerBase):
             item, "trade_id", "traded_id", "deal_no", "trade_no"
         )
         trade_id_source = "broker"
-        price = _first_present(
+        price = _first_positive_number(
             _pick_value(item, "traded_price"),
             _pick_value(item, "trade_price"),
             _pick_value(item, "avg_price", "avg_cost"),
             _pick_value(item, "price"),
         )
-        amount = _first_present(
+        amount = _first_positive_number(
             _pick_value(item, "trade_volume"),
             _pick_value(item, "traded_volume"),
             _pick_value(item, "volume"),
@@ -568,7 +580,7 @@ class QmtBroker(BrokerBase):
         tax = _first_present(
             _pick_value(item, "tax"), _pick_value(item, "stamp_tax")
         )
-        deal_balance = _first_present(
+        deal_balance = _first_positive_number(
             _pick_value(item, "deal_balance"),
             _pick_value(item, "traded_amount"),
             _pick_value(item, "trade_value"),
@@ -1405,8 +1417,10 @@ class QmtBroker(BrokerBase):
             "filled_volume",
             "volume_traded",
         )
-        traded_price = _pick_value(
-            item, "traded_price", "avg_price", "trade_price"
+        traded_price = _first_positive_number(
+            _pick_value(item, "traded_price"),
+            _pick_value(item, "avg_price"),
+            _pick_value(item, "trade_price"),
         )
         order_type = _pick_value(item, "order_type", "orderType", "type")
         order_remark = _pick_value(item, "order_remark", "remark")

@@ -27,6 +27,7 @@ from .domain import (
     ReconciliationState,
     as_shanghai_time,
     money_to_units,
+    UnpricedFillPolicy,
 )
 from .fill_booking import SQLiteFillBookingService
 from .repository import RepositoryError, SQLiteStrategyRepository
@@ -277,6 +278,7 @@ class SQLiteReconciliationService:
         require_verified_capabilities: bool = True,
         durable_broker_history: bool = False,
         unknown_fee_tolerance_units_per_order: int = money_to_units("5"),
+        unpriced_fill_policy: UnpricedFillPolicy = UnpricedFillPolicy.STRICT,
     ) -> None:
         if (
             type(unknown_fee_tolerance_units_per_order) is not int
@@ -290,6 +292,7 @@ class SQLiteReconciliationService:
         self.unknown_fee_tolerance_units_per_order = (
             unknown_fee_tolerance_units_per_order
         )
+        self.unpriced_fill_policy = unpriced_fill_policy
         self._ledger = SQLiteStrategyRepository(database_path)
         self._booking = SQLiteFillBookingService(
             database_path,
@@ -434,7 +437,11 @@ class SQLiteReconciliationService:
             try:
                 linked_trade = dict(trade)
                 linked_trade["order_id"] = broker_order_id
-                evidence = normalize_trade_evidence(linked_trade, broker_orders)
+                evidence = normalize_trade_evidence(
+                    linked_trade,
+                    broker_orders,
+                    self.unpriced_fill_policy,
+                )
                 fill = BrokerFill(
                     fill_id="broker:{}".format(evidence.broker_trade_id),
                     broker_trade_id=evidence.broker_trade_id,
@@ -447,6 +454,8 @@ class SQLiteReconciliationService:
                     commission_units=evidence.commission_units,
                     tax_units=evidence.tax_units,
                     traded_at=evidence.traded_at,
+                    price_source=evidence.price_source,
+                    price_known=evidence.price_known,
                 )
                 account = self._ledger.get_strategy_account(account_id)
                 result = self._booking.book_fill(
@@ -497,7 +506,7 @@ class SQLiteReconciliationService:
             ) and broker_order_id not in current_broker_ids:
                 blockers.append("missing_working_order:{}".format(broker_order_id))
 
-        required_cash, owned_positions = self._ledger_view(
+        required_cash, owned_positions, frozen_sell_qty = self._ledger_view(
             account_id, physical_account_id, snapshot.as_of
         )
         unknown_fee_order_count = self._unknown_fee_order_count(physical_account_id)
@@ -519,12 +528,15 @@ class SQLiteReconciliationService:
         }
         for security, (owned_total, owned_sellable) in sorted(owned_positions.items()):
             broker_total, broker_sellable = broker_positions.get(security, (0, 0))
-            if broker_total < owned_total or broker_sellable < owned_sellable:
+            required_sellable = max(
+                0, owned_sellable - frozen_sell_qty.get(security, 0)
+            )
+            if broker_total < owned_total or broker_sellable < required_sellable:
                 blockers.append(
                     "broker_position_insufficient:{}:strategy=({},{}):broker=({},{})".format(
                         security,
                         owned_total,
-                        owned_sellable,
+                        required_sellable,
                         broker_total,
                         broker_sellable,
                     )
@@ -544,6 +556,7 @@ class SQLiteReconciliationService:
             "unknown_fee_order_count": unknown_fee_order_count,
             "unknown_fee_cash_tolerance_units": unknown_fee_cash_tolerance,
             "strategy_owned_position_count": len(owned_positions),
+            "strategy_frozen_sell_qty": frozen_sell_qty,
             "capability_verification_required": self.require_verified_capabilities,
             "durable_broker_history": self.durable_broker_history,
         }
@@ -623,7 +636,7 @@ class SQLiteReconciliationService:
         account_id: str,
         physical_account_id: str,
         as_of: datetime,
-    ) -> Tuple[int, Dict[str, Tuple[int, int]]]:
+    ) -> Tuple[int, Dict[str, Tuple[int, int]], Dict[str, int]]:
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN")
@@ -672,8 +685,25 @@ class SQLiteReconciliationService:
                         current_total + row["total_qty"],
                         current_sellable + sellable,
                     )
+            frozen_rows = connection.execute(
+                """
+                SELECT o.security, COALESCE(SUM(o.requested_qty - o.filled_qty), 0)
+                FROM strategy_orders o
+                JOIN strategy_accounts a
+                  ON a.strategy_account_id = o.strategy_account_id
+                WHERE a.physical_account_id = ?
+                  AND o.side = 'SELL'
+                  AND o.state IN ('SUBMITTED','PARTIALLY_FILLED','SUBMIT_UNKNOWN')
+                  AND o.broker_order_id IS NOT NULL
+                GROUP BY o.security
+                """,
+                (physical_account_id,),
+            ).fetchall()
+            frozen_sell_qty = {
+                row["security"]: max(0, int(row[1])) for row in frozen_rows
+            }
             connection.commit()
-            return cast(int, required_cash), positions
+            return cast(int, required_cash), positions, frozen_sell_qty
         except BaseException:
             connection.rollback()
             raise

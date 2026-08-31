@@ -10,7 +10,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union, cast
 
-from .domain import SHANGHAI_TZ, OrderSide, as_shanghai_time, money_to_units, price_to_units
+from .domain import (
+    SHANGHAI_TZ,
+    FillPriceSource,
+    OrderSide,
+    UnpricedFillPolicy,
+    as_shanghai_time,
+    money_to_units,
+    price_to_units,
+)
 
 
 class BrokerContractError(RuntimeError):
@@ -196,6 +204,8 @@ class BrokerTradeEvidence:
     commission_units: Optional[int]
     tax_units: Optional[int]
     traded_at: datetime
+    price_source: FillPriceSource
+    price_known: bool
 
     def __post_init__(self) -> None:
         if not self.broker_trade_id or not self.broker_order_id or not self.security:
@@ -212,6 +222,8 @@ class BrokerTradeEvidence:
             type(self.tax_units) is not int or self.tax_units < 0
         ):
             raise ValueError("broker trade tax must be non-negative or unknown")
+        if self.price_known != (self.price_source is FillPriceSource.BROKER_TRADE):
+            raise ValueError("broker trade price source is inconsistent")
         object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 
@@ -279,6 +291,68 @@ def _broker_price_to_units(value: object) -> int:
         raise BrokerContractError("broker price field is invalid") from exc
 
 
+def _positive_price_units(*values: object) -> Optional[int]:
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            units = _broker_price_to_units(value)
+        except BrokerContractError:
+            continue
+        if units > 0:
+            return units
+    return None
+
+
+def _positive_int(value: object) -> Optional[int]:
+    if type(value) is int:
+        return cast(int, value) if cast(int, value) > 0 else None
+    if type(value) is str:
+        try:
+            parsed = int(cast(str, value))
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _price_from_deal_balance(
+    trade: Mapping[str, object], quantity: int
+) -> Optional[int]:
+    for key in ("deal_balance", "traded_amount", "trade_value", "amount_value"):
+        value = trade.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            balance = Decimal(_decimal_input(value))
+            if not balance.is_finite() or balance <= 0:
+                continue
+            units = price_to_units(balance / Decimal(quantity))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+        if units > 0:
+            return units
+    return None
+
+
+def _conservative_order_price(
+    order: Optional[Mapping[str, object]], quantity: int
+) -> Optional[int]:
+    if order is None:
+        return None
+    order_quantity = _positive_int(order.get("amount") or order.get("quantity"))
+    filled_quantity = _positive_int(
+        order.get("filled") or order.get("traded_volume")
+    )
+    if order_quantity != quantity or filled_quantity != quantity:
+        return None
+    return _positive_price_units(
+        order.get("order_price"),
+        order.get("broker_price"),
+        order.get("limit_price"),
+    )
+
+
 def _positive_quantity(value: object) -> int:
     if type(value) is int:
         quantity = cast(int, value)
@@ -334,6 +408,7 @@ def _broker_trade_time(value: object) -> datetime:
 def normalize_trade_evidence(
     trade: Mapping[str, object],
     orders_by_id: Mapping[str, Mapping[str, object]],
+    unpriced_fill_policy: UnpricedFillPolicy = UnpricedFillPolicy.STRICT,
 ) -> BrokerTradeEvidence:
     trade_id = _text(trade.get("trade_id"))
     trade_id_source = _text(trade.get("trade_id_source")).lower()
@@ -346,11 +421,26 @@ def normalize_trade_evidence(
     if not security:
         raise BrokerContractError("broker trade has no security")
     quantity = _positive_quantity(trade.get("amount") or trade.get("quantity"))
-    price = trade.get("price")
-    if price is None:
-        price = trade.get("traded_price")
-    price_units = _broker_price_to_units(price)
-    if price_units <= 0:
+    price_units = _positive_price_units(
+        trade.get("price"),
+        trade.get("traded_price"),
+        trade.get("trade_price"),
+        trade.get("avg_price"),
+    )
+    if price_units is None:
+        price_units = _price_from_deal_balance(trade, quantity)
+    price_source = FillPriceSource.BROKER_TRADE
+    price_known = True
+    if price_units is None and (
+        unpriced_fill_policy is UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE
+    ):
+        price_units = _conservative_order_price(
+            orders_by_id.get(order_id), quantity
+        )
+        if price_units is not None:
+            price_source = FillPriceSource.ORDER_PRICE_FALLBACK
+            price_known = False
+    if price_units is None:
         raise BrokerContractError("broker trade price is invalid")
 
     side = _side_from_row(trade)
@@ -379,6 +469,8 @@ def normalize_trade_evidence(
         commission_units=commission_units,
         tax_units=tax_units,
         traded_at=traded_at,
+        price_source=price_source,
+        price_known=price_known,
     )
 
 

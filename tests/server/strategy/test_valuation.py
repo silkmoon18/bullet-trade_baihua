@@ -8,6 +8,7 @@ import pytest
 from bullet_trade.server.strategy import (
     BrokerFill,
     BrokerOrder,
+    FillPriceSource,
     MarketMark,
     OrderSide,
     OrderState,
@@ -185,6 +186,49 @@ def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
     assert payload["nav"] is None
     assert payload["returns"] is None
     assert payload["total_pnl"] is None
+
+
+def test_estimated_fill_price_blocks_performance(ledger_services):
+    _, _, capital, booking, valuation = ledger_services
+    booking.register_order(_order("buy-estimated", OrderSide.BUY, 1000))
+    capital.reserve_cash(
+        "good-etf", money_to_units("2100"), 0, "buy-estimated"
+    )
+    original = _fill(
+        "f-buy-estimated", "buy-estimated", OrderSide.BUY, 1000, "2", "0"
+    )
+    estimated = BrokerFill(
+        fill_id=original.fill_id,
+        order_id=original.order_id,
+        fingerprint=original.fingerprint,
+        broker_trade_id=original.broker_trade_id,
+        security=original.security,
+        side=original.side,
+        quantity=original.quantity,
+        price_units=original.price_units,
+        commission_units=original.commission_units,
+        tax_units=original.tax_units,
+        traded_at=original.traded_at,
+        price_source=FillPriceSource.ORDER_PRICE_FALLBACK,
+        price_known=False,
+    )
+    booking.book_fill(
+        "good-etf",
+        estimated,
+        1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    snapshot = valuation.create_snapshot(
+        "good-etf", {SECURITY: _mark()}, AS_OF, timedelta(minutes=1)
+    )
+
+    assert snapshot.unknown_price_fill_count == 1
+    assert snapshot.performance_ready is False
+    assert snapshot.performance_blockers == ("estimated_fill_prices",)
+    payload = SQLiteStrategyAPI._snapshot_payload(snapshot)
+    assert payload["unknown_price_fill_count"] == 1
+    assert payload["nav"] is None
 
 
 def test_sell_snapshot_reconciles_realized_and_unrealized_pnl(ledger_services):

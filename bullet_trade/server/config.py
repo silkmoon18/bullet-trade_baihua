@@ -68,6 +68,7 @@ class ServerConfig:
     strategy_cash_buffer: float = 100.0
     strategy_minimum_order: float = 0.0
     strategy_buy_fee_buffer: float = 5.0
+    strategy_unpriced_fill_policy: str = "STRICT"
     strategy_capabilities_path: Optional[str] = None
     feishu_webhook_url: Optional[str] = None
     feishu_signing_secret: str = ""
@@ -77,6 +78,16 @@ def _split_items(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
     return [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+
+
+def _unpriced_fill_policy(raw: Optional[str]) -> str:
+    value = str(raw or "STRICT").strip().upper()
+    if value not in ("STRICT", "CONSERVATIVE_ORDER_PRICE"):
+        raise ValueError(
+            "QMT_STRATEGY_UNPRICED_FILL_POLICY must be "
+            "STRICT or CONSERVATIVE_ORDER_PRICE"
+        )
+    return value
 
 
 def _parse_accounts(raw: Optional[str]) -> Dict[str, AccountConfig]:
@@ -257,6 +268,9 @@ def build_server_config(args) -> ServerConfig:
         strategy_cash_buffer=max(0.0, get_env_float("QMT_STRATEGY_CASH_BUFFER", 100.0)),
         strategy_minimum_order=max(0.0, get_env_float("QMT_STRATEGY_MINIMUM_ORDER", 0.0)),
         strategy_buy_fee_buffer=max(0.0, get_env_float("QMT_STRATEGY_BUY_FEE_BUFFER", 5.0)),
+        strategy_unpriced_fill_policy=_unpriced_fill_policy(
+            get_env("QMT_STRATEGY_UNPRICED_FILL_POLICY")
+        ),
         strategy_capabilities_path=get_env("QMT_STRATEGY_CAPABILITIES_FILE"),
         feishu_webhook_url=get_env("FEISHU_WEBHOOK_URL"),
         feishu_signing_secret=get_env("FEISHU_SIGNING_SECRET", "") or "",

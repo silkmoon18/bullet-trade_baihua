@@ -92,6 +92,8 @@ def _fee_notification_detail(fill: BrokerFill) -> str:
     )
     if fill.commission_units is None or fill.tax_units is None:
         detail += "；成交金额仅计已知费用"
+    if not fill.price_known:
+        detail += "；成交价缺失，使用委托保护价保守估算"
     return detail
 
 
@@ -417,8 +419,9 @@ class SQLiteFillBookingService:
                 INSERT INTO fills(
                     fill_id, order_id, broker_trade_id, fill_fingerprint,
                     security, side, quantity, price_units, commission_units,
-                    tax_units, commission_known, tax_known, traded_at, booked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tax_units, commission_known, tax_known, traded_at, booked_at,
+                    price_source, price_known
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fill.fill_id,
@@ -435,6 +438,8 @@ class SQLiteFillBookingService:
                     int(fill.tax_units is not None),
                     fill.traded_at.isoformat(),
                     timestamp,
+                    fill.price_source.value,
+                    int(fill.price_known),
                 ),
             )
             realized_pnl_units = 0
@@ -529,6 +534,8 @@ class SQLiteFillBookingService:
                 "tax_units": fill.tax_units,
                 "commission_known": fill.commission_units is not None,
                 "tax_known": fill.tax_units is not None,
+                "price_source": fill.price_source.value,
+                "price_known": fill.price_known,
                 "reservation_released_units": reservation_released,
                 "realized_pnl_units": realized_pnl_units,
             }
@@ -769,12 +776,15 @@ class SQLiteFillBookingService:
             fill.quantity,
             fill.price_units,
             fill.traded_at.isoformat(),
+            fill.price_source.value,
+            int(fill.price_known),
         )
         actual = tuple(
             row[name]
             for name in (
                 "fill_id", "order_id", "broker_trade_id", "security", "side",
                 "quantity", "price_units", "traded_at",
+                "price_source", "price_known",
             )
         )
         if actual != expected or (

@@ -415,6 +415,21 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    Migration(
+        7,
+        "explicit_estimated_fill_prices",
+        (
+            (
+                "ALTER TABLE fills ADD COLUMN price_source TEXT NOT NULL "
+                "DEFAULT 'BROKER_TRADE' CHECK (price_source IN "
+                "('BROKER_TRADE','ORDER_PRICE_FALLBACK'))"
+            ),
+            (
+                "ALTER TABLE fills ADD COLUMN price_known INTEGER NOT NULL "
+                "DEFAULT 1 CHECK (price_known IN (0, 1))"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

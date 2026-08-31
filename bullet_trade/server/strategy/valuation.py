@@ -81,6 +81,7 @@ class PortfolioSnapshot:
     nav_units: int
     fees_known: bool
     unknown_fee_fill_count: int
+    unknown_price_fill_count: int
     performance_blockers: Tuple[str, ...]
     performance_ready: bool
     positions: Tuple[PortfolioPositionSnapshot, ...]
@@ -226,6 +227,9 @@ class SQLiteValuationService:
                        COALESCE(SUM(
                            CASE WHEN f.commission_known = 0 OR f.tax_known = 0
                                 THEN 1 ELSE 0 END
+                       ), 0),
+                       COALESCE(SUM(
+                           CASE WHEN f.price_known = 0 THEN 1 ELSE 0 END
                        ), 0)
                 FROM fills f
                 JOIN strategy_orders o ON o.order_id = f.order_id
@@ -235,6 +239,7 @@ class SQLiteValuationService:
             ).fetchone()
             fees = cast(int, fee_row[0])
             unknown_fee_fill_count = cast(int, fee_row[1])
+            unknown_price_fill_count = cast(int, fee_row[2])
             flow_rows = connection.execute(
                 """
                 SELECT flow_type, amount_units FROM capital_flows
@@ -287,6 +292,8 @@ class SQLiteValuationService:
                 performance_blockers.append("capital_flows_unsupported")
             if unknown_fee_fill_count:
                 performance_blockers.append("unknown_fill_fees")
+            if unknown_price_fill_count:
+                performance_blockers.append("estimated_fill_prices")
             result = PortfolioSnapshot(
                 account_id=account.account_id,
                 strategy_id=account.strategy_id,
@@ -306,6 +313,7 @@ class SQLiteValuationService:
                 nav_units=nav_units,
                 fees_known=unknown_fee_fill_count == 0,
                 unknown_fee_fill_count=unknown_fee_fill_count,
+                unknown_price_fill_count=unknown_price_fill_count,
                 performance_blockers=tuple(performance_blockers),
                 performance_ready=not performance_blockers,
                 positions=position_tuple,
