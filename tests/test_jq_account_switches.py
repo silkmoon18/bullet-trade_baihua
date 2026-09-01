@@ -15,8 +15,16 @@ STRATEGY_ID = "good_etf"
 
 
 @pytest.fixture()
-def helper():
-    return importlib.reload(_helper)
+def helper(monkeypatch):
+    loaded = importlib.reload(_helper)
+    monkeypatch.setattr(
+        loaded,
+        "_local_wall_clock",
+        lambda: loaded.time.struct_time(
+            (2026, 8, 28, 10, 30, 0, 4, 240, -1)
+        ),
+    )
+    return loaded
 
 
 def _context(run_type="sim_trade"):
@@ -557,3 +565,143 @@ def test_parallel_risk_uses_each_accounts_own_cost_basis(helper, monkeypatch):
     assert result["accounts"][1]["stop_loss"] == []
     assert submitted[0][0] == {"510300.XSHG": 0.0}
     assert jq_exits == []
+
+
+def test_same_day_catch_up_remains_eligible_until_market_close(
+    helper, monkeypatch
+):
+    context = _context()
+    context.current_dt = "2026-08-28 09:30:00"
+    monkeypatch.setattr(
+        helper,
+        "_local_wall_clock",
+        lambda: helper.time.struct_time(
+            (2026, 8, 28, 13, 0, 0, 4, 240, -1)
+        ),
+    )
+
+    gate = helper._qmt_callback_gate(context)
+
+    assert gate.allowed is True
+
+
+def test_after_close_replay_skips_qmt_rebalance_but_keeps_jq(
+    helper, monkeypatch
+):
+    _config(monkeypatch, {
+        "jq_account_enabled": True,
+        "qmt_account_enabled": True,
+    })
+    warnings = []
+    jq_orders = []
+    namespace = {
+        "log": types.SimpleNamespace(
+            warn=lambda message: warnings.append(str(message))
+        ),
+        "order_target": lambda security, amount: None,
+        "order_target_value": (
+            lambda security, value, style=None:
+            jq_orders.append((security, value))
+        ),
+        "get_open_orders": lambda: {},
+        "cancel_order": lambda order: None,
+    }
+    for name in helper._RUNTIME_MUTATION_NAMES:
+        namespace.setdefault(name, lambda *args, **kwargs: None)
+    context = _context()
+    context.current_dt = "2026-08-28 09:30:00"
+    context.portfolio = _portfolio(10_000)
+    runtime = helper.install_joinquant_runtime(
+        namespace,
+        context=context,
+        strategy_id=STRATEGY_ID,
+        qmt_initial_capital=10_000,
+        profile_module=PROFILE_MODULE,
+    )
+    monkeypatch.setattr(
+        helper,
+        "_local_wall_clock",
+        lambda: helper.time.struct_time(
+            (2026, 8, 28, 23, 7, 0, 4, 240, -1)
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("historical replay must not reach QMT")
+
+    monkeypatch.setattr(helper, "advance_runtime_targets", forbidden)
+    monkeypatch.setattr(helper, "get_portfolio", forbidden)
+    monkeypatch.setattr(helper, "submit_runtime_targets", forbidden)
+    monkeypatch.setattr(helper, "notify_target_buy_plan", forbidden)
+
+    result = runtime.execute_rebalance(
+        context,
+        {"510300.XSHG": 0.5},
+        {"510300.XSHG": 10.0},
+        "open-20260828",
+        helper.ExecutionRequest(),
+    )
+
+    assert result["qmt"] == {"skipped_historical_replay": True}
+    assert jq_orders == [("510300.XSHG", 5_000.0)]
+    assert "检测到聚宽历史回放，已跳过QMT调仓执行" in warnings[-1]
+
+
+def test_cross_day_replay_skips_qmt_risk_but_keeps_jq(
+    helper, monkeypatch
+):
+    _config(monkeypatch, {
+        "jq_account_enabled": True,
+        "qmt_account_enabled": True,
+    })
+    warnings = []
+    jq_exits = []
+    namespace = {
+        "log": types.SimpleNamespace(
+            warn=lambda message: warnings.append(str(message))
+        ),
+        "order_target": (
+            lambda security, amount: jq_exits.append((security, amount))
+        ),
+    }
+    for name in helper._RUNTIME_MUTATION_NAMES:
+        namespace.setdefault(name, lambda *args, **kwargs: None)
+    context = _context()
+    context.current_dt = "2026-08-28 10:30:00"
+    context.portfolio = _portfolio(
+        10_000,
+        {"510300.XSHG": _position(9.0, 10.0, 4_500)},
+    )
+    runtime = helper.install_joinquant_runtime(
+        namespace,
+        context=context,
+        strategy_id=STRATEGY_ID,
+        qmt_initial_capital=10_000,
+        profile_module=PROFILE_MODULE,
+    )
+    monkeypatch.setattr(
+        helper,
+        "_local_wall_clock",
+        lambda: helper.time.struct_time(
+            (2026, 8, 29, 10, 30, 0, 5, 241, -1)
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("historical replay must not reach QMT")
+
+    monkeypatch.setattr(helper, "advance_runtime_targets", forbidden)
+    monkeypatch.setattr(helper, "get_portfolio", forbidden)
+    monkeypatch.setattr(helper, "submit_runtime_targets", forbidden)
+
+    result = runtime.execute_risk_management(
+        context,
+        0.95,
+        1.10,
+        "risk-20260828-1030",
+    )
+
+    assert result["qmt_skipped_historical_replay"] is True
+    assert [item["account"] for item in result["accounts"]] == ["JQ"]
+    assert jq_exits == [("510300.XSHG", 0)]
+    assert "策略日期与实际日期不一致" in warnings[-1]

@@ -23,6 +23,8 @@
 - 冷启动升级：helper/config/策略文件变更必须先停止聚宽策略、确认旧进程
   退出，再由平台启动全新进程。同一进程内重复安装仅在签名完全一致时幂等
   返回；签名漂移或检测到上一代 helper 遗留记录即失败关闭。
+- 历史回放：聚宽暂停恢复时仍允许JQ账户重建，但收盘后或跨日回放不得
+  向QMT提交调仓、风控目标或计划通知。
 - 本 helper 运行在用户自有、可信的策略进程中，不防御同进程恶意 Python
   代码、monkey patch 或热重载攻击（docs/live-ledger/02-decisions.md D021）。
 """
@@ -82,8 +84,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 15
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v15"
+STRATEGY_RUNTIME_API_VERSION = 16
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v16"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -141,6 +143,76 @@ _active_namespace = None  # type: Optional[Dict[str, Any]]
 _runtime_target_state = None  # type: Optional[Dict[str, Any]]
 _security_name_cache = {}  # type: Dict[str, str]
 _TERMINAL_INTENT_STATES = frozenset({"COMPLETED", "CANCELED", "FAILED"})
+_QMT_CALLBACK_WINDOW_START_SECONDS = 9 * 60 * 60 + 15 * 60
+_QMT_CALLBACK_WINDOW_END_SECONDS = 15 * 60 * 60
+_QmtCallbackGate = namedtuple(
+    "_QmtCallbackGate", "allowed strategy_time actual_time reason"
+)
+
+
+def _local_wall_clock() -> Any:
+    """Return the JoinQuant worker's local wall clock (Asia/Shanghai in production)."""
+
+    return time.localtime()
+
+
+def _strategy_clock_parts(value: Any) -> Optional[Tuple[int, ...]]:
+    """Normalize JoinQuant datetime-like values without adding runtime dependencies."""
+
+    if isinstance(value, str):
+        try:
+            parsed = time.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+            return tuple(parsed[:6])
+        except (TypeError, ValueError):
+            return None
+    try:
+        return (
+            int(value.year),
+            int(value.month),
+            int(value.day),
+            int(value.hour),
+            int(value.minute),
+            int(value.second),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _qmt_callback_gate(context: Any) -> Any:
+    """Reject QMT side effects produced by JoinQuant's historical catch-up replay."""
+
+    strategy = _strategy_clock_parts(getattr(context, "current_dt", None))
+    actual = _local_wall_clock()
+    actual_parts = tuple(actual[:6])
+    actual_text = time.strftime("%Y-%m-%d %H:%M:%S", actual)
+    if strategy is None:
+        return _QmtCallbackGate(
+            False, "<invalid>", actual_text, "策略时间不可识别"
+        )
+    strategy_text = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+        *strategy
+    )
+    if strategy[:3] != actual_parts[:3]:
+        return _QmtCallbackGate(
+            False, strategy_text, actual_text, "策略日期与实际日期不一致"
+        )
+    actual_seconds = (
+        actual_parts[3] * 60 * 60
+        + actual_parts[4] * 60
+        + actual_parts[5]
+    )
+    if not (
+        _QMT_CALLBACK_WINDOW_START_SECONDS
+        <= actual_seconds
+        < _QMT_CALLBACK_WINDOW_END_SECONDS
+    ):
+        return _QmtCallbackGate(
+            False,
+            strategy_text,
+            actual_text,
+            "实际时间不在QMT当日执行窗口09:15-15:00",
+        )
+    return _QmtCallbackGate(True, strategy_text, actual_text, "")
 
 
 def is_hong_kong_etf(
@@ -1528,6 +1600,21 @@ class JoinQuantRuntime:
         if callable(entry):
             entry(message)
 
+    def _qmt_callback_allowed(self, context: Any, operation: str) -> bool:
+        gate = _qmt_callback_gate(context)
+        if gate.allowed:
+            return True
+        self._log(
+            "warn",
+            "检测到聚宽历史回放，已跳过QMT{} | 策略时间={} 实际时间={} 原因={}".format(
+                operation,
+                gate.strategy_time,
+                gate.actual_time,
+                gate.reason,
+            ),
+        )
+        return False
+
     def _platform_api(self, name: str) -> Callable[..., Any]:
         if self._namespace is None:
             raise RuntimeError("策略namespace不可用")
@@ -1841,7 +1928,13 @@ class JoinQuantRuntime:
         notification_items = []
         qmt_submitted = False
 
-        if self.qmt_account_enabled:
+        qmt_callback_allowed = (
+            self.qmt_account_enabled
+            and self._qmt_callback_allowed(context, "调仓执行")
+        )
+        if self.qmt_account_enabled and not qmt_callback_allowed:
+            result["qmt"] = {"skipped_historical_replay": True}
+        if qmt_callback_allowed:
             try:
                 self._retry_qmt_readiness(context)
                 if not self.advance_targets(context):
@@ -2020,7 +2113,13 @@ class JoinQuantRuntime:
             take_profit_execution or default_etf_take_profit_execution()
         )
         result = {"accounts": [], "errors": []}
-        if self.qmt_account_enabled:
+        qmt_callback_allowed = (
+            self.qmt_account_enabled
+            and self._qmt_callback_allowed(context, "风控执行")
+        )
+        if self.qmt_account_enabled and not qmt_callback_allowed:
+            result["qmt_skipped_historical_replay"] = True
+        if qmt_callback_allowed:
             try:
                 self._retry_qmt_readiness(context)
                 intent_idle = self.advance_targets(context)
