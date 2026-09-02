@@ -40,6 +40,7 @@ from .tick import TickSubscriptionManager
 
 
 _STRATEGY_STARTUP_RETRY_SECONDS = 5.0
+_STRATEGY_EXPIRY_RETRY_SECONDS = 60.0
 
 
 @dataclass
@@ -79,6 +80,7 @@ class ServerApplication:
         self._idempotency_cache: Dict[Tuple[str, str, str], _IdempotencyEntry] = {}
         self._idempotency_lock = asyncio.Lock()
         self._strategy_startup_task: Optional[asyncio.Task] = None
+        self._strategy_expiry_task: Optional[asyncio.Task] = None
         self._dashboard_sample_task: Optional[asyncio.Task] = None
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
@@ -191,6 +193,13 @@ class ServerApplication:
             except asyncio.CancelledError:
                 pass
             self._strategy_startup_task = None
+        if self._strategy_expiry_task:
+            self._strategy_expiry_task.cancel()
+            try:
+                await self._strategy_expiry_task
+            except asyncio.CancelledError:
+                pass
+            self._strategy_expiry_task = None
         if self._dashboard_sample_task:
             self._dashboard_sample_task.cancel()
             try:
@@ -838,6 +847,14 @@ class ServerApplication:
                 )
         if self.tick_manager:
             await self.tick_manager.start()
+        expire_intents = getattr(
+            self.strategy_api, "expire_previous_day_intents", None
+        )
+        if callable(expire_intents) and self._strategy_expiry_task is None:
+            self._strategy_expiry_task = asyncio.create_task(
+                self._strategy_expiry_loop(),
+                name="strategy-ledger-midnight-expiry",
+            )
 
     async def _check_strategy_startup(self, *, log_failure: bool) -> bool:
         """Reconcile existing strategy accounts after the broker becomes ready."""
@@ -870,6 +887,44 @@ class ServerApplication:
             if await self._check_strategy_startup(log_failure=False):
                 log.info("QMT连接就绪，StrategyLedger启动对账已自动恢复")
                 return
+
+    async def _strategy_expiry_loop(self) -> None:
+        """Close previous-day target orders at 00:00 Asia/Shanghai."""
+
+        assert self.strategy_api is not None
+        while True:
+            now = datetime.now(SHANGHAI_TZ)
+            try:
+                result = await self.strategy_api.expire_previous_day_intents(
+                    now
+                )
+            except Exception:
+                log.exception("StrategyLedger 午夜撤单任务异常")
+                delay = _STRATEGY_EXPIRY_RETRY_SECONDS
+            else:
+                if result.expired:
+                    log.info(
+                        "StrategyLedger 午夜撤单完成 | 过期意图=%s "
+                        "撤单请求=%s 已关闭=%s 待确认=%s 未绑定=%s 错误=%s",
+                        result.expired,
+                        result.cancel_requests,
+                        result.canceled,
+                        result.pending,
+                        result.unbound,
+                        result.errors,
+                    )
+                if result.pending or result.unbound or result.errors:
+                    delay = _STRATEGY_EXPIRY_RETRY_SECONDS
+                else:
+                    next_midnight = datetime.combine(
+                        now.date() + timedelta(days=1),
+                        datetime.min.time(),
+                        tzinfo=SHANGHAI_TZ,
+                    )
+                    delay = max(
+                        0.5, (next_midnight - now).total_seconds()
+                    )
+            await asyncio.sleep(delay)
 
     def _health_snapshot(self) -> Dict:
         value = {

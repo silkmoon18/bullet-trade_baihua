@@ -229,7 +229,7 @@ class JoinQuantRuntime:
         weights: Dict[str, Any],
         marks: Dict[str, Any],
         idempotency_key: str,
-        execution: Optional[ExecutionRequest] = ...,
+        execution: ExecutionRequest,
         security_names: Optional[Dict[str, str]] = ...,
     ) -> Dict[str, Any]: ...
     @staticmethod
@@ -267,7 +267,7 @@ class JoinQuantRuntime:
         weights: Dict[str, Any],
         marks: Dict[str, Any],
         idempotency_key: str,
-        execution: ExecutionRequest,
+        execution: Optional[ExecutionRequest] = ...,
     ) -> Dict[str, Any]: ...
     def execute_risk_management(
         self,

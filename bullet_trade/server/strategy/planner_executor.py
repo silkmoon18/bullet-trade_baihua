@@ -115,6 +115,17 @@ class DispatchResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class IntentOrderProgress:
+    security: str
+    side: OrderSide
+    requested_qty: int
+    filled_qty: int
+    remaining_qty: int
+    state: OrderState
+    limit_price_units: Optional[int]
+
+
 def _trade_value(price_units: int, quantity: int) -> int:
     return (price_units * quantity * MONEY_SCALE + PRICE_SCALE // 2) // PRICE_SCALE
 
@@ -250,6 +261,11 @@ class SQLiteTargetExecutionService:
         working = self._working_orders(intent.account_id)
         if any(row["state"] == OrderState.SUBMIT_UNKNOWN.value for row in working):
             raise TargetPlanningError("submit-unknown order blocks execution")
+        intent_working = [
+            row for row in working if row["intent_id"] == intent.intent_id
+        ]
+        if len(intent_working) != len(working):
+            return IntentAdvanceResult(intent, (), True)
         intent_payload = self._intent_payload(intent.intent_id)
         if intent_payload.get("cancel_requested") is True:
             if working:
@@ -257,11 +273,29 @@ class SQLiteTargetExecutionService:
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.CANCELED), (), False
             )
-        if working:
+        if any(row["side"] == OrderSide.SELL.value for row in intent_working):
             return IntentAdvanceResult(intent, (), True)
+        positions = {item.security: item for item in snapshot.positions}
+        if intent_working:
+            uncovered_delta = False
+            for security in sorted(set(intent.targets) | set(positions)):
+                position = positions.get(security)
+                current_qty = position.total_qty if position else 0
+                delta = int(intent.targets.get(security, 0)) - current_qty
+                if delta == 0:
+                    continue
+                side = OrderSide.SELL if delta < 0 else OrderSide.BUY
+                if not any(
+                    row["security"] == security
+                    and row["side"] == side.value
+                    for row in intent_working
+                ):
+                    uncovered_delta = True
+                    break
+            if not uncovered_delta:
+                return IntentAdvanceResult(intent, (), True)
         self._require_ready(intent.account_id, snapshot, current)
 
-        positions = {item.security: item for item in snapshot.positions}
         sells = []
         buys = []
         sell_pending = False
@@ -282,6 +316,11 @@ class SQLiteTargetExecutionService:
             side = OrderSide.SELL if delta < 0 else OrderSide.BUY
             if delta < 0:
                 sell_pending = True
+            if any(
+                row["security"] == security and row["side"] == side.value
+                for row in intent_working
+            ):
+                continue
             if (
                 intent.execution_request.follow_up is FollowUpPolicy.NONE
                 and self._order_count(intent.intent_id, security, side) > 0
@@ -334,6 +373,11 @@ class SQLiteTargetExecutionService:
                         )
                     )
 
+        if sell_pending and intent_working:
+            return IntentAdvanceResult(
+                self._set_state(intent_id, IntentState.EXECUTING), (), True,
+                waiting_for_trigger,
+            )
         if sell_pending and not sells:
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.EXECUTING), (), True,
@@ -341,12 +385,12 @@ class SQLiteTargetExecutionService:
             )
         selected = sells or self._affordable_buys(snapshot, buys)
         if not selected:
-            if waiting_for_trigger:
+            if waiting_for_trigger or intent_working:
                 return IntentAdvanceResult(
                     self._set_state(intent_id, IntentState.EXECUTING),
                     (),
-                    False,
-                    True,
+                    bool(intent_working),
+                    waiting_for_trigger,
                 )
             return IntentAdvanceResult(self._set_state(intent_id, IntentState.COMPLETED), (), False)
         side = OrderSide.SELL if sells else OrderSide.BUY
@@ -413,6 +457,38 @@ class SQLiteTargetExecutionService:
             return _intent(cast(sqlite3.Row, row))
         finally:
             connection.close()
+
+    def intent_orders(
+        self, intent_id: str
+    ) -> Tuple[IntentOrderProgress, ...]:
+        self.get_intent(intent_id)
+        connection = connect_database(self.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT security, side, requested_qty, filled_qty, state, "
+                "limit_price_units FROM strategy_orders "
+                "WHERE intent_id = ? ORDER BY created_at, order_id",
+                (intent_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(
+            IntentOrderProgress(
+                security=str(row["security"]),
+                side=OrderSide(row["side"]),
+                requested_qty=int(row["requested_qty"]),
+                filled_qty=int(row["filled_qty"]),
+                remaining_qty=int(row["requested_qty"])
+                - int(row["filled_qty"]),
+                state=OrderState(row["state"]),
+                limit_price_units=(
+                    int(row["limit_price_units"])
+                    if row["limit_price_units"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        )
 
     def stale_broker_order_ids(
         self,
@@ -738,7 +814,14 @@ class SQLiteTargetExecutionService:
             or intent.trading_day != current.date()
             or security not in self.reference_prices(intent_id)
             or self.intent_cancel_requested(intent_id)
-            or self._working_orders(intent.account_id)
+        ):
+            return False
+        working = self._working_orders(intent.account_id)
+        if any(
+            row["intent_id"] != intent.intent_id
+            or row["state"] == OrderState.SUBMIT_UNKNOWN.value
+            or row["side"] == OrderSide.SELL.value
+            for row in working
         ):
             return False
         connection = connect_database(self.database_path)
@@ -756,6 +839,10 @@ class SQLiteTargetExecutionService:
         if delta == 0:
             return False
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+        if working and side is OrderSide.SELL:
+            return False
+        if any(row["security"] == security for row in working):
+            return False
         style = (
             intent.execution_request.sell_style
             if side is OrderSide.SELL

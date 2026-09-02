@@ -24,6 +24,7 @@ from .domain import (
     NAV_SCALE,
     PRICE_SCALE,
     SHANGHAI_TZ,
+    PortfolioIntent,
     UnpricedFillPolicy,
     money_to_units,
     price_to_units,
@@ -54,6 +55,7 @@ from .valuation import MarketMark, SQLiteValuationService
 DatabasePath = Union[str, Path]
 logger = logging.getLogger(__name__)
 EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
+VALUATION_MARK_MAX_IDLE_AGE = timedelta(days=10)
 
 
 def _uses_conditional_execution(request: ExecutionRequest) -> bool:
@@ -73,6 +75,16 @@ class StrategyAPIConfig:
     minimum_order_units: int = 0
     buy_fee_buffer_units: int = money_to_units("5")
     unpriced_fill_policy: UnpricedFillPolicy = UnpricedFillPolicy.STRICT
+
+
+@dataclass(frozen=True)
+class ExpiredIntentSweepResult:
+    expired: int = 0
+    cancel_requests: int = 0
+    canceled: int = 0
+    pending: int = 0
+    unbound: int = 0
+    errors: int = 0
 
 
 def _json_value(value: object) -> object:
@@ -408,6 +420,17 @@ class SQLiteStrategyAPI:
             security: value / NAV_SCALE
             for security, value in stored.get("weights_ppm", {}).items()
         }
+        orders = []
+        for progress in self.planner.intent_orders(intent_id):
+            item = cast(Dict[str, object], _json_value(progress))
+            limit_price_units = item.pop("limit_price_units", None)
+            item["limit_price"] = (
+                _price(cast(int, limit_price_units))
+                if limit_price_units is not None
+                else None
+            )
+            orders.append(item)
+        result["orders"] = orders
         return result
 
     async def cancel_intent(
@@ -426,32 +449,54 @@ class SQLiteStrategyAPI:
         intent = self.planner.get_intent(intent_id)
         if intent.account_id != strategy_id:
             raise ValueError("intent does not belong to strategy")
+        return await self._cancel_bound_intent(
+            intent, account_context, account_key
+        )
+
+    async def _cancel_bound_intent(
+        self,
+        intent: PortfolioIntent,
+        account_context: object,
+        account_key: str,
+    ) -> Dict[str, object]:
         requested = []
-        broker_order_ids = self.planner.cancelable_broker_order_ids(intent_id)
-        self.planner.request_intent_cancellation(intent_id)
-        for broker_order_id in broker_order_ids:
-            await cast(Any, self.broker).cancel_order(
-                account_context, broker_order_id
-            )
-            requested.append(broker_order_id)
-        if requested:
-            await self._refresh(
-                account_context, account_key, strategy_id, {}
-            )
+        broker_order_ids = self.planner.cancelable_broker_order_ids(
+            intent.intent_id
+        )
+        self.planner.request_intent_cancellation(intent.intent_id)
+        if broker_order_ids:
+            try:
+                for broker_order_id in broker_order_ids:
+                    await cast(Any, self.broker).cancel_order(
+                        account_context, broker_order_id
+                    )
+                    requested.append(broker_order_id)
+            finally:
+                # QMT can report that an exchange DAY order is already invalid
+                # when the midnight cancel reaches it.  Refresh even when that
+                # response raises so StrategyLedger can observe the terminal
+                # broker state instead of retrying forever on stale state.
+                physical_id = self._physical_id(account_key)
+                broker_snapshot = await collect_async_broker_snapshot(
+                    cast(Any, self.broker), account_context
+                )
+                self._synchronize(
+                    intent.account_id, physical_id, broker_snapshot
+                )
         canceled = False
         try:
-            intent = self.planner.cancel_intent_if_idle(intent_id)
+            intent = self.planner.cancel_intent_if_idle(intent.intent_id)
             canceled = intent.state.value == "CANCELED"
         except TargetPlanningError as exc:
             if not requested:
                 raise
             logger.info(
                 "intent %s cancellation still pending: %s",
-                intent_id,
+                intent.intent_id,
                 exc,
             )
-            intent = self.planner.get_intent(intent_id)
-        await self._sync_quote_subscriptions(strategy_id)
+            intent = self.planner.get_intent(intent.intent_id)
+        await self._sync_quote_subscriptions(intent.account_id)
         result = cast(Dict[str, object], _json_value(intent))
         result["execution"] = execution_request_to_wire(
             intent.execution_request
@@ -461,6 +506,50 @@ class SQLiteStrategyAPI:
             "canceled": canceled,
             "cancel_requested_order_ids": requested,
         }
+
+    async def expire_previous_day_intents(
+        self, now: Optional[datetime] = None
+    ) -> ExpiredIntentSweepResult:
+        """Cancel active broker orders whose target was valid only that day."""
+
+        current = self._as_of(now, datetime.now(SHANGHAI_TZ))
+        expired = cancel_requests = canceled = pending = unbound = errors = 0
+        for intent in self.planner.active_intents():
+            if intent.trading_day is None or intent.trading_day >= current.date():
+                continue
+            expired += 1
+            binding = self._runtime_bindings.get(intent.account_id)
+            if binding is None:
+                unbound += 1
+                continue
+            lock = self._resume_locks[intent.account_id]
+            try:
+                async with lock:
+                    result = await self._cancel_bound_intent(
+                        intent, binding[0], binding[1]
+                    )
+            except Exception:
+                errors += 1
+                logger.exception(
+                    "StrategyLedger 午夜撤单失败 | strategy=%s",
+                    intent.account_id,
+                )
+                continue
+            cancel_requests += len(
+                result.get("cancel_requested_order_ids", ())
+            )
+            if result.get("canceled"):
+                canceled += 1
+            else:
+                pending += 1
+        return ExpiredIntentSweepResult(
+            expired=expired,
+            cancel_requests=cancel_requests,
+            canceled=canceled,
+            pending=pending,
+            unbound=unbound,
+            errors=errors,
+        )
 
     def get_reconciliation(
         self, account_key: str, payload: Mapping[str, object]
@@ -557,7 +646,10 @@ class SQLiteStrategyAPI:
         if qmt_mark_times:
             as_of = max((as_of, *qmt_mark_times))
         snapshot = self.valuation.create_snapshot(
-            strategy_id, marks, as_of, self.config.max_age
+            strategy_id,
+            marks,
+            as_of,
+            self._valuation_mark_max_age(as_of),
         )
         return snapshot, reconciliation, marks
 
@@ -625,7 +717,7 @@ class SQLiteStrategyAPI:
             tick = await tick_fn(security)
             price = self._tick_price(tick)
             mark_as_of = self._tick_as_of(tick)
-            if not self._market_time_is_fresh(
+            if not self._valuation_mark_is_fresh(
                 mark_as_of, datetime.now(SHANGHAI_TZ)
             ):
                 raise ValueError(
@@ -1069,6 +1161,28 @@ class SQLiteStrategyAPI:
 
     def _quote_is_fresh(self, quote: MarketQuote, now: datetime) -> bool:
         return self._market_time_is_fresh(quote.as_of, now)
+
+    @staticmethod
+    def _is_execution_session(value: datetime) -> bool:
+        minutes = value.hour * 60 + value.minute
+        return 9 * 60 + 30 <= minutes < 11 * 60 + 30 or (
+            13 * 60 <= minutes < 15 * 60
+        )
+
+    def _valuation_mark_max_age(self, now: datetime) -> timedelta:
+        current = self._as_of(now, None)
+        if self._is_execution_session(current):
+            return self.config.max_age
+        return max(self.config.max_age, VALUATION_MARK_MAX_IDLE_AGE)
+
+    def _valuation_mark_is_fresh(
+        self, market_as_of: datetime, now: datetime
+    ) -> bool:
+        current = self._as_of(now, None)
+        age = current - market_as_of
+        return -timedelta(seconds=5) <= age <= self._valuation_mark_max_age(
+            current
+        )
 
     def _market_time_is_fresh(
         self, market_as_of: datetime, now: datetime

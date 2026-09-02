@@ -459,6 +459,53 @@ def test_conditional_limit_waits_without_order_then_uses_fixed_boundary(tmp_path
     assert triggered.orders[0].execution_type is ExecutionType.CONDITIONAL_LIMIT
 
 
+def test_working_buy_does_not_block_another_security_trigger(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    execution = ExecutionRequest(
+        style=ConditionalLimitExecution(
+            2_000, ConditionalLimitPriceMode.BOUNDARY
+        )
+    )
+    first = planner.submit_target_weights(
+        ACCOUNT,
+        "independent-buy-triggers",
+        {A: "0.4", B: "0.4"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=execution,
+        quotes={
+            A: MarketQuote(
+                A, as_of, ask_price_units=price_to_units("10.01")
+            ),
+            B: MarketQuote(
+                B, as_of, ask_price_units=price_to_units("5.02")
+            ),
+        },
+    )
+    assert [item.security for item in first.orders] == [A]
+
+    refreshed = SQLiteValuationService(database).create_snapshot(
+        ACCOUNT, marks, as_of, timedelta(minutes=1)
+    )
+    b_quote = MarketQuote(
+        B, as_of, ask_price_units=price_to_units("5.01")
+    )
+    assert planner.quote_triggers_intent(
+        first.intent.intent_id, B, b_quote, as_of
+    ) is True
+
+    second = planner.advance_intent(
+        first.intent.intent_id,
+        refreshed,
+        marks,
+        as_of,
+        quotes={B: b_quote},
+    )
+    assert [item.security for item in second.orders] == [B]
+    assert len(planner.intent_orders(first.intent.intent_id)) == 2
+
+
 def test_market_execution_is_not_encoded_as_limit_order(tmp_path):
     _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
     planned = planner.submit_target_weights(

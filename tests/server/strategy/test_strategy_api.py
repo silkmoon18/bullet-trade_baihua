@@ -509,9 +509,20 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
 
 
 @pytest.mark.asyncio
-async def test_qmt_mark_preserves_timestamp_and_rejects_stale_tick(api):
+async def test_qmt_mark_preserves_timestamp_and_rejects_stale_tick(
+    api, monkeypatch
+):
     service, _, _, _ = api
-    request_time = datetime.now(SHANGHAI_TZ).replace(microsecond=0)
+    request_time = datetime(2026, 9, 2, 10, 30, tzinfo=SHANGHAI_TZ)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return request_time if tz is not None else request_time.replace(
+                tzinfo=None
+            )
+
+    monkeypatch.setattr(strategy_api_module, "datetime", FixedDatetime)
 
     class TimestampedData:
         def __init__(self, tick_time):
@@ -535,6 +546,21 @@ async def test_qmt_mark_preserves_timestamp_and_rejects_stale_tick(api):
         await service._marks(
             None, request_time, "good_etf", (SECURITY,)
         )
+
+
+def test_valuation_marks_allow_session_break_but_execution_quotes_stay_strict(
+    api,
+):
+    service, _, _, _ = api
+    lunch = datetime(2026, 9, 2, 12, 56, tzinfo=SHANGHAI_TZ)
+    lunch_mark = datetime(2026, 9, 2, 11, 29, 59, tzinfo=SHANGHAI_TZ)
+    after_close = datetime(2026, 9, 2, 16, 57, tzinfo=SHANGHAI_TZ)
+    close_mark = datetime(2026, 9, 2, 15, 0, 38, tzinfo=SHANGHAI_TZ)
+
+    assert service._valuation_mark_is_fresh(lunch_mark, lunch) is True
+    assert service._valuation_mark_is_fresh(close_mark, after_close) is True
+    assert service._market_time_is_fresh(lunch_mark, lunch) is False
+    assert service._market_time_is_fresh(close_mark, after_close) is False
 
 
 @pytest.mark.asyncio
@@ -587,6 +613,78 @@ async def test_idle_intent_can_be_canceled_before_risk_replacement(tmp_path):
     assert canceled["canceled"] is True
     assert canceled["intent"]["state"] == "CANCELED"
     assert data.subscriptions[-1] == ()
+
+
+@pytest.mark.asyncio
+async def test_midnight_expiry_cancels_working_order_and_closes_intent(tmp_path):
+    class CancelingBroker(FakeBroker):
+        def __init__(self):
+            super().__init__()
+            self.reserved_by_order = {}
+
+        async def place_order(self, account, payload):
+            before = self.cash
+            result = await super().place_order(account, payload)
+            self.reserved_by_order[result["order_id"]] = before - self.cash
+            return result
+
+        async def cancel_order(self, account, order_id):
+            result = await super().cancel_order(account, order_id)
+            for row in self.orders:
+                if row["order_id"] == order_id:
+                    row["status"] = "canceled"
+            self.cash += self.reserved_by_order.pop(order_id, 0.0)
+            return result
+
+    broker = CancelingBroker()
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            database_path=tmp_path / "strategy-midnight.db",
+            trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
+            cash_buffer_units=0,
+            max_age=timedelta(minutes=5),
+        ),
+        broker,
+        _capabilities(),
+        FakeData(),
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": 10_000},
+    )
+    submitted = await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "midnight-expiry",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+        },
+    )
+    result = await service.expire_previous_day_intents(
+        datetime.now(SHANGHAI_TZ) + timedelta(days=1)
+    )
+
+    assert result.expired == 1
+    assert result.cancel_requests == 1
+    assert result.canceled == 1
+    assert result.pending == 0
+    assert len(broker.cancel_calls) == 1
+    restored = service.get_intent(
+        {
+            "strategy_id": "good_etf",
+            "intent_id": submitted["intent"]["intent_id"],
+        }
+    )
+    assert restored["state"] == "CANCELED"
+    assert restored["orders"][0]["state"] == "CANCELED"
+    assert service.repository.get_strategy_account(
+        "good_etf"
+    ).reserved_cash_units == 0
 
 
 @pytest.mark.parametrize(

@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 16,
+        "api_version": 17,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -126,9 +126,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 16
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 17
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v16"
+        "bullet-trade-joinquant-runtime-helper-v17"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -480,6 +480,83 @@ def test_portfolio_view_preserves_unknown_remote_performance(helper):
         "2026-08-20T09:29:59+08:00"
     )
     assert portfolio.positions["510050.XSHG"].mark_source == "qmt"
+
+
+def test_qmt_execution_summary_logs_target_fill_remainder_and_reserved_cash(
+    helper, monkeypatch
+):
+    logger = types.SimpleNamespace(messages=[])
+    logger.info = logger.messages.append
+    logger.warn = logger.messages.append
+    runtime = helper.JoinQuantRuntime(
+        _state("QMT_REMOTE", "sim_trade"), {"log": logger}
+    )
+    portfolio = helper.PortfolioView(
+        {
+            "account_id": "paper",
+            "as_of": "2026-09-02T14:55:00+08:00",
+            "snapshot_version": "snapshot-progress",
+            "ledger_version": 3,
+            "cash": 6652.0,
+            "reserved_cash": 2712.18,
+            "available_cash": 3940.72,
+            "positions_value": 3340.70,
+            "total_value": 9993.60,
+            "starting_cash": 10000,
+            "total_pnl": None,
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "fees": None,
+            "fees_known": False,
+            "performance_blockers": ["unknown_fill_fees"],
+            "performance_ready": False,
+            "positions": {
+                "589290.XSHG": {
+                    "security": "589290.XSHG",
+                    "total_amount": 500,
+                    "closeable_amount": 0,
+                    "avg_cost": 0.774,
+                    "price": 0.779,
+                    "value": 389.5,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        helper,
+        "get_intent",
+        lambda *args, **kwargs: {
+            "trading_day": "2026-09-02",
+            "state": "EXECUTING",
+            "targets": {"589290.XSHG": 4000, "589700.XSHG": 1600},
+            "orders": [
+                {
+                    "security": "589290.XSHG",
+                    "requested_qty": 4000,
+                    "filled_qty": 500,
+                    "state": "PARTIALLY_FILLED",
+                }
+            ],
+        },
+    )
+
+    runtime._log_qmt_execution_summary(portfolio)
+
+    assert "冻结资金=2712.18" in logger.messages[0]
+    assert any(
+        "589290.XSHG" in message
+        and "目标=4000" in message
+        and "当前=500" in message
+        and "待买3500" in message
+        and "累计成交=500" in message
+        for message in logger.messages
+    )
+    assert any(
+        "589700.XSHG" in message
+        and "目标=1600" in message
+        and "状态=等待价格" in message
+        for message in logger.messages
+    )
 
 
 def test_portfolio_view_rejects_inconsistent_fee_status(helper):

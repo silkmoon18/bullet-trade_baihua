@@ -84,8 +84,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 16
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v16"
+STRATEGY_RUNTIME_API_VERSION = 17
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v17"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -1730,15 +1730,27 @@ class JoinQuantRuntime:
         for view in views:
             account = view.account
             portfolio = view.portfolio
-            self._log(
-                "info",
-                "{}组合资金 | 可用={:.2f} 总资产={:.2f} 持仓市值={:.2f}".format(
+            if account == "QMT":
+                fund_message = (
+                    "QMT组合资金 | 可用={:.2f} 冻结={:.2f} "
+                    "总资产={:.2f} 持仓市值={:.2f}"
+                ).format(
+                    portfolio.available_cash,
+                    float(getattr(portfolio, "reserved_cash", 0.0)),
+                    portfolio.total_value,
+                    portfolio.positions_value,
+                )
+            else:
+                fund_message = (
+                    "{}组合资金 | 可用={:.2f} 总资产={:.2f} "
+                    "持仓市值={:.2f}"
+                ).format(
                     account,
                     portfolio.available_cash,
                     portfolio.total_value,
                     portfolio.positions_value,
-                ),
-            )
+                )
+            self._log("info", fund_message)
             for security in sorted(portfolio.positions):
                 position = portfolio.positions[security]
                 market_detail = ""
@@ -1780,6 +1792,83 @@ class JoinQuantRuntime:
                             ",".join(portfolio.performance_blockers),
                         ),
                     )
+                self._log_qmt_execution_summary(portfolio, context)
+
+    def _log_qmt_execution_summary(
+        self, portfolio: Any, context: Any = None
+    ) -> None:
+        """Log target, position and order progress from the remote ledger."""
+
+        try:
+            current_dt = getattr(context, "current_dt", None)
+            key = (
+                "open-{}".format(current_dt.strftime("%Y%m%d"))
+                if current_dt is not None
+                else None
+            )
+            intent = get_intent(idempotency_key=key) if key else get_intent()
+        except Exception as exc:
+            self._log("warn", "QMT执行状态读取失败：{}".format(exc))
+            return
+        if not intent:
+            self._log("info", "QMT执行状态 | 当前无活动目标")
+            return
+        self._log(
+            "info",
+            "QMT执行状态 | 交易日={} 状态={} 冻结资金={:.2f}".format(
+                intent.get("trading_day") or "未知",
+                intent.get("state") or "未知",
+                float(getattr(portfolio, "reserved_cash", 0.0)),
+            ),
+        )
+        targets = {
+            str(security): int(quantity)
+            for security, quantity in intent.get("targets", {}).items()
+        }
+        orders = [
+            item for item in intent.get("orders", ()) if type(item) is dict
+        ]
+        securities = set(targets) | set(portfolio.positions)
+        securities.update(
+            str(item.get("security"))
+            for item in orders
+            if item.get("security")
+        )
+        for security in sorted(securities):
+            target = targets.get(security, 0)
+            position = portfolio.positions.get(security)
+            current = int(getattr(position, "total_amount", 0))
+            related = [
+                item for item in orders if item.get("security") == security
+            ]
+            requested = sum(
+                int(item.get("requested_qty", 0)) for item in related
+            )
+            filled = sum(int(item.get("filled_qty", 0)) for item in related)
+            states = sorted(
+                {str(item.get("state") or "UNKNOWN") for item in related}
+            )
+            delta = target - current
+            difference = (
+                "已达目标"
+                if delta == 0
+                else "待买{}".format(delta)
+                if delta > 0
+                else "待卖{}".format(-delta)
+            )
+            self._log(
+                "info",
+                "QMT执行明细 | {} 目标={} 当前={} 差额={} "
+                "累计委托={} 累计成交={} 状态={}".format(
+                    _security_label(security),
+                    target,
+                    current,
+                    difference,
+                    requested,
+                    filled,
+                    "/".join(states) if states else "等待价格",
+                ),
+            )
 
     def ensure_ready(self, qmt_initial_capital: Any, context: Any) -> Any:
         self._qmt_initial_capital = qmt_initial_capital
