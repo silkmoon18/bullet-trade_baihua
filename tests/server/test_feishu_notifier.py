@@ -32,7 +32,7 @@ def test_trade_notification_uses_interactive_card_with_required_fields():
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["template"] == "green"
     assert payload["card"]["header"]["title"]["content"] == (
-        "订单全部成交 · good_etf"
+        "订单全部成交 · 上证50ETF（510050.XSHG） · good_etf"
     )
     content = payload["card"]["elements"][0]["text"]["content"]
     lines = content.splitlines()
@@ -69,6 +69,9 @@ def test_rejected_order_card_keeps_empty_trade_values_visible():
     )
 
     assert payload["card"]["header"]["template"] == "red"
+    assert payload["card"]["header"]["title"]["content"] == (
+        "订单被拒绝 · 510300.XSHG"
+    )
     content = payload["card"]["elements"][0]["text"]["content"]
     assert "**金额：** ¥-" in content
     assert "**单价：** ¥-" in content

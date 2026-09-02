@@ -83,6 +83,16 @@ def _markdown_div(lines: list[str]) -> Dict[str, Any]:
     }
 
 
+def _security_title(security: str, security_name: str) -> str:
+    code = str(security or "").strip()
+    name = str(security_name or "").strip()
+    if not code or code == "-":
+        return name
+    if name:
+        return "{}（{}）".format(name, code)
+    return code
+
+
 class FeishuTradeNotifier:
     def __init__(
         self,
@@ -120,6 +130,11 @@ class FeishuTradeNotifier:
             "CANCELED": "订单已撤销",
             "REJECTED": "订单被拒绝",
         }.get(notification.event.upper(), "量化交易通知")
+        security_title = _security_title(
+            notification.security, notification.security_name
+        )
+        if security_title:
+            title = "{} · {}".format(title, security_title)
         if notification.strategy_id and notification.strategy_id != "-":
             title = "{} · {}".format(title, notification.strategy_id)
         occurred_at = notification.occurred_at or datetime.now(SHANGHAI_TZ)
