@@ -430,6 +430,39 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    Migration(
+        8,
+        "dashboard_performance_snapshots",
+        (
+            """
+            CREATE TABLE dashboard_snapshots (
+                strategy_account_id TEXT NOT NULL
+                    REFERENCES strategy_accounts(strategy_account_id),
+                snapshot_minute TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                total_value_units INTEGER NOT NULL
+                    CHECK (typeof(total_value_units) = 'integer' AND total_value_units >= 0),
+                cash_units INTEGER NOT NULL
+                    CHECK (typeof(cash_units) = 'integer' AND cash_units >= 0),
+                positions_value_units INTEGER NOT NULL
+                    CHECK (typeof(positions_value_units) = 'integer' AND positions_value_units >= 0),
+                total_pnl_units INTEGER
+                    CHECK (total_pnl_units IS NULL OR typeof(total_pnl_units) = 'integer'),
+                nav_units INTEGER
+                    CHECK (nav_units IS NULL OR typeof(nav_units) = 'integer'),
+                fees_units INTEGER
+                    CHECK (fees_units IS NULL OR typeof(fees_units) = 'integer'),
+                performance_ready INTEGER NOT NULL
+                    CHECK (performance_ready IN (0, 1)),
+                PRIMARY KEY (strategy_account_id, snapshot_minute)
+            )
+            """,
+            (
+                "CREATE INDEX idx_dashboard_snapshots_account_as_of "
+                "ON dashboard_snapshots(strategy_account_id, as_of)"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

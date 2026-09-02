@@ -72,6 +72,11 @@ class ServerConfig:
     strategy_capabilities_path: Optional[str] = None
     feishu_webhook_url: Optional[str] = None
     feishu_signing_secret: str = ""
+    dashboard_enabled: bool = False
+    dashboard_listen: str = "0.0.0.0"
+    dashboard_port: int = 8080
+    dashboard_token: str = ""
+    dashboard_sample_interval_seconds: int = 60
 
 
 def _split_items(raw: Optional[str]) -> List[str]:
@@ -274,5 +279,17 @@ def build_server_config(args) -> ServerConfig:
         strategy_capabilities_path=get_env("QMT_STRATEGY_CAPABILITIES_FILE"),
         feishu_webhook_url=get_env("FEISHU_WEBHOOK_URL"),
         feishu_signing_secret=get_env("FEISHU_SIGNING_SECRET", "") or "",
+        dashboard_enabled=get_env_bool("QMT_DASHBOARD_ENABLED", False),
+        dashboard_listen=get_env("QMT_DASHBOARD_LISTEN", "0.0.0.0") or "0.0.0.0",
+        dashboard_port=max(1, get_env_int("QMT_DASHBOARD_PORT", 8080)),
+        dashboard_token=get_env("QMT_DASHBOARD_TOKEN", "") or "",
+        dashboard_sample_interval_seconds=max(
+            15, get_env_int("QMT_DASHBOARD_SAMPLE_INTERVAL_SECONDS", 60)
+        ),
     )
+    if cfg.dashboard_enabled:
+        if not cfg.strategy_database_path:
+            raise ValueError("QMT_DASHBOARD_ENABLED requires QMT_STRATEGY_LEDGER_DB")
+        if not cfg.dashboard_token:
+            raise ValueError("QMT_DASHBOARD_ENABLED requires QMT_DASHBOARD_TOKEN")
     return cfg

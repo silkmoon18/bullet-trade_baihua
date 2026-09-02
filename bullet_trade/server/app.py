@@ -14,7 +14,7 @@ import json
 import ipaddress
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from bullet_trade.core.globals import log
@@ -30,9 +30,11 @@ from bullet_trade.server.strategy import (
     money_to_units,
     load_verified_capabilities,
 )
+from bullet_trade.server.strategy.domain import SHANGHAI_TZ
 
 from .adapters.base import AccountRouter, AdapterBundle, AccountContext, SubAccountConfig, VirtualAccountManager
 from .config import ServerConfig
+from .dashboard import DashboardHTTPServer, DashboardReadModel, tail_log_file
 from .session import ClientSession
 from .tick import TickSubscriptionManager
 
@@ -77,6 +79,7 @@ class ServerApplication:
         self._idempotency_cache: Dict[Tuple[str, str, str], _IdempotencyEntry] = {}
         self._idempotency_lock = asyncio.Lock()
         self._strategy_startup_task: Optional[asyncio.Task] = None
+        self._dashboard_sample_task: Optional[asyncio.Task] = None
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
         self.strategy_api: Optional[SQLiteStrategyAPI] = None
@@ -135,10 +138,34 @@ class ServerApplication:
                 account_key = ctx.config.key or "default"
                 self._risk_by_account[account_key] = RiskController()
                 self._risk_locks[account_key] = asyncio.Lock()
+        self.dashboard_read_model: Optional[DashboardReadModel] = None
+        self.dashboard_server: Optional[DashboardHTTPServer] = None
+        if self.config.dashboard_enabled:
+            if self.strategy_api is None or not self.config.strategy_database_path:
+                raise RuntimeError("dashboard requires StrategyLedger")
+            self.dashboard_read_model = DashboardReadModel(
+                self.config.strategy_database_path
+            )
+            self.dashboard_server = DashboardHTTPServer(
+                self.config.dashboard_listen,
+                self.config.dashboard_port,
+                self.config.dashboard_token,
+                self._dashboard_payload,
+            )
 
     async def start(self) -> None:
         self._ensure_runtime_events()
         await self._start_components()
+        if self.dashboard_server:
+            await self.dashboard_server.start()
+            log.info(
+                "Read-only dashboard API listening on %s:%s",
+                self.config.dashboard_listen,
+                self.dashboard_server.bound_port,
+            )
+            self._dashboard_sample_task = asyncio.create_task(
+                self._sample_dashboard_loop(), name="dashboard-snapshot-sampler"
+            )
         self._server = await asyncio.start_server(self._handle_client, self.config.listen, self.config.port)
         host = self._server.sockets[0].getsockname() if self._server.sockets else (self.config.listen, self.config.port)
         log.info(f"QMT server listening on {host}")
@@ -164,6 +191,15 @@ class ServerApplication:
             except asyncio.CancelledError:
                 pass
             self._strategy_startup_task = None
+        if self._dashboard_sample_task:
+            self._dashboard_sample_task.cancel()
+            try:
+                await self._dashboard_sample_task
+            except asyncio.CancelledError:
+                pass
+            self._dashboard_sample_task = None
+        if self.dashboard_server:
+            await self.dashboard_server.stop()
         if self.tick_manager:
             await self.tick_manager.stop()
         for session in list(self._sessions):
@@ -176,6 +212,125 @@ class ServerApplication:
                 await self.adapters.broker_adapter.stop()
             except Exception:
                 pass
+
+    async def _dashboard_payload(
+        self, strategy_id: Optional[str], log_limit: int
+    ) -> Dict[str, object]:
+        """Build one read-only website response from live state and SQLite."""
+
+        server = self._dashboard_server_status()
+        generated_at = datetime.now(SHANGHAI_TZ).isoformat()
+        if self.dashboard_read_model is None:
+            return {"generated_at": generated_at, "server": server}
+        strategies = self.dashboard_read_model.list_strategies()
+        if strategy_id is None and log_limit == 0:
+            return {"generated_at": generated_at, "server": server}
+        selected = strategy_id or (
+            str(strategies[0]["strategy_id"]) if strategies else None
+        )
+        snapshot: Optional[Dict[str, object]] = None
+        snapshot_error: Optional[str] = None
+        if selected:
+            try:
+                snapshot = await self._dashboard_live_snapshot(selected)
+                self.dashboard_read_model.record_snapshot(snapshot)
+            except Exception as exc:
+                snapshot_error = str(exc)
+            activity = self.dashboard_read_model.strategy_activity(selected)
+            if snapshot:
+                names = activity.get("security_names", {})
+                positions = snapshot.get("positions", {})
+                if isinstance(names, dict) and isinstance(positions, dict):
+                    for security, position in positions.items():
+                        if isinstance(position, dict):
+                            position.setdefault("name", names.get(security, ""))
+        else:
+            activity = {
+                "intents": [],
+                "orders": [],
+                "fills": [],
+                "history": [],
+                "security_names": {},
+            }
+        return {
+            "generated_at": generated_at,
+            "server": server,
+            "strategies": strategies,
+            "selected_strategy_id": selected,
+            "snapshot": snapshot,
+            "snapshot_error": snapshot_error,
+            "activity": activity,
+            "logs": tail_log_file(self.config.log_file, log_limit),
+        }
+
+    async def _dashboard_live_snapshot(
+        self, strategy_id: str
+    ) -> Dict[str, object]:
+        if self.strategy_api is None or self.dashboard_read_model is None:
+            raise RuntimeError("StrategyLedger is unavailable")
+        strategy = next(
+            (
+                item
+                for item in self.dashboard_read_model.list_strategies()
+                if item.get("strategy_id") == strategy_id
+            ),
+            None,
+        )
+        if strategy is None:
+            raise KeyError("strategy not found: {}".format(strategy_id))
+        physical_id = str(strategy.get("physical_account_id") or "")
+        account_key = (
+            physical_id.split(":", 1)[1] if ":" in physical_id else physical_id
+        )
+        account_key = account_key or "default"
+        account_context = self.router.get(account_key)
+        return await self.strategy_api.get_snapshot(
+            account_context, account_key, {"strategy_id": strategy_id}
+        )
+
+    async def _sample_dashboard_loop(self) -> None:
+        assert self.dashboard_read_model is not None
+        interval = self.config.dashboard_sample_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            for strategy in self.dashboard_read_model.list_strategies():
+                strategy_id = str(strategy.get("strategy_id") or "")
+                if not strategy_id:
+                    continue
+                try:
+                    snapshot = await self._dashboard_live_snapshot(strategy_id)
+                    self.dashboard_read_model.record_snapshot(snapshot)
+                except Exception as exc:
+                    log.debug(
+                        "dashboard snapshot sample failed for %s: %s",
+                        strategy_id,
+                        exc,
+                    )
+
+    def _dashboard_server_status(self) -> Dict[str, object]:
+        raw = self._health_snapshot().get("value", {})
+        qmt = dict(raw.get("qmt", {}) or {}) if isinstance(raw, dict) else {}
+        state = qmt.get("state")
+        if hasattr(state, "value"):
+            qmt["state"] = state.value
+        return {
+            "process_alive": bool(raw.get("process_alive"))
+            if isinstance(raw, dict)
+            else False,
+            "uptime_seconds": raw.get("uptime_seconds")
+            if isinstance(raw, dict)
+            else None,
+            "backend_type": raw.get("backend_type")
+            if isinstance(raw, dict)
+            else None,
+            "qmt": qmt,
+            "strategy_ledger_ready": raw.get("strategy_ledger_ready")
+            if isinstance(raw, dict)
+            else False,
+            "trading_enabled": self.config.strategy_trading_enabled,
+            "enabled_strategy_ids": list(self.config.strategy_enabled_ids),
+            "dashboard_read_only": True,
+        }
 
     def active_features(self) -> List[str]:
         """返回当前配置启用的功能列表。
@@ -194,6 +349,8 @@ class ServerApplication:
             features.append("broker")
         if self.strategy_api:
             features.append("strategy_ledger_v1")
+        if self.dashboard_server:
+            features.append("read_only_dashboard")
         return features
 
     def _qmt_status_snapshot(self) -> Optional[Dict[str, Any]]:

@@ -261,6 +261,20 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
 
+### 11.1 只读策略看板
+
+看板 HTTP 接口和交易 TCP 接口使用不同端口与不同 token。它只读取
+StrategyLedger、QMT 快照和 server 日志，不提供下单或撤单接口。收益历史从启用看板后按
+分钟采样，因此不会伪造启用前的历史净值。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `QMT_DASHBOARD_ENABLED` | `false` | 是否启用只读看板 HTTP 接口。 |
+| `QMT_DASHBOARD_LISTEN` | `0.0.0.0` | 看板监听地址。 |
+| `QMT_DASHBOARD_PORT` | `8080` | 看板 HTTP 端口。 |
+| `QMT_DASHBOARD_TOKEN` | 空 | 独立 Bearer token；启用看板时必填。 |
+| `QMT_DASHBOARD_SAMPLE_INTERVAL_SECONDS` | `60` | 收益/资金快照采样间隔，最小 15 秒。 |
+
 ## 12. qmt-remote 客户端
 
 这些配置作用在远程客户端，也就是 `DEFAULT_DATA_PROVIDER=qmt-remote` 或 `DEFAULT_BROKER=qmt-remote` 的一侧。

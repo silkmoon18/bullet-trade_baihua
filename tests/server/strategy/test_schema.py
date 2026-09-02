@@ -20,6 +20,7 @@ EXPECTED_TABLES = {
     "capital_flows",
     "cash_pools",
     "corporate_actions",
+    "dashboard_snapshots",
     "fills",
     "ledger_entries",
     "outbox",
@@ -80,7 +81,7 @@ def test_empty_database_migrates_and_repeat_is_noop(tmp_path):
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7, 8]
         fill_columns = {
             row[1]: row for row in connection.execute("PRAGMA table_info(fills)")
         }
@@ -107,7 +108,7 @@ def test_version_one_database_upgrades_to_latest(tmp_path):
     connection = connect_database(database)
     try:
         assert "strategy_orders" in _table_names(connection)
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 7
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
     finally:
         connection.close()
 
