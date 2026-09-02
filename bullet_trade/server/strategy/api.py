@@ -521,9 +521,7 @@ class SQLiteStrategyAPI:
 
         current = self._as_of(now, datetime.now(SHANGHAI_TZ))
         expired = cancel_requests = canceled = pending = unbound = errors = 0
-        for intent in self.planner.active_intents():
-            if intent.trading_day is None or intent.trading_day >= current.date():
-                continue
+        for intent in self.planner.expired_intents(current.date()):
             expired += 1
             binding = self._runtime_bindings.get(intent.account_id)
             if binding is None:

@@ -21,7 +21,7 @@ from bullet_trade.server.strategy import (
 )
 from bullet_trade.server.strategy.schema import connect_database
 from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
-from bullet_trade.server.strategy.domain import SHANGHAI_TZ
+from bullet_trade.server.strategy.domain import IntentState, SHANGHAI_TZ
 
 
 SECURITY = "510050.XSHG"
@@ -704,6 +704,62 @@ async def test_midnight_expiry_cancels_working_order_and_closes_intent(tmp_path)
     assert service.repository.get_strategy_account(
         "good_etf"
     ).reserved_cash_units == 0
+
+
+@pytest.mark.asyncio
+async def test_midnight_expiry_recovers_terminal_intent_with_working_order(
+    tmp_path,
+):
+    class CancelingBroker(FakeBroker):
+        async def cancel_order(self, account, order_id):
+            result = await super().cancel_order(account, order_id)
+            for row in self.orders:
+                if row["order_id"] == order_id:
+                    row["status"] = "canceled"
+            return result
+
+    broker = CancelingBroker()
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            database_path=tmp_path / "strategy-terminal-expiry.db",
+            trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
+            cash_buffer_units=0,
+            max_age=timedelta(minutes=5),
+        ),
+        broker,
+        _capabilities(),
+        FakeData(),
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": 10_000},
+    )
+    submitted = await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "terminal-midnight-expiry",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+        },
+    )
+    intent_id = submitted["intent"]["intent_id"]
+    service.planner._set_state(intent_id, IntentState.CANCELED)
+
+    result = await service.expire_previous_day_intents(
+        datetime.now(SHANGHAI_TZ) + timedelta(days=1)
+    )
+
+    assert result.expired == 1
+    assert result.canceled == 1
+    restored = service.get_intent(
+        {"strategy_id": "good_etf", "intent_id": intent_id}
+    )
+    assert restored["orders"][0]["state"] == "CANCELED"
 
 
 @pytest.mark.parametrize(

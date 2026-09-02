@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Tuple, Union, cast
@@ -254,11 +254,13 @@ class SQLiteTargetExecutionService:
         if intent.state in (IntentState.COMPLETED, IntentState.CANCELED, IntentState.FAILED):
             return IntentAdvanceResult(intent, (), False)
         current = now or datetime.now(SHANGHAI_TZ)
+        working = self._working_orders(intent.account_id)
         if intent.trading_day is not None and current.date() != intent.trading_day:
+            if any(row["intent_id"] == intent.intent_id for row in working):
+                return IntentAdvanceResult(intent, (), True)
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.CANCELED), (), False
             )
-        working = self._working_orders(intent.account_id)
         if any(row["state"] == OrderState.SUBMIT_UNKNOWN.value for row in working):
             raise TargetPlanningError("submit-unknown order blocks execution")
         intent_working = [
@@ -784,6 +786,33 @@ class SQLiteTargetExecutionService:
         finally:
             connection.close()
 
+    def expired_intents(self, before: date) -> Tuple[PortfolioIntent, ...]:
+        """Return expired active intents and terminal intents with working orders."""
+
+        connection = connect_database(self.database_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT intent.*
+                FROM portfolio_intents AS intent
+                LEFT JOIN strategy_orders AS order_row
+                  ON order_row.intent_id = intent.intent_id
+                 AND order_row.state IN (
+                    'PENDING_SUBMIT','SUBMIT_UNKNOWN','SUBMITTED','PARTIALLY_FILLED'
+                 )
+                WHERE intent.state IN ('CREATED','PLANNED','EXECUTING','RECONCILING')
+                   OR order_row.order_id IS NOT NULL
+                ORDER BY intent.created_at
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(
+            intent
+            for intent in (_intent(cast(sqlite3.Row, row)) for row in rows)
+            if intent.trading_day is not None and intent.trading_day < before
+        )
+
     def reference_prices(self, intent_id: str) -> Mapping[str, int]:
         payload = self._intent_payload(intent_id)
         return {
@@ -879,12 +908,6 @@ class SQLiteTargetExecutionService:
         """Cancel an active intent only when no broker order remains working."""
 
         intent = self.get_intent(intent_id)
-        if intent.state in (
-            IntentState.COMPLETED,
-            IntentState.CANCELED,
-            IntentState.FAILED,
-        ):
-            return intent
         working = [
             row
             for row in self._working_orders(intent.account_id)
@@ -894,6 +917,12 @@ class SQLiteTargetExecutionService:
             raise TargetPlanningError(
                 "working orders must finish cancellation before intent cancellation"
             )
+        if intent.state in (
+            IntentState.COMPLETED,
+            IntentState.CANCELED,
+            IntentState.FAILED,
+        ):
+            return intent
         return self._set_state(intent_id, IntentState.CANCELED)
 
     def request_intent_cancellation(self, intent_id: str) -> PortfolioIntent:

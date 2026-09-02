@@ -30,7 +30,7 @@ from bullet_trade.server.strategy import (
     money_to_units,
     price_to_units,
 )
-from bullet_trade.server.strategy.domain import BrokerFill, SHANGHAI_TZ
+from bullet_trade.server.strategy.domain import BrokerFill, IntentState, SHANGHAI_TZ
 from bullet_trade.server.strategy.schema import connect_database
 
 
@@ -504,6 +504,31 @@ def test_working_buy_does_not_block_another_security_trigger(tmp_path):
     )
     assert [item.security for item in second.orders] == [B]
     assert len(planner.intent_orders(first.intent.intent_id)) == 2
+
+
+def test_expired_intent_stays_active_until_working_order_is_terminal(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planned = planner.submit_target_weights(
+        ACCOUNT,
+        "expire-after-order",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+    )
+
+    expired = planner.advance_intent(
+        planned.intent.intent_id,
+        snapshot,
+        marks,
+        as_of + timedelta(days=1),
+    )
+
+    assert expired.intent.state is IntentState.EXECUTING
+    assert expired.waiting_for_fills is True
+    assert planner.expired_intents((as_of + timedelta(days=1)).date()) == (
+        expired.intent,
+    )
 
 
 def test_market_execution_is_not_encoded_as_limit_order(tmp_path):
