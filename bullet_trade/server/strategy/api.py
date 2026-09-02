@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, fields, is_dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
@@ -465,6 +465,7 @@ class SQLiteStrategyAPI:
         intent: PortfolioIntent,
         account_context: object,
         account_key: str,
+        expire_before: Optional[date] = None,
     ) -> Dict[str, object]:
         requested = []
         broker_order_ids = self.planner.cancelable_broker_order_ids(
@@ -490,6 +491,11 @@ class SQLiteStrategyAPI:
                 self._synchronize(
                     intent.account_id, physical_id, broker_snapshot
                 )
+        expired_order_ids = ()
+        if expire_before is not None:
+            expired_order_ids = self.planner.finalize_expired_orders(
+                intent.intent_id, expire_before
+            )
         canceled = False
         try:
             intent = self.planner.cancel_intent_if_idle(intent.intent_id)
@@ -512,6 +518,7 @@ class SQLiteStrategyAPI:
             "intent": result,
             "canceled": canceled,
             "cancel_requested_order_ids": requested,
+            "expired_order_ids": expired_order_ids,
         }
 
     async def expire_previous_day_intents(
@@ -531,7 +538,10 @@ class SQLiteStrategyAPI:
             try:
                 async with lock:
                     result = await self._cancel_bound_intent(
-                        intent, binding[0], binding[1]
+                        intent,
+                        binding[0],
+                        binding[1],
+                        expire_before=current.date(),
                     )
             except Exception:
                 errors += 1

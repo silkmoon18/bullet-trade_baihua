@@ -813,6 +813,31 @@ class SQLiteTargetExecutionService:
             if intent.trading_day is not None and intent.trading_day < before
         )
 
+    def finalize_expired_orders(
+        self, intent_id: str, before: date
+    ) -> Tuple[str, ...]:
+        """Close the unfilled remainder of previous-day DAY orders locally."""
+
+        intent = self.get_intent(intent_id)
+        if intent.trading_day is None or intent.trading_day >= before:
+            raise TargetPlanningError("intent has not expired")
+        rows = tuple(
+            row
+            for row in self._working_orders(intent.account_id)
+            if row["intent_id"] == intent_id
+        )
+        finalized = []
+        for row in rows:
+            account = self._ledger.get_strategy_account(intent.account_id)
+            self._booking.finalize_order(
+                intent.account_id,
+                str(row["order_id"]),
+                OrderState.CANCELED,
+                account.ledger_version,
+            )
+            finalized.append(str(row["order_id"]))
+        return tuple(finalized)
+
     def reference_prices(self, intent_id: str) -> Mapping[str, int]:
         payload = self._intent_payload(intent_id)
         return {

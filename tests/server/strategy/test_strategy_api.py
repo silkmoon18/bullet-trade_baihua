@@ -762,6 +762,57 @@ async def test_midnight_expiry_recovers_terminal_intent_with_working_order(
     assert restored["orders"][0]["state"] == "CANCELED"
 
 
+@pytest.mark.asyncio
+async def test_midnight_expiry_closes_day_order_left_working_in_broker_history(
+    tmp_path,
+):
+    broker = FakeBroker()
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            database_path=tmp_path / "strategy-day-order-expiry.db",
+            trading_enabled=True,
+            enabled_strategy_ids=("good_etf",),
+            cash_buffer_units=0,
+            max_age=timedelta(minutes=5),
+        ),
+        broker,
+        _capabilities(),
+        FakeData(),
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": 10_000},
+    )
+    submitted = await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "broker-history-expiry",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+        },
+    )
+
+    result = await service.expire_previous_day_intents(
+        datetime.now(SHANGHAI_TZ) + timedelta(days=1)
+    )
+
+    assert result.canceled == 1
+    restored = service.get_intent(
+        {
+            "strategy_id": "good_etf",
+            "intent_id": submitted["intent"]["intent_id"],
+        }
+    )
+    assert restored["orders"][0]["state"] == "CANCELED"
+    assert service.repository.get_strategy_account(
+        "good_etf"
+    ).reserved_cash_units == 0
+
+
 @pytest.mark.parametrize(
     ("legacy_mode", "normalised_mode"),
     [
