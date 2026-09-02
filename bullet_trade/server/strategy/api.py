@@ -353,21 +353,28 @@ class SQLiteStrategyAPI:
         physical_id = self._physical_id(account_key)
         connection = connect_database(self.database_path)
         try:
-            row = connection.execute(
+            rows = connection.execute(
                 "SELECT strategy_account_id FROM strategy_accounts WHERE physical_account_id = ?",
                 (physical_id,),
-            ).fetchone()
+            ).fetchall()
         finally:
             connection.close()
-        if row is None:
+        if not rows:
             self.startup_ready = False
             return False
-        self._bind_runtime(str(row[0]), account_context, account_key)
+        strategy_ids = tuple(str(row[0]) for row in rows)
+        for strategy_id in strategy_ids:
+            self._bind_runtime(strategy_id, account_context, account_key)
         snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
-        result = self._synchronize(str(row[0]), physical_id, snapshot)
-        self.startup_ready = result.state.value == "READY"
+        results = tuple(
+            self._synchronize(strategy_id, physical_id, snapshot)
+            for strategy_id in strategy_ids
+        )
+        self.startup_ready = all(
+            result.state.value == "READY" for result in results
+        )
         return self.startup_ready
 
     def get_intent(self, payload: Mapping[str, object]) -> Dict[str, object]:

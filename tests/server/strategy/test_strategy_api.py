@@ -170,6 +170,25 @@ async def test_ensure_account_and_real_snapshot(api):
 
 
 @pytest.mark.asyncio
+async def test_startup_rebinds_every_strategy_on_same_physical_account(api):
+    service, _, account, _ = api
+    for strategy_id in ("old_strategy", "good_etf_remote"):
+        await service.ensure_account(
+            account,
+            "default",
+            {"strategy_id": strategy_id, "initial_capital": 10_000},
+        )
+
+    service._runtime_bindings.clear()
+
+    assert await service.startup_check(account, "default") is True
+    assert set(service._runtime_bindings) == {
+        "old_strategy",
+        "good_etf_remote",
+    }
+
+
+@pytest.mark.asyncio
 async def test_new_strategy_rebases_external_cash_and_uses_remaining_pool(api):
     service, broker, account, _ = api
     await service.ensure_account(
