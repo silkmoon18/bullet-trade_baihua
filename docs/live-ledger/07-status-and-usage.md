@@ -68,7 +68,7 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 仅QMT开启时，聚宽原生交易函数被阻断，策略只提交StrategyLedger目标。两者同时开启时，helper把同一目标权重分别乘各账户自己的总资产；止盈止损也分别读取两个账户自己的持仓成本。QMT开启后通知归属固定为QMT，只发送QMT计划、委托和成交卡片，不重复发送JQ计划卡片。
 
-回测仍固定BACKTEST，不受两个开关影响。QMT实际下单还受服务器`QMT_STRATEGY_TRADING_ENABLED`和`QMT_STRATEGY_ENABLED_IDS`控制。必须同时上传v18 helper、schema v3私有配置和策略。helper安装时自动完成QMT账户初始化和对账触发，策略不再显式调用readiness接口。仅QMT模式下，启动时QMT分配资金不足、账实差异或对账不新鲜仍会失败关闭；JQ+QMT并行模式下，QMT暂未就绪只暂停QMT分支，JQ继续运行，QMT会在实际调仓或风控前重新对账，通过后才恢复执行。总持仓不足等差异不会被绕过。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+回测仍固定BACKTEST，不受两个开关影响。QMT实际下单还受服务器`QMT_STRATEGY_TRADING_ENABLED`和`QMT_STRATEGY_ENABLED_IDS`控制。必须同时上传v18 helper、schema v3私有配置和策略。helper安装时自动完成QMT账户初始化和对账触发，策略不再显式调用readiness接口。仅QMT模式下，启动时QMT分配资金不足、账实差异或对账不新鲜仍会失败关闭；JQ+QMT并行模式下，QMT暂未就绪只暂停QMT分支，JQ继续运行，QMT会在实际调仓或风控前重新对账，通过后才恢复执行。总持仓不足等差异不会被绕过。账本在午夜进入新交易日后，QMT的可卖数量可能仍停留在券商夜间结算前状态；00:00至09:15之间仅由此产生的可卖量差异记为延迟校验，不阻断也不发送阻断卡片，09:15后仍不足才按真实执行风险阻断。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
 helper设置的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。费用缺失时显示为未知，不伪造为0。
 
