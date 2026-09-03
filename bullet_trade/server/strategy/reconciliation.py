@@ -450,6 +450,11 @@ class SQLiteReconciliationService:
                 linked_trade = dict(trade)
                 linked_trade["order_id"] = broker_order_id
                 matching_broker_order = broker_orders.get(broker_key)
+                if matching_broker_order is None:
+                    # Durable fills can outlive the broker's order query.  The
+                    # day-scoped local order remains authoritative for side;
+                    # booking still verifies every other immutable fill field.
+                    linked_trade["side"] = local["side"]
                 evidence = normalize_trade_evidence(
                     linked_trade,
                     (

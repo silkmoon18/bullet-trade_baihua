@@ -175,11 +175,22 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
 
     first = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
     second = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+    replay_without_broker_order = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            trades=(_broker_trade(),),
+        ),
+    )
 
     assert first.state is ReconciliationState.READY
     assert first.details["booked_trade_ids"] == ("trade-1",)
     assert second.state is ReconciliationState.READY
     assert second.details["booked_trade_ids"] == ()
+    assert replay_without_broker_order.state is ReconciliationState.READY
+    assert replay_without_broker_order.details["booked_trade_ids"] == ()
     account = repository.get_strategy_account(ACCOUNT_ID)
     assert account.cash_units == money_to_units("7995")
 
