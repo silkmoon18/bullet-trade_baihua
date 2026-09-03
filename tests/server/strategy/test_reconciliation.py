@@ -195,6 +195,38 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert account.cash_units == money_to_units("7995")
 
 
+def test_t0_fund_fill_is_booked_as_immediately_sellable(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    snapshot = _snapshot(
+        "17995",
+        positions=(BrokerPositionSnapshot(SECURITY, 1000, 1000),),
+        orders=(_broker_order(),),
+        trades=(_broker_trade(),),
+    )
+
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        snapshot,
+        settlement_cycles={SECURITY: 0},
+    )
+
+    connection = connect_database(database)
+    try:
+        position = connection.execute(
+            "SELECT total_qty, sellable_qty FROM positions "
+            "WHERE strategy_account_id = ? AND security = ?",
+            (ACCOUNT_ID, SECURITY),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert result.state is ReconciliationState.READY
+    assert tuple(position) == (1000, 1000)
+
+
 def test_qmt_order_and_trade_ids_can_be_reused_on_a_later_trading_day(tmp_path):
     database, _, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)

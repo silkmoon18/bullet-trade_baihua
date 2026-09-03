@@ -138,6 +138,32 @@ def test_partial_buy_uses_real_fill_and_cancel_releases_only_remainder(services)
     assert repository.replay_account("good-etf") == canceled.account
 
 
+def test_t0_buy_is_sellable_on_acquisition_day(services):
+    repository, capital, booking = services
+    booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
+
+    booked = booking.book_fill(
+        "good-etf",
+        _fill("f-1", "buy-1", OrderSide.BUY, 1000),
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 10),
+    )
+
+    assert booked.position.total_qty == 1000
+    assert booked.position.sellable_qty == 1000
+    booking.register_order(_order("sell-1", OrderSide.SELL, 1000))
+    sold = booking.book_fill(
+        "good-etf",
+        _fill("f-sell", "sell-1", OrderSide.SELL, 1000, price="2.10"),
+        expected_ledger_version=booked.account.ledger_version,
+    )
+    assert sold.position.total_qty == 0
+    assert sold.position.sellable_qty == 0
+    assert sold.account.cash_units == money_to_units("10090")
+    assert repository.replay_account("good-etf") == sold.account
+
+
 def test_full_buy_releases_price_buffer_and_duplicate_fill_is_noop(services):
     repository, capital, booking = services
     booking.register_order(_order("buy-1", OrderSide.BUY, 1000))

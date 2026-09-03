@@ -158,16 +158,32 @@ class MarketQuote:
     bid_price_units: Optional[int] = None
     ask_price_units: Optional[int] = None
     last_price_units: Optional[int] = None
+    high_limit_units: Optional[int] = None
+    low_limit_units: Optional[int] = None
+    preclose_units: Optional[int] = None
+    instrument_type: Optional[str] = None
+    continuous_auction: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if type(self.security) is not str or not self.security:
             raise ValueError("security cannot be empty")
         if not isinstance(self.as_of, datetime):
             raise TypeError("as_of must be datetime")
-        for name in ("bid_price_units", "ask_price_units", "last_price_units"):
+        for name in (
+            "bid_price_units",
+            "ask_price_units",
+            "last_price_units",
+            "high_limit_units",
+            "low_limit_units",
+            "preclose_units",
+        ):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError("{} must be a positive integer".format(name))
+        if self.instrument_type is not None and type(self.instrument_type) is not str:
+            raise TypeError("instrument_type must be a string or None")
+        if self.continuous_auction is not None and type(self.continuous_auction) is not bool:
+            raise TypeError("continuous_auction must be a bool or None")
 
 
 def _style_to_wire(style: ExecutionStyle) -> Dict[str, object]:

@@ -13,7 +13,7 @@
 - 已具备按真实买卖成交更新现金、订单冻结、持仓lot、费用和已实现盈亏的事务服务，重复fill不会重复入账；费用字段缺失时保留`UNKNOWN`，不伪造为0。
 - 已具备基于新鲜行情的现金、持仓市值、总资产、NAV、费用和盈亏原子快照，可作为后续聚宽组合视图数据源。
 - MiniQMT包装账户快照已统一解包；提交响应未知的订单可按完整`client_tag`自动认领。
-- 目标权重按总资产计算，现金缓冲只在实际买入检查时执行；QMT_REMOTE每次调用明确携带买卖两侧的执行类型、追单和改价策略。GoodETF调仓卖出使用交易所市价IOC，买入使用0.2%条件边界限价。
+- 目标权重按总资产计算，现金缓冲只在实际买入检查时执行；GoodETF调仓卖出为市价IOC，买入沿用聚宽开盘后取得的last_price与原0.2%偏移生成固定限价。ETF直接申报固定价格；股票仅等待该价格进入对应板块笼子，不按盘口重定价。
 - 直连xtquant时，QMT快照优先使用`get_full_tick`并保留交易端原始行情时间；`get_last_quote`和1分钟K线只作回退，不得用服务器当前时间冒充行情时间。缺少时间、超过`QMT_STRATEGY_MAX_AGE_SECONDS`或异常来自未来的QMT mark/tick均不可用于估值、风控或条件下单；QMT持仓和风控日志同时打印行情时间与来源。QMT tick先在本地账本判断价格条件，命中后才查询真实账户并下单；兼容`subscribe_quote`真实返回的`{证券: [tick, ...]}`批量结构，批内短暂触发不会被后续价格覆盖，并为每个标的记录一次“首次收到执行行情”。活动意图结束后自动退订不再需要的标的。订单、成交、错误和断连由QMT原生回调推进，不增加固定1秒轮询。BigQMT HTTP gateway尚未桥接这些原生回调，不能把该适配器视为同等完成。
 
 ## 2. 还缺什么
@@ -46,7 +46,7 @@ VALIDATE_REMOTE_DURING_BACKTEST = True
 STRATEGY_ID = 'good_etf_remote'
 ```
 
-v14 helper在所有账户组合均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
+v18 helper在所有账户组合均须上传。远程预检为`True`时还必须上传私有配置；它只读取真实快照，历史回测仍使用聚宽原生订单。离线回测可临时设为`False`，此时helper不读取配置、不连接服务器。
 
 先运行校验：
 
@@ -64,13 +64,13 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 ### 账户开关
 
-私有`jq_runtime_config.py`使用两个bool：`jq_account_enabled`和`qmt_account_enabled`。仅JQ开启时，聚宽正常原生下单、撤单和模拟撮合，不叠加QMT的0.2%价格边界，并维持现有JQ目标计划通知。缺少策略键时默认JQ开、QMT关。
+私有`jq_runtime_config.py`使用两个bool：`jq_account_enabled`和`qmt_account_enabled`。仅JQ开启时，聚宽正常原生下单、撤单和模拟撮合，不叠加QMT执行规则，并维持现有JQ目标计划通知。缺少策略键时默认JQ开、QMT关。
 
 仅QMT开启时，聚宽原生交易函数被阻断，策略只提交StrategyLedger目标。两者同时开启时，helper把同一目标权重分别乘各账户自己的总资产；止盈止损也分别读取两个账户自己的持仓成本。QMT开启后通知归属固定为QMT，只发送QMT计划、委托和成交卡片，不重复发送JQ计划卡片。
 
-回测仍固定BACKTEST，不受两个开关影响。QMT实际下单还受服务器`QMT_STRATEGY_TRADING_ENABLED`和`QMT_STRATEGY_ENABLED_IDS`控制。必须同时上传v14 helper、schema v3私有配置和策略。helper安装时自动完成QMT账户初始化和对账触发，策略不再显式调用readiness接口。仅QMT模式下，启动时QMT分配资金不足、账实差异或对账不新鲜仍会失败关闭；JQ+QMT并行模式下，QMT暂未就绪只暂停QMT分支，JQ继续运行，QMT会在实际调仓或风控前重新对账，通过后才恢复执行。总持仓不足等差异不会被绕过。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
+回测仍固定BACKTEST，不受两个开关影响。QMT实际下单还受服务器`QMT_STRATEGY_TRADING_ENABLED`和`QMT_STRATEGY_ENABLED_IDS`控制。必须同时上传v18 helper、schema v3私有配置和策略。helper安装时自动完成QMT账户初始化和对账触发，策略不再显式调用readiness接口。仅QMT模式下，启动时QMT分配资金不足、账实差异或对账不新鲜仍会失败关闭；JQ+QMT并行模式下，QMT暂未就绪只暂停QMT分支，JQ继续运行，QMT会在实际调仓或风控前重新对账，通过后才恢复执行。总持仓不足等差异不会被绕过。完整操作见[本机部署runbook](20-local-deployment-runbook.md)。
 
-`good_etf.py`中的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。费用缺失时显示为未知，不伪造为0。
+helper设置的`set_order_cost`只用于BACKTEST/JQ模拟撮合。QMT在下单前按服务器费用缓冲预留现金；成交后只接受QMT/券商明确返回的实际费用，不用聚宽模拟佣金覆盖。费用缺失时显示为未知，不伪造为0。
 
 ### 每次调用的执行参数
 
@@ -78,25 +78,29 @@ python -X utf8 scripts/export_joinquant.py --output E:\temp\good_etf_joinquant
 
 | 执行类型 | 含义 |
 |---|---|
-| `LimitExecution` | 立即按参考价计算的限价提交 |
-| `ConditionalLimitExecution` | 对手价进入固定允许边界后才提交限价；GoodETF调仓买入和止盈使用此类型 |
+| `LimitExecution` | 按参考价和偏移形成固定限价；ETF直接提交，股票若超出笼子则等待原价可申报；GoodETF买入与止盈使用此类型 |
+| `ConditionalLimitExecution` | 对手价进入固定允许边界后才提交限价，供需要固定策略价格条件的其他调用使用 |
 | `MarketExecution` | 使用QMT股票市价类型；GoodETF调仓卖出和止损使用此类型 |
 | `MarketableLimitExecution` | 立即提交带保护边界的积极限价，不伪装成市价 |
 
-`ExecutionRequest.style`是默认及买侧类型，`sell_style`可为同一个组合目标单独指定卖侧类型；网络执行契约为schema v2，服务器仍可读取历史schema v1意图。`FollowUpPolicy.NONE`表示订单终态后不补剩余量；`UNTIL_FILLED_TODAY`表示只在提交当日继续处理剩余目标。`KEEP_ORIGINAL`固定使用最初聚宽参考价；`RECOMPUTE`在后续补单时使用最新QMT行情重新计算。所有类型均通过同一个StrategyLedger接口，不是GoodETF专用服务器分支。
+`ExecutionRequest.style`是默认及买侧类型，`sell_style`可覆盖卖侧；执行协议保持schema v2，仍可读取v1。`FollowUpPolicy.NONE`表示终态后不补剩余量，`UNTIL_FILLED_TODAY`表示仅当日处理剩余量。`KEEP_ORIGINAL`始终沿用初次参考价及偏移，GoodETF使用此配置；仅调用方显式选择`RECOMPUTE`才在补单时更新参考价。价格笼子判断只决定原价能否申报，不是重定价指令。
 
 GoodETF当前逐类委托如下：
 
 | 场景 | BACKTEST/JQ | QMT_REMOTE |
 |---|---|---|
 | 09:30清理非目标持仓/减仓 | 聚宽`order_target(code, 0)`或`order_target_value(...)`，默认撮合，策略不做订单级追单 | 沪市五档即时成交剩余撤销、深市五档即时成交剩余撤销；终态回报后继续补剩余目标，卖出完成后才规划买入 |
-| 09:30增持目标ETF | 聚宽`order_target_value(code, target_value)`，不传限价，策略不做订单级追单 | 聚宽参考价上方0.2%条件限价，`UNTIL_FILLED_TODAY + KEEP_ORIGINAL` |
+| 09:30增持目标ETF | 聚宽`order_target_value(code, target_value)`，不传限价，策略不做订单级追单 | 初次聚宽last_price×1.002，按ETF 0.001元精度和QMT涨跌停规则处理后直接挂单；不等待卖一回落到买价，`UNTIL_FILLED_TODAY + KEEP_ORIGINAL` |
 | 5%止损 | 现价严格低于成本95%时调用聚宽`order_target(code, 0)`；未成交且下次风控仍满足条件时再次调用 | 无最低价格阈值的QMT市价IOC，终态回报后在当日继续处理剩余清仓目标 |
-| 10%止盈 | 现价严格高于成本110%时调用聚宽`order_target(code, 0)`；未成交且下次风控仍满足条件时再次调用 | 以触发时参考价下方0.2%为固定最低卖价；买一价达到边界才挂限价，`UNTIL_FILLED_TODAY + KEEP_ORIGINAL` |
+| 10%止盈 | 现价严格高于成本110%时调用聚宽`order_target(code, 0)`；未成交且下次风控仍满足条件时再次调用 | 初次触发时的参考价×0.998直接挂限价；不改成买一价，`UNTIL_FILLED_TODAY + KEEP_ORIGINAL` |
 
-这里的“追踪至当日完成”不是定时撤单改价：服务器不会为了追价反复撤销仍有效的同价委托。只有同一标的上一笔委托已进入成交、撤销或拒绝等终态后仍有剩余目标，才继续处理；市价IOC直接再次提交，条件限价则重新等待原始价格边界。调仓仍坚持先卖后买；进入买入阶段后，各标的独立等待价格和推进，某一标的部分成交不会阻塞其他标的。常驻服务器在次日00:00（Asia/Shanghai）主动撤销前一交易日仍在途的委托并关闭当日目标，不依赖聚宽进程在线。代码中的1.5%仅用于市价单的账本估值/资金预留字段，不是QMT市价成交边界。若同一轮同时触发止损和止盈，为优先风险退出，该批清仓目标统一使用止损的市价执行方式。
+这里的“追踪至当日完成”不是定时撤单改价：有效委托保持排队，部分成交只更新已成交量，上一笔进入终态后才按原价处理剩余量；市价IOC的原有补单行为不变。股票限价若明确因笼子拒绝，等待更新行情确认原定价格可申报后再以原价提交；非笼子拒单不盲目重试。ETF不走股票笼子重试。调仓仍先卖后买，各买入标的独立推进，午夜结束旧日目标。1.5%仍只是市价单估值/预留字段，不是新增的成交边界；同一批同时触发止损与止盈时仍优先用市价退出。
 
 若风控触发时普通调仓仍活动，服务器先持久化取消请求：等待价格但尚未挂单的意图可立即结束；已有在途订单时先撤单并等待QMT确认，确认前不会提交第二个重叠目标，也不会在回调后恢复原调仓。
+
+ETF没有股票动态价格笼子，不代表没有涨跌幅限制。服务器采用QMT当日`UpStopPrice/DownStopPrice`，不根据ETF名称或上市日期自行推断豁免；缺少上下限只表示无法做本地钳制，不代表确认该品种无限制。直连QMT通过`T+0基金`板块识别可当日回转品种，新买入成交据此记为当日可卖；其余/无法识别的品种按T+1。板块数据按日缓存，识别失败当日保守按T+1（重启可重试）；已记账的历史批次不自动改变可卖日。最终卖出仍不能超过策略归属可卖量和QMT实际可卖量。
+
+本次实现、验证和升级顺序见[固定价格与申报时机修改记录](23-fixed-limit-review.md)。
 
 ## 4. good_etf与原策略的关系
 

@@ -87,7 +87,7 @@ def test_position_and_fill_invariants():
         )
 
 
-def test_position_lot_requires_explicit_later_sellable_trade_date():
+def test_position_lot_allows_t0_and_rejects_pre_acquisition_sellable_date():
     acquired = date(2026, 8, 10)
     lot = PositionLot(
         lot_id="lot-1",
@@ -100,13 +100,24 @@ def test_position_lot_requires_explicit_later_sellable_trade_date():
         cost_price_units=3_500_000,
     )
     assert lot.sellable_from_trade_date > lot.acquired_trade_date
+    t0_lot = PositionLot(
+        lot_id="lot-2",
+        account_id="good-etf",
+        security="518880.XSHG",
+        acquired_trade_date=acquired,
+        sellable_from_trade_date=acquired,
+        original_qty=100,
+        remaining_qty=100,
+        cost_price_units=3_500_000,
+    )
+    assert t0_lot.sellable_from_trade_date == acquired
     with pytest.raises(ValueError, match="sellable_from_trade_date"):
         PositionLot(
-            lot_id="lot-2",
+            lot_id="lot-3",
             account_id="good-etf",
             security="510300.XSHG",
             acquired_trade_date=acquired,
-            sellable_from_trade_date=acquired,
+            sellable_from_trade_date=acquired - timedelta(days=1),
             original_qty=100,
             remaining_qty=100,
             cost_price_units=3_500_000,

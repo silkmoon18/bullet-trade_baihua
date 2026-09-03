@@ -305,6 +305,7 @@ class SQLiteReconciliationService:
         account_id: str,
         physical_account_id: str,
         snapshot: BrokerAccountSnapshot,
+        settlement_cycles: Optional[Mapping[str, int]] = None,
     ) -> ReconciliationResult:
         if self.require_verified_capabilities:
             try:
@@ -335,6 +336,7 @@ class SQLiteReconciliationService:
         broker_orders = {}
         broker_order_ids_by_sysid = {}
         adopted_order_ids = []
+        rejected_orders = []
         for row in snapshot.orders:
             broker_order_id = _broker_identifier(row.get("order_id"))
             remark = _text(row.get("order_remark") or row.get("remark"))
@@ -488,7 +490,12 @@ class SQLiteReconciliationService:
                     fill,
                     account.ledger_version,
                     sellable_from_trade_date=(
-                        evidence.traded_at.date() + timedelta(days=1)
+                        evidence.traded_at.date()
+                        + timedelta(
+                            days=self._settlement_cycle(
+                                evidence.security, settlement_cycles
+                            )
+                        )
                         if evidence.side is OrderSide.BUY
                         else None
                     ),
@@ -508,6 +515,21 @@ class SQLiteReconciliationService:
             terminal = _order_state(row.get("status"))
             if local is None or terminal is None:
                 continue
+            if terminal is OrderState.REJECTED:
+                reason = _text(
+                    row.get("status_msg")
+                    or row.get("error_msg")
+                    or row.get("message")
+                    or row.get("error")
+                )
+                rejected_orders.append(
+                    {
+                        "local_order_id": str(local["order_id"]),
+                        "intent_id": str(local.get("intent_id") or ""),
+                        "security": str(local["security"]),
+                        "reason": reason,
+                    }
+                )
             try:
                 account = self._ledger.get_strategy_account(account_id)
                 self._booking.finalize_order(
@@ -572,6 +594,7 @@ class SQLiteReconciliationService:
             "blockers": sorted(set(blockers)),
             "booked_trade_ids": booked_trade_ids,
             "adopted_order_ids": adopted_order_ids,
+            "rejected_orders": rejected_orders,
             "broker_order_count": len(snapshot.orders),
             "broker_trade_count": len(snapshot.trades),
             "broker_position_count": len(snapshot.positions),
@@ -594,6 +617,16 @@ class SQLiteReconciliationService:
             details,
             snapshot.as_of,
         )
+
+    @staticmethod
+    def _settlement_cycle(
+        security: str,
+        settlement_cycles: Optional[Mapping[str, int]],
+    ) -> int:
+        if settlement_cycles is None:
+            return 1
+        value = settlement_cycles.get(security, 1)
+        return value if type(value) is int and value in (0, 1) else 1
 
     def latest(
         self,

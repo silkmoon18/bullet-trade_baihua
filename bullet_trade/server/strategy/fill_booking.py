@@ -372,10 +372,10 @@ class SQLiteFillBookingService:
         trade_date = fill.traded_at.date()
         if fill.side is OrderSide.BUY and (
             sellable_from_trade_date is None
-            or sellable_from_trade_date <= trade_date
+            or sellable_from_trade_date < trade_date
         ):
             raise LedgerInvariantError(
-                "buy fill requires a later sellable trade date"
+                "buy fill requires a valid sellable trade date"
             )
 
         connection = connect_database(self.database_path)

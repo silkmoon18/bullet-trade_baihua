@@ -84,8 +84,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 17
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v17"
+STRATEGY_RUNTIME_API_VERSION = 18
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v18"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -447,12 +447,10 @@ class ExecutionRequest(_ExecutionRequestTuple):
 
 
 def default_etf_rebalance_execution() -> ExecutionRequest:
-    """Default ETF rebalance: market sells, then conditional-limit buys."""
+    """Market sells, then fixed limits from the original JQ last_price."""
 
     return ExecutionRequest(
-        style=ConditionalLimitExecution(
-            2_000, ConditionalLimitPriceMode.BOUNDARY
-        ),
+        style=LimitExecution(2_000),
         sell_style=MarketExecution(15_000),
         follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing=RepricingPolicy.KEEP_ORIGINAL,
@@ -470,12 +468,10 @@ def default_etf_stop_loss_execution() -> ExecutionRequest:
 
 
 def default_etf_take_profit_execution() -> ExecutionRequest:
-    """Default ETF take profit: wait inside the original 0.2% boundary."""
+    """Keep the original take-profit reference price and 0.2% offset."""
 
     return ExecutionRequest(
-        style=ConditionalLimitExecution(
-            2_000, ConditionalLimitPriceMode.BOUNDARY
-        ),
+        style=LimitExecution(2_000),
         follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing=RepricingPolicy.KEEP_ORIGINAL,
     )

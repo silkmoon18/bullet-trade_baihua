@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Tuple, Union, cast
 from uuid import uuid4
 
+from bullet_trade.core import pricing
+
 from .capital import SQLiteCapitalService
 from .domain import (
     MONEY_SCALE,
@@ -47,6 +49,20 @@ from .valuation import MarketMark, PortfolioSnapshot
 
 DatabasePath = Union[str, Path]
 Weight = Union[str, int, float, Decimal]
+_PRICE_CAGE_REJECTION_TOKENS = (
+    "价格笼子",
+    "有效申报价格",
+    "有效竞价范围",
+    "申报价格范围",
+    "超出价格范围",
+)
+
+
+def is_price_cage_rejection(reason: object) -> bool:
+    text = str(reason or "").strip().lower()
+    return bool(text) and any(
+        token.lower() in text for token in _PRICE_CAGE_REJECTION_TOKENS
+    )
 
 
 class TargetPlanningError(RepositoryError):
@@ -323,6 +339,12 @@ class SQLiteTargetExecutionService:
                 for row in intent_working
             ):
                 continue
+            execution_quote = (quotes or {}).get(security)
+            if not self._rejection_allows_quote(
+                intent.intent_id, security, execution_quote
+            ):
+                waiting_for_trigger = True
+                continue
             if (
                 intent.execution_request.follow_up is FollowUpPolicy.NONE
                 and self._order_count(intent.intent_id, security, side) > 0
@@ -343,7 +365,8 @@ class SQLiteTargetExecutionService:
                 intent.execution_request,
                 side,
                 reference_price,
-                (quotes or {}).get(security),
+                execution_quote,
+                security,
             )
             if prepared is None:
                 waiting_for_trigger = True
@@ -632,6 +655,7 @@ class SQLiteTargetExecutionService:
         execution_type,
         as_of,
     ):
+        self._clear_execution_rejection(intent.intent_id, security)
         retry = self._order_count(intent.intent_id, security, side)
         key = "{}:{}:{}:{}".format(intent.intent_id, security, side.value, retry)
         broker_style = {"type": "market"} if execution_type is ExecutionType.MARKET else {
@@ -712,48 +736,54 @@ class SQLiteTargetExecutionService:
             return (mark_price_units * (NAV_SCALE + offset) + NAV_SCALE - 1) // NAV_SCALE
         return max(1, mark_price_units * (NAV_SCALE - offset) // NAV_SCALE)
 
-    def _prepare_execution(self, request, side, reference_price, quote):
+    def _prepare_execution(self, request, side, reference_price, quote, security):
         style = (
             request.sell_style
             if side is OrderSide.SELL and request.sell_style is not None
             else request.style
         )
-        if isinstance(style, LimitExecution):
-            price = self._boundary_price(
-                reference_price, side, style.price_band_ppm
-            )
-            return price, price, style.execution_type
-        if isinstance(style, MarketableLimitExecution):
-            price = self._boundary_price(
-                reference_price, side, style.price_band_ppm
-            )
-            return price, price, style.execution_type
         if isinstance(style, MarketExecution):
             protect = self._boundary_price(
                 reference_price, side, style.protect_price_band_ppm
             )
             return None, protect, style.execution_type
-        if not isinstance(style, ConditionalLimitExecution):
+        price = self._boundary_price(reference_price, side, style.price_band_ppm)
+        if isinstance(style, ConditionalLimitExecution):
+            if quote is None:
+                return None
+            counterparty = (
+                quote.ask_price_units if side is OrderSide.BUY else quote.bid_price_units
+            )
+            if counterparty is None or (
+                counterparty > price if side is OrderSide.BUY else counterparty < price
+            ):
+                return None
+            if style.price_mode is ConditionalLimitPriceMode.COUNTERPARTY:
+                price = counterparty
+        elif not isinstance(style, (LimitExecution, MarketableLimitExecution)):
             raise TargetPlanningError("unsupported execution style")
-        boundary = self._boundary_price(
-            reference_price, side, style.price_band_ppm
-        )
-        if quote is None:
+        if not self._limit_can_submit(security, side, price, quote):
             return None
-        if side is OrderSide.BUY:
-            counterparty = quote.ask_price_units
-            condition_met = counterparty is not None and counterparty <= boundary
-        else:
-            counterparty = quote.bid_price_units
-            condition_met = counterparty is not None and counterparty >= boundary
-        if not condition_met or counterparty is None:
-            return None
-        price = (
-            boundary
-            if style.price_mode is ConditionalLimitPriceMode.BOUNDARY
-            else counterparty
-        )
         return price, price, style.execution_type
+
+    @staticmethod
+    def _limit_can_submit(security, side, price, quote):
+        instrument_type = quote.instrument_type if quote is not None else None
+        if pricing.infer_price_cage_board(security, instrument_type) is None:
+            return True
+        if quote is None:
+            return False
+        return pricing.limit_price_within_cage(
+            security,
+            side is OrderSide.BUY,
+            price / PRICE_SCALE,
+            bid_price=(quote.bid_price_units or 0) / PRICE_SCALE,
+            ask_price=(quote.ask_price_units or 0) / PRICE_SCALE,
+            last_price=(quote.last_price_units or 0) / PRICE_SCALE,
+            preclose=(quote.preclose_units or 0) / PRICE_SCALE,
+            instrument_type=instrument_type,
+            continuous_auction=quote.continuous_auction is not False,
+        )
 
     def _expire_old_intents(self, account_id, now):
         connection = connect_database(self.database_path)
@@ -871,6 +901,133 @@ class SQLiteTargetExecutionService:
             ).items()
         }
 
+    def record_rejected_orders(
+        self,
+        intent_id: str,
+        rejected_orders,
+        quotes: Mapping[str, MarketQuote],
+    ) -> Tuple[Mapping[str, object], ...]:
+        """Persist retry disposition for newly observed broker rejections."""
+
+        intent = self.get_intent(intent_id)
+        payload = self._intent_payload(intent_id)
+        handled = set(payload.get("handled_rejection_order_ids", ()))
+        blocks = dict(payload.get("execution_rejections", {}))
+        recorded = []
+        for item in rejected_orders:
+            if not isinstance(item, Mapping):
+                continue
+            order_id = str(item.get("local_order_id") or "").strip()
+            security = str(item.get("security") or "").strip()
+            if (
+                not order_id
+                or not security
+                or order_id in handled
+                or str(item.get("intent_id") or "") != intent_id
+            ):
+                continue
+            reason = str(item.get("reason") or "").strip()
+            side = self._order_side(order_id)
+            style = (
+                intent.execution_request.sell_style
+                if side is OrderSide.SELL
+                and intent.execution_request.sell_style is not None
+                else intent.execution_request.style
+            )
+            quote = quotes.get(security)
+            retryable = (
+                isinstance(style, (LimitExecution, MarketableLimitExecution, ConditionalLimitExecution))
+                and pricing.infer_price_cage_board(
+                    security,
+                    quote.instrument_type if quote is not None else None,
+                )
+                is not None
+                and is_price_cage_rejection(reason)
+            )
+            blocks[security] = {
+                "local_order_id": order_id,
+                "reason": reason,
+                "retryable": retryable,
+                "retry_after_quote": (
+                    quote.as_of.isoformat() if quote is not None else None
+                ),
+            }
+            handled.add(order_id)
+            recorded.append(
+                {
+                    "security": security,
+                    "reason": reason,
+                    "retryable": retryable,
+                }
+            )
+        if not recorded:
+            return ()
+        payload["handled_rejection_order_ids"] = sorted(handled)
+        payload["execution_rejections"] = blocks
+        self._write_intent_payload(intent_id, payload)
+        return tuple(recorded)
+
+    def _rejection_allows_quote(
+        self, intent_id: str, security: str, quote: Optional[MarketQuote]
+    ) -> bool:
+        item = self._intent_payload(intent_id).get(
+            "execution_rejections", {}
+        ).get(security)
+        if not isinstance(item, Mapping):
+            return True
+        if item.get("retryable") is not True or quote is None:
+            return False
+        raw_after = item.get("retry_after_quote")
+        if not raw_after:
+            return True
+        try:
+            retry_after = datetime.fromisoformat(str(raw_after))
+        except ValueError:
+            return False
+        if retry_after.tzinfo is None or retry_after.utcoffset() is None:
+            retry_after = retry_after.replace(tzinfo=SHANGHAI_TZ)
+        return quote.as_of > retry_after
+
+    def _clear_execution_rejection(
+        self, intent_id: str, security: str
+    ) -> None:
+        payload = self._intent_payload(intent_id)
+        blocks = dict(payload.get("execution_rejections", {}))
+        if security not in blocks:
+            return
+        blocks.pop(security, None)
+        payload["execution_rejections"] = blocks
+        self._write_intent_payload(intent_id, payload)
+
+    def _write_intent_payload(self, intent_id: str, payload) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE portfolio_intents SET targets_json = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    datetime.now(SHANGHAI_TZ).isoformat(),
+                    intent_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _order_side(self, order_id: str) -> OrderSide:
+        connection = connect_database(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT side FROM strategy_orders WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise TargetPlanningError("rejected order is missing")
+        return OrderSide(str(row[0]))
+
     def quote_triggers_intent(
         self,
         intent_id: str,
@@ -921,14 +1078,14 @@ class SQLiteTargetExecutionService:
             return False
         if any(row["security"] == security for row in working):
             return False
+        if not self._rejection_allows_quote(intent_id, security, quote):
+            return False
         style = (
             intent.execution_request.sell_style
             if side is OrderSide.SELL
             and intent.execution_request.sell_style is not None
             else intent.execution_request.style
         )
-        if not isinstance(style, ConditionalLimitExecution):
-            return False
         if (
             intent.execution_request.follow_up is FollowUpPolicy.NONE
             and self._order_count(intent.intent_id, security, side) > 0
@@ -936,6 +1093,8 @@ class SQLiteTargetExecutionService:
             return False
         reference_price = self.reference_prices(intent_id).get(security)
         if reference_price is None:
+            return False
+        if not isinstance(style, (LimitExecution, MarketableLimitExecution, ConditionalLimitExecution)):
             return False
         if (
             intent.execution_request.repricing
@@ -949,6 +1108,7 @@ class SQLiteTargetExecutionService:
                 side,
                 reference_price,
                 quote,
+                security,
             )
             is not None
         )

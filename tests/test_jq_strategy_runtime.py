@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 17,
+        "api_version": 18,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -117,6 +117,7 @@ def test_public_contract_exports_and_constants(helper):
         "submit_targets",
         "ExecutionRequest",
         "ConditionalLimitExecution",
+        "LimitExecution",
         "MarketExecution",
         "default_etf_rebalance_execution",
         "default_etf_stop_loss_execution",
@@ -126,9 +127,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 17
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 18
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v17"
+        "bullet-trade-joinquant-runtime-helper-v18"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -154,14 +155,13 @@ def test_default_etf_execution_policies_preserve_strategy_behavior(helper):
     stop_loss = helper.default_etf_stop_loss_execution()
     take_profit = helper.default_etf_take_profit_execution()
 
-    assert isinstance(rebalance.style, helper.ConditionalLimitExecution)
+    assert isinstance(rebalance.style, helper.LimitExecution)
     assert rebalance.style.price_band_ppm == 2_000
-    assert rebalance.style.price_mode is helper.ConditionalLimitPriceMode.BOUNDARY
     assert isinstance(rebalance.sell_style, helper.MarketExecution)
     assert rebalance.sell_style.protect_price_band_ppm == 15_000
     assert isinstance(stop_loss.style, helper.MarketExecution)
     assert stop_loss.style.protect_price_band_ppm == 15_000
-    assert isinstance(take_profit.style, helper.ConditionalLimitExecution)
+    assert isinstance(take_profit.style, helper.LimitExecution)
     assert take_profit.style.price_band_ppm == 2_000
     assert take_profit.sell_style is None
     assert stop_loss.follow_up is helper.FollowUpPolicy.UNTIL_FILLED_TODAY

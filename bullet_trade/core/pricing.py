@@ -6,7 +6,37 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional, Tuple, Any, Dict
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from enum import Enum
+from typing import Optional, Tuple, Any, Dict, Mapping
+
+
+class PriceCageBoard(str, Enum):
+    SH_MAIN = "SH_MAIN"
+    SZ_MAIN = "SZ_MAIN"
+    GEM = "GEM"
+    STAR = "STAR"
+    BSE = "BSE"
+
+
+@dataclass(frozen=True)
+class PriceCageRule:
+    """Continuous-auction limit-order rule for one stock board."""
+
+    buy_ratio: float
+    sell_ratio: float
+    fallback_ticks: int
+
+
+# Daily limits come from QMT's UpStopPrice/DownStopPrice, not board defaults.
+CAGE_CONFIG: Mapping[PriceCageBoard, PriceCageRule] = {
+    PriceCageBoard.SH_MAIN: PriceCageRule(1.02, 0.98, 10),
+    PriceCageBoard.SZ_MAIN: PriceCageRule(1.02, 0.98, 10),
+    PriceCageBoard.GEM: PriceCageRule(1.02, 0.98, 10),
+    PriceCageBoard.STAR: PriceCageRule(1.02, 0.98, 0),
+    PriceCageBoard.BSE: PriceCageRule(1.05, 0.95, 10),
+}
 
 
 def _split_security(security: str) -> Tuple[str, str]:
@@ -51,7 +81,7 @@ def _normalize_market(market: str) -> str:
         return "SH"
     if upper in ("XSHE", "SZ"):
         return "SZ"
-    if upper in ("BJ", "BSE"):
+    if upper in ("BJ", "BSE", "XBSE"):
         return "BJ"
     return upper
 
@@ -164,49 +194,130 @@ def get_min_price_step(security: str, price: float) -> float:
     ):
         return 0.001
 
-    # 其余沪深 A 股
-    if price < 1:
-        return 0.001
+    # 沪深北 A 股的常规最小价格变动单位为 0.01 元；不要因为股价低于
+    # 1 元就把股票误判成基金的 0.001 元报价单位。
     return 0.01
 
 
-def _infer_price_rule(security: str) -> str:
+def infer_price_cage_board(
+    security: str, instrument_type: Optional[str] = None
+) -> Optional[PriceCageBoard]:
+    """Resolve the stock board, preferring QMT's instrument type.
+
+    Funds, bonds and indexes do not inherit a stock board's dynamic 2%/5%
+    price cage merely because their code is listed on the same exchange.
+    Prefixes are only the board fallback after the product type is known to be
+    a stock (or when QMT omitted that metadata).
+    """
+
+    kind = str(instrument_type or "").strip().lower()
+    if any(token in kind for token in ("fund", "etf", "lof", "bond", "index")):
+        return None
+    if is_etf(security):
+        return None
     code, market = _split_security(security)
-    if market in ("BJ", "BSE"):
+    normalized_market = _normalize_market(market)
+    if normalized_market == "BJ":
+        return PriceCageBoard.BSE
+    if normalized_market == "SH":
+        if code.startswith("688"):
+            return PriceCageBoard.STAR
+        return PriceCageBoard.SH_MAIN
+    if normalized_market == "SZ":
+        if code.startswith("30"):
+            return PriceCageBoard.GEM
+        return PriceCageBoard.SZ_MAIN
+    return None
+
+
+def _infer_price_rule(security: str) -> str:
+    """Backward-compatible internal label for older callers/tests."""
+
+    board = infer_price_cage_board(security)
+    if board is PriceCageBoard.BSE:
         return "beijing"
-    if market in ("XSHG", "SH"):
-        if code.startswith("68"):
-            return "sci"
-        return "main"
-    if market in ("XSHE", "SZ"):
-        # 创业板（30开头）和主板同一规则（102%/98% + 十档）
+    if board is PriceCageBoard.STAR:
+        return "sci"
+    if board in (
+        PriceCageBoard.SH_MAIN,
+        PriceCageBoard.SZ_MAIN,
+        PriceCageBoard.GEM,
+    ):
         return "main"
     return "other"
 
 
 def compute_price_bounds(
-    security: str, base_price: float, tick_size: float
+    security: str,
+    base_price: float,
+    tick_size: float,
+    instrument_type: Optional[str] = None,
 ) -> Tuple[Optional[float], Optional[float]]:
     """
     返回 (买入上限, 卖出下限)，用于价格笼子裁剪。
     base_price 来自交易所“基准价”的近似值（通常取 last_price）。
     """
-    rule = _infer_price_rule(security)
+    board = infer_price_cage_board(security, instrument_type)
+    if board is None:
+        return None, None
+    rule = CAGE_CONFIG[board]
     tick = tick_size if tick_size > 0 else 0.01
-    if rule == "beijing":
-        return (
-            max(base_price * 1.05, base_price + 0.1),
-            min(base_price * 0.95, base_price - 0.1),
-        )
-    if rule == "sci":
-        return base_price * 1.02, base_price * 0.98
-    if rule == "main":
-        extra = 10 * tick
-        return max(base_price * 1.02, base_price + extra), min(
-            base_price * 0.98, base_price - extra
-        )
-    # 其他市场不强制（返回 None）
-    return None, None
+    buy_bound = base_price * rule.buy_ratio
+    sell_bound = base_price * rule.sell_ratio
+    if rule.fallback_ticks:
+        extra = rule.fallback_ticks * tick
+        buy_bound = max(buy_bound, base_price + extra)
+        sell_bound = min(sell_bound, base_price - extra)
+    return buy_bound, sell_bound
+
+
+def limit_price_within_cage(
+    security: str,
+    is_buy: bool,
+    limit_price: float,
+    *,
+    bid_price: Optional[float] = None,
+    ask_price: Optional[float] = None,
+    last_price: Optional[float] = None,
+    preclose: Optional[float] = None,
+    instrument_type: Optional[str] = None,
+    continuous_auction: bool = True,
+) -> bool:
+    """Check a caller's fixed limit; never replace it with the cage boundary.
+
+    ETFs have no stock dynamic cage. For stocks, quotes supply only the
+    exchange base used to decide when the original limit may be submitted.
+    Daily limits and tick precision remain separate adapter validations.
+    """
+
+    if _to_positive_float(limit_price) is None:
+        return False
+    if (
+        infer_price_cage_board(security, instrument_type) is None
+        or not continuous_auction
+    ):
+        return True
+    raw_values = (
+        (ask_price, bid_price, last_price, preclose)
+        if is_buy
+        else (bid_price, ask_price, last_price, preclose)
+    )
+    base = next(
+        (value for value in (_to_positive_float(item) for item in raw_values) if value),
+        None,
+    )
+    if base is None:
+        return False
+    tick = get_min_price_step(security, base)
+    upper, lower = compute_price_bounds(security, base, tick, instrument_type)
+    boundary = _round_inside_bound(
+        upper if is_buy else lower, tick, upper_bound=is_buy
+    )
+    return (
+        limit_price <= boundary + 1e-9
+        if is_buy
+        else limit_price >= boundary - 1e-9
+    )
 
 
 def _clamp(value: float, lower: Optional[float], upper: Optional[float]) -> float:
@@ -241,6 +352,19 @@ def _round_to_tick(price: float, tick_size: float) -> float:
     rounded = round(price / tick_size) * tick_size
     # 避免浮点尾差
     return float(f"{rounded:.6f}")
+
+
+def _round_inside_bound(
+    price: float, tick_size: float, *, upper_bound: bool
+) -> float:
+    """Round without crossing an exchange upper/lower price boundary."""
+
+    if tick_size <= 0:
+        return price
+    raw = Decimal(str(price)) / Decimal(str(tick_size))
+    mode = ROUND_FLOOR if upper_bound else ROUND_CEILING
+    ticks = raw.to_integral_value(rounding=mode)
+    return float(ticks * Decimal(str(tick_size)))
 
 
 def compute_trade_price_bounds(

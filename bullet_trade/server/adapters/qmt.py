@@ -271,6 +271,15 @@ class QmtDataAdapter(RemoteDataAdapter):
             )
         self._execution_symbols = desired
 
+    async def get_tplus(self, security: str) -> int:
+        """Return 0/1 settlement cycle from QMT's T+0 fund sector."""
+
+        return int(
+            await self._run_guarded_qmt_call(
+                self.provider.get_tplus, security
+            )
+        )
+
     async def _run_guarded_qmt_call(self, func, *args, **kwargs):
         """在 QMT guard 保护下执行 live xtdata 调用。
 
@@ -520,7 +529,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
     - 最小手数与步进规则取整（按配置）
     - 停牌检查
     - 涨跌停价格校验
-    - 市价单价格笼子计算
+    - 市价单保护价计算
     - 卖出时可卖数量检查
     """
 
@@ -963,7 +972,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         1. 获取实时行情（停牌检查、最新价、涨跌停价）
         2. 最小手数/步进规则取整
         3. 价格校验（限价单在涨跌停范围内）
-        4. 市价单价格笼子计算
+        4. 市价单保护价计算（限价单沿用调用方价格）
         5. 卖出时可卖数量检查
         """
         import logging
@@ -1064,7 +1073,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                 if abs(price - requested_market_price) > 1e-9:
                     logger.warning(
                         f"{security} 客户端保护价 {requested_market_price:.4f} "
-                        f"超出当前价格笼子/涨跌停，调整为 {price:.4f}"
+                        f"超出当前合法价格范围，调整为 {price:.4f}"
                     )
                 logger.info(f"{security} 市价单沿用客户端保护价: {price:.4f} " f"（基准价={last_price:.4f}）")
             else:

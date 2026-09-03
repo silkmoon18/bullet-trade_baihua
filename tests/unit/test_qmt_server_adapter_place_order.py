@@ -185,7 +185,7 @@ async def test_strategy_ledger_order_rejects_legacy_qmt_auto_split(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_qmt_server_clamps_explicit_market_buy_protect_price_to_cage(monkeypatch):
+async def test_qmt_server_does_not_apply_stock_price_cage_to_etf(monkeypatch):
     async def _fake_snapshot(_security):
         return {
             "last_price": 100.0,
@@ -221,8 +221,41 @@ async def test_qmt_server_clamps_explicit_market_buy_protect_price_to_cage(monke
     )
 
     assert fake_broker.calls[0]["market"] is True
-    assert fake_broker.calls[0]["price"] == pytest.approx(102.0)
-    assert result["order_price"] == pytest.approx(102.0)
+    assert fake_broker.calls[0]["price"] == pytest.approx(103.0)
+    assert result["order_price"] == pytest.approx(103.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side,limit_price", [("BUY", 1.002), ("SELL", 0.998)])
+async def test_qmt_server_fixed_limit_does_not_follow_best_quote(
+    monkeypatch, side, limit_price
+):
+    async def snapshot(_security):
+        return {
+            "last_price": 1.050, "bid_price1": 1.049, "ask_price1": 1.051,
+            "high_limit": 1.200, "low_limit": 0.800, "paused": False,
+        }
+
+    config = ServerConfig(
+        server_type="qmt", listen="127.0.0.1", port=0, token="t",
+        enable_data=False, enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    adapter = QmtBrokerAdapter(config, router)
+    ctx = router.get("default")
+    broker = _FakeBroker()
+    adapter._brokers[ctx.config.key] = broker
+    monkeypatch.setattr(adapter, "_get_live_snapshot", snapshot)
+
+    result = await adapter.place_order(ctx, {
+        "security": "159967.SZ", "side": side, "amount": 100,
+        "style": {"type": "limit", "price": limit_price}, "wait_timeout": 0,
+    })
+
+    assert broker.calls[0]["market"] is False
+    assert broker.calls[0]["price"] == pytest.approx(limit_price)
+    assert result["order_price"] == pytest.approx(limit_price)
 
 
 @pytest.mark.asyncio

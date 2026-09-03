@@ -26,6 +26,8 @@
 20. [目标规划与执行](18-target-planner-executor.md)
 21. [策略API与聚宽真实组合视图](19-strategy-api-joinquant-view.md)
 22. [本机部署、备份与小额验收](20-local-deployment-runbook.md)
+23. [通用执行类型计划](21-generic-execution-plan.md)
+24. [固定价格、价格笼子与T+0修改记录](23-fixed-limit-review.md)
 
 `archive/`：历史审查记录归档（S01逐轮REWORK与S01至S03逐轮冻结明细）；其中各轮候选结论均已失效，仅作历史记录，不作为放行证据。
 

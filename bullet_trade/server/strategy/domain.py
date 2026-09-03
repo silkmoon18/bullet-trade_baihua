@@ -217,8 +217,10 @@ class PositionLot:
         _require_int(self.cost_price_units, "cost_price_units")
         if self.remaining_qty > self.original_qty:
             raise ValueError("remaining_qty cannot exceed original_qty")
-        if self.sellable_from_trade_date <= self.acquired_trade_date:
-            raise ValueError("sellable_from_trade_date must follow acquired_trade_date")
+        if self.sellable_from_trade_date < self.acquired_trade_date:
+            raise ValueError(
+                "sellable_from_trade_date cannot precede acquired_trade_date"
+            )
 
 
 @dataclass(frozen=True)

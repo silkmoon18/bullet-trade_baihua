@@ -7,6 +7,7 @@ import bullet_trade.server.strategy.api as strategy_api_module
 from bullet_trade.server.config import AccountConfig
 from bullet_trade.server.adapters.base import AccountContext
 from bullet_trade.server.strategy import (
+    LimitExecution,
     BrokerCashMismatchError,
     BrokerCapabilityProfile,
     CapabilityState,
@@ -14,6 +15,7 @@ from bullet_trade.server.strategy import (
     ExecutionRequest,
     LedgerInvariantError,
     MarketMark,
+    MarketQuote,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
@@ -120,6 +122,7 @@ class CallbackData(FakeData):
             "bidPrice": [9.99],
             "askPrice": [self.ask_price],
             "dt": datetime.now(SHANGHAI_TZ).isoformat(),
+            "openInt": 13,
         }
 
     def emit(self, payload):
@@ -187,9 +190,9 @@ async def test_startup_rebinds_all_but_reconciles_only_enabled_strategy(
     reconciled = []
     synchronize = service._synchronize
 
-    def record_synchronize(strategy_id, physical_id, snapshot):
+    async def record_synchronize(strategy_id, physical_id, snapshot):
         reconciled.append(strategy_id)
-        return synchronize(strategy_id, physical_id, snapshot)
+        return await synchronize(strategy_id, physical_id, snapshot)
 
     monkeypatch.setattr(service, "_synchronize", record_synchronize)
 
@@ -463,6 +466,162 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     assert notification.items[0].security_name == "上证50ETF"
     with pytest.raises(Exception, match="not found"):
         service.repository.get_strategy_account("good_etf")
+
+
+def test_native_tick_retains_same_day_limits_but_not_previous_day(api):
+    service, _, _, _ = api
+    now = datetime.now(SHANGHAI_TZ)
+    service._quote_cache[SECURITY] = MarketQuote(
+        SECURITY, now,
+        high_limit_units=price_to_units("2.75"),
+        low_limit_units=price_to_units("2.25"),
+        instrument_type="etf",
+    )
+    tick = {"lastPrice": 2.50, "askPrice": [2.501], "openInt": 13}
+    current = service._quote_from_tick(SECURITY, tick, now)
+    assert current.high_limit_units == price_to_units("2.75")
+    assert current.low_limit_units == price_to_units("2.25")
+    assert current.instrument_type == "etf"
+    explicit_zero = service._quote_from_tick(
+        SECURITY, dict(tick, high_limit=0), now
+    )
+    assert explicit_zero.high_limit_units is None
+    tomorrow = service._quote_from_tick(SECURITY, tick, now + timedelta(days=1))
+    assert tomorrow.high_limit_units is None
+    assert tomorrow.low_limit_units is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "security,reason,expected_calls",
+    [
+        ("600000.XSHG", "超出有效申报价格范围", 2),
+        ("600000.XSHG", "可用资金不足", 1),
+        (SECURITY, "超出有效申报价格范围", 1),
+    ],
+)
+async def test_repeat_submit_observes_rejection_before_replanning(
+    api, security, reason, expected_calls
+):
+    service, broker, account, _ = api
+    service.data_provider = CallbackData()
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
+    )
+    request = {
+        "strategy_id": "good_etf",
+        "idempotency_key": "rejected-target",
+        "weights": {security: "0.5"},
+        "marks": {security: "10"},
+        "execution": execution_request_to_wire(
+            ExecutionRequest(style=LimitExecution(2_000))
+        ),
+    }
+    first = await service.submit_targets(account, "default", request)
+    assert broker.order_calls == 1
+    broker.orders[0].update(status="rejected", status_msg=reason)
+    broker.cash = 20000.0  # broker released the rejected order's reservation
+
+    second = await service.submit_targets(account, "default", request)
+    assert second["planned_orders"] == []
+    assert broker.order_calls == 1
+    third = await service.submit_targets(account, "default", request)
+    assert broker.order_calls == expected_calls
+    if expected_calls == 2:
+        assert third["planned_orders"][0]["limit_price_units"] == first["planned_orders"][0]["limit_price_units"]
+
+
+@pytest.mark.asyncio
+async def test_stock_original_limit_resumes_on_quote_entering_cage(api):
+    service, broker, account, _ = api
+    data = CallbackData()
+    data.ask_price = 9.70
+    data.add_tick_listener(service._on_tick_event)
+    service.data_provider = data
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
+    )
+    stock = "600000.XSHG"
+    result = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "stock-cage-callback",
+        "weights": {stock: "0.5"}, "marks": {stock: "10"},
+        "execution": execution_request_to_wire(ExecutionRequest(style=LimitExecution(2_000))),
+    })
+    assert result["planned_orders"] == []
+    assert data.subscriptions == [(stock,)]
+    assert broker.order_calls == 0
+    data.emit({"600000.SH": {
+        "lastPrice": 9.90, "askPrice": [9.90], "bidPrice": [9.89], "openInt": 13,
+        "dt": datetime.now(SHANGHAI_TZ).isoformat(),
+    }})
+    for _ in range(100):
+        if broker.order_calls:
+            break
+        await asyncio.sleep(0.01)
+    assert broker.order_calls == 1
+    connection = connect_database(service.database_path)
+    try:
+        price = connection.execute("SELECT limit_price_units FROM strategy_orders").fetchone()[0]
+    finally:
+        connection.close()
+    assert price == price_to_units("10.02")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cycle,expected_sellable", [(0, 500), (1, 0)])
+async def test_snapshot_books_fund_using_qmt_settlement_cycle(
+    api, monkeypatch, cycle, expected_sellable
+):
+    service, broker, account, _ = api
+    service.data_provider = CallbackData()
+    resolved = []
+
+    async def get_tplus(security):
+        resolved.append(security)
+        return cycle
+
+    monkeypatch.setattr(service.data_provider, "get_tplus", get_tplus, raising=False)
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
+    )
+    await service.submit_targets(
+        account,
+        "default",
+        {
+            "strategy_id": "good_etf",
+            "idempotency_key": "t0-fill",
+            "weights": {SECURITY: "0.5"},
+            "marks": {SECURITY: "10"},
+        },
+    )
+    broker.orders[0]["status"] = "filled"
+    broker.trades = [{
+        "trade_id": "T1",
+        "trade_id_source": "broker",
+        "order_id": broker.orders[0]["order_id"],
+        "security": SECURITY,
+        "side": "BUY",
+        "amount": 500,
+        "price": 10.02,
+        "commission_fee": 5.0,
+        "commission_known": True,
+        "tax": 0.0,
+        "tax_known": True,
+        "time": datetime.now(SHANGHAI_TZ).isoformat(),
+    }]
+    broker.positions = [{
+        "security": SECURITY,
+        "amount": 500,
+        "closeable_amount": expected_sellable,
+    }]
+    snapshot = await service.get_snapshot(
+        account, "default", {"strategy_id": "good_etf"}
+    )
+
+    assert resolved == [SECURITY]
+    assert snapshot["reconciliation"]["details"]["blockers"] == []
+    assert snapshot["reconciliation"]["state"] == "READY"
+    assert snapshot["positions"][SECURITY]["closeable_amount"] == expected_sellable
 
 
 @pytest.mark.asyncio

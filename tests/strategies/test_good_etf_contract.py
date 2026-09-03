@@ -58,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 17,
+            "api_version": 18,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -221,6 +221,7 @@ def _helper_with_install(runtime, calls):
         "RuntimeMode",
         "ExecutionRequest",
         "ConditionalLimitExecution",
+        "LimitExecution",
         "ConditionalLimitPriceMode",
         "MarketExecution",
         "FollowUpPolicy",
@@ -327,7 +328,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf_remote",
         "qmt_initial_capital": 10000,
-        "expected_api_version": 17,
+        "expected_api_version": 18,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -528,7 +529,7 @@ def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):
     )
 
 
-def test_remote_take_profit_keeps_conditional_limit_execution(monkeypatch):
+def test_remote_take_profit_keeps_reference_price_limit_execution(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     position = types.SimpleNamespace(
         price=11.1, avg_cost=10.0, value=11100.0
@@ -549,5 +550,6 @@ def test_remote_take_profit_keeps_conditional_limit_execution(monkeypatch):
     assert len(runtime.submissions) == 1
     assert runtime.submissions[0][1] == {"510001.XSHG": 0.0}
     execution = runtime.submissions[0][4]
-    assert isinstance(execution.style, real_helper.ConditionalLimitExecution)
+    assert isinstance(execution.style, real_helper.LimitExecution)
+    assert execution.style.price_band_ppm == 2_000
     assert execution.sell_style is None

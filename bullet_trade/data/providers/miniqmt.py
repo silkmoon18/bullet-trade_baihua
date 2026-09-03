@@ -4,7 +4,7 @@ import logging
 import os
 from datetime import date as Date
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import pandas as pd
 
@@ -78,6 +78,9 @@ class MiniQMTProvider(DataProvider):
         )
         self._tick_callback = None
         self._tick_subscription_ids: Dict[str, Any] = {}
+        self._tick_metadata: Dict[str, Dict[str, Any]] = {}
+        self._t0_funds_cache_day: Optional[Date] = None
+        self._t0_funds: Set[str] = set()
 
     # ------------------------ 工具函数 ------------------------
     @staticmethod
@@ -414,7 +417,9 @@ class MiniQMTProvider(DataProvider):
             xtdata = self._ensure_xtdata()
             tick_map = xtdata.get_full_tick([code])  # type: ignore[attr-defined]
             tick = tick_map.get(code) if isinstance(tick_map, dict) else None
-            normalized = self._normalize_current_tick(code, tick)
+            normalized = self._normalize_current_tick(
+                code, tick, self._current_tick_metadata(xtdata, code)
+            )
             if normalized is not None:
                 return normalized
         except Exception:
@@ -423,7 +428,9 @@ class MiniQMTProvider(DataProvider):
             if xtdata is None:
                 xtdata = self._ensure_xtdata()
             quote = xtdata.get_last_quote(code)  # type: ignore[attr-defined]
-            normalized = self._normalize_current_tick(code, quote)
+            normalized = self._normalize_current_tick(
+                code, quote, self._current_tick_metadata(xtdata, code)
+            )
             if normalized is not None:
                 return normalized
         except Exception:
@@ -447,9 +454,58 @@ class MiniQMTProvider(DataProvider):
             return None
         return None
 
+    def _current_tick_metadata(self, xt: Any, code: str) -> Dict[str, Any]:
+        cached = self._tick_metadata.get(code, {})
+        metadata: Dict[str, Any] = dict(cached)
+        if "instrument_type" not in metadata:
+            detected = self._detect_instrument_type(xt, code)
+            if detected:
+                metadata["instrument_type"] = detected
+                self._tick_metadata[code] = {
+                    "instrument_type": detected
+                }
+        try:
+            detail = xt.get_instrument_detail(code)
+        except Exception:
+            detail = None
+        if isinstance(detail, dict):
+            for source, target in (
+                ("UpStopPrice", "high_limit"),
+                ("DownStopPrice", "low_limit"),
+                ("PreClose", "preclose"),
+                ("PreClosePrice", "preclose"),
+            ):
+                if target not in metadata and detail.get(source) not in (None, ""):
+                    metadata[target] = detail[source]
+        return metadata
+
+    def get_tplus(self, security: str) -> int:
+        """Resolve fund settlement from QMT's official ``T+0基金`` sector.
+
+        Missing or unavailable sector data falls back to T+1. This is safer
+        for a strategy-owned ledger than consuming another owner's physically
+        sellable position in a shared account.
+        """
+
+        qmt_security = self._normalize_security_code(security)
+        if self._t0_funds_cache_day != Date.today():
+            self._t0_funds_cache_day = Date.today()
+            self._t0_funds = set()
+            try:
+                xt = self._ensure_xtdata()
+                values = xt.get_stock_list_in_sector("T+0基金")
+                self._t0_funds = {
+                    self._normalize_security_code(str(item))
+                    for item in (values or ())
+                    if str(item).strip()
+                }
+            except Exception as exc:
+                logger.warning("MiniQMT读取T+0基金板块失败，保守按T+1: %s", exc)
+        return 0 if qmt_security in self._t0_funds else 1
+
     @classmethod
     def _normalize_current_tick(
-        cls, code: str, tick: Any
+        cls, code: str, tick: Any, metadata: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:
         """Normalize one xtdata tick without inventing a market timestamp."""
 
@@ -488,6 +544,7 @@ class MiniQMTProvider(DataProvider):
             "last_price": last,
             "dt": cls._normalize_tick_time(raw_time, code),
         }
+        result.update(metadata or {})
         for name in (
             "bidPrice",
             "askPrice",
@@ -495,6 +552,19 @@ class MiniQMTProvider(DataProvider):
             "ask_price1",
             "bid1",
             "ask1",
+            "openInt",
+            "stockStatus",
+            "market_status",
+            "high_limit",
+            "highLimit",
+            "UpStopPrice",
+            "low_limit",
+            "lowLimit",
+            "DownStopPrice",
+            "preclose",
+            "pre_close",
+            "lastClose",
+            "preClose",
         ):
             quote_value = value(name)
             if quote_value is not None:

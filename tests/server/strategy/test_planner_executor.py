@@ -14,6 +14,7 @@ from bullet_trade.server.strategy import (
     MarketMark,
     MarketExecution,
     MarketQuote,
+    LimitExecution,
     ExecutionRequest,
     ExecutionType,
     FollowUpPolicy,
@@ -519,6 +520,214 @@ def test_conditional_limit_waits_without_order_then_uses_fixed_boundary(tmp_path
     assert len(triggered.orders) == 1
     assert triggered.orders[0].limit_price_units == price_to_units("10.02")
     assert triggered.orders[0].execution_type is ExecutionType.CONDITIONAL_LIMIT
+
+
+@pytest.mark.parametrize("with_quote", [False, True])
+def test_fixed_etf_limit_keeps_jq_reference_despite_new_quote(tmp_path, with_quote):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    quote = MarketQuote(
+        A,
+        as_of,
+        bid_price_units=price_to_units("9.999"),
+        ask_price_units=price_to_units("10.500"),
+        last_price_units=price_to_units("10"),
+        instrument_type="etf",
+        continuous_auction=True,
+    )
+
+    result = planner.submit_target_weights(
+        ACCOUNT,
+        "fixed-etf-buy",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(style=LimitExecution(2_000)),
+        quotes={A: quote} if with_quote else {},
+    )
+
+    assert len(result.orders) == 1
+    assert result.orders[0].limit_price_units == price_to_units("10.02")
+    assert result.orders[0].execution_type is ExecutionType.LIMIT
+
+
+def test_stock_fixed_limit_waits_for_cage_then_submits_original_price(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    stock = "600000.XSHG"
+    marks = dict(marks, **{stock: MarketMark(stock, price_to_units("10"), as_of, "jq")})
+    execution = ExecutionRequest(style=LimitExecution(2_000))
+    outside = MarketQuote(stock, as_of, ask_price_units=price_to_units("9.70"))
+    waiting = planner.submit_target_weights(
+        ACCOUNT, "stock-fixed", {stock: "0.5"}, snapshot, marks, as_of,
+        execution_request=execution, quotes={stock: outside},
+    )
+    assert waiting.orders == ()
+    assert waiting.waiting_for_trigger is True
+    inside = MarketQuote(stock, as_of, ask_price_units=price_to_units("9.90"))
+    marks[stock] = MarketMark(stock, price_to_units("9.90"), as_of, "qmt")
+    submitted = planner.submit_target_weights(
+        ACCOUNT, "stock-fixed", {stock: "0.5"}, snapshot, marks, as_of,
+        execution_request=execution, quotes={stock: inside},
+    )
+    assert len(submitted.orders) == 1
+    assert submitted.orders[0].limit_price_units == price_to_units("10.02")
+    assert planner.reference_prices(waiting.intent.intent_id)[stock] == price_to_units("10")
+
+
+def test_fixed_limit_cage_rejection_waits_for_newer_quote_before_retry(tmp_path):
+    database, repository, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    stock = "600000.XSHG"
+    marks = dict(marks)
+    marks[stock] = MarketMark(
+        stock,
+        price_to_units("10"),
+        as_of,
+        "qmt",
+    )
+    quote = MarketQuote(
+        stock,
+        as_of,
+        ask_price_units=price_to_units("10.001"),
+        instrument_type="stock",
+    )
+    result = planner.submit_target_weights(
+        ACCOUNT,
+        "cage-rejection",
+        {stock: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(style=LimitExecution(2_000)),
+        quotes={stock: quote},
+    )
+    order = result.orders[0]
+    booking = SQLiteFillBookingService(database)
+    account = repository.get_strategy_account(ACCOUNT)
+    booking.finalize_order(
+        ACCOUNT, order.order_id, OrderState.REJECTED, account.ledger_version
+    )
+    recorded = planner.record_rejected_orders(
+        result.intent.intent_id,
+        (
+            {
+                "local_order_id": order.order_id,
+                "intent_id": result.intent.intent_id,
+                "security": stock,
+                "reason": "申报价格超出有效申报价格范围",
+            },
+        ),
+        {stock: quote},
+    )
+
+    assert recorded[0]["retryable"] is True
+    assert planner.quote_triggers_intent(
+        result.intent.intent_id, stock, quote, as_of
+    ) is False
+    outside = MarketQuote(
+        stock, as_of + timedelta(milliseconds=1),
+        ask_price_units=price_to_units("9.70"),
+    )
+    assert planner.quote_triggers_intent(
+        result.intent.intent_id, stock, outside, as_of
+    ) is False
+    newer = MarketQuote(
+        stock,
+        as_of + timedelta(milliseconds=2),
+        ask_price_units=price_to_units("9.90"),
+        instrument_type="stock",
+    )
+    assert planner.quote_triggers_intent(
+        result.intent.intent_id, stock, newer, as_of
+    ) is True
+    refreshed = SQLiteValuationService(database).create_snapshot(
+        ACCOUNT, marks, as_of, timedelta(minutes=1)
+    )
+    retry = planner.advance_intent(
+        result.intent.intent_id, refreshed, marks, as_of, quotes={stock: newer}
+    )
+    assert retry.orders[0].limit_price_units == order.limit_price_units
+
+
+def test_fixed_limit_non_cage_rejection_is_not_retried(tmp_path):
+    database, repository, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    quote = MarketQuote(A, as_of, ask_price_units=price_to_units("10.001"))
+    result = planner.submit_target_weights(
+        ACCOUNT,
+        "non-cage-rejection",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(style=LimitExecution(2_000)),
+        quotes={A: quote},
+    )
+    order = result.orders[0]
+    account = repository.get_strategy_account(ACCOUNT)
+    SQLiteFillBookingService(database).finalize_order(
+        ACCOUNT, order.order_id, OrderState.REJECTED, account.ledger_version
+    )
+    recorded = planner.record_rejected_orders(
+        result.intent.intent_id,
+        (
+            {
+                "local_order_id": order.order_id,
+                "intent_id": result.intent.intent_id,
+                "security": A,
+                "reason": "可用资金不足",
+            },
+        ),
+        {A: quote},
+    )
+
+    assert recorded[0]["retryable"] is False
+    newer = MarketQuote(
+        A,
+        as_of + timedelta(seconds=1),
+        ask_price_units=price_to_units("10.002"),
+    )
+    assert planner.quote_triggers_intent(
+        result.intent.intent_id, A, newer, as_of
+    ) is False
+
+
+def test_etf_never_enters_stock_price_cage_retry_loop(tmp_path):
+    database, repository, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    quote = MarketQuote(
+        A,
+        as_of,
+        ask_price_units=price_to_units("10.001"),
+        instrument_type="etf",
+    )
+    result = planner.submit_target_weights(
+        ACCOUNT,
+        "etf-cage-text",
+        {A: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+        execution_request=ExecutionRequest(style=LimitExecution(2_000)),
+        quotes={A: quote},
+    )
+    order = result.orders[0]
+    account = repository.get_strategy_account(ACCOUNT)
+    SQLiteFillBookingService(database).finalize_order(
+        ACCOUNT, order.order_id, OrderState.REJECTED, account.ledger_version
+    )
+
+    recorded = planner.record_rejected_orders(
+        result.intent.intent_id,
+        (
+            {
+                "local_order_id": order.order_id,
+                "intent_id": result.intent.intent_id,
+                "security": A,
+                "reason": "申报价格超出有效申报价格范围",
+            },
+        ),
+        {A: quote},
+    )
+
+    assert recorded[0]["retryable"] is False
 
 
 def test_working_buy_does_not_block_another_security_trigger(tmp_path):

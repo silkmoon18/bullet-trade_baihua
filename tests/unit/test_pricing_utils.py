@@ -1,6 +1,3 @@
-import pytest
-
-
 from bullet_trade.core import pricing
 from bullet_trade.core.orders import MarketOrderStyle
 
@@ -15,7 +12,7 @@ def test_min_price_step_etf():
 
 def test_min_price_step_a_share_brackets():
     _assert_close(pricing.get_min_price_step("600000.XSHG", 12.0), 0.01)
-    _assert_close(pricing.get_min_price_step("600000.XSHG", 0.8), 0.001)
+    _assert_close(pricing.get_min_price_step("600000.XSHG", 0.8), 0.01)
 
 
 def test_price_bounds_mainboard():
@@ -28,6 +25,51 @@ def test_price_bounds_beijing():
     buy_upper, sell_lower = pricing.compute_price_bounds("430047.BJ", 10.0, 0.01)
     _assert_close(buy_upper, max(10 * 1.05, 10 + 0.1))
     _assert_close(sell_lower, min(10 * 0.95, 10 - 0.1))
+
+
+def test_price_cage_uses_board_rules_and_does_not_treat_etf_as_stock():
+    assert pricing.infer_price_cage_board("600000.XSHG") is pricing.PriceCageBoard.SH_MAIN
+    assert pricing.infer_price_cage_board("300001.XSHE") is pricing.PriceCageBoard.GEM
+    assert pricing.infer_price_cage_board("688001.XSHG") is pricing.PriceCageBoard.STAR
+    assert pricing.compute_price_bounds("510050.XSHG", 3.0, 0.001) == (None, None)
+
+
+def test_fixed_limit_waits_for_stock_cage_without_repricing():
+    assert not pricing.limit_price_within_cage(
+        "600000.XSHG", True, 10.02, ask_price=9.70
+    )
+    assert pricing.limit_price_within_cage(
+        "600000.XSHG", True, 10.02, ask_price=9.90
+    )
+    assert not pricing.limit_price_within_cage(
+        "600000.XSHG", False, 9.98, bid_price=10.30
+    )
+    assert pricing.limit_price_within_cage(
+        "600000.XSHG", False, 9.98, bid_price=10.10
+    )
+
+
+def test_etf_fixed_limit_does_not_wait_for_counterparty_or_stock_cage():
+    assert pricing.limit_price_within_cage("510050.XSHG", True, 1.002)
+    assert pricing.limit_price_within_cage(
+        "510050.XSHG", True, 1.002, ask_price=1.050
+    )
+    assert pricing.limit_price_within_cage(
+        "159001.XSHE", False, 0.998, bid_price=0.950, instrument_type="etf"
+    )
+
+
+def test_cage_phase_and_low_price_stock_fallback():
+    assert pricing.limit_price_within_cage(
+        "600000.XSHG", True, 3.09, ask_price=3.0
+    )
+    assert not pricing.limit_price_within_cage(
+        "688001.XSHG", True, 3.09, ask_price=3.0
+    )
+    assert pricing.limit_price_within_cage(
+        "688001.XSHG", True, 3.09, ask_price=3.0, continuous_auction=False
+    )
+    assert not pricing.limit_price_within_cage("600000.XSHG", True, 3.09)
 
 
 def test_compute_market_protect_price_defaults():

@@ -12,6 +12,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, cast
 
+from bullet_trade.core.pricing import infer_price_cage_board
+
 from .broker_contract import BrokerCapabilityProfile
 from ..feishu_notifier import (
     TargetBuyPlanItem,
@@ -33,6 +35,8 @@ from .execution import (
     ConditionalLimitExecution,
     ExecutionRequest,
     MarketQuote,
+    LimitExecution,
+    MarketableLimitExecution,
     RepricingPolicy,
     execution_request_from_wire,
     execution_request_to_wire,
@@ -58,10 +62,17 @@ EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 VALUATION_MARK_MAX_IDLE_AGE = timedelta(days=10)
 
 
-def _uses_conditional_execution(request: ExecutionRequest) -> bool:
-    return isinstance(request.style, ConditionalLimitExecution) or isinstance(
-        request.sell_style, ConditionalLimitExecution
-    )
+def _uses_quote_execution(
+    request: ExecutionRequest, security: Optional[str] = None
+) -> bool:
+    for style in (request.style, request.sell_style):
+        if isinstance(style, ConditionalLimitExecution):
+            return True
+        if isinstance(style, (LimitExecution, MarketableLimitExecution)) and (
+            security is None or infer_price_cage_board(security) is not None
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -221,7 +232,9 @@ class SQLiteStrategyAPI:
                     )
                 ) from exc
             account, created = ensured.account, ensured.created
-        result = self._synchronize(strategy_id, physical_id, broker_snapshot)
+        result = await self._synchronize(
+            strategy_id, physical_id, broker_snapshot
+        )
         account = self.repository.get_strategy_account(strategy_id)
         self.startup_ready = result.state.value == "READY"
         return {
@@ -283,7 +296,10 @@ class SQLiteStrategyAPI:
             execution_request = execution_request_from_wire(raw_execution)
         else:
             raise ValueError("execution must be an object")
-        if _uses_conditional_execution(execution_request):
+        snapshot, reconciliation, marks = await self._refresh(
+            account_context, account_key, strategy_id, payload
+        )
+        if any(_uses_quote_execution(execution_request, security) for security in marks):
             replace = getattr(
                 self.data_provider, "replace_execution_quotes", None
             )
@@ -294,9 +310,6 @@ class SQLiteStrategyAPI:
                 raise RuntimeError(
                     "current data adapter has no native quote callback support"
                 )
-        snapshot, _, marks = await self._refresh(
-            account_context, account_key, strategy_id, payload
-        )
         cancel_requested_order_ids = []
         for broker_order_id in self.planner.stale_broker_order_ids(strategy_id):
             await cast(Any, self.broker).cancel_order(
@@ -304,12 +317,18 @@ class SQLiteStrategyAPI:
             )
             cancel_requested_order_ids.append(broker_order_id)
         if cancel_requested_order_ids:
-            snapshot, _, marks = await self._refresh(
+            snapshot, reconciliation, marks = await self._refresh(
                 account_context, account_key, strategy_id, payload
             )
         quotes = await self._execution_quotes(
             execution_request, tuple(marks), snapshot.as_of
         )
+        # A repeated submit can be the first query to observe a broker
+        # rejection. Persist its disposition before planning any remainder.
+        for intent in self.planner.active_intents(strategy_id):
+            self._record_reconciliation_rejections(
+                intent.intent_id, reconciliation, quotes
+            )
         advance = self.planner.submit_target_weights(
             strategy_id,
             key,
@@ -321,7 +340,7 @@ class SQLiteStrategyAPI:
             quotes=quotes,
             security_names=security_names,
         )
-        if _uses_conditional_execution(execution_request):
+        if _uses_quote_execution(execution_request):
             await self._sync_quote_subscriptions(strategy_id)
         dispatched = []
 
@@ -335,6 +354,9 @@ class SQLiteStrategyAPI:
         # Pick up immediate fills/rejections and make the returned view real.
         refreshed, reconciliation, _ = await self._refresh(
             account_context, account_key, strategy_id, payload
+        )
+        self._record_reconciliation_rejections(
+            advance.intent.intent_id, reconciliation, quotes
         )
         await self._sync_quote_subscriptions(strategy_id)
         return {
@@ -375,10 +397,10 @@ class SQLiteStrategyAPI:
         snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
-        results = tuple(
-            self._synchronize(strategy_id, physical_id, snapshot)
+        results = [
+            await self._synchronize(strategy_id, physical_id, snapshot)
             for strategy_id in reconcile_ids
-        )
+        ]
         self.startup_ready = all(
             result.state.value == "READY" for result in results
         )
@@ -498,7 +520,7 @@ class SQLiteStrategyAPI:
                 broker_snapshot = await collect_async_broker_snapshot(
                     cast(Any, self.broker), account_context
                 )
-                self._synchronize(
+                await self._synchronize(
                     intent.account_id, physical_id, broker_snapshot
                 )
         expired_order_ids = ()
@@ -654,7 +676,9 @@ class SQLiteStrategyAPI:
         broker_snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
-        reconciliation = self._synchronize(strategy_id, physical_id, broker_snapshot)
+        reconciliation = await self._synchronize(
+            strategy_id, physical_id, broker_snapshot
+        )
         as_of = self._as_of(payload.get("as_of"), broker_snapshot.as_of)
         raw_weights = payload.get("weights")
         target_securities = (
@@ -678,10 +702,14 @@ class SQLiteStrategyAPI:
         )
         return snapshot, reconciliation, marks
 
-    def _synchronize(self, strategy_id, physical_id, broker_snapshot):
+    async def _synchronize(self, strategy_id, physical_id, broker_snapshot):
         previous = self.reconciliation.latest(physical_id, strategy_id)
+        settlement_cycles = await self._settlement_cycles(broker_snapshot)
         result = self.reconciliation.synchronize(
-            strategy_id, physical_id, broker_snapshot
+            strategy_id,
+            physical_id,
+            broker_snapshot,
+            settlement_cycles=settlement_cycles,
         )
         self.startup_ready = result.state.value == "READY"
         if (
@@ -706,6 +734,39 @@ class SQLiteStrategyAPI:
                 )
             except Exception:
                 pass
+        return result
+
+    async def _settlement_cycles(
+        self, broker_snapshot
+    ) -> Mapping[str, int]:
+        resolver = getattr(self.data_provider, "get_tplus", None)
+        if not callable(resolver):
+            return {}
+        securities = {
+            self._joinquant_security(
+                str(
+                    trade.get("security")
+                    or trade.get("stock_code")
+                    or trade.get("stockCode")
+                    or ""
+                )
+            )
+            for trade in broker_snapshot.trades
+            if isinstance(trade, Mapping)
+        }
+        result = {}
+        for security in sorted(item for item in securities if item):
+            try:
+                cycle = await resolver(security)
+            except Exception as exc:
+                logger.warning(
+                    "StrategyLedger无法识别%s结算周期，保守按T+1: %s",
+                    security,
+                    exc,
+                )
+                continue
+            if type(cycle) is int and cycle in (0, 1):
+                result[security] = cycle
         return result
 
     async def _marks(
@@ -761,36 +822,23 @@ class SQLiteStrategyAPI:
         securities: Sequence[str],
         as_of: datetime,
     ) -> Mapping[str, MarketQuote]:
-        if not _uses_conditional_execution(execution_request):
+        if not _uses_quote_execution(execution_request):
             return {}
         tick_fn = getattr(self.data_provider, "get_current_tick", None)
         if tick_fn is None:
             return {}
         quotes = {}
         for security in securities:
+            if not _uses_quote_execution(execution_request, security):
+                continue
             tick = await tick_fn(security)
             if not isinstance(tick, Mapping):
                 continue
-            bid = self._best_quote_price(tick, "bid")
-            ask = self._best_quote_price(tick, "ask")
-            last = self._tick_price_or_none(tick)
             try:
                 quote_as_of = self._tick_as_of(tick)
             except ValueError:
                 continue
-            quote = MarketQuote(
-                security=security,
-                as_of=quote_as_of,
-                bid_price_units=(
-                    price_to_units(str(bid)) if bid is not None else None
-                ),
-                ask_price_units=(
-                    price_to_units(str(ask)) if ask is not None else None
-                ),
-                last_price_units=(
-                    price_to_units(str(last)) if last is not None else None
-                ),
-            )
+            quote = self._quote_from_tick(security, tick, quote_as_of)
             if not self._quote_is_fresh(
                 quote, datetime.now(SHANGHAI_TZ)
             ):
@@ -798,6 +846,42 @@ class SQLiteStrategyAPI:
             quotes[security] = quote
             self._quote_cache[security] = quote
         return quotes
+
+    def _quote_from_tick(
+        self, security: str, tick: Mapping[str, object], as_of: datetime
+    ) -> MarketQuote:
+        bid = self._best_quote_price(tick, "bid")
+        ask = self._best_quote_price(tick, "ask")
+        last = self._tick_price_or_none(tick)
+        previous = self._quote_cache.get(security)
+        if previous is not None and previous.as_of.date() != as_of.date():
+            previous = None
+        metadata = {}
+        for field_name, aliases in (
+            ("high_limit_units", ("high_limit", "highLimit", "UpStopPrice", "up_stop_price")),
+            ("low_limit_units", ("low_limit", "lowLimit", "DownStopPrice", "down_stop_price")),
+            ("preclose_units", ("preclose", "pre_close", "lastClose", "preClose")),
+        ):
+            # Native ticks omit instrument detail. Preserve same-day metadata,
+            # but respect an explicit zero and never carry daily limits overnight.
+            metadata[field_name] = (
+                getattr(previous, field_name)
+                if previous is not None and not any(name in tick for name in aliases)
+                else self._tick_price_units(tick, *aliases)
+            )
+        return MarketQuote(
+            security=security,
+            as_of=as_of,
+            bid_price_units=price_to_units(str(bid)) if bid is not None else None,
+            ask_price_units=price_to_units(str(ask)) if ask is not None else None,
+            last_price_units=price_to_units(str(last)) if last is not None else None,
+            instrument_type=(
+                self._tick_instrument_type(tick)
+                or (previous.instrument_type if previous is not None else None)
+            ),
+            continuous_auction=self._tick_continuous_auction(tick, as_of),
+            **metadata,
+        )
 
     def _bind_runtime(
         self, strategy_id: str, account_context: object, account_key: str
@@ -849,27 +933,12 @@ class SQLiteStrategyAPI:
         first_symbols = set()
         for security, tick in self._tick_items(payload):
             received_at = datetime.now(SHANGHAI_TZ)
-            bid = self._best_quote_price(tick, "bid")
-            ask = self._best_quote_price(tick, "ask")
-            last = self._tick_price_or_none(tick)
             try:
                 quote_as_of = self._tick_as_of(tick)
             except ValueError as exc:
                 self._reject_tick_once(security, str(exc))
                 continue
-            quote = MarketQuote(
-                security=security,
-                as_of=quote_as_of,
-                bid_price_units=(
-                    price_to_units(str(bid)) if bid is not None else None
-                ),
-                ask_price_units=(
-                    price_to_units(str(ask)) if ask is not None else None
-                ),
-                last_price_units=(
-                    price_to_units(str(last)) if last is not None else None
-                ),
-            )
+            quote = self._quote_from_tick(security, tick, quote_as_of)
             if not self._quote_is_fresh(quote, received_at):
                 self._reject_tick_once(
                     security,
@@ -928,7 +997,7 @@ class SQLiteStrategyAPI:
             return
         for intent in self.planner.active_intents():
             if (
-                not _uses_conditional_execution(intent.execution_request)
+                not _uses_quote_execution(intent.execution_request, security)
                 or security not in self.planner.reference_prices(intent.intent_id)
                 or intent.account_id not in self._runtime_bindings
                 or not self._strategy_reconciliation_enabled(intent.account_id)
@@ -1014,7 +1083,7 @@ class SQLiteStrategyAPI:
             }
             for security, price_units in references.items()
         }
-        snapshot, _, market_marks = await self._refresh(
+        snapshot, reconciliation, market_marks = await self._refresh(
             binding[0],
             binding[1],
             intent.account_id,
@@ -1024,13 +1093,17 @@ class SQLiteStrategyAPI:
                 "as_of": now,
             },
         )
-        advance = self.planner.advance_intent(
+        self._record_reconciliation_rejections(
+            intent_id, reconciliation, execution_quotes
+        )
+        self.planner.advance_intent(
             intent_id,
             snapshot,
             market_marks,
             now,
             quotes=execution_quotes,
         )
+
         async def submitter(order_payload: Mapping[str, object]):
             return await cast(Any, self.broker).place_order(
                 binding[0], dict(order_payload)
@@ -1038,6 +1111,32 @@ class SQLiteStrategyAPI:
 
         await self._dispatch_pending(submitter, intent.account_id)
         await self._sync_quote_subscriptions(intent.account_id)
+
+    def _record_reconciliation_rejections(
+        self,
+        intent_id: str,
+        reconciliation,
+        quotes: Mapping[str, MarketQuote],
+    ) -> None:
+        details = getattr(reconciliation, "details", {})
+        if not isinstance(details, Mapping):
+            return
+        recorded = self.planner.record_rejected_orders(
+            intent_id,
+            details.get("rejected_orders", ()),
+            quotes,
+        )
+        for item in recorded:
+            logger.warning(
+                "StrategyLedger 委托拒绝处理 | %s | %s | 原因=%s",
+                item.get("security"),
+                (
+                    "等待新行情确认原定限价进入价格笼子后重试"
+                    if item.get("retryable") is True
+                    else "非价格笼子拒单，不自动重试"
+                ),
+                item.get("reason") or "券商未返回原因",
+            )
 
     async def _dispatch_pending(self, submitter, strategy_account_id: str):
         dispatched = []
@@ -1059,10 +1158,14 @@ class SQLiteStrategyAPI:
     async def _sync_quote_subscriptions(self, strategy_id: str) -> None:
         symbols = set()
         for intent in self.planner.active_intents(strategy_id):
-            if _uses_conditional_execution(
+            if _uses_quote_execution(
                 intent.execution_request
             ) and not self.planner.intent_cancel_requested(intent.intent_id):
-                symbols.update(self.planner.reference_prices(intent.intent_id))
+                symbols.update(
+                    security
+                    for security in self.planner.reference_prices(intent.intent_id)
+                    if _uses_quote_execution(intent.execution_request, security)
+                )
         replace = getattr(
             self.data_provider, "replace_execution_quotes", None
         )
@@ -1138,6 +1241,44 @@ class SQLiteStrategyAPI:
             if number > 0:
                 return number
         return None
+
+    @staticmethod
+    def _tick_price_units(
+        tick: Mapping[str, object], *names: str
+    ) -> Optional[int]:
+        for name in names:
+            value = tick.get(name)
+            try:
+                number = float(value) if value not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return price_to_units(str(number))
+        return None
+
+    @staticmethod
+    def _tick_instrument_type(tick: Mapping[str, object]) -> Optional[str]:
+        for name in ("instrument_type", "security_type", "instrumentType"):
+            value = tick.get(name)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _tick_continuous_auction(
+        tick: Mapping[str, object], as_of: datetime
+    ) -> bool:
+        for name in ("openInt", "stockStatus", "market_status"):
+            value = tick.get(name)
+            try:
+                status = int(value) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                status = None
+            if status == 13:
+                return True
+            if status in (1, 11, 12, 14, 15, 16, 17, 18, 19, 20, 22, 23):
+                return False
+        return SQLiteStrategyAPI._is_execution_session(as_of)
 
     @staticmethod
     def _tick_price_or_none(tick: Mapping[str, object]):
