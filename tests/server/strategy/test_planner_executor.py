@@ -31,6 +31,7 @@ from bullet_trade.server.strategy import (
     price_to_units,
 )
 from bullet_trade.server.strategy.domain import BrokerFill, IntentState, SHANGHAI_TZ
+from bullet_trade.server.strategy.repository import RepositoryError
 from bullet_trade.server.strategy.schema import connect_database
 
 
@@ -112,6 +113,31 @@ def test_weight_target_creates_one_lot_rounded_buy_and_reserves_cash(tmp_path):
         assert row[0] == OrderState.PENDING_SUBMIT.value
     finally:
         connection.close()
+
+
+def test_planning_uses_own_latest_reconciliation_not_another_strategy(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    connection = connect_database(database)
+    try:
+        later = (as_of + timedelta(seconds=1)).isoformat()
+        connection.execute(
+            """
+            INSERT INTO reconciliation_runs(
+                reconciliation_id, physical_account_id, strategy_account_id,
+                state, broker_as_of, details_json, started_at, completed_at
+            ) VALUES (?, ?, ?, 'BLOCKED', ?, '{}', ?, ?)
+            """,
+            ("other-run", PHYSICAL, "other-strategy", later, later, later),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = planner.submit_target_weights(
+        ACCOUNT, "own-ready-run", {A: 0.5}, snapshot, marks, as_of
+    )
+
+    assert len(result.orders) == 1
 
 
 def test_cash_buffer_does_not_shrink_weight_target(tmp_path):
@@ -330,6 +356,42 @@ def test_sell_phase_uses_market_override_before_conditional_buy(tmp_path):
     assert follow_up.orders[0].security == A
     assert follow_up.orders[0].execution_type is ExecutionType.MARKET
     assert follow_up.orders[0].limit_price_units is None
+
+
+def test_dispatch_attachment_error_keeps_original_error_and_done_outbox(
+    tmp_path, monkeypatch
+):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planner.submit_target_weights(
+        ACCOUNT, "dispatch-attach-error", {A: "0.5"}, snapshot, marks, as_of
+    )
+
+    async def submit(_):
+        return {"order_id": "broker-accepted"}
+
+    def fail_attachment(*_args):
+        raise RepositoryError("injected attachment failure")
+
+    monkeypatch.setattr(planner._booking, "mark_order_submitted", fail_attachment)
+
+    with pytest.raises(
+        TargetPlanningError,
+        match="ledger attachment failed.*injected attachment failure",
+    ):
+        asyncio.run(planner.dispatch_next(submit))
+
+    connection = connect_database(database)
+    try:
+        operation = connection.execute(
+            "SELECT state FROM strategy_operations"
+        ).fetchone()[0]
+        outbox = connection.execute("SELECT state FROM outbox").fetchone()[0]
+        order = connection.execute("SELECT state FROM strategy_orders").fetchone()[0]
+    finally:
+        connection.close()
+    assert operation == "COMPLETED"
+    assert outbox == "DONE"
+    assert order == OrderState.PENDING_SUBMIT.value
 
 
 def test_global_switch_and_tplus1_both_block_new_buy(tmp_path):

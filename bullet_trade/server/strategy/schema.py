@@ -463,6 +463,83 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    Migration(
+        9,
+        "broker_identifiers_are_trading_day_scoped",
+        (
+            "DROP INDEX idx_strategy_orders_broker_id",
+            (
+                "CREATE INDEX idx_strategy_orders_broker_id_day "
+                "ON strategy_orders(trading_day, broker_order_id) "
+                "WHERE broker_order_id IS NOT NULL"
+            ),
+            "DROP INDEX idx_fills_broker_trade_id",
+            (
+                "CREATE INDEX idx_fills_broker_trade_id_day "
+                "ON fills(substr(traded_at, 1, 10), broker_trade_id) "
+                "WHERE broker_trade_id IS NOT NULL"
+            ),
+            "ALTER TABLE reconciliation_runs ADD COLUMN strategy_account_id TEXT",
+            (
+                "CREATE INDEX idx_reconciliation_strategy_started "
+                "ON reconciliation_runs(strategy_account_id, started_at)"
+            ),
+            "DROP INDEX idx_broker_order_history_last_seen",
+            "ALTER TABLE broker_order_history RENAME TO broker_order_history_v5",
+            """
+            CREATE TABLE broker_order_history (
+                account_key TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (account_key, trading_day, broker_order_id)
+            )
+            """,
+            """
+            INSERT INTO broker_order_history(
+                account_key, trading_day, broker_order_id, payload_json,
+                first_seen_at, last_seen_at
+            )
+            SELECT account_key, substr(first_seen_at, 1, 10), broker_order_id,
+                   payload_json, first_seen_at, last_seen_at
+            FROM broker_order_history_v5
+            """,
+            "DROP TABLE broker_order_history_v5",
+            (
+                "CREATE INDEX idx_broker_order_history_last_seen "
+                "ON broker_order_history(account_key, last_seen_at)"
+            ),
+            "DROP INDEX idx_broker_trade_history_last_seen",
+            "ALTER TABLE broker_trade_history RENAME TO broker_trade_history_v5",
+            """
+            CREATE TABLE broker_trade_history (
+                account_key TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                broker_trade_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (account_key, trading_day, broker_trade_id)
+            )
+            """,
+            """
+            INSERT INTO broker_trade_history(
+                account_key, trading_day, broker_trade_id, payload_json,
+                first_seen_at, last_seen_at
+            )
+            SELECT account_key, substr(first_seen_at, 1, 10), broker_trade_id,
+                   payload_json, first_seen_at, last_seen_at
+            FROM broker_trade_history_v5
+            """,
+            "DROP TABLE broker_trade_history_v5",
+            (
+                "CREATE INDEX idx_broker_trade_history_last_seen "
+                "ON broker_trade_history(account_key, last_seen_at)"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

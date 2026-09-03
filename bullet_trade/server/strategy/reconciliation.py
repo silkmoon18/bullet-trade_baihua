@@ -17,6 +17,7 @@ from .broker_contract import (
     normalize_trade_evidence,
     require_strategy_ledger_v1,
 )
+from .broker_history import broker_trading_day
 from .domain import (
     SHANGHAI_TZ,
     AccountStatus,
@@ -327,7 +328,7 @@ class SQLiteReconciliationService:
         ignored_broker_order_count = 0
         ignored_broker_trade_count = 0
         (
-            orders_by_broker_id,
+            orders_by_broker_key,
             orders_by_client_tag,
             all_orders_by_client_tag,
         ) = self._local_orders(account_id)
@@ -344,15 +345,19 @@ class SQLiteReconciliationService:
                 else:
                     ignored_broker_order_count += 1
                 continue
-            broker_orders[broker_order_id] = row
+            trading_day = broker_trading_day(row, "order", snapshot.as_of)
+            broker_key = (trading_day, broker_order_id)
+            broker_orders[broker_key] = row
             order_sysid = _broker_identifier(
                 row.get("order_sysid") or row.get("sysid")
             )
             if order_sysid:
-                broker_order_ids_by_sysid.setdefault(order_sysid, set()).add(
-                    broker_order_id
+                broker_order_ids_by_sysid.setdefault(
+                    (trading_day, order_sysid), set()
+                ).add(
+                    broker_key
                 )
-            local = orders_by_broker_id.get(broker_order_id)
+            local = orders_by_broker_key.get(broker_key)
             if local is None:
                 matches = {
                     orders_by_client_tag[token]["order_id"]: orders_by_client_tag[token]
@@ -370,7 +375,8 @@ class SQLiteReconciliationService:
                         local = dict(local)
                         local["broker_order_id"] = broker_order_id
                         local["state"] = adopted.state.value
-                        orders_by_broker_id[broker_order_id] = local
+                        broker_key = (local["trading_day"], broker_order_id)
+                        orders_by_broker_key[broker_key] = local
                         adopted_order_ids.append(local["order_id"])
                     except (RepositoryError, ValueError) as exc:
                         blockers.append(
@@ -393,19 +399,22 @@ class SQLiteReconciliationService:
             key=lambda row: _text(row.get("time") or row.get("trade_time")),
         ):
             broker_order_id = _broker_identifier(trade.get("order_id"))
-            local = orders_by_broker_id.get(broker_order_id)
+            trading_day = broker_trading_day(trade, "trade", snapshot.as_of)
+            broker_key = (trading_day, broker_order_id)
+            local = orders_by_broker_key.get(broker_key)
             if local is None:
                 trade_sysid = _broker_identifier(
                     trade.get("order_sysid") or trade.get("sysid")
                 )
-                matching_order_ids = broker_order_ids_by_sysid.get(
-                    trade_sysid, set()
+                matching_order_keys = broker_order_ids_by_sysid.get(
+                    (trading_day, trade_sysid), set()
                 )
-                if len(matching_order_ids) == 1:
-                    candidate_id = next(iter(matching_order_ids))
-                    candidate = orders_by_broker_id.get(candidate_id)
+                if len(matching_order_keys) == 1:
+                    candidate_key = next(iter(matching_order_keys))
+                    candidate = orders_by_broker_key.get(candidate_key)
                     if candidate is not None:
-                        broker_order_id = candidate_id
+                        broker_key = candidate_key
+                        broker_order_id = candidate_key[1]
                         local = candidate
             remark = _text(trade.get("order_remark") or trade.get("remark"))
             if local is None and remark:
@@ -415,16 +424,19 @@ class SQLiteReconciliationService:
                     ]
                     for token in (item.strip() for item in remark.split("|"))
                     if token in all_orders_by_client_tag
-                    and _broker_identifier(
-                        all_orders_by_client_tag[token].get("broker_order_id")
-                    )
-                    in broker_orders
+                    and (
+                        all_orders_by_client_tag[token].get("trading_day"),
+                        _broker_identifier(
+                            all_orders_by_client_tag[token].get("broker_order_id")
+                        ),
+                    ) in broker_orders
                 }
                 if len(matches) == 1:
                     candidate = next(iter(matches.values()))
                     broker_order_id = _broker_identifier(
                         candidate.get("broker_order_id")
                     )
+                    broker_key = (candidate.get("trading_day"), broker_order_id)
                     local = candidate
             if local is None:
                 if self._remark_matches(remark, all_orders_by_client_tag):
@@ -437,13 +449,21 @@ class SQLiteReconciliationService:
             try:
                 linked_trade = dict(trade)
                 linked_trade["order_id"] = broker_order_id
+                matching_broker_order = broker_orders.get(broker_key)
                 evidence = normalize_trade_evidence(
                     linked_trade,
-                    broker_orders,
+                    (
+                        {broker_order_id: matching_broker_order}
+                        if matching_broker_order is not None
+                        else {}
+                    ),
                     self.unpriced_fill_policy,
                 )
+                fill_scope = evidence.traded_at.date().isoformat()
                 fill = BrokerFill(
-                    fill_id="broker:{}".format(evidence.broker_trade_id),
+                    fill_id="broker:{}:{}".format(
+                        fill_scope, evidence.broker_trade_id
+                    ),
                     broker_trade_id=evidence.broker_trade_id,
                     order_id=local["order_id"],
                     fingerprint=_fingerprint(evidence),
@@ -477,8 +497,9 @@ class SQLiteReconciliationService:
                     )
                 )
 
-        for broker_order_id, row in broker_orders.items():
-            local = orders_by_broker_id.get(broker_order_id)
+        for broker_key, row in broker_orders.items():
+            broker_order_id = broker_key[1]
+            local = orders_by_broker_key.get(broker_key)
             terminal = _order_state(row.get("status"))
             if local is None or terminal is None:
                 continue
@@ -493,18 +514,18 @@ class SQLiteReconciliationService:
             except RepositoryError as exc:
                 blockers.append("order_error:{}:{}".format(broker_order_id, str(exc)))
 
-        current_broker_ids = {
-            broker_order_id
-            for broker_order_id, row in broker_orders.items()
+        current_broker_keys = {
+            broker_key
+            for broker_key, row in broker_orders.items()
             if row.get("_broker_history_only") is not True
         }
-        for broker_order_id, local in orders_by_broker_id.items():
+        for broker_key, local in orders_by_broker_key.items():
             if local["state"] in (
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIALLY_FILLED.value,
                 OrderState.SUBMIT_UNKNOWN.value,
-            ) and broker_order_id not in current_broker_ids:
-                blockers.append("missing_working_order:{}".format(broker_order_id))
+            ) and broker_key not in current_broker_keys:
+                blockers.append("missing_working_order:{}".format(broker_key[1]))
 
         required_cash, owned_positions, frozen_sell_qty = self._ledger_view(
             account_id, physical_account_id, snapshot.as_of
@@ -569,17 +590,31 @@ class SQLiteReconciliationService:
             snapshot.as_of,
         )
 
-    def latest(self, physical_account_id: str) -> Optional[ReconciliationResult]:
+    def latest(
+        self,
+        physical_account_id: str,
+        strategy_account_id: Optional[str] = None,
+    ) -> Optional[ReconciliationResult]:
         connection = connect_database(self.database_path)
         try:
-            row = connection.execute(
-                """
-                SELECT * FROM reconciliation_runs
-                WHERE physical_account_id = ?
-                ORDER BY started_at DESC LIMIT 1
-                """,
-                (physical_account_id,),
-            ).fetchone()
+            if strategy_account_id is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM reconciliation_runs
+                    WHERE physical_account_id = ?
+                    ORDER BY started_at DESC LIMIT 1
+                    """,
+                    (physical_account_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT * FROM reconciliation_runs
+                    WHERE physical_account_id = ? AND strategy_account_id = ?
+                    ORDER BY started_at DESC LIMIT 1
+                    """,
+                    (physical_account_id, strategy_account_id),
+                ).fetchone()
             if row is None:
                 return None
             return ReconciliationResult(
@@ -600,8 +635,8 @@ class SQLiteReconciliationService:
                 (account_id,),
             ).fetchall()
             local_orders = [dict(row) for row in rows]
-            by_broker_id = {
-                row["broker_order_id"]: row
+            by_broker_key = {
+                (row["trading_day"], row["broker_order_id"]): row
                 for row in local_orders
                 if row["broker_order_id"]
             }
@@ -619,7 +654,7 @@ class SQLiteReconciliationService:
                 for row in local_orders
                 if row["client_tag"]
             }
-            return by_broker_id, by_client_tag, all_by_client_tag
+            return by_broker_key, by_client_tag, all_by_client_tag
         finally:
             connection.close()
 
@@ -754,13 +789,14 @@ class SQLiteReconciliationService:
             connection.execute(
                 """
                 INSERT INTO reconciliation_runs(
-                    reconciliation_id, physical_account_id, state, broker_as_of,
-                    details_json, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    reconciliation_id, physical_account_id, strategy_account_id,
+                    state, broker_as_of, details_json, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reconciliation_id,
                     physical_account_id,
+                    account_id,
                     state.value,
                     broker_as_of.isoformat(),
                     details_json,

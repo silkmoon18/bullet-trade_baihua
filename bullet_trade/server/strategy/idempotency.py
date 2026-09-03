@@ -258,7 +258,9 @@ class SQLiteOperationRepository:
         finally:
             connection.close()
 
-    def claim_next(self) -> Optional[OutboxClaim]:
+    def claim_next(
+        self, strategy_account_id: Optional[str] = None
+    ) -> Optional[OutboxClaim]:
         """Atomically claim the oldest dispatchable outbox row.
 
         Single-process claim: the ``BEGIN IMMEDIATE`` transaction holds the
@@ -277,10 +279,11 @@ class SQLiteOperationRepository:
                 WHERE op.state = 'PENDING'
                   AND o.state = 'PENDING'
                   AND o.available_at <= ?
+                  AND (? IS NULL OR o.strategy_account_id = ?)
                 ORDER BY o.outbox_id
                 LIMIT 1
                 """,
-                (now_text,),
+                (now_text, strategy_account_id, strategy_account_id),
             ).fetchone()
             if row is None:
                 connection.commit()

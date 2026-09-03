@@ -213,6 +213,35 @@ def test_later_known_fee_does_not_conflict_with_booked_unknown_fill(services):
     assert repository.replay_account("good-etf") == first.account
 
 
+def test_scoped_fill_id_replays_legacy_fill_without_conflict(services):
+    _, capital, booking = services
+    booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "buy-1")
+    legacy = _fill(
+        "broker:T-1",
+        "buy-1",
+        OrderSide.BUY,
+        1000,
+        broker_trade_id="T-1",
+    )
+    current = replace(legacy, fill_id="broker:2026-08-10:T-1")
+
+    booking.book_fill(
+        "good-etf",
+        legacy,
+        1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    replay = booking.book_fill(
+        "good-etf",
+        current,
+        0,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    assert replay.duplicate is True
+
+
 def test_sell_consumes_t1_lot_and_returns_real_proceeds(services):
     _, capital, booking = services
     booking.register_order(_order("buy-1", OrderSide.BUY, 1000))

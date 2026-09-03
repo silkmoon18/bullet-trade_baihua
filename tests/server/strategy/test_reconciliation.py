@@ -139,6 +139,28 @@ def test_matching_empty_account_is_ready(tmp_path):
     assert reconciliation.latest(PHYSICAL_ID) == result
 
 
+def test_latest_reconciliation_is_scoped_to_strategy_account(tmp_path):
+    _, _, capital, reconciliation = _services(tmp_path)
+    capital.ensure_strategy_account(
+        "other-strategy",
+        "other_strategy",
+        PHYSICAL_ID,
+        money_to_units("1000"),
+    )
+    blocked = reconciliation.synchronize(
+        ACCOUNT_ID, PHYSICAL_ID, _snapshot("0")
+    )
+    ready = reconciliation.synchronize(
+        "other-strategy", PHYSICAL_ID, _snapshot("20000")
+    )
+
+    assert blocked.state is ReconciliationState.BLOCKED
+    assert ready.state is ReconciliationState.READY
+    assert reconciliation.latest(PHYSICAL_ID) == ready
+    assert reconciliation.latest(PHYSICAL_ID, ACCOUNT_ID) == blocked
+    assert reconciliation.latest(PHYSICAL_ID, "other-strategy") == ready
+
+
 def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     database, repository, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)
@@ -160,6 +182,78 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert second.details["booked_trade_ids"] == ()
     account = repository.get_strategy_account(ACCOUNT_ID)
     assert account.cash_units == money_to_units("7995")
+
+
+def test_qmt_order_and_trade_ids_can_be_reused_on_a_later_trading_day(tmp_path):
+    database, _, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    first = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "17995",
+            positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),),
+            trades=(_broker_trade(),),
+        ),
+    )
+    assert first.state is ReconciliationState.READY
+
+    sell = replace(
+        _order("sell-2", "broker-buy-1"),
+        client_tag="bt:test:sell-2",
+        broker_order_id=None,
+        side=OrderSide.SELL,
+        state=OrderState.PENDING_SUBMIT,
+        trading_day=date(2026, 8, 12),
+    )
+    booking.register_order(sell)
+    broker_order = dict(
+        _broker_order(),
+        side="SELL",
+        is_buy=False,
+        order_remark=sell.client_tag,
+        order_time="2026-08-12 09:30:00",
+    )
+    broker_trade = dict(
+        _broker_trade(),
+        side="SELL",
+        price=2.1,
+        commission_fee=5.0,
+        time="2026-08-12 09:30:01",
+    )
+
+    second = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot(
+            "20090",
+            orders=(broker_order,),
+            trades=(broker_trade,),
+            day=date(2026, 8, 12),
+        ),
+    )
+
+    assert second.state is ReconciliationState.READY
+    assert second.details["adopted_order_ids"] == (sell.order_id,)
+    connection = connect_database(database)
+    try:
+        assert connection.execute(
+            "SELECT total_qty FROM positions WHERE strategy_account_id = ? "
+            "AND security = ?",
+            (ACCOUNT_ID, SECURITY),
+        ).fetchone()[0] == 0
+        fills = connection.execute(
+            "SELECT traded_at, broker_trade_id FROM fills ORDER BY traded_at"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [(row["traded_at"][:10], row["broker_trade_id"]) for row in fills] == [
+        ("2026-08-11", "trade-1"),
+        ("2026-08-12", "trade-1"),
+    ]
 
 
 def test_zero_order_id_trade_is_relinked_by_strategy_client_tag(tmp_path):

@@ -761,14 +761,21 @@ class SQLiteFillBookingService:
               ON e.strategy_account_id = o.strategy_account_id
              AND e.reference_type = 'order' AND e.reference_id = f.order_id
              AND json_extract(e.payload_json, '$.fill_id') = f.fill_id
-            WHERE f.fill_fingerprint = ? OR f.broker_trade_id = ?
+            WHERE f.fill_fingerprint = ?
+               OR (
+                    f.broker_trade_id = ?
+                    AND substr(f.traded_at, 1, 10) = ?
+               )
             """,
-            (fill.fingerprint, fill.broker_trade_id),
+            (
+                fill.fingerprint,
+                fill.broker_trade_id,
+                fill.traded_at.date().isoformat(),
+            ),
         ).fetchone()
         if row is None:
             return None
         expected = (
-            fill.fill_id,
             fill.order_id,
             fill.broker_trade_id,
             fill.security,
@@ -782,7 +789,7 @@ class SQLiteFillBookingService:
         actual = tuple(
             row[name]
             for name in (
-                "fill_id", "order_id", "broker_trade_id", "security", "side",
+                "order_id", "broker_trade_id", "security", "side",
                 "quantity", "price_units", "traded_at",
                 "price_source", "price_known",
             )

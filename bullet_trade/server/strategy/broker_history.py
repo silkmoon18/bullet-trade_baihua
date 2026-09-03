@@ -45,6 +45,86 @@ def _payload_json(payload: Mapping[str, object]) -> str:
     )
 
 
+def broker_trading_day(
+    payload: Mapping[str, object],
+    kind: str,
+    fallback: Optional[datetime] = None,
+) -> Optional[str]:
+    """Return the exchange trading day used to scope reusable QMT ids."""
+
+    explicit = str(payload.get("_broker_trading_day") or "").strip()
+    if explicit:
+        try:
+            return datetime.strptime(explicit[:10], "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+    keys = (
+        ("time", "trade_time", "traded_time")
+        if kind == "trade"
+        else ("order_time", "time", "add_time")
+    )
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        parsed = _event_datetime(value)
+        if parsed is not None:
+            return as_shanghai_time(parsed).date().isoformat()
+    if fallback is None:
+        return None
+    return as_shanghai_time(fallback).date().isoformat()
+
+
+def _event_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif type(value) in (int, float):
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000
+        if number < 946_684_800:
+            return None
+        try:
+            parsed = datetime.fromtimestamp(number, tz=SHANGHAI_TZ)
+        except (OSError, OverflowError, ValueError):
+            return None
+    elif type(value) is str:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            number = int(text)
+            if len(text) in (13, 16):
+                number //= 1000 if len(text) == 13 else 1_000_000
+            if number >= 946_684_800 and len(str(number)) == 10:
+                try:
+                    return datetime.fromtimestamp(number, tz=SHANGHAI_TZ)
+                except (OSError, OverflowError, ValueError):
+                    return None
+        parsed = None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            for pattern in (
+                "%Y%m%d%H%M%S",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y%m%d",
+                "%Y-%m-%d",
+            ):
+                try:
+                    parsed = datetime.strptime(text, pattern)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return parsed
+
+
 def _merge_payload(
     previous: Mapping[str, object], current: Mapping[str, object]
 ) -> Mapping[str, object]:
@@ -186,17 +266,21 @@ class SQLiteBrokerHistoryStore:
         broker_id = str(payload.get(payload_id_key) or "").strip()
         if not account or not broker_id:
             return False
-        timestamp = as_shanghai_time(
-            observed_at or datetime.now(SHANGHAI_TZ)
-        ).isoformat()
+        observed = as_shanghai_time(observed_at or datetime.now(SHANGHAI_TZ))
+        timestamp = observed.isoformat()
+        kind = "trade" if table == "broker_trade_history" else "order"
+        trading_day = broker_trading_day(payload, kind, observed)
+        if trading_day is None:
+            return False
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT payload_json FROM {} WHERE account_key = ? AND {} = ?".format(
+                "SELECT payload_json FROM {} WHERE account_key = ? "
+                "AND trading_day = ? AND {} = ?".format(
                     table, id_column
                 ),
-                (account, broker_id),
+                (account, trading_day, broker_id),
             ).fetchone()
             merged = dict(payload)
             if existing is not None:
@@ -205,14 +289,21 @@ class SQLiteBrokerHistoryStore:
             connection.execute(
                 """
                 INSERT INTO {table}(
-                    account_key, {id_column}, payload_json,
+                    account_key, trading_day, {id_column}, payload_json,
                     first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(account_key, {id_column}) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_key, trading_day, {id_column}) DO UPDATE SET
                     payload_json = excluded.payload_json,
                     last_seen_at = excluded.last_seen_at
                 """.format(table=table, id_column=id_column),
-                (account, broker_id, _payload_json(merged), timestamp, timestamp),
+                (
+                    account,
+                    trading_day,
+                    broker_id,
+                    _payload_json(merged),
+                    timestamp,
+                    timestamp,
+                ),
             )
             connection.commit()
             return True
@@ -228,12 +319,26 @@ class SQLiteBrokerHistoryStore:
         connection = connect_database(self.database_path)
         try:
             rows = connection.execute(
-                "SELECT payload_json FROM {} WHERE account_key = ? ORDER BY first_seen_at".format(
+                "SELECT trading_day, payload_json FROM {} "
+                "WHERE account_key = ? ORDER BY trading_day, first_seen_at".format(
                     table
                 ),
                 (account_key,),
             ).fetchall()
-            return tuple(json.loads(cast(str, row["payload_json"])) for row in rows)
+            result = []
+            kind = "trade" if table == "broker_trade_history" else "order"
+            for row in rows:
+                payload = json.loads(cast(str, row["payload_json"]))
+                stored_day = str(row["trading_day"])
+                payload_day = broker_trading_day(payload, kind)
+                # The v5 cache keyed only by the numeric broker id. If QMT
+                # reused that id, its last payload overwrote the older day.
+                # Do not expose such a falsely dated migrated observation.
+                if payload_day is not None and payload_day != stored_day:
+                    continue
+                payload["_broker_trading_day"] = stored_day
+                result.append(payload)
+            return tuple(result)
         except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
             raise BrokerHistoryError("failed to read broker history") from exc
         finally:
@@ -247,6 +352,7 @@ def merge_broker_rows(
 ) -> list[Mapping[str, object]]:
     """Return durable history with the newest current observation winning."""
 
+    kind = "trade" if id_key == "trade_id" else "order"
     merged = {}
     for row in history:
         broker_id = str(row.get(id_key) or "").strip()
@@ -254,10 +360,20 @@ def merge_broker_rows(
             continue
         historical = dict(row)
         historical["_broker_history_only"] = True
-        merged[broker_id] = historical
+        day = broker_trading_day(historical, kind)
+        merged[(day, broker_id)] = historical
     for row in current:
         broker_id = str(row.get(id_key) or "").strip()
-        if broker_id:
-            merged[broker_id] = dict(_merge_payload(merged.get(broker_id, {}), row))
-            merged[broker_id]["_broker_history_only"] = False
+        if not broker_id:
+            continue
+        day = broker_trading_day(row, kind)
+        if day is None:
+            candidates = [key for key in merged if key[1] == broker_id]
+            key = candidates[0] if len(candidates) == 1 else (None, broker_id)
+        else:
+            key = (day, broker_id)
+        merged[key] = dict(_merge_payload(merged.get(key, {}), row))
+        if day is not None:
+            merged[key]["_broker_trading_day"] = day
+        merged[key]["_broker_history_only"] = False
     return list(merged.values())

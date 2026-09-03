@@ -138,6 +138,7 @@ class SQLiteStrategyAPI:
         self._seen_tick_symbols = set()
         self._rejected_tick_symbols = set()
         self._resume_locks = {}
+        self._dispatch_lock = asyncio.Lock()
         self._background_tasks = set()
         self.repository = SQLiteStrategyRepository(self.database_path)
         self.repository.initialize()
@@ -329,11 +330,7 @@ class SQLiteStrategyAPI:
                 account_context, dict(order_payload)
             )
 
-        while True:
-            dispatch = await self.planner.dispatch_next(submitter)
-            if dispatch is None:
-                break
-            dispatched.append(dispatch)
+        dispatched.extend(await self._dispatch_pending(submitter, strategy_id))
 
         # Pick up immediate fills/rejections and make the returned view real.
         refreshed, reconciliation, _ = await self._refresh(
@@ -354,7 +351,8 @@ class SQLiteStrategyAPI:
         connection = connect_database(self.database_path)
         try:
             rows = connection.execute(
-                "SELECT strategy_account_id FROM strategy_accounts WHERE physical_account_id = ?",
+                "SELECT strategy_account_id, strategy_id FROM strategy_accounts "
+                "WHERE physical_account_id = ?",
                 (physical_id,),
             ).fetchall()
         finally:
@@ -362,19 +360,31 @@ class SQLiteStrategyAPI:
         if not rows:
             self.startup_ready = False
             return False
-        strategy_ids = tuple(str(row[0]) for row in rows)
-        for strategy_id in strategy_ids:
-            self._bind_runtime(strategy_id, account_context, account_key)
+        account_ids = tuple(str(row["strategy_account_id"]) for row in rows)
+        for strategy_account_id in account_ids:
+            self._bind_runtime(strategy_account_id, account_context, account_key)
+        reconcile_ids = tuple(
+            str(row["strategy_account_id"])
+            for row in rows
+            if not self.config.trading_enabled
+            or str(row["strategy_id"]) in self.config.enabled_strategy_ids
+        )
+        if not reconcile_ids:
+            self.startup_ready = False
+            return False
         snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
         )
         results = tuple(
             self._synchronize(strategy_id, physical_id, snapshot)
-            for strategy_id in strategy_ids
+            for strategy_id in reconcile_ids
         )
         self.startup_ready = all(
             result.state.value == "READY" for result in results
         )
+        if self.startup_ready:
+            for strategy_id in reconcile_ids:
+                await self._sync_quote_subscriptions(strategy_id)
         return self.startup_ready
 
     def get_intent(self, payload: Mapping[str, object]) -> Dict[str, object]:
@@ -669,7 +679,7 @@ class SQLiteStrategyAPI:
         return snapshot, reconciliation, marks
 
     def _synchronize(self, strategy_id, physical_id, broker_snapshot):
-        previous = self.reconciliation.latest(physical_id)
+        previous = self.reconciliation.latest(physical_id, strategy_id)
         result = self.reconciliation.synchronize(
             strategy_id, physical_id, broker_snapshot
         )
@@ -921,6 +931,7 @@ class SQLiteStrategyAPI:
                 not _uses_conditional_execution(intent.execution_request)
                 or security not in self.planner.reference_prices(intent.intent_id)
                 or intent.account_id not in self._runtime_bindings
+                or not self._strategy_reconciliation_enabled(intent.account_id)
             ):
                 continue
             if not self.planner.quote_triggers_intent(
@@ -941,6 +952,7 @@ class SQLiteStrategyAPI:
             strategy_id
             for strategy_id, (_, key) in self._runtime_bindings.items()
             if key == account_key
+            and self._strategy_reconciliation_enabled(strategy_id)
         ]
         for strategy_id in strategy_ids:
             lock = self._resume_locks[strategy_id]
@@ -1019,18 +1031,30 @@ class SQLiteStrategyAPI:
             now,
             quotes=execution_quotes,
         )
-        if not advance.orders:
-            await self._sync_quote_subscriptions(intent.account_id)
-            return
-
         async def submitter(order_payload: Mapping[str, object]):
             return await cast(Any, self.broker).place_order(
                 binding[0], dict(order_payload)
             )
 
-        while await self.planner.dispatch_next(submitter) is not None:
-            pass
+        await self._dispatch_pending(submitter, intent.account_id)
         await self._sync_quote_subscriptions(intent.account_id)
+
+    async def _dispatch_pending(self, submitter, strategy_account_id: str):
+        dispatched = []
+        async with self._dispatch_lock:
+            while True:
+                dispatch = await self.planner.dispatch_next(
+                    submitter, strategy_account_id
+                )
+                if dispatch is None:
+                    break
+                dispatched.append(dispatch)
+        return tuple(dispatched)
+
+    def _strategy_reconciliation_enabled(self, strategy_account_id: str) -> bool:
+        if not self.config.trading_enabled:
+            return True
+        return strategy_account_id in self.config.enabled_strategy_ids
 
     async def _sync_quote_subscriptions(self, strategy_id: str) -> None:
         symbols = set()

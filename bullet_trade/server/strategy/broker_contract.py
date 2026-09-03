@@ -484,15 +484,16 @@ def normalize_trade_batch(
         if order_id:
             orders_by_id[order_id] = order
 
-    unique: Dict[str, BrokerTradeEvidence] = {}
+    unique: Dict[Tuple[object, str], BrokerTradeEvidence] = {}
     result = []
     for trade in trades:
         evidence = normalize_trade_evidence(trade, orders_by_id)
-        previous = unique.get(evidence.broker_trade_id)
+        identity = (evidence.traded_at.date(), evidence.broker_trade_id)
+        previous = unique.get(identity)
         if previous is not None:
             if previous != evidence:
                 raise BrokerContractError("duplicate broker trade id has conflicting data")
             continue
-        unique[evidence.broker_trade_id] = evidence
+        unique[identity] = evidence
         result.append(evidence)
     return tuple(result)

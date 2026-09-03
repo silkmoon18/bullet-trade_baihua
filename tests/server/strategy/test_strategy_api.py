@@ -13,9 +13,11 @@ from bullet_trade.server.strategy import (
     ConditionalLimitExecution,
     ExecutionRequest,
     LedgerInvariantError,
+    MarketMark,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
     money_to_units,
+    price_to_units,
     XTQUANT_DIRECT_CAPABILITIES,
     execution_request_to_wire,
 )
@@ -170,9 +172,11 @@ async def test_ensure_account_and_real_snapshot(api):
 
 
 @pytest.mark.asyncio
-async def test_startup_rebinds_every_strategy_on_same_physical_account(api):
+async def test_startup_rebinds_all_but_reconciles_only_enabled_strategy(
+    api, monkeypatch
+):
     service, _, account, _ = api
-    for strategy_id in ("old_strategy", "good_etf_remote"):
+    for strategy_id in ("old_strategy", "good_etf"):
         await service.ensure_account(
             account,
             "default",
@@ -180,12 +184,64 @@ async def test_startup_rebinds_every_strategy_on_same_physical_account(api):
         )
 
     service._runtime_bindings.clear()
+    reconciled = []
+    synchronize = service._synchronize
+
+    def record_synchronize(strategy_id, physical_id, snapshot):
+        reconciled.append(strategy_id)
+        return synchronize(strategy_id, physical_id, snapshot)
+
+    monkeypatch.setattr(service, "_synchronize", record_synchronize)
 
     assert await service.startup_check(account, "default") is True
     assert set(service._runtime_bindings) == {
         "old_strategy",
-        "good_etf_remote",
+        "good_etf",
     }
+    assert reconciled == ["good_etf"]
+
+
+@pytest.mark.asyncio
+async def test_resume_dispatches_existing_pending_outbox_without_new_order(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": 10_000},
+    )
+    as_of = datetime.now(SHANGHAI_TZ)
+    marks = {
+        SECURITY: MarketMark(
+            SECURITY,
+            price_to_units("10"),
+            as_of,
+            "test",
+        )
+    }
+    snapshot = service.valuation.create_snapshot(
+        "good_etf", marks, as_of, timedelta(minutes=5)
+    )
+    planned = service.planner.submit_target_weights(
+        "good_etf",
+        "pending-before-restart",
+        {SECURITY: "0.5"},
+        snapshot,
+        marks,
+        as_of,
+    )
+    assert len(planned.orders) == 1
+    assert broker.order_calls == 0
+
+    await asyncio.wait_for(
+        service._resume_intent_locked(planned.intent.intent_id), timeout=2
+    )
+
+    assert broker.order_calls == 1
+    connection = connect_database(service.database_path)
+    try:
+        assert connection.execute("SELECT state FROM outbox").fetchone()[0] == "DONE"
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio

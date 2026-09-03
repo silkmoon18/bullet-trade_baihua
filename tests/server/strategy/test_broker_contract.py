@@ -372,6 +372,25 @@ def test_duplicate_identical_trades_are_one_fill_but_conflicts_are_rejected():
         )
 
 
+def test_same_trade_id_on_different_trading_days_is_not_a_duplicate():
+    first = {
+        "trade_id": "T-REUSED",
+        "trade_id_source": "broker",
+        "order_id": "O-REUSED",
+        "security": "510050.XSHG",
+        "amount": 100,
+        "price": "2.50",
+        "side": "BUY",
+        "time": "2026-08-27 10:00:00",
+    }
+    second = dict(first, side="SELL", time="2026-09-03 10:00:00")
+
+    trades = normalize_trade_batch([first, second], [])
+
+    assert len(trades) == 2
+    assert [trade.side for trade in trades] == [OrderSide.BUY, OrderSide.SELL]
+
+
 def test_big_qmt_normalization_marks_native_ids_and_fee_presence():
     normalized = _normalize_trade(
         {

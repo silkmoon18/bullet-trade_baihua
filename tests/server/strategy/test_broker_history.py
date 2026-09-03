@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from bullet_trade.server.strategy.broker_history import (
@@ -5,6 +6,7 @@ from bullet_trade.server.strategy.broker_history import (
     merge_broker_rows,
 )
 from bullet_trade.server.strategy.domain import SHANGHAI_TZ
+from bullet_trade.server.strategy.schema import connect_database, migrate_database
 
 
 def test_broker_history_survives_reopen_and_updates_order_state(tmp_path):
@@ -140,3 +142,89 @@ def test_history_filters_and_current_rows_win_merge(tmp_path):
     assert by_id["O-1"]["_broker_history_only"] is False
     assert by_id["O-2"]["status"] == "filled"
     assert by_id["O-2"]["_broker_history_only"] is True
+
+
+def test_reused_qmt_ids_are_kept_separately_by_trading_day(tmp_path):
+    store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
+    store.record_order(
+        "default",
+        {
+            "order_id": "REUSED",
+            "security": "510050.XSHG",
+            "order_time": "2026-08-27 09:30:00",
+        },
+    )
+    store.record_order(
+        "default",
+        {
+            "order_id": "REUSED",
+            "security": "560490.XSHG",
+            "order_time": "2026-09-03 09:30:00",
+        },
+    )
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "REUSED-TRADE",
+            "order_id": "REUSED",
+            "security": "510050.XSHG",
+            "time": "2026-08-27 09:30:01",
+        },
+    )
+    store.record_trade(
+        "default",
+        {
+            "trade_id": "REUSED-TRADE",
+            "order_id": "REUSED",
+            "security": "560490.XSHG",
+            "time": "2026-09-03 09:30:01",
+        },
+    )
+
+    orders = store.list_orders("default")
+    trades = store.list_trades("default")
+
+    assert [(row["_broker_trading_day"], row["security"]) for row in orders] == [
+        ("2026-08-27", "510050.XSHG"),
+        ("2026-09-03", "560490.XSHG"),
+    ]
+    assert [(row["_broker_trading_day"], row["security"]) for row in trades] == [
+        ("2026-08-27", "510050.XSHG"),
+        ("2026-09-03", "560490.XSHG"),
+    ]
+
+
+def test_migration_hides_v5_row_overwritten_by_a_later_day(tmp_path):
+    database = tmp_path / "ledger.db"
+    migrate_database(database, target_version=8)
+    connection = connect_database(database)
+    try:
+        connection.execute(
+            """
+            INSERT INTO broker_order_history(
+                account_key, broker_order_id, payload_json,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "default",
+                "REUSED",
+                json.dumps(
+                    {
+                        "order_id": "REUSED",
+                        "security": "560490.XSHG",
+                        "order_time": "2026-09-03 09:30:00",
+                    }
+                ),
+                "2026-08-27T09:30:00+08:00",
+                "2026-09-03T09:30:00+08:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    migrate_database(database)
+
+    store = SQLiteBrokerHistoryStore(database)
+
+    assert store.list_orders("default") == ()

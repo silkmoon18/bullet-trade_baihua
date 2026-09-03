@@ -182,6 +182,31 @@ def test_concurrent_claims_have_a_single_winner(operation_repository):
     assert sum(item is not None for item in claims) == 1
 
 
+def test_claim_can_be_scoped_to_one_strategy_account(operation_repository):
+    ledger = SQLiteStrategyRepository(operation_repository.database_path)
+    ledger.create_strategy_account(
+        "other-strategy",
+        "other_strategy",
+        "qmt-main",
+        100_000_000,
+    )
+    first = _create(operation_repository, key="first")
+    other = operation_repository.create_operation(
+        "other-strategy",
+        "portfolio.submit",
+        "second",
+        {"targets": {"510300.XSHG": 200}},
+    )
+
+    claimed = operation_repository.claim_next("other-strategy")
+
+    assert claimed is not None
+    assert claimed.operation_id == other.operation.operation_id
+    remaining = operation_repository.claim_next("good-etf")
+    assert remaining is not None
+    assert remaining.operation_id == first.operation.operation_id
+
+
 def test_unknown_submission_is_not_requeued(operation_repository):
     _create(operation_repository)
     claim = operation_repository.claim_next()

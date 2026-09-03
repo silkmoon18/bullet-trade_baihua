@@ -424,8 +424,9 @@ class SQLiteTargetExecutionService:
     async def dispatch_next(
         self,
         submitter: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]],
+        strategy_account_id: Optional[str] = None,
     ) -> Optional[DispatchResult]:
-        claim = self._operations.claim_next()
+        claim = self._operations.claim_next(strategy_account_id)
         if claim is None:
             return None
         envelope = json.loads(claim.payload_json)
@@ -439,16 +440,39 @@ class SQLiteTargetExecutionService:
             broker_id = str(response.get("order_id") or response.get("broker_order_id") or "").strip()
             if not broker_id:
                 raise RuntimeError("broker response has no order id")
-            self._operations.finish_submission(claim.outbox_id, response)
-            self._booking.mark_order_submitted(account_id, claim.operation_id, broker_id)
-            return DispatchResult(claim.operation_id, broker_id, False)
         except BaseException as exc:
             error = "{}: {}".format(type(exc).__name__, str(exc))
-            self._operations.finish_submission(claim.outbox_id, {"error": error}, unknown=True)
-            self._booking.mark_order_submit_unknown(account_id, claim.operation_id, error)
+            try:
+                self._operations.finish_submission(
+                    claim.outbox_id, {"error": error}, unknown=True
+                )
+                self._booking.mark_order_submit_unknown(
+                    account_id, claim.operation_id, error
+                )
+            except Exception as recovery_exc:
+                raise TargetPlanningError(
+                    "broker submission failed and ledger recovery also failed: "
+                    "{}; recovery={}: {}".format(
+                        error,
+                        type(recovery_exc).__name__,
+                        str(recovery_exc),
+                    )
+                ) from recovery_exc
             if not isinstance(exc, Exception):
                 raise
             return DispatchResult(claim.operation_id, None, True, error)
+        try:
+            self._operations.finish_submission(claim.outbox_id, response)
+            self._booking.mark_order_submitted(
+                account_id, claim.operation_id, broker_id
+            )
+        except Exception as exc:
+            raise TargetPlanningError(
+                "broker accepted the order but ledger attachment failed: {}: {}".format(
+                    type(exc).__name__, str(exc)
+                )
+            ) from exc
+        return DispatchResult(claim.operation_id, broker_id, False)
 
     def get_intent(self, intent_id: str) -> PortfolioIntent:
         connection = connect_database(self.database_path)
@@ -1027,8 +1051,10 @@ class SQLiteTargetExecutionService:
         connection = connect_database(self.database_path)
         try:
             row = connection.execute(
-                "SELECT state, broker_as_of FROM reconciliation_runs WHERE physical_account_id = ? ORDER BY started_at DESC LIMIT 1",
-                (account.physical_account_id,),
+                "SELECT state, broker_as_of FROM reconciliation_runs "
+                "WHERE physical_account_id = ? AND strategy_account_id = ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (account.physical_account_id, account_id),
             ).fetchone()
         finally:
             connection.close()
