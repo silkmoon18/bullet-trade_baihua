@@ -63,6 +63,7 @@ class ServerConfig:
     order_risk_enabled: bool = False
     strategy_database_path: Optional[str] = None
     strategy_trading_enabled: bool = False
+    strategy_simulation_validation_enabled: bool = False
     strategy_enabled_ids: List[str] = field(default_factory=list)
     strategy_allow_buys: bool = True
     strategy_max_age_seconds: int = 300
@@ -364,6 +365,9 @@ def build_server_config(args) -> ServerConfig:
         order_risk_enabled=bool(order_risk_enabled),
         strategy_database_path=strategy_database_path,
         strategy_trading_enabled=get_env_bool("QMT_STRATEGY_TRADING_ENABLED", False),
+        strategy_simulation_validation_enabled=get_env_bool(
+            "QMT_STRATEGY_SIMULATION_VALIDATION_ENABLED", False
+        ),
         strategy_enabled_ids=list(dict.fromkeys(
             _split_items(get_env("QMT_STRATEGY_ENABLED_IDS"))
         )),

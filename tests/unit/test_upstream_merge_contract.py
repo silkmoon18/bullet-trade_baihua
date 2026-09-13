@@ -30,8 +30,10 @@ def test_remote_preserves_pre_broker_rejection(called):
 def test_fork_config_and_upstream_write_limit_coexist(monkeypatch):
     monkeypatch.setenv("QMT_STRATEGY_ENABLED_IDS", "one,two")
     monkeypatch.setenv("QMT_STRATEGY_TRADING_ENABLED", "false")
+    monkeypatch.setenv("QMT_STRATEGY_SIMULATION_VALIDATION_ENABLED", "true")
     monkeypatch.setenv("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES", "123")
     cfg = build_server_config(SimpleNamespace())
     assert cfg.strategy_enabled_ids == ["one", "two"]
     assert not cfg.strategy_trading_enabled
+    assert cfg.strategy_simulation_validation_enabled
     assert cfg.idempotency_max_entries == 123

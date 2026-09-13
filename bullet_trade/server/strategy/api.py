@@ -83,6 +83,7 @@ def _uses_quote_execution(
 class StrategyAPIConfig:
     database_path: DatabasePath
     trading_enabled: bool = False
+    simulation_validation_enabled: bool = False
     enabled_strategy_ids: Tuple[str, ...] = ()
     allow_buys: bool = True
     max_age: timedelta = timedelta(minutes=5)
@@ -165,7 +166,10 @@ class SQLiteStrategyAPI:
             self.database_path,
             capabilities,
             notification_handler,
-            require_verified_capabilities=config.trading_enabled,
+            require_verified_capabilities=(
+                config.trading_enabled
+                and not config.simulation_validation_enabled
+            ),
             durable_broker_history=durable_broker_history,
             unknown_fee_tolerance_units_per_order=config.buy_fee_buffer_units,
             unpriced_fill_policy=config.unpriced_fill_policy,

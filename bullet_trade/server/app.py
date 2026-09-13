@@ -188,6 +188,9 @@ class ServerApplication:
                 StrategyAPIConfig(
                     database_path=self.config.strategy_database_path,
                     trading_enabled=self.config.strategy_trading_enabled,
+                    simulation_validation_enabled=(
+                        self.config.strategy_simulation_validation_enabled
+                    ),
                     enabled_strategy_ids=tuple(self.config.strategy_enabled_ids),
                     allow_buys=self.config.strategy_allow_buys,
                     max_age=timedelta(seconds=self.config.strategy_max_age_seconds),
@@ -204,6 +207,14 @@ class ServerApplication:
                 self.feishu_notifier.queue_message if self.feishu_notifier else None,
                 durable_broker_history=durable_broker_history,
             )
+            if (
+                self.config.strategy_trading_enabled
+                and self.config.strategy_simulation_validation_enabled
+            ):
+                log.warning(
+                    "StrategyLedger 模拟账户验证模式已开启；能力证明门禁暂时关闭，"
+                    "仍仅允许策略白名单执行"
+                )
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
                 account_key = ctx.config.key or "default"
@@ -446,6 +457,9 @@ class ServerApplication:
             if isinstance(raw, dict)
             else False,
             "trading_enabled": self.config.strategy_trading_enabled,
+            "simulation_validation_enabled": (
+                self.config.strategy_simulation_validation_enabled
+            ),
             "enabled_strategy_ids": list(self.config.strategy_enabled_ids),
             "dashboard_read_only": True,
         }
@@ -1571,6 +1585,15 @@ class ServerApplication:
                 value["big_qmt_gateway"] = big_qmt_gateway
         if self.strategy_api is not None:
             value["strategy_ledger_ready"] = self.strategy_api.startup_ready
+            value["strategy_trading_enabled"] = (
+                self.config.strategy_trading_enabled
+            )
+            value["strategy_simulation_validation_enabled"] = (
+                self.config.strategy_simulation_validation_enabled
+            )
+            value["strategy_enabled_ids"] = list(
+                self.config.strategy_enabled_ids
+            )
         return {
             "dtype": "dict",
             "value": value,

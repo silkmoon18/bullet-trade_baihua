@@ -49,7 +49,13 @@ BIG_QMT_TRANSPORT=bridge
 BIG_QMT_BRIDGE_PORT=9001
 BIG_QMT_GATEWAY_PASSWORD=填写本机令牌
 QMT_STRATEGY_TRADING_ENABLED=false
+QMT_STRATEGY_SIMULATION_VALIDATION_ENABLED=false
 ```
+
+首次在已确认的模拟账户中直接使用真实策略信号验收时，可临时把
+`QMT_STRATEGY_SIMULATION_VALIDATION_ENABLED`设为`true`。它只跳过“必须先有能力证明”
+这一循环依赖，策略白名单、账本、对账、资金限制和幂等仍然生效。验证完成并写入实际
+能力证据后必须改回`false`；真实资金账户不得使用。
 
 保留原 `QMT_SERVER_TOKEN`、端口/公网访问限制、`QMT_ACCOUNT_ID`、账户 key、原 `QMT_STRATEGY_LEDGER_DB` 路径、通知和策略白名单。不要换一个空数据库或新策略 ID 来规避对账。
 

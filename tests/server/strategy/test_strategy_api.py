@@ -1622,3 +1622,35 @@ async def test_unverified_capabilities_block_when_trading_is_enabled(tmp_path):
     assert notifications[-1].event == "RECONCILIATION_BLOCKED"
     assert notifications[-1].strategy_id == "good_etf"
     assert "capability" in notifications[-1].detail
+
+
+@pytest.mark.asyncio
+async def test_simulation_validation_executes_without_preexisting_capability_evidence(
+    tmp_path,
+):
+    broker = FakeBroker()
+    notifications = []
+    service = SQLiteStrategyAPI(
+        StrategyAPIConfig(
+            tmp_path / "simulation-validation.db",
+            trading_enabled=True,
+            simulation_validation_enabled=True,
+            enabled_strategy_ids=("good_etf",),
+        ),
+        broker,
+        XTQUANT_DIRECT_CAPABILITIES,
+        FakeData(),
+        notifications.append,
+    )
+    account = AccountContext(AccountConfig("default", "qmt-account"))
+
+    result = await service.ensure_account(
+        account,
+        "default",
+        {"strategy_id": "good_etf", "initial_capital": "10000"},
+    )
+
+    assert result["reconciliation"]["state"] == "READY"
+    assert result["reconciliation"]["details"][
+        "capability_verification_required"
+    ] is False
