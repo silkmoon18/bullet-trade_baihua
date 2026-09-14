@@ -102,13 +102,22 @@ class QmtBridge:
                 and str(hello.get("account_id", "")) == self.account_id
                 and str(hello.get("account_type", "")).upper() == self.account_type
             )
-            if not valid or self.connected:
+            if not valid:
                 return
+            # QMT may restart the strategy while the server has not yet
+            # observed EOF on the previous local socket.  The authenticated
+            # replacement is the current QMT process and must be allowed to
+            # take over immediately; otherwise the restarted strategy can be
+            # rejected during the short stale-connection window.
+            if self.connected:
+                log.info("Replacing stale Big QMT bridge connection")
+                self._disconnect()
             self.writer, accepted = writer, True
             self.last_seen = time.monotonic()
             self.health = dict(hello.get("health") or {})
             writer.write(b'{"type":"welcome","version":1}\n')
             await writer.drain()
+            log.info("Big QMT bridge connected")
             self.emit("connected")
             while self.writer is writer:
                 raw = await asyncio.wait_for(reader.readline(), 10)

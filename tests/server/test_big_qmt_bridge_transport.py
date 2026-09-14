@@ -53,6 +53,39 @@ async def test_wrong_identity_not_accepted(overrides):
 
 
 @pytest.mark.asyncio
+async def test_authenticated_reconnect_replaces_stale_connection():
+    bridge = QmtBridge("test", "fake", "STOCK", port=0)
+    events = []
+    bridge.listeners.append(lambda *args: events.append(args))
+    await bridge.start()
+    try:
+        reader1, writer1, welcome1 = await connect(bridge)
+        assert json.loads(welcome1)["type"] == "welcome"
+
+        reader2, writer2, welcome2 = await connect(bridge)
+        assert json.loads(welcome2)["type"] == "welcome"
+        assert bridge.ready
+        assert await asyncio.wait_for(reader1.readline(), 1) == b""
+        assert events[-2:] == [
+            ("disconnected", None),
+            ("connected", None),
+        ]
+
+        request = asyncio.create_task(bridge.request("/account", {}))
+        command = json.loads(await reader2.readline())
+        writer2.write(json.dumps(dict(
+            type="response", id=command["id"], ok=True,
+            value={"available_cash": 100},
+        )).encode() + b"\n")
+        await writer2.drain()
+        assert await request == {"available_cash": 100}
+        writer1.close()
+        writer2.close()
+    finally:
+        await bridge.stop()
+
+
+@pytest.mark.asyncio
 async def test_lost_write_is_not_replayed_on_reconnect():
     bridge = QmtBridge("test", "fake", "STOCK", port=0)
     await bridge.start()
