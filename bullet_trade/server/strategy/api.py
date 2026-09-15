@@ -506,6 +506,7 @@ class SQLiteStrategyAPI:
         finally:
             connection.close()
         stored = json.loads(row[0]) if row is not None else {}
+        result["execution_wait"] = stored.get("execution_wait")
         result["weights"] = {
             security: value / NAV_SCALE
             for security, value in stored.get("weights_ppm", {}).items()

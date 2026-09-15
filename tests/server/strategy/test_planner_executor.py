@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -94,6 +95,19 @@ def _setup(tmp_path, as_of=None):
     )
     planner = SQLiteTargetExecutionService(database, config)
     return database, repository, capital, reconciliation, planner, snapshot, marks, as_of
+
+
+def _execution_wait(database, intent_id):
+    connection = connect_database(database)
+    try:
+        row = connection.execute(
+            "SELECT targets_json FROM portfolio_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return json.loads(row[0])["execution_wait"]
 
 
 def test_weight_target_creates_one_lot_rounded_buy_and_reserves_cash(tmp_path):
@@ -892,7 +906,25 @@ def test_follow_up_none_does_not_resubmit_terminal_remainder(tmp_path):
     )
 
     assert result.orders == ()
-    assert result.intent.state.value == "COMPLETED"
+    assert result.intent.state.value == "FAILED"
+    assert _execution_wait(database, first.intent.intent_id)["reason"] == (
+        "follow_up_disabled"
+    )
+
+
+def test_unaffordable_target_stays_executing_instead_of_completing(tmp_path):
+    database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    short = replace(snapshot, available_cash_units=money_to_units("100"))
+
+    result = planner.submit_target_weights(
+        ACCOUNT, "budget-short", {A: "0.5"}, short, marks, as_of
+    )
+
+    assert result.orders == ()
+    assert result.intent.state.value == "EXECUTING"
+    wait = _execution_wait(database, result.intent.intent_id)
+    assert wait["reason"] == "insufficient_cash"
+    assert wait["remaining_quantities"] == {A: result.intent.targets[A]}
 
 
 def test_daily_intent_expires_instead_of_carrying_to_next_day(tmp_path):

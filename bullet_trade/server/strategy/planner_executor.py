@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -13,6 +14,7 @@ from typing import Awaitable, Callable, Mapping, Optional, Tuple, Union, cast
 from uuid import uuid4
 
 from bullet_trade.core import pricing
+from ..feishu_notifier import TradeNotification
 
 from .capital import SQLiteCapitalService
 from .domain import (
@@ -50,6 +52,7 @@ from .valuation import MarketMark, PortfolioSnapshot
 
 DatabasePath = Union[str, Path]
 Weight = Union[str, int, float, Decimal]
+logger = logging.getLogger(__name__)
 _PRICE_CAGE_REJECTION_TOKENS = (
     "价格笼子",
     "有效申报价格",
@@ -323,6 +326,8 @@ class SQLiteTargetExecutionService:
         buys = []
         sell_pending = False
         waiting_for_trigger = False
+        remaining = {}
+        exhausted = set()
         original_references = {
             security: int(value)
             for security, value in intent_payload.get(
@@ -336,6 +341,8 @@ class SQLiteTargetExecutionService:
             delta = target - current
             if delta == 0:
                 continue
+            if abs(delta) >= self.config.lot_size or (delta < 0 and target == 0):
+                remaining[security] = delta
             side = OrderSide.SELL if delta < 0 else OrderSide.BUY
             if delta < 0:
                 sell_pending = True
@@ -354,6 +361,7 @@ class SQLiteTargetExecutionService:
                 intent.execution_request.follow_up is FollowUpPolicy.NONE
                 and self._order_count(intent.intent_id, security, side) > 0
             ):
+                exhausted.add(security)
                 continue
             mark = marks.get(security)
             if mark is None:
@@ -416,13 +424,35 @@ class SQLiteTargetExecutionService:
         selected = sells or self._affordable_buys(snapshot, buys)
         if not selected:
             if waiting_for_trigger or intent_working:
+                self._record_execution_wait(intent, None)
                 return IntentAdvanceResult(
                     self._set_state(intent_id, IntentState.EXECUTING),
                     (),
                     bool(intent_working),
                     waiting_for_trigger,
                 )
+            if remaining:
+                if set(remaining) <= exhausted:
+                    reason = "follow_up_disabled"
+                    description = "实际持仓未达目标；接口指定不追单，不再提交剩余数量。"
+                    state = IntentState.FAILED
+                else:
+                    state = IntentState.EXECUTING
+                    if not self.config.allow_buys:
+                        reason, description = "buys_disabled", "买入开关关闭，目标尚未达到。"
+                    elif buys and all(_trade_value(b[3], b[1]) < self.config.minimum_order_units for b in buys):
+                        reason, description = "minimum_order", "剩余目标金额小于最小下单金额。"
+                    else:
+                        reason = "insufficient_cash"
+                        description = "扣除现金缓冲及费用预留后，预算不足；保留原目标，当日资金变化后再执行。"
+                self._record_execution_wait(intent, {
+                    "reason": reason, "description": description,
+                    "remaining_quantities": remaining,
+                })
+                return IntentAdvanceResult(self._set_state(intent_id, state), (), False)
+            self._record_execution_wait(intent, None)
             return IntentAdvanceResult(self._set_state(intent_id, IntentState.COMPLETED), (), False)
+        self._record_execution_wait(intent, None)
         side = OrderSide.SELL if sells else OrderSide.BUY
         orders = tuple(
             self._enqueue(
@@ -751,6 +781,36 @@ class SQLiteTargetExecutionService:
                 )
                 available -= value + self.config.buy_fee_buffer_units
         return result
+
+    def _record_execution_wait(self, intent, details):
+        """Persist a changed incomplete-target reason without notification spam."""
+        payload = self._intent_payload(intent.intent_id)
+        if payload.get("execution_wait") == details:
+            return
+        if details is None:
+            payload.pop("execution_wait", None)
+        else:
+            payload["execution_wait"] = details
+        self._write_intent_payload(intent.intent_id, payload)
+        if details is None:
+            return
+        logger.warning("QMT组合目标未完成 | strategy_id=%s | reason=%s | %s | 剩余=%s",
+                       intent.account_id, details["reason"], details["description"],
+                       details["remaining_quantities"])
+        if self._booking._notification_handler is not None:
+            names = payload.get("security_names", {})
+            labels = ["{}({})".format(s, names.get(s) or "名称未知")
+                      for s in details["remaining_quantities"]]
+            self._booking._notify(TradeNotification(
+                event="TARGET_INCOMPLETE", strategy_id=intent.account_id,
+                security="-", side="-",
+                status="FAILED" if details["reason"] == "follow_up_disabled" else "EXECUTING",
+                title="QMT组合目标未完成 · " + "、".join(labels),
+                detail="**原因：** {}\n**描述：** {}\n{}".format(
+                    details["reason"], details["description"],
+                    "\n".join("**剩余目标：** {}({}) {}股".format(s, names.get(s) or "名称未知", q)
+                              for s, q in details["remaining_quantities"].items())),
+            ))
 
     @staticmethod
     def _boundary_price(mark_price_units, side, offset):
