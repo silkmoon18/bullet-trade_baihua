@@ -24,7 +24,7 @@ import socket
 import time
 from collections import OrderedDict
 
-BUILD_ID = "20260912_bridge_v1"
+BUILD_ID = "20260915_bridge_v2"
 MAX_FRAME = 2 * 1024 * 1024
 _runtime = None
 
@@ -57,7 +57,18 @@ def _clean(value):
 def _raw(row):
     if isinstance(row, dict):
         return _clean(row)
-    return {name: _clean(getattr(row, name)) for name in dir(row) if name.startswith("m_")}
+    result = {}
+    for name in dir(row):
+        if not name.startswith("m_"):
+            continue
+        try:
+            result[name] = _clean(getattr(row, name))
+        except Exception:
+            # Some QMT objects expose internal C++ handles (for example
+            # CXtOrderTag) without a Python converter. They are not broker
+            # facts and must not break order/deal normalization.
+            continue
+    return result
 
 
 def _qmt(code):

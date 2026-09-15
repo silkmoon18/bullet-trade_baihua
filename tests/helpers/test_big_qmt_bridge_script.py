@@ -97,6 +97,23 @@ def test_native_fields_and_unknown_fee_are_not_invented(script):
     assert (order["price"], order["order_price"], order["order_remark"]) == (1.001, 1.002, "bt:tag")
 
 
+def test_unconvertible_native_raw_field_is_skipped(script):
+    class NativeOrder:
+        m_strOrderSysID = "native-order"
+        m_strInstrumentID = "510300"
+        m_strExchangeID = "SH"
+        m_nOpType = 23
+
+        @property
+        def m_oOrderTag(self):
+            raise TypeError("No to_python converter for CXtOrderTag")
+
+    order = script._order(NativeOrder())
+    assert order["order_id"] == "native-order"
+    assert order["security"] == "510300.XSHG"
+    assert "m_oOrderTag" not in order["raw"]
+
+
 def test_tick_batch_subscription_lifecycle_and_callback_filter(script):
     context = SimpleNamespace(get_instrument_detail=lambda _: {"PriceTick": 0.001},
         subscribe_quote=lambda *args, **kwargs: 1, unsubscribe_quote=lambda _: None)
