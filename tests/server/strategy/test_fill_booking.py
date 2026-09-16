@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from datetime import date, datetime
 
@@ -45,11 +46,12 @@ def _order(
     quantity,
     trading_day=date(2026, 8, 10),
     limit_price="2.00",
+    intent_id=None,
 ):
     return BrokerOrder(
         order_id=order_id,
         account_id="good-etf",
-        intent_id=None,
+        intent_id=intent_id,
         client_tag="tag-{}".format(order_id),
         broker_order_id="broker-{}".format(order_id),
         security=SECURITY,
@@ -165,6 +167,246 @@ def test_zero_fallback_partial_buy_notifies_unknown_and_preserves_remainder_rese
     assert len(notifications) == 2  # Submit + first fill only.
     canceled = booking.finalize_order("good-etf", "zero-buy", OrderState.CANCELED, result.account.ledger_version)
     assert canceled.released_cash_units == money_to_units("405")
+
+
+def _insert_intent(booking, intent_id, targets):
+    payload = {
+        "trading_day": "2026-08-10",
+        "reference_prices_units": {SECURITY: price_to_units("2.00")},
+        "execution_request": {
+            "schema_version": 2,
+            "style": {"type": "LIMIT", "price_band_ppm": 2000},
+            "sell_style": {
+                "type": "MARKET",
+                "protect_price_band_ppm": 15_000,
+            },
+            "follow_up": "UNTIL_FILLED_TODAY",
+            "repricing": "KEEP_ORIGINAL",
+        },
+    }
+    payload.update(targets)
+    connection = connect_database(booking.database_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO portfolio_intents(
+                intent_id, strategy_account_id, idempotency_key,
+                expected_ledger_version, state, targets_json,
+                created_at, updated_at
+            ) VALUES (?, 'good-etf', ?, 0, 'EXECUTING', ?, ?, ?)
+            """,
+            (
+                intent_id,
+                "key-{}".format(intent_id),
+                json.dumps(payload),
+                "2026-08-10T09:30:00+08:00",
+                "2026-08-10T09:30:00+08:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _ledger_payload(booking, entry_type, order_id):
+    connection = connect_database(booking.database_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT payload_json FROM ledger_entries
+            WHERE entry_type = ? AND reference_id = ?
+            ORDER BY event_seq DESC LIMIT 1
+            """,
+            (entry_type, order_id),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row is not None else None
+    finally:
+        connection.close()
+
+
+def _seed_long_position(repository, capital, booking, intent_id=None):
+    """Buy 1000 shares at 2.00 so the follow-up sell has a cost basis."""
+
+    booking.register_order(
+        _order("seed-buy", OrderSide.BUY, 1000, intent_id=intent_id, limit_price="2.00")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2005"), 0, "seed-buy")
+    booked = booking.book_fill(
+        "good-etf",
+        _fill("seed-fill", "seed-buy", OrderSide.BUY, 1000),
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 10),
+    )
+    assert booked.account.cash_units == money_to_units("7995")
+    return booked
+
+
+def test_unpriced_sell_credits_conservative_proceeds_without_faking_price(services):
+    """零价卖出按保护价下沿保守补足回款，但成交价仍是 0/不可信。"""
+
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-sell", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-sell")
+    booking.register_order(
+        _order(
+            "sell-1",
+            OrderSide.SELL,
+            1000,
+            intent_id="intent-sell",
+            limit_price=None,
+        )
+    )
+    zero_sell = replace(
+        _fill("zero-sell", "sell-1", OrderSide.SELL, 1000),
+        price_units=0,
+        price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill(
+        "good-etf", zero_sell, expected_ledger_version=2
+    )
+
+    # 2.00 参考价、15000ppm 卖出保护带 -> 保护价下沿 1.97，回款下界 1970 元。
+    # 7995 + 1970 - 5 = 9960
+    assert result.account.cash_units == money_to_units("9960")
+    assert result.account.reserved_cash_units == 0
+    assert result.position.total_qty == 0
+    # 1965 - 2005 成本
+    assert result.realized_pnl_units == money_to_units("-40")
+    assert repository.replay_account("good-etf") == result.account
+
+    db = connect_database(booking.database_path)
+    try:
+        row = tuple(
+            db.execute(
+                """
+                SELECT price_units, price_source, price_known
+                FROM fills WHERE fill_id = 'zero-sell'
+                """
+            ).fetchone()
+        )
+    finally:
+        db.close()
+    assert row == (0, "ZERO_FALLBACK", 0)
+
+    payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
+    assert payload["gross_units"] == 0
+    assert payload["price_known"] == 0
+    assert payload["estimated_proceeds_units"] == money_to_units("1970")
+    assert payload["proceeds_estimate"] == {
+        "basis": "SELL_PROTECTION_BOUNDARY",
+        "reference_price_units": price_to_units("2.00"),
+        "band_ppm": 15_000,
+        "boundary_price_units": price_to_units("1.97"),
+        "estimated_gross_units": money_to_units("1970"),
+    }
+
+
+def test_unpriced_sell_without_reference_price_keeps_zero_proceeds(services):
+    """缺少参考价/卖出风格时退化为原行为，不做任何估算。"""
+
+    repository, capital, booking = services
+    _seed_long_position(repository, capital, booking)
+    booking.register_order(
+        _order("sell-1", OrderSide.SELL, 1000, limit_price=None)
+    )
+    zero_sell = replace(
+        _fill("zero-sell", "sell-1", OrderSide.SELL, 1000),
+        price_units=0,
+        price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill("good-etf", zero_sell, expected_ledger_version=2)
+
+    assert result.account.cash_units == money_to_units("7990")
+    payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
+    assert "proceeds_estimate" not in payload
+    assert "estimated_proceeds_units" not in payload
+
+
+def test_unpriced_sell_estimate_never_double_counts_estimated_gross(services):
+    """委托价估算低于保护价下沿时只补差额，不重复计入。"""
+
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-sell", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-sell")
+    booking.register_order(
+        _order("sell-1", OrderSide.SELL, 1000, intent_id="intent-sell")
+    )
+    estimated_sell = replace(
+        _fill("est-sell", "sell-1", OrderSide.SELL, 1000, price="1.50"),
+        price_source=FillPriceSource.ORDER_PRICE_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill("good-etf", estimated_sell, expected_ledger_version=2)
+
+    # 已按 1.50 记 1500 元，只补到保护价下沿 1970 元，再扣 5 元费用
+    assert result.account.cash_units == money_to_units("9960")
+    payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
+    assert payload["estimated_proceeds_units"] == money_to_units("470")
+
+
+def test_trusted_sell_price_is_untouched_by_the_estimate(services):
+    """成交价可信时不进入估算分支。"""
+
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-sell", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-sell")
+    booking.register_order(
+        _order("sell-1", OrderSide.SELL, 1000, intent_id="intent-sell")
+    )
+
+    result = booking.book_fill(
+        "good-etf",
+        _fill("real-sell", "sell-1", OrderSide.SELL, 1000, price="2.10"),
+        expected_ledger_version=2,
+    )
+
+    # 7995 + 2100 - 5
+    assert result.account.cash_units == money_to_units("10090")
+    assert result.realized_pnl_units == money_to_units("90")
+    payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
+    assert payload["price_known"] == 1
+    assert "proceeds_estimate" not in payload
+
+
+def test_zero_price_sell_becomes_affordable_for_the_pending_buy(services):
+    """估算回款让当日买入预算可用，不再凭空少一笔钱。"""
+
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-rot", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-rot")
+    booking.register_order(
+        _order("sell-1", OrderSide.SELL, 1000, intent_id="intent-rot", limit_price=None)
+    )
+    booking.book_fill(
+        "good-etf",
+        replace(
+            _fill("zero-sell", "sell-1", OrderSide.SELL, 1000),
+            price_units=0,
+            price_source=FillPriceSource.ZERO_FALLBACK,
+            price_known=False,
+        ),
+        expected_ledger_version=2,
+    )
+
+    booking.register_order(
+        _order("buy-2", OrderSide.BUY, 4000, intent_id="intent-rot")
+    )
+    account = repository.get_strategy_account("good-etf")
+    capital.reserve_cash("good-etf", money_to_units("7980"), account.ledger_version, "buy-2")
+    booked = booking.book_fill(
+        "good-etf",
+        _fill("buy-2-fill", "buy-2", OrderSide.BUY, 4000, price="1.99"),
+        expected_ledger_version=account.ledger_version + 1,
+        sellable_from_trade_date=date(2026, 8, 10),
+    )
+
+    # 9960 - (7960 + 5) = 1995，若卖出回款仍按 0 记账这里会直接抛不变式异常
+    assert booked.account.cash_units == money_to_units("1995")
 
 
 def test_t0_buy_is_sellable_on_acquisition_day(services):

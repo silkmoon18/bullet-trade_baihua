@@ -79,7 +79,81 @@ def _known_fee_units(fill: BrokerFill) -> int:
     return (fill.commission_units or 0) + (fill.tax_units or 0)
 
 
-def _fee_notification_detail(fill: BrokerFill) -> str:
+_MAX_PROCEEDS_BAND_PPM = 50_000
+
+
+def _intent_payload(connection: sqlite3.Connection, intent_id: object) -> dict:
+    if not intent_id:
+        return {}
+    row = connection.execute(
+        "SELECT targets_json FROM portfolio_intents WHERE intent_id = ?",
+        (str(intent_id),),
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(row["targets_json"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _conservative_sell_proceeds(
+    payload: dict,
+    security: str,
+    quantity: int,
+    gross_units: int,
+) -> Tuple[int, Optional[dict]]:
+    """估算成交价不可信的卖出回款的保守下界。
+
+    券商对部分市价委托不回报成交价与成交金额，零价入账会让卖出回款完全不
+    进账本，进而使当日买入预算凭空少一笔钱。这里复用建意图时记录的参考价与
+    下发到券商的卖出保护带，取保护价下沿作为成交价——对卖出而言是回款下界。
+
+    该估算只补现金，绝不写回成交价：``fills.price_units`` 仍为 0、
+    ``price_known`` 仍为 0，估算依据完整记录在账本分录里。
+    """
+
+    if not isinstance(payload, dict) or type(quantity) is not int or quantity <= 0:
+        return 0, None
+    references = payload.get("reference_prices_units")
+    if not isinstance(references, dict):
+        return 0, None
+    reference_units = references.get(security)
+    if type(reference_units) is not int or reference_units <= 0:
+        return 0, None
+    request = payload.get("execution_request")
+    if not isinstance(request, dict):
+        return 0, None
+    style = request.get("sell_style")
+    if not isinstance(style, dict):
+        style = request.get("style")
+    if not isinstance(style, dict):
+        return 0, None
+    band_ppm = style.get("protect_price_band_ppm")
+    if type(band_ppm) is not int:
+        band_ppm = style.get("price_band_ppm")
+    if type(band_ppm) is not int or not 0 <= band_ppm <= _MAX_PROCEEDS_BAND_PPM:
+        return 0, None
+    boundary_units = max(
+        1, reference_units * (PRICE_SCALE - band_ppm) // PRICE_SCALE
+    )
+    estimated_gross_units = _trade_value_units(boundary_units, quantity)
+    shortfall_units = estimated_gross_units - gross_units
+    if shortfall_units <= 0:
+        return 0, None
+    return shortfall_units, {
+        "basis": "SELL_PROTECTION_BOUNDARY",
+        "reference_price_units": reference_units,
+        "band_ppm": band_ppm,
+        "boundary_price_units": boundary_units,
+        "estimated_gross_units": estimated_gross_units,
+    }
+
+
+def _fee_notification_detail(
+    fill: BrokerFill, proceeds_estimated: bool = False
+) -> str:
     def display(label: str, value: Optional[int]) -> str:
         if value is None:
             return "{} 未知".format(label)
@@ -94,9 +168,15 @@ def _fee_notification_detail(fill: BrokerFill) -> str:
     if fill.commission_units is None or fill.tax_units is None:
         detail += "；成交金额仅计已知费用"
     if fill.price_source is FillPriceSource.ZERO_FALLBACK:
-        detail += "；成交价和可用估价缺失，按0记账（非真实成交价），资金/收益不准确"
+        detail += "；成交价和成交金额缺失"
+        if proceeds_estimated:
+            detail += "，按卖出保护价下沿保守估算回款入账（非真实成交价，收益不准确）"
+        else:
+            detail += "，按0记账（非真实成交价），资金/收益不准确"
     elif not fill.price_known:
         detail += "；成交价缺失，使用委托保护价保守估算"
+        if proceeds_estimated:
+            detail += "，并按卖出保护价下沿补足回款下界"
     return detail
 
 
@@ -448,6 +528,8 @@ class SQLiteFillBookingService:
                 ),
             )
             realized_pnl_units = 0
+            proceeds_estimate_units = 0
+            proceeds_estimate = None
             if fill.side is OrderSide.BUY:
                 cash_delta = -(gross_units + fee_units)
                 order_reserved = self._order_reserved_units(
@@ -478,7 +560,16 @@ class SQLiteFillBookingService:
                     and fill.price_source is not FillPriceSource.ZERO_FALLBACK
                 ):
                     raise LedgerInvariantError("sell fees exceed trade value")
-                cash_delta = gross_units - fee_units
+                if not fill.price_known:
+                    proceeds_estimate_units, proceeds_estimate = (
+                        _conservative_sell_proceeds(
+                            _intent_payload(connection, order["intent_id"]),
+                            fill.security,
+                            fill.quantity,
+                            gross_units,
+                        )
+                    )
+                cash_delta = gross_units + proceeds_estimate_units - fee_units
                 reservation_released = 0
                 reserved_after = account.reserved_cash_units
                 position, cost_basis_units = self._book_sell_position(
@@ -547,6 +638,10 @@ class SQLiteFillBookingService:
                 "reservation_released_units": reservation_released,
                 "realized_pnl_units": realized_pnl_units,
             }
+            if proceeds_estimate is not None:
+                payload["cash_delta_units"] = cash_delta
+                payload["estimated_proceeds_units"] = proceeds_estimate_units
+                payload["proceeds_estimate"] = proceeds_estimate
             payload_json = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
@@ -605,11 +700,13 @@ class SQLiteFillBookingService:
                     amount=money_units_to_display(
                         gross_units + fee_units
                         if fill.side is OrderSide.BUY
-                        else gross_units - fee_units
+                        else cash_delta
                     ),
                     order_id=fill.order_id,
                     trade_id=fill.broker_trade_id,
-                    detail=_fee_notification_detail(fill),
+                    detail=_fee_notification_detail(
+                        fill, proceeds_estimated=proceeds_estimate is not None
+                    ),
                     occurred_at=fill.traded_at,
                 )
             )
