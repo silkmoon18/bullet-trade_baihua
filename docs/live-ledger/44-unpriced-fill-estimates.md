@@ -52,7 +52,7 @@
 - 提交 `aa7887c` 推送 `origin/codex/big-qmt-bridge`；服务器快进到同一提交，工作区干净，`strategy_ledger_ready=true`、big_qmt ready。
 - 当日已有成交不主动重算（遵 26 号第 25 条），改为一次性独立校正：按同一口径补记 159063.XSHE 8,084,880 units（≈808.49 元）与 159295.XSHE 8,037,600 units（≈803.76 元），合计 16,122,480 units（≈1612.25 元）；`entry_type=SELL_PROCEEDS_ESTIMATE_CORRECTION`，逐笔以 `fill_id` 作 `reference_id`，脚本幂等。策略现金 266.51 → 1878.76 元，`ledger_version` 54 → 56，`replay_account` 与账本一致。校正脚本存于上述备份目录 `backfill.py`。
 - 同一维护窗口轮换了 `QMT_SERVER_TOKEN`（聚宽侧已同步更新 `bt.configure`）；IP 白名单先启用后按用户要求撤回，最终仅靠 token。
-- **买入侧与 `_refresh_position` 修正在同日稍后完成，尚未部署**；部署需与卖出侧同一套停服流程，属独立一次维护窗口。
+- 同日 22:18 追加部署**买入侧与收窄后的触发条件**：提交 `355c586`（`aa7887c..355c586`）。服务器先 `fetch` 并核对目标提交与 `fill_booking.py` 对象哈希（`2f0d5c3e`）一致后才停服，停服后 `reset --hard` 到该提交、`py_compile` 通过再起服；备份在 `.data/backups/unpriced-fill-estimates-20260916-221826`。部署后工作区干净（文件与提交逐字节一致）、模块已含买卖两个估算函数、`strategy_ledger_ready=true`、当日订单仍为 5 笔、现金 1878.76 元与 `ledger_version=56` 未变、两条校正分录（16,122,480 units）完整。
 - 当日 588900.XSHG 缺 700 股不会自愈：该 intent 于次日首次提交调仓时按既有规则自动 CANCEL，次日按新计划重新推导目标。
 
 ## 遗留
