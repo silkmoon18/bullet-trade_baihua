@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union, cast
+from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
 
 from ..feishu_notifier import (
     TradeNotification,
@@ -104,7 +104,10 @@ def _conservative_sell_proceeds(
     quantity: int,
     gross_units: int,
 ) -> Tuple[int, Optional[dict]]:
-    """估算成交价不可信的卖出回款的保守下界。
+    """估算显式零价（ZERO_FALLBACK）卖出的回款保守下界。
+
+    仅对 ``price_source is ZERO_FALLBACK`` 的成交生效；委托价兜底
+    （ORDER_PRICE_FALLBACK）保持原有行为，不被抬高到保护价边界。
 
     券商对部分市价委托不回报成交价与成交金额，零价入账会让卖出回款完全不
     进账本，进而使当日买入预算凭空少一笔钱。这里复用建意图时记录的参考价与
@@ -151,8 +154,71 @@ def _conservative_sell_proceeds(
     }
 
 
+def _conservative_buy_cost(
+    payload: dict,
+    security: str,
+    quantity: int,
+    gross_units: int,
+    max_gross_units: int,
+) -> Tuple[int, Optional[dict]]:
+    """估算显式零价（ZERO_FALLBACK）买入的成本保守上界。
+
+    仅对 ``price_source is ZERO_FALLBACK`` 的成交生效；委托价兜底
+    （ORDER_PRICE_FALLBACK）保持原有行为。
+
+    与 ``_conservative_sell_proceeds`` 对称：零价买入会让现金少扣、持仓成本
+    只剩费用，这里取买入保护价上沿作为成交价——对买入而言是成本上界。估算值
+    受该委托已预留现金约束，不会突破 ``buy fill exceeds order reserved cash``。
+
+    该估算只补账本金额，绝不写回成交价：``fills.price_units`` 仍为 0、
+    ``price_known`` 仍为 0，估算依据完整记录在账本分录里。
+    """
+
+    if not isinstance(payload, dict) or type(quantity) is not int or quantity <= 0:
+        return 0, None
+    references = payload.get("reference_prices_units")
+    if not isinstance(references, dict):
+        return 0, None
+    reference_units = references.get(security)
+    if type(reference_units) is not int or reference_units <= 0:
+        return 0, None
+    request = payload.get("execution_request")
+    if not isinstance(request, dict):
+        return 0, None
+    style = request.get("buy_style")
+    if not isinstance(style, dict):
+        style = request.get("style")
+    if not isinstance(style, dict):
+        return 0, None
+    band_ppm = style.get("protect_price_band_ppm")
+    if type(band_ppm) is not int:
+        band_ppm = style.get("price_band_ppm")
+    if type(band_ppm) is not int or not 0 <= band_ppm <= _MAX_PROCEEDS_BAND_PPM:
+        return 0, None
+    boundary_units = max(1, reference_units * (PRICE_SCALE + band_ppm) // PRICE_SCALE)
+    estimated_gross_units = _trade_value_units(boundary_units, quantity)
+    if type(max_gross_units) is not int or max_gross_units < 0:
+        max_gross_units = 0
+    capped = estimated_gross_units > max_gross_units
+    if capped:
+        estimated_gross_units = max_gross_units
+    extra_units = estimated_gross_units - gross_units
+    if extra_units <= 0:
+        return 0, None
+    return extra_units, {
+        "basis": "BUY_PROTECTION_BOUNDARY",
+        "reference_price_units": reference_units,
+        "band_ppm": band_ppm,
+        "boundary_price_units": boundary_units,
+        "estimated_gross_units": estimated_gross_units,
+        "capped_to_order_reservation": capped,
+    }
+
+
 def _fee_notification_detail(
-    fill: BrokerFill, proceeds_estimated: bool = False
+    fill: BrokerFill,
+    proceeds_estimated: bool = False,
+    costs_estimated: bool = False,
 ) -> str:
     def display(label: str, value: Optional[int]) -> str:
         if value is None:
@@ -171,12 +237,12 @@ def _fee_notification_detail(
         detail += "；成交价和成交金额缺失"
         if proceeds_estimated:
             detail += "，按卖出保护价下沿保守估算回款入账（非真实成交价，收益不准确）"
+        elif costs_estimated:
+            detail += "，按买入保护价上沿保守估算成本扣款入账（非真实成交价，收益不准确）"
         else:
             detail += "，按0记账（非真实成交价），资金/收益不准确"
     elif not fill.price_known:
         detail += "；成交价缺失，使用委托保护价保守估算"
-        if proceeds_estimated:
-            detail += "，并按卖出保护价下沿补足回款下界"
     return detail
 
 
@@ -530,11 +596,22 @@ class SQLiteFillBookingService:
             realized_pnl_units = 0
             proceeds_estimate_units = 0
             proceeds_estimate = None
+            cost_estimate_units = 0
+            cost_estimate = None
             if fill.side is OrderSide.BUY:
-                cash_delta = -(gross_units + fee_units)
                 order_reserved = self._order_reserved_units(
                     connection, account_id, fill.order_id
                 )
+                if fill.price_source is FillPriceSource.ZERO_FALLBACK:
+                    cost_estimate_units, cost_estimate = _conservative_buy_cost(
+                        _intent_payload(connection, order["intent_id"]),
+                        fill.security,
+                        fill.quantity,
+                        gross_units,
+                        max(0, order_reserved - fee_units),
+                    )
+                booked_cost_units = gross_units + cost_estimate_units
+                cash_delta = -(booked_cost_units + fee_units)
                 consumed_reservation = -cash_delta
                 if consumed_reservation > order_reserved:
                     raise LedgerInvariantError(
@@ -551,7 +628,7 @@ class SQLiteFillBookingService:
                     connection,
                     account_id,
                     fill,
-                    gross_units + fee_units,
+                    booked_cost_units + fee_units,
                     cast(date, sellable_from_trade_date),
                 )
             else:
@@ -560,7 +637,7 @@ class SQLiteFillBookingService:
                     and fill.price_source is not FillPriceSource.ZERO_FALLBACK
                 ):
                     raise LedgerInvariantError("sell fees exceed trade value")
-                if not fill.price_known:
+                if fill.price_source is FillPriceSource.ZERO_FALLBACK:
                     proceeds_estimate_units, proceeds_estimate = (
                         _conservative_sell_proceeds(
                             _intent_payload(connection, order["intent_id"]),
@@ -621,7 +698,7 @@ class SQLiteFillBookingService:
                     fill.order_id,
                 ),
             )
-            payload = {
+            payload: Dict[str, Any] = {
                 "fill_id": fill.fill_id,
                 "broker_trade_id": fill.broker_trade_id,
                 "order_id": fill.order_id,
@@ -638,6 +715,10 @@ class SQLiteFillBookingService:
                 "reservation_released_units": reservation_released,
                 "realized_pnl_units": realized_pnl_units,
             }
+            if cost_estimate is not None:
+                payload["cash_delta_units"] = cash_delta
+                payload["estimated_cost_units"] = cost_estimate_units
+                payload["cost_estimate"] = cost_estimate
             if proceeds_estimate is not None:
                 payload["cash_delta_units"] = cash_delta
                 payload["estimated_proceeds_units"] = proceeds_estimate_units
@@ -698,14 +779,16 @@ class SQLiteFillBookingService:
                     quantity=fill.quantity,
                     price=price_units_to_display(fill.price_units),
                     amount=money_units_to_display(
-                        gross_units + fee_units
+                        gross_units + cost_estimate_units + fee_units
                         if fill.side is OrderSide.BUY
                         else cash_delta
                     ),
                     order_id=fill.order_id,
                     trade_id=fill.broker_trade_id,
                     detail=_fee_notification_detail(
-                        fill, proceeds_estimated=proceeds_estimate is not None
+                        fill,
+                        proceeds_estimated=proceeds_estimate is not None,
+                        costs_estimated=cost_estimate is not None,
                     ),
                     occurred_at=fill.traded_at,
                 )
@@ -1076,18 +1159,26 @@ class SQLiteFillBookingService:
             for row in lot_rows
             if row["sellable_from_trade_date"] <= trade_date.isoformat()
         )
-        remaining_cost = sum(
-            _round_div(
-                (
-                    _trade_value_units(row["source_price_units"], row["original_qty"])
-                    + row["source_commission_units"]
-                    + row["source_tax_units"]
+        remaining_cost = 0
+        for row in lot_rows:
+            source_price_units = row["source_price_units"]
+            if source_price_units == 0:
+                # 成交价未知的买入已在入账时按保护价上沿估算过成本，结论存在批次
+                # 上；若仍拿 0 价重算，成本会被错误地压成只剩费用。
+                per_lot_cost = _trade_value_units(
+                    row["cost_price_units"], row["remaining_qty"]
                 )
-                * row["remaining_qty"],
-                row["original_qty"],
-            )
-            for row in lot_rows
-        )
+            else:
+                per_lot_cost = _round_div(
+                    (
+                        _trade_value_units(source_price_units, row["original_qty"])
+                        + row["source_commission_units"]
+                        + row["source_tax_units"]
+                    )
+                    * row["remaining_qty"],
+                    row["original_qty"],
+                )
+            remaining_cost += per_lot_cost
         avg_cost = _cost_price_units(remaining_cost, total_qty) if total_qty else 0
         connection.execute(
             """

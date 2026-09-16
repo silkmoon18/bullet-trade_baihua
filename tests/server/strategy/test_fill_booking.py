@@ -326,8 +326,8 @@ def test_unpriced_sell_without_reference_price_keeps_zero_proceeds(services):
     assert "estimated_proceeds_units" not in payload
 
 
-def test_unpriced_sell_estimate_never_double_counts_estimated_gross(services):
-    """委托价估算低于保护价下沿时只补差额，不重复计入。"""
+def test_order_price_fallback_sell_is_not_estimated(services):
+    """委托价兜底（非 0）不进入估算分支，保持原有按委托价记账的行为。"""
 
     repository, capital, booking = services
     _insert_intent(booking, "intent-sell", {})
@@ -343,10 +343,12 @@ def test_unpriced_sell_estimate_never_double_counts_estimated_gross(services):
 
     result = booking.book_fill("good-etf", estimated_sell, expected_ledger_version=2)
 
-    # 已按 1.50 记 1500 元，只补到保护价下沿 1970 元，再扣 5 元费用
-    assert result.account.cash_units == money_to_units("9960")
+    # 只按委托价 1.50 记 1500 元，再扣 5 元费用；不被抬到保护价下沿 1970 元
+    assert result.account.cash_units == money_to_units("9490")
     payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
-    assert payload["estimated_proceeds_units"] == money_to_units("470")
+    assert payload["price_known"] == 0
+    assert "proceeds_estimate" not in payload
+    assert "estimated_proceeds_units" not in payload
 
 
 def test_trusted_sell_price_is_untouched_by_the_estimate(services):
@@ -407,6 +409,183 @@ def test_zero_price_sell_becomes_affordable_for_the_pending_buy(services):
 
     # 9960 - (7960 + 5) = 1995，若卖出回款仍按 0 记账这里会直接抛不变式异常
     assert booked.account.cash_units == money_to_units("1995")
+
+
+def test_unpriced_buy_charges_conservative_cost_without_faking_price(services):
+    """零价买入按保护价上沿保守扣款，同时修正持仓成本，成交价仍是 0/不可信。"""
+
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-buy", {})
+    booking.register_order(
+        _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-z")
+    zero_buy = replace(
+        _fill("zero-buy", "buy-z", OrderSide.BUY, 1000),
+        price_units=0,
+        price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill(
+        "good-etf",
+        zero_buy,
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    # 2.00 参考价、2000ppm 买入保护带 -> 保护价上沿 2.004，成本上界 2004 元。
+    # 10000 - (2004 + 5) = 7991
+    assert result.account.cash_units == money_to_units("7991")
+    assert result.account.reserved_cash_units == 0
+    assert result.position.total_qty == 1000
+    # 成本不再只剩费用，(2004 + 5) / 1000 = 2.009
+    assert result.position.avg_cost_price_units == price_to_units("2.009")
+    assert repository.replay_account("good-etf") == result.account
+
+    db = connect_database(booking.database_path)
+    try:
+        row = tuple(
+            db.execute(
+                """
+                SELECT price_units, price_source, price_known
+                FROM fills WHERE fill_id = 'zero-buy'
+                """
+            ).fetchone()
+        )
+    finally:
+        db.close()
+    assert row == (0, "ZERO_FALLBACK", 0)
+
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
+    assert payload["gross_units"] == 0
+    assert payload["price_known"] == 0
+    assert payload["estimated_cost_units"] == money_to_units("2004")
+    assert payload["cost_estimate"] == {
+        "basis": "BUY_PROTECTION_BOUNDARY",
+        "reference_price_units": price_to_units("2.00"),
+        "band_ppm": 2000,
+        "boundary_price_units": price_to_units("2.004"),
+        "estimated_gross_units": money_to_units("2004"),
+        "capped_to_order_reservation": False,
+    }
+
+
+def test_unpriced_buy_estimate_is_capped_by_order_reservation(services):
+    """估算成本不得超过该委托已预留现金，否则会撞上不变式异常。"""
+
+    _, capital, booking = services
+    _insert_intent(booking, "intent-buy", {})
+    booking.register_order(
+        _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2006"), 0, "buy-z")
+    zero_buy = replace(
+        _fill("zero-buy", "buy-z", OrderSide.BUY, 1000),
+        price_units=0,
+        price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill(
+        "good-etf",
+        zero_buy,
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    # 估算 2004 元 + 5 元费用超出 2006 元预留，毛额被压到 2006 - 5 = 2001 元
+    assert result.account.cash_units == money_to_units("7994")
+    assert result.account.reserved_cash_units == 0
+    assert result.position.avg_cost_price_units == price_to_units("2.006")
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
+    assert payload["cost_estimate"]["capped_to_order_reservation"] is True
+    assert payload["cost_estimate"]["estimated_gross_units"] == money_to_units("2001")
+
+
+def test_unpriced_buy_without_reference_price_keeps_fee_only_cost(services):
+    """缺少参考价时不估算，退化为按 0 记账（只扣已知费用），不抛异常。"""
+
+    _, capital, booking = services
+    _insert_intent(booking, "intent-buy", {"reference_prices_units": {}})
+    booking.register_order(
+        _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-z")
+    zero_buy = replace(
+        _fill("zero-buy", "buy-z", OrderSide.BUY, 1000),
+        price_units=0,
+        price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill(
+        "good-etf",
+        zero_buy,
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    assert result.account.cash_units == money_to_units("9995")
+    assert result.account.reserved_cash_units == 0
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
+    assert payload["gross_units"] == 0
+    assert "cost_estimate" not in payload
+
+
+def test_order_price_fallback_buy_is_not_estimated(services):
+    """委托价兜底（非 0）的买入不进入估算分支，成本仍按委托价计。"""
+
+    _, capital, booking = services
+    _insert_intent(booking, "intent-buy", {})
+    booking.register_order(
+        _order("buy-o", OrderSide.BUY, 1000, intent_id="intent-buy")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-o")
+    fallback_buy = replace(
+        _fill("order-buy", "buy-o", OrderSide.BUY, 1000, price="1.50"),
+        price_source=FillPriceSource.ORDER_PRICE_FALLBACK,
+        price_known=False,
+    )
+
+    result = booking.book_fill(
+        "good-etf",
+        fallback_buy,
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    # 10000 - (1500 + 5) = 8495，成本 1.505；不被抬到保护价上沿 2.004
+    assert result.account.cash_units == money_to_units("8495")
+    assert result.account.reserved_cash_units == 0
+    assert result.position.avg_cost_price_units == price_to_units("1.505")
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-o")
+    assert payload["price_known"] == 0
+    assert "cost_estimate" not in payload
+
+
+def test_trusted_buy_price_is_untouched_by_the_estimate(services):
+    """有价买入完全不受估算影响。"""
+
+    _, capital, booking = services
+    _insert_intent(booking, "intent-buy", {})
+    booking.register_order(
+        _order("buy-k", OrderSide.BUY, 1000, intent_id="intent-buy")
+    )
+    capital.reserve_cash("good-etf", money_to_units("2005"), 0, "buy-k")
+
+    result = booking.book_fill(
+        "good-etf",
+        _fill("buy-k-fill", "buy-k", OrderSide.BUY, 1000),
+        expected_ledger_version=1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+
+    assert result.account.cash_units == money_to_units("7995")
+    assert result.position.avg_cost_price_units == price_to_units("2.005")
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-k")
+    assert payload["gross_units"] == money_to_units("2000")
+    assert "cost_estimate" not in payload
 
 
 def test_t0_buy_is_sellable_on_acquisition_day(services):
