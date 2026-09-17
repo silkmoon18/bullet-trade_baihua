@@ -260,6 +260,52 @@ def test_sell_snapshot_reconciles_realized_and_unrealized_pnl(ledger_services):
     assert snapshot.fees_units == money_to_units("9")
 
 
+def test_proceeds_correction_entry_counts_as_realized_pnl(ledger_services):
+    _, repository, capital, booking, valuation = ledger_services
+    buy = _buy(capital, booking)
+    booking.register_order(
+        _order("sell-1", OrderSide.SELL, 600, date(2026, 8, 11))
+    )
+    booking.book_fill(
+        "good-etf",
+        _fill(
+            "f-sell", "sell-1", OrderSide.SELL, 600,
+            "2.00", "0", "0", date(2026, 8, 11),
+        ),
+        buy.account.ledger_version,
+    )
+    account = repository.get_strategy_account("good-etf")
+    repository.append_account_event(
+        "good-etf",
+        expected_ledger_version=account.ledger_version,
+        entry_type="SELL_PROCEEDS_ESTIMATE_CORRECTION",
+        amount_units=money_to_units("500"),
+        reserved_after_units=account.reserved_cash_units,
+        event_type="SELL_PROCEEDS_ESTIMATE_CORRECTED",
+        payload={
+            "reason": "zero_price_sell_proceeds_backfill",
+            "estimated_gross_units": money_to_units("500"),
+        },
+        reference_type="fill",
+        reference_id="f-sell",
+    )
+
+    snapshot = valuation.create_snapshot(
+        "good-etf", {SECURITY: _mark("2.50")}, AS_OF, timedelta(minutes=1)
+    )
+
+    assert snapshot.cash_units == money_to_units("9695")
+    assert snapshot.realized_pnl_units == (
+        money_to_units("500") - money_to_units("3")
+    )
+    assert snapshot.unrealized_pnl_units == money_to_units("198")
+    assert snapshot.total_pnl_units == money_to_units("695")
+    assert (
+        snapshot.total_pnl_units
+        == snapshot.realized_pnl_units + snapshot.unrealized_pnl_units
+    )
+
+
 @pytest.mark.parametrize(
     "marks, blocker",
     [

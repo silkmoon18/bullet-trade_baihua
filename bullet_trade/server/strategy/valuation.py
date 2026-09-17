@@ -365,8 +365,10 @@ class SQLiteValuationService:
     def _realized_pnl(connection: sqlite3.Connection, account_id: str) -> int:
         rows = connection.execute(
             """
-            SELECT payload_json FROM ledger_entries
-            WHERE strategy_account_id = ? AND entry_type = 'SELL_FILL_BOOKED'
+            SELECT entry_type, amount_units, payload_json FROM ledger_entries
+            WHERE strategy_account_id = ? AND entry_type IN (
+                'SELL_FILL_BOOKED', 'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+            )
             ORDER BY event_seq
             """,
             (account_id,),
@@ -374,9 +376,19 @@ class SQLiteValuationService:
         total = 0
         for row in rows:
             try:
-                value = json.loads(row["payload_json"])["realized_pnl_units"]
-            except (KeyError, TypeError, ValueError) as exc:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError) as exc:
                 raise LedgerInvariantError("sell fill pnl ledger is invalid") from exc
+            if type(payload) is not dict:
+                raise LedgerInvariantError("sell fill pnl ledger is invalid")
+            value = payload.get("realized_pnl_units")
+            if value is None:
+                if row["entry_type"] != "SELL_PROCEEDS_ESTIMATE_CORRECTION":
+                    raise LedgerInvariantError("sell fill pnl ledger is invalid")
+                # A proceeds correction only credits cash, and that cash is not
+                # an external capital flow, so the credited amount is itself the
+                # realized gain this total has to include.
+                value = row["amount_units"]
             if type(value) is not int:
                 raise LedgerInvariantError("sell fill pnl ledger is invalid")
             total += value
