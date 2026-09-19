@@ -147,6 +147,10 @@ class PortfolioView:
     unknown_price_fill_count: int
     nav: Optional[float]
     returns: Optional[float]
+    estimated_nav: Optional[float]
+    estimated_returns: Optional[float]
+    performance_estimated: bool
+    returns_note: Optional[str]
     performance_blockers: Tuple[str, ...]
     performance_ready: bool
     positions: Dict[str, PositionView]

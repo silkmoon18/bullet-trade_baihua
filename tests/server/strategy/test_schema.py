@@ -170,6 +170,45 @@ def test_zero_price_migration_preserves_existing_fill_rows_and_constraints(tmp_p
         connection.close()
 
 
+def test_estimated_price_migration_preserves_legacy_zero_and_accepts_marked_estimate(tmp_path):
+    connection = connect_database(tmp_path / "v11.db")
+    try:
+        apply_migrations(connection, target_version=11)
+        _insert_account(connection)
+        connection.execute("""
+            INSERT INTO strategy_orders(order_id, strategy_account_id, client_tag,
+                security, side, requested_qty, state, trading_day, created_at, updated_at)
+            VALUES ('o', 'good-etf', 'tag', '510050.XSHG', 'BUY', 200, 'FILLED',
+                '2026-09-07', '2026-09-07', '2026-09-07')
+        """)
+        connection.execute("""
+            INSERT INTO fills(fill_id, order_id, broker_trade_id, fill_fingerprint,
+                security, side, quantity, price_units, commission_units, tax_units,
+                traded_at, booked_at, commission_known, tax_known, price_source, price_known)
+            VALUES ('old-zero', 'o', 'trade-old', 'fingerprint-old',
+                '510050.XSHG', 'BUY', 100, 0, 0, 0, '2026-09-07', '2026-09-07',
+                0, 0, 'ZERO_FALLBACK', 0)
+        """)
+        assert apply_migrations(connection) == LATEST_SCHEMA_VERSION
+        assert tuple(connection.execute(
+            "SELECT price_units, price_source, price_known FROM fills WHERE fill_id = 'old-zero'"
+        ).fetchone()) == (0, "ZERO_FALLBACK", 0)
+        connection.execute("""
+            INSERT INTO fills(fill_id, order_id, broker_trade_id, fill_fingerprint,
+                security, side, quantity, price_units, commission_units, tax_units,
+                traded_at, booked_at, commission_known, tax_known, price_source, price_known)
+            VALUES ('estimate', 'o', 'trade-estimate', 'fingerprint-estimate',
+                '510050.XSHG', 'BUY', 100, 2000000, 0, 0, '2026-09-07', '2026-09-07',
+                0, 0, 'ZERO_PRICE_ESTIMATE', 0)
+        """)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE fills SET price_known = 1 WHERE fill_id = 'estimate'")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+
+
 def test_database_constraints_reject_invalid_balances_state_and_float(tmp_path):
     connection = connect_database(tmp_path / "constraints.db")
     try:

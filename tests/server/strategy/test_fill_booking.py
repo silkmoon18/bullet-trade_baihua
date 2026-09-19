@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -10,11 +10,14 @@ from bullet_trade.server.strategy import (
     FillConflictError,
     FillPriceSource,
     LedgerInvariantError,
+    MarketMark,
     OrderSide,
     OrderState,
     SQLiteCapitalService,
     SQLiteFillBookingService,
+    SQLiteStrategyAPI,
     SQLiteStrategyRepository,
+    SQLiteValuationService,
     money_to_units,
     price_to_units,
 )
@@ -141,32 +144,34 @@ def test_partial_buy_uses_real_fill_and_cancel_releases_only_remainder(services)
     assert repository.replay_account("good-etf") == canceled.account
 
 
-def test_zero_fallback_partial_buy_notifies_unknown_and_preserves_remainder_reservation(services):
+def test_zero_fallback_partial_buy_notifies_estimate_and_preserves_remainder_reservation(services):
     _, capital, original_booking = services
     notifications = []
     booking = SQLiteFillBookingService(original_booking.database_path, notifications.append)
-    booking.register_order(_order("zero-buy", OrderSide.BUY, 200))
+    _insert_intent(booking, "intent-partial", {})
+    booking.register_order(_order("zero-buy", OrderSide.BUY, 200, intent_id="intent-partial"))
     capital.reserve_cash("good-etf", money_to_units("405"), 0, "zero-buy")
     fill = replace(_fill("zero-fill", "zero-buy", OrderSide.BUY, 100),
                    price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
                    price_known=False, commission_units=None, tax_units=None)
     result = booking.book_fill("good-etf", fill, 1, sellable_from_trade_date=date(2026, 8, 11))
-    assert result.account.cash_units == money_to_units("10000")
-    assert result.account.reserved_cash_units == money_to_units("405")
+    assert result.account.cash_units == money_to_units("9800")
+    assert result.account.reserved_cash_units == money_to_units("205")
     assert result.position.total_qty == 100
-    assert result.position.avg_cost_price_units == 0
+    assert result.position.avg_cost_price_units == price_to_units("2.00")
     assert result.order_state is OrderState.PARTIALLY_FILLED
     notice = notifications[-1]
-    assert str(notice.price) == "0"
-    assert str(notice.amount) == "0"
+    assert notice.price == 2
+    assert notice.amount == 200
+    assert notice.estimated is True
     assert notice.quantity == 100
-    assert "按0记账（非真实成交价）" in notice.detail
+    assert "收益为非精确收益" in notice.detail
     assert "佣金 未知" in notice.detail and "税费 未知" in notice.detail
     assert booking.book_fill("good-etf", fill, result.account.ledger_version,
                              sellable_from_trade_date=date(2026, 8, 11)).duplicate
     assert len(notifications) == 2  # Submit + first fill only.
     canceled = booking.finalize_order("good-etf", "zero-buy", OrderState.CANCELED, result.account.ledger_version)
-    assert canceled.released_cash_units == money_to_units("405")
+    assert canceled.released_cash_units == money_to_units("205")
 
 
 def _insert_intent(booking, intent_id, targets):
@@ -241,8 +246,8 @@ def _seed_long_position(repository, capital, booking, intent_id=None):
     return booked
 
 
-def test_unpriced_sell_credits_conservative_proceeds_without_faking_price(services):
-    """零价卖出按保护价下沿保守补足回款，但成交价仍是 0/不可信。"""
+def test_unpriced_sell_books_estimated_unit_price(services):
+    """零价卖出把参考价作为估算单价入账，但保留非真实标记。"""
 
     repository, capital, booking = services
     _insert_intent(booking, "intent-sell", {})
@@ -267,13 +272,11 @@ def test_unpriced_sell_credits_conservative_proceeds_without_faking_price(servic
         "good-etf", zero_sell, expected_ledger_version=2
     )
 
-    # 2.00 参考价、15000ppm 卖出保护带 -> 保护价下沿 1.97，回款下界 1970 元。
-    # 7995 + 1970 - 5 = 9960
-    assert result.account.cash_units == money_to_units("9960")
+    # 2.00 参考价暂估 2000 元，使下一笔调仓可以继续。
+    assert result.account.cash_units == money_to_units("9990")
     assert result.account.reserved_cash_units == 0
     assert result.position.total_qty == 0
-    # 1965 - 2005 成本
-    assert result.realized_pnl_units == money_to_units("-40")
+    assert result.realized_pnl_units == money_to_units("-10")
     assert repository.replay_account("good-etf") == result.account
 
     db = connect_database(booking.database_path)
@@ -288,23 +291,40 @@ def test_unpriced_sell_credits_conservative_proceeds_without_faking_price(servic
         )
     finally:
         db.close()
-    assert row == (0, "ZERO_FALLBACK", 0)
+    assert row == (price_to_units("2.00"), "ZERO_PRICE_ESTIMATE", 0)
 
     payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
-    assert payload["gross_units"] == 0
+    assert payload["gross_units"] == money_to_units("2000")
     assert payload["price_known"] == 0
-    assert payload["estimated_proceeds_units"] == money_to_units("1970")
-    assert payload["proceeds_estimate"] == {
-        "basis": "SELL_PROTECTION_BOUNDARY",
-        "reference_price_units": price_to_units("2.00"),
-        "band_ppm": 15_000,
-        "boundary_price_units": price_to_units("1.97"),
-        "estimated_gross_units": money_to_units("1970"),
+    assert payload["estimated_proceeds_units"] == money_to_units("2000")
+    assert payload["credited_proceeds_estimate_units"] == money_to_units("2000")
+    assert payload["price_estimate"] == {
+        "basis": "INTENT_REFERENCE_PRICE",
+        "price_units": price_to_units("2.00"),
+        "capped_to_order_reservation": False,
     }
+    snapshot = SQLiteValuationService(booking.database_path).create_snapshot(
+        "good-etf", {},
+        datetime(2026, 8, 10, 10, 1, tzinfo=SHANGHAI_TZ),
+        timedelta(minutes=1),
+    )
+    assert snapshot.available_cash_units == money_to_units("9990")
+    assert snapshot.conservative_cash_units == money_to_units("7990")
+    assert snapshot.estimated_sell_proceeds_units == money_to_units("2000")
+    assert snapshot.unconfirmed_cash_credit_units == money_to_units("2000")
+    assert snapshot.performance_ready is False
+    public = SQLiteStrategyAPI._snapshot_payload(snapshot)
+    assert public["estimated_sell_proceeds"] == 2000.0
+    assert public["unconfirmed_cash_credit"] == 2000.0
+    assert public["available_cash"] == 9990.0
+    assert public["nav"] is None
+    assert public["estimated_nav"] == 0.999
+    assert public["estimated_returns"] == pytest.approx(-0.001)
+    assert "非精确收益" in public["returns_note"]
 
 
-def test_unpriced_sell_without_reference_price_keeps_zero_proceeds(services):
-    """缺少参考价/卖出风格时退化为原行为，不做任何估算。"""
+def test_unpriced_sell_without_reference_price_uses_position_cost(services):
+    """缺少参考价时用已有持仓成本估单价，仍正常记回款。"""
 
     repository, capital, booking = services
     _seed_long_position(repository, capital, booking)
@@ -320,10 +340,10 @@ def test_unpriced_sell_without_reference_price_keeps_zero_proceeds(services):
 
     result = booking.book_fill("good-etf", zero_sell, expected_ledger_version=2)
 
-    assert result.account.cash_units == money_to_units("7990")
+    assert result.account.cash_units == money_to_units("9995")
     payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
-    assert "proceeds_estimate" not in payload
-    assert "estimated_proceeds_units" not in payload
+    assert payload["price_estimate"]["basis"] == "POSITION_COST_FALLBACK"
+    assert payload["estimated_proceeds_units"] == money_to_units("2005")
 
 
 def test_order_price_fallback_sell_is_not_estimated(services):
@@ -375,8 +395,8 @@ def test_trusted_sell_price_is_untouched_by_the_estimate(services):
     assert "proceeds_estimate" not in payload
 
 
-def test_zero_price_sell_becomes_affordable_for_the_pending_buy(services):
-    """估算回款让当日买入预算可用，不再凭空少一笔钱。"""
+def test_zero_price_sell_estimate_funds_pending_buy(services):
+    """参考价暂估回款可推动卖出后买入，不把成交价伪装为已知。"""
 
     repository, capital, booking = services
     _insert_intent(booking, "intent-rot", {})
@@ -395,24 +415,17 @@ def test_zero_price_sell_becomes_affordable_for_the_pending_buy(services):
         expected_ledger_version=2,
     )
 
-    booking.register_order(
-        _order("buy-2", OrderSide.BUY, 4000, intent_id="intent-rot")
-    )
+    booking.register_order(_order("buy-2", OrderSide.BUY, 4000, intent_id="intent-rot"))
     account = repository.get_strategy_account("good-etf")
-    capital.reserve_cash("good-etf", money_to_units("7980"), account.ledger_version, "buy-2")
-    booked = booking.book_fill(
-        "good-etf",
-        _fill("buy-2-fill", "buy-2", OrderSide.BUY, 4000, price="1.99"),
-        expected_ledger_version=account.ledger_version + 1,
-        sellable_from_trade_date=date(2026, 8, 10),
+    assert account.available_cash_units == money_to_units("9990")
+    reserved = capital.reserve_cash(
+        "good-etf", money_to_units("9000"), account.ledger_version, "buy-2"
     )
-
-    # 9960 - (7960 + 5) = 1995，若卖出回款仍按 0 记账这里会直接抛不变式异常
-    assert booked.account.cash_units == money_to_units("1995")
+    assert reserved.reserved_cash_units == money_to_units("9000")
 
 
-def test_unpriced_buy_charges_conservative_cost_without_faking_price(services):
-    """零价买入按保护价上沿保守扣款，同时修正持仓成本，成交价仍是 0/不可信。"""
+def test_unpriced_buy_books_estimated_unit_price(services):
+    """零价买入按参考价估单价，标记为估算。"""
 
     repository, capital, booking = services
     _insert_intent(booking, "intent-buy", {})
@@ -434,13 +447,11 @@ def test_unpriced_buy_charges_conservative_cost_without_faking_price(services):
         sellable_from_trade_date=date(2026, 8, 11),
     )
 
-    # 2.00 参考价、2000ppm 买入保护带 -> 保护价上沿 2.004，成本上界 2004 元。
-    # 10000 - (2004 + 5) = 7991
-    assert result.account.cash_units == money_to_units("7991")
+    # 2.00 参考价暂估 2000 元；含已知费用扣 2005 元。
+    assert result.account.cash_units == money_to_units("7995")
     assert result.account.reserved_cash_units == 0
     assert result.position.total_qty == 1000
-    # 成本不再只剩费用，(2004 + 5) / 1000 = 2.009
-    assert result.position.avg_cost_price_units == price_to_units("2.009")
+    assert result.position.avg_cost_price_units == price_to_units("2.005")
     assert repository.replay_account("good-etf") == result.account
 
     db = connect_database(booking.database_path)
@@ -455,31 +466,28 @@ def test_unpriced_buy_charges_conservative_cost_without_faking_price(services):
         )
     finally:
         db.close()
-    assert row == (0, "ZERO_FALLBACK", 0)
+    assert row == (price_to_units("2.00"), "ZERO_PRICE_ESTIMATE", 0)
 
     payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
-    assert payload["gross_units"] == 0
+    assert payload["gross_units"] == money_to_units("2000")
     assert payload["price_known"] == 0
-    assert payload["estimated_cost_units"] == money_to_units("2004")
-    assert payload["cost_estimate"] == {
-        "basis": "BUY_PROTECTION_BOUNDARY",
-        "reference_price_units": price_to_units("2.00"),
-        "band_ppm": 2000,
-        "boundary_price_units": price_to_units("2.004"),
-        "estimated_gross_units": money_to_units("2004"),
+    assert payload["estimated_cost_units"] == money_to_units("2000")
+    assert payload["price_estimate"] == {
+        "basis": "INTENT_REFERENCE_PRICE",
+        "price_units": price_to_units("2.00"),
         "capped_to_order_reservation": False,
     }
 
 
-def test_unpriced_buy_estimate_is_capped_by_order_reservation(services):
-    """估算成本不得超过该委托已预留现金，否则会撞上不变式异常。"""
+def test_unpriced_buy_estimate_above_reservation_is_capped_not_blocked(services):
+    """参考价超出预留资金时，仍记成交数量，估算金额以已预留资金为限。"""
 
     _, capital, booking = services
     _insert_intent(booking, "intent-buy", {})
     booking.register_order(
         _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy")
     )
-    capital.reserve_cash("good-etf", money_to_units("2006"), 0, "buy-z")
+    capital.reserve_cash("good-etf", money_to_units("1990"), 0, "buy-z")
     zero_buy = replace(
         _fill("zero-buy", "buy-z", OrderSide.BUY, 1000),
         price_units=0,
@@ -487,29 +495,44 @@ def test_unpriced_buy_estimate_is_capped_by_order_reservation(services):
         price_known=False,
     )
 
-    result = booking.book_fill(
-        "good-etf",
-        zero_buy,
-        expected_ledger_version=1,
+    booked = booking.book_fill(
+        "good-etf", zero_buy, expected_ledger_version=1,
         sellable_from_trade_date=date(2026, 8, 11),
     )
-
-    # 估算 2004 元 + 5 元费用超出 2006 元预留，毛额被压到 2006 - 5 = 2001 元
-    assert result.account.cash_units == money_to_units("7994")
-    assert result.account.reserved_cash_units == 0
-    assert result.position.avg_cost_price_units == price_to_units("2.006")
-    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
-    assert payload["cost_estimate"]["capped_to_order_reservation"] is True
-    assert payload["cost_estimate"]["estimated_gross_units"] == money_to_units("2001")
+    assert booked.order_state is OrderState.FILLED
+    assert booked.position.total_qty == 1000
+    assert booked.account.cash_units == money_to_units("8010")
+    assert _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")[
+        "price_estimate"
+    ]["capped_to_order_reservation"] is True
 
 
-def test_unpriced_buy_without_reference_price_keeps_fee_only_cost(services):
-    """缺少参考价时不估算，退化为按 0 记账（只扣已知费用），不抛异常。"""
+def test_unpriced_buy_uses_local_limit_when_intent_reference_is_missing(services):
+    _, capital, booking = services
+    booking.register_order(_order("buy-limit", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-limit")
+    zero_buy = replace(
+        _fill("zero-limit", "buy-limit", OrderSide.BUY, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    result = booking.book_fill(
+        "good-etf", zero_buy, 1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    assert result.account.cash_units == money_to_units("7995")
+    assert result.position.avg_cost_price_units == price_to_units("2.005")
+    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-limit")
+    assert payload["price_estimate"]["basis"] == "ORDER_LIMIT_PRICE"
+
+
+def test_unpriced_buy_without_reference_price_uses_reserved_budget(services):
+    """参考价也缺失时，按原订单预留资金暂算，不丢成交股数。"""
 
     _, capital, booking = services
     _insert_intent(booking, "intent-buy", {"reference_prices_units": {}})
     booking.register_order(
-        _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy")
+        _order("buy-z", OrderSide.BUY, 1000, intent_id="intent-buy", limit_price=None)
     )
     capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-z")
     zero_buy = replace(
@@ -519,18 +542,281 @@ def test_unpriced_buy_without_reference_price_keeps_fee_only_cost(services):
         price_known=False,
     )
 
-    result = booking.book_fill(
-        "good-etf",
-        zero_buy,
-        expected_ledger_version=1,
+    booked = booking.book_fill(
+        "good-etf", zero_buy, expected_ledger_version=1,
         sellable_from_trade_date=date(2026, 8, 11),
     )
+    assert booked.order_state is OrderState.FILLED
+    assert booked.position.total_qty == 1000
+    assert booked.account.cash_units == money_to_units("7990")
+    assert _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")[
+        "price_estimate"
+    ]["basis"] == "ORDER_RESERVED_BUDGET"
 
-    assert result.account.cash_units == money_to_units("9995")
-    assert result.account.reserved_cash_units == 0
-    payload = _ledger_payload(booking, "BUY_FILL_BOOKED", "buy-z")
-    assert payload["gross_units"] == 0
-    assert "cost_estimate" not in payload
+
+def test_verified_price_corrects_zero_sell_once(services):
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-correction", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-correction")
+    booking.register_order(_order(
+        "sell-correct", OrderSide.SELL, 1000,
+        intent_id="intent-correction", limit_price=None,
+    ))
+    zero = replace(
+        _fill("correct-fill", "sell-correct", OrderSide.SELL, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    booked = booking.book_fill("good-etf", zero, 2)
+    assert booked.account.cash_units == money_to_units("9990")
+    assert capital.calibrate_broker_available_cash(
+        "qmt-main", money_to_units("20000")
+    ) == money_to_units("20000")
+
+    verified = _fill("correct-fill", "sell-correct", OrderSide.SELL, 1000, price="2.10")
+    corrected = booking.book_fill(
+        "good-etf", verified, booked.account.ledger_version
+    )
+    assert corrected.corrected is True
+    assert corrected.account.cash_units == money_to_units("10090")
+    assert corrected.realized_pnl_units == money_to_units("100")
+    assert repository.replay_account("good-etf") == corrected.account
+    assert capital.calibrate_broker_available_cash(
+        "qmt-main", money_to_units("20000")
+    ) == money_to_units("20000")
+    assert booking.book_fill(
+        "good-etf", verified, corrected.account.ledger_version
+    ).duplicate is True
+    db = connect_database(booking.database_path)
+    try:
+        assert tuple(db.execute(
+            "SELECT price_units, price_source, price_known FROM fills "
+            "WHERE fill_id = 'correct-fill'"
+        ).fetchone()) == (price_to_units("2.10"), "BROKER_TRADE", 1)
+        assert db.execute(
+            "SELECT COUNT(*) FROM ledger_entries "
+            "WHERE entry_type = 'FILL_PRICE_CORRECTED'"
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_legacy_estimated_sell_credit_is_visible_and_corrected_once(services, monkeypatch):
+    repository, capital, booking = services
+    _seed_long_position(repository, capital, booking)
+    booking.register_order(_order("legacy-sell", OrderSide.SELL, 1000, limit_price=None))
+    zero = replace(
+        _fill("legacy-fill", "legacy-sell", OrderSide.SELL, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    monkeypatch.setattr(booking, "_price_zero_fill", lambda conn, account_id, fill: (fill, None))
+    booked = booking.book_fill("good-etf", zero, 2)
+    credited = repository.append_account_event(
+        "good-etf", booked.account.ledger_version,
+        "SELL_PROCEEDS_ESTIMATE_CORRECTION", money_to_units("1970"),
+        booked.account.reserved_cash_units, "SELL_PROCEEDS_ESTIMATE_CORRECTED",
+        {"estimated_gross_units": money_to_units("1970")},
+        reference_type="fill", reference_id="legacy-fill",
+    )
+    assert credited.cash_units == money_to_units("9960")
+    valuation = SQLiteValuationService(booking.database_path)
+    as_of = datetime(2026, 8, 10, 10, 1, tzinfo=SHANGHAI_TZ)
+    provisional = valuation.create_snapshot("good-etf", {}, as_of, timedelta(minutes=1))
+    assert provisional.unconfirmed_cash_credit_units == money_to_units("1970")
+    assert provisional.available_cash_units == money_to_units("9960")
+    assert provisional.conservative_cash_units == money_to_units("7990")
+
+    verified = _fill("legacy-fill", "legacy-sell", OrderSide.SELL, 1000, price="2.10")
+    corrected = booking.book_fill("good-etf", verified, credited.ledger_version)
+    assert corrected.account.cash_units == money_to_units("10090")
+    assert repository.replay_account("good-etf") == corrected.account
+    final = valuation.create_snapshot("good-etf", {}, as_of, timedelta(minutes=1))
+    assert final.unconfirmed_cash_credit_units == 0
+    assert final.available_cash_units == money_to_units("10090")
+    assert final.performance_ready is True
+
+
+def test_old_inline_sell_estimate_credit_is_corrected_once(services, monkeypatch):
+    repository, capital, booking = services
+    _insert_intent(booking, "inline-legacy", {})
+    _seed_long_position(repository, capital, booking, intent_id="inline-legacy")
+    booking.register_order(_order(
+        "inline-sell", OrderSide.SELL, 1000,
+        intent_id="inline-legacy", limit_price=None,
+    ))
+    zero = replace(
+        _fill("inline-fill", "inline-sell", OrderSide.SELL, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    monkeypatch.setattr(booking, "_price_zero_fill", lambda conn, account_id, fill: (fill, None))
+    booked = booking.book_fill("good-etf", zero, 2)
+
+    # Recreate the previous release's 1.97 protection-boundary estimate
+    # without changing the immutable fill ID or event sequence.
+    db = connect_database(booking.database_path)
+    try:
+        row = db.execute(
+            "SELECT event_seq, amount_units, cash_after_units, payload_json "
+            "FROM ledger_entries WHERE entry_type = 'SELL_FILL_BOOKED' "
+            "AND reference_id = 'inline-sell'"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload.pop("credited_proceeds_estimate_units")
+        old_estimate = money_to_units("1970")
+        difference = old_estimate - money_to_units("2000")
+        payload["estimated_proceeds_units"] = old_estimate
+        payload["cash_delta_units"] += difference
+        payload["realized_pnl_units"] += difference
+        append_only_trigger = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'ledger_entries_no_update'"
+        ).fetchone()[0]
+        db.execute("DROP TRIGGER ledger_entries_no_update")
+        db.execute(
+            "UPDATE ledger_entries SET amount_units = ?, cash_after_units = ?, "
+            "payload_json = ? WHERE strategy_account_id = 'good-etf' "
+            "AND event_seq = ?",
+            (
+                row["amount_units"] + difference,
+                row["cash_after_units"] + difference,
+                json.dumps(payload), row["event_seq"],
+            ),
+        )
+        db.execute(
+            "UPDATE strategy_accounts SET cash_units = cash_units + ? "
+            "WHERE strategy_account_id = 'good-etf'",
+            (difference,),
+        )
+        db.execute(append_only_trigger)
+        db.commit()
+    finally:
+        db.close()
+
+    assert repository.replay_account("good-etf").cash_units == money_to_units("9960")
+    valuation = SQLiteValuationService(booking.database_path)
+    as_of = datetime(2026, 8, 10, 10, 1, tzinfo=SHANGHAI_TZ)
+    provisional = valuation.create_snapshot("good-etf", {}, as_of, timedelta(minutes=1))
+    assert provisional.available_cash_units == money_to_units("9960")
+    assert provisional.unconfirmed_cash_credit_units == money_to_units("1970")
+
+    verified = _fill("inline-fill", "inline-sell", OrderSide.SELL, 1000, price="2.10")
+    corrected = booking.book_fill(
+        "good-etf", verified, booked.account.ledger_version
+    )
+    assert corrected.account.cash_units == money_to_units("10090")
+    assert repository.replay_account("good-etf") == corrected.account
+    assert valuation.create_snapshot(
+        "good-etf", {}, as_of, timedelta(minutes=1)
+    ).unconfirmed_cash_credit_units == 0
+
+
+def test_verified_zero_buy_after_partial_sale_corrects_basis_and_pnl(services):
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-buy-correction", {})
+    booking.register_order(_order(
+        "buy-correct", OrderSide.BUY, 1000, intent_id="intent-buy-correction"
+    ))
+    capital.reserve_cash("good-etf", money_to_units("2010"), 0, "buy-correct")
+    zero_buy = replace(
+        _fill("correct-buy-fill", "buy-correct", OrderSide.BUY, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    booked = booking.book_fill(
+        "good-etf", zero_buy, 1, sellable_from_trade_date=date(2026, 8, 10)
+    )
+    assert booked.position.avg_cost_price_units == price_to_units("2.005")
+    booking.register_order(_order("sell-half", OrderSide.SELL, 500, limit_price=None))
+    sold = booking.book_fill(
+        "good-etf",
+        _fill("half-fill", "sell-half", OrderSide.SELL, 500, price="2.10"),
+        booked.account.ledger_version,
+    )
+    assert sold.realized_pnl_units == money_to_units("42.5")
+
+    verified = _fill(
+        "correct-buy-fill", "buy-correct", OrderSide.BUY, 1000, price="1.99"
+    )
+    corrected = booking.book_fill(
+        "good-etf", verified, sold.account.ledger_version,
+        sellable_from_trade_date=date(2026, 8, 10),
+    )
+    assert corrected.corrected is True
+    assert corrected.account.cash_units == money_to_units("9050")
+    assert corrected.position.total_qty == 500
+    assert corrected.position.avg_cost_price_units == price_to_units("1.995")
+    assert corrected.realized_pnl_units == money_to_units("5")
+    assert repository.replay_account("good-etf") == corrected.account
+
+    valuation = SQLiteValuationService(booking.database_path)
+    snapshot = valuation.create_snapshot(
+        "good-etf",
+        {SECURITY: MarketMark(
+            security=SECURITY, price_units=price_to_units("2.10"),
+            as_of=datetime(2026, 8, 10, 10, 1, tzinfo=SHANGHAI_TZ),
+            source="qmt",
+        )},
+        datetime(2026, 8, 10, 10, 1, tzinfo=SHANGHAI_TZ),
+        timedelta(minutes=1),
+    )
+    assert snapshot.unknown_price_fill_count == 0
+    assert snapshot.performance_ready is True
+    assert snapshot.realized_pnl_units == money_to_units("47.5")
+    assert snapshot.total_pnl_units == (
+        snapshot.realized_pnl_units + snapshot.unrealized_pnl_units
+    )
+
+
+def test_order_price_fallback_can_upgrade_to_verified_price(services):
+    repository, capital, booking = services
+    booking.register_order(_order("fallback-buy", OrderSide.BUY, 1000))
+    capital.reserve_cash("good-etf", money_to_units("2100"), 0, "fallback-buy")
+    fallback = replace(
+        _fill("fallback-fill", "fallback-buy", OrderSide.BUY, 1000, price="1.50"),
+        price_source=FillPriceSource.ORDER_PRICE_FALLBACK,
+        price_known=False,
+    )
+    booked = booking.book_fill(
+        "good-etf", fallback, 1,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    assert booked.account.cash_units == money_to_units("8495")
+    verified = _fill(
+        "fallback-fill", "fallback-buy", OrderSide.BUY, 1000, price="2.00"
+    )
+    corrected = booking.book_fill(
+        "good-etf", verified, booked.account.ledger_version,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    assert corrected.corrected is True
+    assert corrected.account.cash_units == money_to_units("7995")
+    assert corrected.position.avg_cost_price_units == price_to_units("2.005")
+    assert repository.replay_account("good-etf") == corrected.account
+
+
+def test_price_upgrade_rejects_changed_trade_quantity(services):
+    repository, capital, booking = services
+    _insert_intent(booking, "identity-check", {})
+    _seed_long_position(repository, capital, booking, intent_id="identity-check")
+    booking.register_order(_order(
+        "identity-sell", OrderSide.SELL, 1000,
+        intent_id="identity-check", limit_price=None,
+    ))
+    zero = replace(
+        _fill("identity-fill", "identity-sell", OrderSide.SELL, 1000),
+        price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+        price_known=False,
+    )
+    booked = booking.book_fill("good-etf", zero, 2)
+    changed = _fill(
+        "identity-fill", "identity-sell", OrderSide.SELL, 900,
+        price="2.10",
+    )
+    with pytest.raises(FillConflictError, match="reused with different fields"):
+        booking.book_fill("good-etf", changed, booked.account.ledger_version)
+    assert repository.replay_account("good-etf") == booked.account
 
 
 def test_order_price_fallback_buy_is_not_estimated(services):

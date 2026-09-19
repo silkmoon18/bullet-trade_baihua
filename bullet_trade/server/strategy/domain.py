@@ -60,6 +60,7 @@ class FillPriceSource(str, Enum):
     BROKER_TRADE = "BROKER_TRADE"
     ORDER_PRICE_FALLBACK = "ORDER_PRICE_FALLBACK"
     ZERO_FALLBACK = "ZERO_FALLBACK"
+    ZERO_PRICE_ESTIMATE = "ZERO_PRICE_ESTIMATE"
 
 
 class UnpricedFillPolicy(str, Enum):

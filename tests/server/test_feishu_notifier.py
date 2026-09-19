@@ -80,6 +80,20 @@ def test_rejected_order_card_keeps_empty_trade_values_visible():
     assert "**单价：** ¥-" in content
 
 
+def test_zero_price_estimate_card_labels_price_and_amount():
+    notifier = FeishuTradeNotifier("https://example.invalid/hook/test")
+    payload = notifier.build_payload(TradeNotification(
+        event="FILLED", strategy_id="good_etf", security="510050.XSHG",
+        side="BUY", status="FILLED", quantity=100, price="2.00",
+        amount="200.00", estimated=True,
+        detail="券商回报价为0；收益为非精确收益",
+    ))
+    content = payload["card"]["elements"][0]["text"]["content"]
+    assert "**金额（估算）：** ¥200.00" in content
+    assert "**单价（估算）：** ¥2.0000" in content
+    assert "非精确收益" in content
+
+
 def test_target_buy_plan_card_lists_items_and_total_amount():
     notifier = FeishuTradeNotifier("https://example.invalid/hook/test")
     payload = notifier.build_payload(

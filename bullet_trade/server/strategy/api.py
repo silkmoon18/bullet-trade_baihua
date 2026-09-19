@@ -1604,6 +1604,11 @@ class SQLiteStrategyAPI:
                 "unrealized_pnl": _money(item.unrealized_pnl_units),
             }
         performance_ready = snapshot.performance_ready
+        performance_estimated = (
+            not performance_ready
+            and "capital_flows_unsupported" not in snapshot.performance_blockers
+            and (snapshot.unknown_price_fill_count > 0 or snapshot.unknown_fee_fill_count > 0)
+        )
         return {
             "account_id": snapshot.account_id,
             "strategy_id": snapshot.strategy_id,
@@ -1613,6 +1618,10 @@ class SQLiteStrategyAPI:
             "cash": _money(snapshot.cash_units),
             "reserved_cash": _money(snapshot.reserved_cash_units),
             "available_cash": _money(snapshot.available_cash_units),
+            "conservative_cash": _money(snapshot.conservative_cash_units),
+            "estimated_sell_proceeds": _money(snapshot.estimated_sell_proceeds_units),
+            "estimated_buy_cost": _money(snapshot.estimated_buy_cost_units),
+            "unconfirmed_cash_credit": _money(snapshot.unconfirmed_cash_credit_units),
             "positions_value": _money(snapshot.positions_value_units),
             "total_value": _money(snapshot.total_assets_units),
             "starting_cash": _money(snapshot.net_capital_units),
@@ -1630,6 +1639,17 @@ class SQLiteStrategyAPI:
             "nav": snapshot.nav_units / NAV_SCALE if performance_ready else None,
             "returns": (
                 snapshot.nav_units / NAV_SCALE - 1.0 if performance_ready else None
+            ),
+            "estimated_nav": (
+                snapshot.nav_units / NAV_SCALE if performance_estimated else None
+            ),
+            "estimated_returns": (
+                snapshot.nav_units / NAV_SCALE - 1.0 if performance_estimated else None
+            ),
+            "performance_estimated": performance_estimated,
+            "returns_note": (
+                "非精确收益：成交价为估算或费用未知"
+                if performance_estimated else None
             ),
             "performance_blockers": list(snapshot.performance_blockers),
             "performance_ready": performance_ready,

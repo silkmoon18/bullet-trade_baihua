@@ -40,6 +40,7 @@ class TradeNotification:
     title: Optional[str] = None
     strategy_id: str = "-"
     security_name: str = ""
+    estimated: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,7 @@ class FeishuTradeNotifier:
             "FILL": "green",
             "FILLED": "green",
             "PARTIALLY_FILLED": "turquoise",
+            "FILL_PRICE_CORRECTED": "blue",
             "CANCELED": "grey",
             "REJECTED": "red",
             "RECONCILIATION_BLOCKED": "red",
@@ -223,6 +225,7 @@ class FeishuTradeNotifier:
             "FILL": "收到成交回报",
             "FILLED": "订单全部成交",
             "PARTIALLY_FILLED": "订单部分成交",
+            "FILL_PRICE_CORRECTED": "成交金额已核实",
             "CANCELED": "订单已撤销",
             "REJECTED": "订单被拒绝",
         }.get(notification.event.upper(), "量化交易通知")
@@ -250,8 +253,14 @@ class FeishuTradeNotifier:
                 if notification.quantity is not None
                 else "-"
             ),
-            "**金额：** ¥{}".format(_display(notification.amount, 2)),
-            "**单价：** ¥{}".format(_display(notification.price, 4)),
+            "**金额{}：** ¥{}".format(
+                "（估算）" if notification.estimated else "",
+                _display(notification.amount, 2),
+            ),
+            "**单价{}：** ¥{}".format(
+                "（估算）" if notification.estimated else "",
+                _display(notification.price, 4),
+            ),
             "**时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
         ])
         if notification.order_id:

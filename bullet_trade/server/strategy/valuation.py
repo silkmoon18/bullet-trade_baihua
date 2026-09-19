@@ -85,6 +85,10 @@ class PortfolioSnapshot:
     performance_blockers: Tuple[str, ...]
     performance_ready: bool
     positions: Tuple[PortfolioPositionSnapshot, ...]
+    estimated_sell_proceeds_units: int = 0
+    estimated_buy_cost_units: int = 0
+    unconfirmed_cash_credit_units: int = 0
+    conservative_cash_units: int = 0
 
 
 def _round_div(numerator: int, denominator: int) -> int:
@@ -164,7 +168,7 @@ class SQLiteValuationService:
                 mark = captured_marks[security]
                 lot_rows = connection.execute(
                     """
-                    SELECT l.original_qty, l.remaining_qty,
+                    SELECT l.original_qty, l.remaining_qty, l.cost_price_units,
                            l.sellable_from_trade_date,
                            f.price_units AS source_price_units,
                            f.commission_units AS source_commission_units,
@@ -182,7 +186,9 @@ class SQLiteValuationService:
                         "position quantity does not match remaining lots for {}".format(security)
                     )
                 remaining_cost = sum(
-                    _round_div(
+                    _trade_value_units(lot["cost_price_units"], lot["remaining_qty"])
+                    if lot["source_price_units"] == 0
+                    else _round_div(
                         (
                             _trade_value_units(
                                 lot["source_price_units"], lot["original_qty"]
@@ -240,6 +246,53 @@ class SQLiteValuationService:
             fees = cast(int, fee_row[0])
             unknown_fee_fill_count = cast(int, fee_row[1])
             unknown_price_fill_count = cast(int, fee_row[2])
+            estimate_rows = connection.execute(
+                """
+                SELECT e.entry_type, e.amount_units, e.payload_json
+                FROM ledger_entries e
+                JOIN fills f ON f.fill_id = CASE
+                    WHEN e.entry_type = 'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                    THEN e.reference_id
+                    ELSE json_extract(e.payload_json, '$.fill_id')
+                END
+                JOIN strategy_orders o ON o.order_id = f.order_id
+                WHERE e.strategy_account_id = ? AND o.strategy_account_id = ?
+                  AND e.entry_type IN (
+                      'BUY_FILL_BOOKED', 'SELL_FILL_BOOKED',
+                      'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                  )
+                  AND f.price_known = 0
+                """,
+                (account_id, account_id),
+            ).fetchall()
+            estimated_sell_proceeds = 0
+            estimated_buy_cost = 0
+            unconfirmed_cash_credit = 0
+            for estimate_row in estimate_rows:
+                if estimate_row["entry_type"] == "SELL_PROCEEDS_ESTIMATE_CORRECTION":
+                    amount = estimate_row["amount_units"]
+                    if type(amount) is not int or amount < 0:
+                        raise LedgerInvariantError("sell proceeds correction is invalid")
+                    estimated_sell_proceeds += amount
+                    unconfirmed_cash_credit += amount
+                    continue
+                estimate_payload = json.loads(estimate_row["payload_json"])
+                if estimate_row["entry_type"] == "SELL_FILL_BOOKED":
+                    amount = estimate_payload.get("estimated_proceeds_units", 0)
+                    if type(amount) is not int or amount < 0:
+                        raise LedgerInvariantError("sell proceeds estimate is invalid")
+                    estimated_sell_proceeds += amount
+                    credited = estimate_payload.get(
+                        "credited_proceeds_estimate_units", amount
+                    )
+                    if type(credited) is not int or not 0 <= credited <= amount:
+                        raise LedgerInvariantError("sell proceeds credit is invalid")
+                    unconfirmed_cash_credit += credited
+                else:
+                    amount = estimate_payload.get("estimated_cost_units", 0)
+                    if type(amount) is not int or amount < 0:
+                        raise LedgerInvariantError("buy cost estimate is invalid")
+                    estimated_buy_cost += amount
             flow_rows = connection.execute(
                 """
                 SELECT flow_type, amount_units FROM capital_flows
@@ -279,6 +332,12 @@ class SQLiteValuationService:
                     for item in position_tuple
                 ],
             }
+            if unconfirmed_cash_credit:
+                # Older snapshots treated this credit as spendable.  Keep the
+                # version distinct without changing the normal priced path.
+                version_payload["unconfirmed_cash_credit_units"] = (
+                    unconfirmed_cash_credit
+                )
             snapshot_version = hashlib.sha256(
                 json.dumps(
                     version_payload,
@@ -317,6 +376,12 @@ class SQLiteValuationService:
                 performance_blockers=tuple(performance_blockers),
                 performance_ready=not performance_blockers,
                 positions=position_tuple,
+                estimated_sell_proceeds_units=estimated_sell_proceeds,
+                estimated_buy_cost_units=estimated_buy_cost,
+                unconfirmed_cash_credit_units=unconfirmed_cash_credit,
+                conservative_cash_units=max(
+                    0, account.cash_units - unconfirmed_cash_credit
+                ),
             )
             connection.commit()
             return result
@@ -367,7 +432,8 @@ class SQLiteValuationService:
             """
             SELECT entry_type, amount_units, payload_json FROM ledger_entries
             WHERE strategy_account_id = ? AND entry_type IN (
-                'SELL_FILL_BOOKED', 'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                'SELL_FILL_BOOKED', 'SELL_PROCEEDS_ESTIMATE_CORRECTION',
+                'FILL_PRICE_CORRECTED'
             )
             ORDER BY event_seq
             """,

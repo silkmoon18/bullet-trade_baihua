@@ -499,6 +499,42 @@ def test_portfolio_view_preserves_unknown_remote_performance(helper):
     assert portfolio.positions["510050.XSHG"].mark_source == "qmt"
 
 
+def test_estimated_remote_return_is_recorded_and_labeled_non_precise(helper, monkeypatch):
+    portfolio = helper.PortfolioView({
+        "account_id": "paper", "as_of": "2026-09-19T14:55:00+08:00",
+        "snapshot_version": "estimated-price", "ledger_version": 3,
+        "cash": 9900, "reserved_cash": 0, "available_cash": 9900,
+        "positions_value": 0, "total_value": 9900, "starting_cash": 10000,
+        "total_pnl": None, "realized_pnl": None, "unrealized_pnl": None,
+        "fees": 5, "fees_known": True, "unknown_fee_fill_count": 0,
+        "unknown_price_fill_count": 1, "nav": None, "returns": None,
+        "estimated_nav": 0.99, "estimated_returns": -0.01,
+        "performance_estimated": True,
+        "returns_note": "非精确收益：成交价含估算",
+        "performance_blockers": ["estimated_fill_prices"],
+        "performance_ready": False, "positions": {},
+    })
+    recorded = []
+    monkeypatch.setattr(helper, "_active_namespace", {
+        "record": lambda **metrics: recorded.append(metrics)
+    })
+    helper._record_runtime_portfolio(portfolio)
+    assert recorded[0]["real_return_estimated"] == -0.01
+    assert "real_return" not in recorded[0]
+
+    logger = types.SimpleNamespace(messages=[])
+    logger.info = logger.messages.append
+    runtime = helper.JoinQuantRuntime(
+        _state("QMT_REMOTE", "sim_trade"), {"log": logger}
+    )
+    monkeypatch.setattr(runtime, "account_portfolios", lambda context: (
+        helper.AccountPortfolioView("QMT", portfolio),
+    ))
+    monkeypatch.setattr(runtime, "_log_qmt_execution_summary", lambda *args: None)
+    runtime.log_account_snapshots(types.SimpleNamespace())
+    assert any("非精确收益" in message for message in logger.messages)
+
+
 def test_qmt_execution_summary_logs_target_fill_remainder_and_reserved_cash(
     helper, monkeypatch
 ):

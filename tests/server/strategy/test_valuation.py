@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
+import json
 from datetime import date, datetime, timedelta
 from threading import Event
 
@@ -22,6 +23,7 @@ from bullet_trade.server.strategy import (
     price_to_units,
 )
 from bullet_trade.server.strategy.domain import NAV_SCALE, SHANGHAI_TZ
+from bullet_trade.server.strategy.schema import connect_database
 
 
 SECURITY = "510050.XSHG"
@@ -192,6 +194,36 @@ def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
 def test_estimated_fill_price_blocks_performance(ledger_services, source):
     _, _, capital, booking, valuation = ledger_services
     booking.register_order(_order("buy-estimated", OrderSide.BUY, 1000))
+    if source is FillPriceSource.ZERO_FALLBACK:
+        connection = connect_database(booking.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO portfolio_intents(
+                    intent_id, strategy_account_id, idempotency_key,
+                    expected_ledger_version, state, targets_json,
+                    created_at, updated_at
+                ) VALUES ('price-estimate', 'good-etf', 'price-estimate', 0,
+                          'EXECUTING', ?, ?, ?)
+                """,
+                (
+                    json.dumps({
+                        "reference_prices_units": {SECURITY: price_to_units("2")},
+                        "execution_request": {"buy_style": {
+                            "protect_price_band_ppm": 2000
+                        }},
+                    }),
+                    "2026-08-10T09:30:00+08:00",
+                    "2026-08-10T09:30:00+08:00",
+                ),
+            )
+            connection.execute(
+                "UPDATE strategy_orders SET intent_id = 'price-estimate' "
+                "WHERE order_id = 'buy-estimated'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
     capital.reserve_cash(
         "good-etf", money_to_units("2100"), 0, "buy-estimated"
     )

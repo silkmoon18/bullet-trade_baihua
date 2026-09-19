@@ -601,6 +601,10 @@ class PortfolioView(object):
         )
         self.nav = _optional_float(payload.get("nav"))
         self.returns = _optional_float(payload.get("returns"))
+        self.estimated_nav = _optional_float(payload.get("estimated_nav"))
+        self.estimated_returns = _optional_float(payload.get("estimated_returns"))
+        self.performance_estimated = bool(payload.get("performance_estimated", False))
+        self.returns_note = payload.get("returns_note")
         self.performance_blockers = tuple(payload.get("performance_blockers", ()))
         self.performance_ready = bool(payload["performance_ready"])
         if self.fees_known and self.fees is None:
@@ -880,6 +884,10 @@ def _record_runtime_portfolio(portfolio: PortfolioView) -> None:
         metrics["real_nav"] = portfolio.nav
     if portfolio.returns is not None:
         metrics["real_return"] = portfolio.returns
+    if portfolio.estimated_nav is not None:
+        metrics["real_nav_estimated"] = portfolio.estimated_nav
+    if portfolio.estimated_returns is not None:
+        metrics["real_return_estimated"] = portfolio.estimated_returns
     if portfolio.fees is not None:
         metrics["real_fees"] = portfolio.fees
     recorder(**metrics)
@@ -1738,14 +1746,19 @@ class JoinQuantRuntime:
             account = view.account
             portfolio = view.portfolio
             if account == "QMT":
+                estimate_note = (
+                    " | 含估算成交价格和金额，非券商实际成交价"
+                    if getattr(portfolio, "unknown_price_fill_count", 0) else ""
+                )
                 fund_message = (
                     "QMT组合资金 | 可用={:.2f} 冻结={:.2f} "
-                    "总资产={:.2f} 持仓市值={:.2f}"
+                    "总资产={:.2f} 持仓市值={:.2f}{}"
                 ).format(
                     portfolio.available_cash,
                     float(getattr(portfolio, "reserved_cash", 0.0)),
                     portfolio.total_value,
                     portfolio.positions_value,
+                    estimate_note,
                 )
             else:
                 fund_message = (
@@ -1788,6 +1801,16 @@ class JoinQuantRuntime:
                         "真实指标 | NAV={:.6f} 收益={:.2%} 费用={}".format(
                             portfolio.nav,
                             portfolio.returns,
+                            fee_display,
+                        ),
+                    )
+                elif portfolio.performance_estimated:
+                    self._log(
+                        "info",
+                        "QMT估算指标 | NAV={:.6f} 收益={:.2%} | {} | 费用={}".format(
+                            portfolio.estimated_nav,
+                            portfolio.estimated_returns,
+                            portfolio.returns_note or "非精确收益",
                             fee_display,
                         ),
                     )

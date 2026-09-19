@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
@@ -54,6 +54,7 @@ class FillBookingResult:
     order_state: OrderState
     realized_pnl_units: int
     duplicate: bool
+    corrected: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,9 +80,6 @@ def _known_fee_units(fill: BrokerFill) -> int:
     return (fill.commission_units or 0) + (fill.tax_units or 0)
 
 
-_MAX_PROCEEDS_BAND_PPM = 50_000
-
-
 def _intent_payload(connection: sqlite3.Connection, intent_id: object) -> dict:
     if not intent_id:
         return {}
@@ -98,118 +96,81 @@ def _intent_payload(connection: sqlite3.Connection, intent_id: object) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _conservative_sell_proceeds(
+def _estimate_unpriced_sell_proceeds(
     payload: dict,
     security: str,
     quantity: int,
     gross_units: int,
+    local_limit_price_units: Optional[int] = None,
 ) -> Tuple[int, Optional[dict]]:
-    """估算显式零价（ZERO_FALLBACK）卖出的回款保守下界。
+    """Use the recorded reference only for provisional cash, never as a fill price."""
 
-    仅对 ``price_source is ZERO_FALLBACK`` 的成交生效；委托价兜底
-    （ORDER_PRICE_FALLBACK）保持原有行为，不被抬高到保护价边界。
-
-    券商对部分市价委托不回报成交价与成交金额，零价入账会让卖出回款完全不
-    进账本，进而使当日买入预算凭空少一笔钱。这里复用建意图时记录的参考价与
-    下发到券商的卖出保护带，取保护价下沿作为成交价——对卖出而言是回款下界。
-
-    该估算只补现金，绝不写回成交价：``fills.price_units`` 仍为 0、
-    ``price_known`` 仍为 0，估算依据完整记录在账本分录里。
-    """
-
-    if not isinstance(payload, dict) or type(quantity) is not int or quantity <= 0:
+    if type(quantity) is not int or quantity <= 0:
         return 0, None
-    references = payload.get("reference_prices_units")
-    if not isinstance(references, dict):
+    references = payload.get("reference_prices_units") if isinstance(payload, dict) else None
+    reference_units = references.get(security) if isinstance(references, dict) else None
+    if type(reference_units) is int and reference_units > 0:
+        estimate_price_units = reference_units
+        basis = "INTENT_REFERENCE_PRICE"
+    elif type(local_limit_price_units) is int and local_limit_price_units > 0:
+        estimate_price_units = local_limit_price_units
+        basis = "ORDER_LIMIT_PRICE"
+    else:
         return 0, None
-    reference_units = references.get(security)
-    if type(reference_units) is not int or reference_units <= 0:
-        return 0, None
-    request = payload.get("execution_request")
-    if not isinstance(request, dict):
-        return 0, None
-    style = request.get("sell_style")
-    if not isinstance(style, dict):
-        style = request.get("style")
-    if not isinstance(style, dict):
-        return 0, None
-    band_ppm = style.get("protect_price_band_ppm")
-    if type(band_ppm) is not int:
-        band_ppm = style.get("price_band_ppm")
-    if type(band_ppm) is not int or not 0 <= band_ppm <= _MAX_PROCEEDS_BAND_PPM:
-        return 0, None
-    boundary_units = max(
-        1, reference_units * (PRICE_SCALE - band_ppm) // PRICE_SCALE
-    )
-    estimated_gross_units = _trade_value_units(boundary_units, quantity)
+    estimated_gross_units = _trade_value_units(estimate_price_units, quantity)
     shortfall_units = estimated_gross_units - gross_units
     if shortfall_units <= 0:
         return 0, None
     return shortfall_units, {
-        "basis": "SELL_PROTECTION_BOUNDARY",
+        "basis": basis,
         "reference_price_units": reference_units,
-        "band_ppm": band_ppm,
-        "boundary_price_units": boundary_units,
+        "estimate_price_units": estimate_price_units,
         "estimated_gross_units": estimated_gross_units,
     }
 
 
-def _conservative_buy_cost(
+def _estimate_unpriced_buy_cost(
     payload: dict,
     security: str,
     quantity: int,
     gross_units: int,
     max_gross_units: int,
+    local_limit_price_units: Optional[int] = None,
+    remaining_order_qty: Optional[int] = None,
 ) -> Tuple[int, Optional[dict]]:
-    """估算显式零价（ZERO_FALLBACK）买入的成本保守上界。
+    """Estimate an unpriced buy from its reference, bounded by reserved cash."""
 
-    仅对 ``price_source is ZERO_FALLBACK`` 的成交生效；委托价兜底
-    （ORDER_PRICE_FALLBACK）保持原有行为。
-
-    与 ``_conservative_sell_proceeds`` 对称：零价买入会让现金少扣、持仓成本
-    只剩费用，这里取买入保护价上沿作为成交价——对买入而言是成本上界。估算值
-    受该委托已预留现金约束，不会突破 ``buy fill exceeds order reserved cash``。
-
-    该估算只补账本金额，绝不写回成交价：``fills.price_units`` 仍为 0、
-    ``price_known`` 仍为 0，估算依据完整记录在账本分录里。
-    """
-
-    if not isinstance(payload, dict) or type(quantity) is not int or quantity <= 0:
+    if type(quantity) is not int or quantity <= 0:
         return 0, None
-    references = payload.get("reference_prices_units")
-    if not isinstance(references, dict):
-        return 0, None
-    reference_units = references.get(security)
-    if type(reference_units) is not int or reference_units <= 0:
-        return 0, None
-    request = payload.get("execution_request")
-    if not isinstance(request, dict):
-        return 0, None
-    style = request.get("buy_style")
-    if not isinstance(style, dict):
-        style = request.get("style")
-    if not isinstance(style, dict):
-        return 0, None
-    band_ppm = style.get("protect_price_band_ppm")
-    if type(band_ppm) is not int:
-        band_ppm = style.get("price_band_ppm")
-    if type(band_ppm) is not int or not 0 <= band_ppm <= _MAX_PROCEEDS_BAND_PPM:
-        return 0, None
-    boundary_units = max(1, reference_units * (PRICE_SCALE + band_ppm) // PRICE_SCALE)
-    estimated_gross_units = _trade_value_units(boundary_units, quantity)
+    references = payload.get("reference_prices_units") if isinstance(payload, dict) else None
+    reference_units = references.get(security) if isinstance(references, dict) else None
+    if type(reference_units) is int and reference_units > 0:
+        estimate_price_units = reference_units
+        basis = "INTENT_REFERENCE_PRICE"
+    elif type(local_limit_price_units) is int and local_limit_price_units > 0:
+        estimate_price_units = local_limit_price_units
+        basis = "ORDER_LIMIT_PRICE"
+    else:
+        estimate_price_units = None
+        basis = "ORDER_RESERVED_BUDGET"
     if type(max_gross_units) is not int or max_gross_units < 0:
         max_gross_units = 0
+    if estimate_price_units is not None:
+        estimated_gross_units = _trade_value_units(estimate_price_units, quantity)
+    elif type(remaining_order_qty) is int and remaining_order_qty >= quantity:
+        estimated_gross_units = _round_div(
+            max_gross_units * quantity, remaining_order_qty
+        )
+    else:
+        estimated_gross_units = max_gross_units
     capped = estimated_gross_units > max_gross_units
     if capped:
         estimated_gross_units = max_gross_units
     extra_units = estimated_gross_units - gross_units
-    if extra_units <= 0:
-        return 0, None
     return extra_units, {
-        "basis": "BUY_PROTECTION_BOUNDARY",
+        "basis": basis,
         "reference_price_units": reference_units,
-        "band_ppm": band_ppm,
-        "boundary_price_units": boundary_units,
+        "estimate_price_units": estimate_price_units,
         "estimated_gross_units": estimated_gross_units,
         "capped_to_order_reservation": capped,
     }
@@ -217,8 +178,9 @@ def _conservative_buy_cost(
 
 def _fee_notification_detail(
     fill: BrokerFill,
-    proceeds_estimated: bool = False,
-    costs_estimated: bool = False,
+    proceeds_estimate: Optional[dict] = None,
+    cost_estimate: Optional[dict] = None,
+    price_estimate: Optional[dict] = None,
 ) -> str:
     def display(label: str, value: Optional[int]) -> str:
         if value is None:
@@ -233,14 +195,37 @@ def _fee_notification_detail(
     )
     if fill.commission_units is None or fill.tax_units is None:
         detail += "；成交金额仅计已知费用"
-    if fill.price_source is FillPriceSource.ZERO_FALLBACK:
+    if price_estimate is not None:
+        detail += "；券商回报价为0，单价和金额按{}估算；收益为非精确收益".format(
+            {
+                "INTENT_REFERENCE_PRICE": "目标参考价",
+                "ORDER_LIMIT_PRICE": "委托限价",
+                "ORDER_RESERVED_BUDGET": "委托预留资金",
+                "POSITION_COST_FALLBACK": "已有持仓成本",
+            }.get(price_estimate["basis"], "已记录价格")
+        )
+    elif fill.price_source is FillPriceSource.ZERO_FALLBACK:
         detail += "；成交价和成交金额缺失"
-        if proceeds_estimated:
-            detail += "，按卖出保护价下沿保守估算回款入账（非真实成交价，收益不准确）"
-        elif costs_estimated:
-            detail += "，按买入保护价上沿保守估算成本扣款入账（非真实成交价，收益不准确）"
+        if proceeds_estimate is not None:
+            basis = (
+                "委托限价" if proceeds_estimate["basis"] == "ORDER_LIMIT_PRICE"
+                else "目标参考价"
+            )
+            detail += "，按{}暂估回款 ¥{} 供调仓使用；非真实成交价，收益不可用".format(
+                basis,
+                money_units_to_display(proceeds_estimate["estimated_gross_units"]),
+            )
+        elif cost_estimate is not None:
+            basis = {
+                "ORDER_LIMIT_PRICE": "委托限价",
+                "ORDER_RESERVED_BUDGET": "委托预留资金",
+            }.get(cost_estimate["basis"], "目标参考价")
+            detail += "，按{}暂估成本 ¥{}；非真实成交价，收益不可用".format(
+                basis,
+                money_units_to_display(cost_estimate["estimated_gross_units"]),
+            )
         else:
-            detail += "，按0记账（非真实成交价），资金/收益不准确"
+            detail += "，无可用参考价；成交股数已入账，金额和收益未知"
     elif not fill.price_known:
         detail += "；成交价缺失，使用委托保护价保守估算"
     return detail
@@ -532,9 +517,41 @@ class SQLiteFillBookingService:
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            price_estimate = None
+            if fill.price_source is FillPriceSource.ZERO_FALLBACK:
+                fill, price_estimate = self._price_zero_fill(connection, account_id, fill)
             duplicate = self._find_duplicate_fill(connection, fill)
             if duplicate is not None:
                 account = _account_from_row(self._select_account(connection, account_id))
+                if not duplicate["price_known"] and fill.price_known:
+                    corrected = self._correct_fill_price(
+                        connection, account_id, account, duplicate, fill,
+                        expected_ledger_version,
+                    )
+                    order = self._select_order(connection, fill.order_id)
+                    connection.commit()
+                    self._notify(
+                        TradeNotification(
+                            event="FILL_PRICE_CORRECTED",
+                            strategy_id=corrected.account.strategy_id,
+                            security=fill.security,
+                            security_name=self._security_name(
+                                connection, order["intent_id"], fill.security
+                            ),
+                            side=fill.side.value,
+                            status=corrected.order_state.value,
+                            quantity=fill.quantity,
+                            price=price_units_to_display(fill.price_units),
+                            amount=money_units_to_display(
+                                _trade_value_units(fill.price_units, fill.quantity)
+                            ),
+                            order_id=fill.order_id,
+                            trade_id=fill.broker_trade_id,
+                            detail="券商补回真实成交价，策略资金和成本已按成交回报更正",
+                            occurred_at=fill.traded_at,
+                        )
+                    )
+                    return corrected
                 position = self._select_position(connection, account_id, fill.security)
                 order = self._select_order(connection, fill.order_id)
                 connection.commit()
@@ -603,12 +620,14 @@ class SQLiteFillBookingService:
                     connection, account_id, fill.order_id
                 )
                 if fill.price_source is FillPriceSource.ZERO_FALLBACK:
-                    cost_estimate_units, cost_estimate = _conservative_buy_cost(
+                    cost_estimate_units, cost_estimate = _estimate_unpriced_buy_cost(
                         _intent_payload(connection, order["intent_id"]),
                         fill.security,
                         fill.quantity,
                         gross_units,
                         max(0, order_reserved - fee_units),
+                        order["limit_price_units"],
+                        order["requested_qty"] - order["filled_qty"],
                     )
                 booked_cost_units = gross_units + cost_estimate_units
                 cash_delta = -(booked_cost_units + fee_units)
@@ -639,13 +658,16 @@ class SQLiteFillBookingService:
                     raise LedgerInvariantError("sell fees exceed trade value")
                 if fill.price_source is FillPriceSource.ZERO_FALLBACK:
                     proceeds_estimate_units, proceeds_estimate = (
-                        _conservative_sell_proceeds(
+                        _estimate_unpriced_sell_proceeds(
                             _intent_payload(connection, order["intent_id"]),
                             fill.security,
                             fill.quantity,
                             gross_units,
+                            order["limit_price_units"],
                         )
                     )
+                # The estimate keeps target execution moving but is not a
+                # broker-confirmed price or an accurate performance input.
                 cash_delta = gross_units + proceeds_estimate_units - fee_units
                 reservation_released = 0
                 reserved_after = account.reserved_cash_units
@@ -715,6 +737,14 @@ class SQLiteFillBookingService:
                 "reservation_released_units": reservation_released,
                 "realized_pnl_units": realized_pnl_units,
             }
+            if price_estimate is not None:
+                payload["price_estimate"] = price_estimate
+                payload["broker_reported_price_units"] = 0
+                if fill.side is OrderSide.BUY:
+                    payload["estimated_cost_units"] = gross_units
+                else:
+                    payload["estimated_proceeds_units"] = gross_units
+                    payload["credited_proceeds_estimate_units"] = gross_units
             if cost_estimate is not None:
                 payload["cash_delta_units"] = cash_delta
                 payload["estimated_cost_units"] = cost_estimate_units
@@ -722,6 +752,7 @@ class SQLiteFillBookingService:
             if proceeds_estimate is not None:
                 payload["cash_delta_units"] = cash_delta
                 payload["estimated_proceeds_units"] = proceeds_estimate_units
+                payload["credited_proceeds_estimate_units"] = proceeds_estimate_units
                 payload["proceeds_estimate"] = proceeds_estimate
             payload_json = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -777,19 +808,27 @@ class SQLiteFillBookingService:
                     side=fill.side.value,
                     status=order_state.value,
                     quantity=fill.quantity,
-                    price=price_units_to_display(fill.price_units),
-                    amount=money_units_to_display(
-                        gross_units + cost_estimate_units + fee_units
-                        if fill.side is OrderSide.BUY
-                        else cash_delta
+                    price=(
+                        None if not fill.price_known and price_estimate is None
+                        else price_units_to_display(fill.price_units)
+                    ),
+                    amount=(
+                        None if not fill.price_known and price_estimate is None
+                        else money_units_to_display(
+                            gross_units + fee_units
+                            if fill.side is OrderSide.BUY
+                            else cash_delta
+                        )
                     ),
                     order_id=fill.order_id,
                     trade_id=fill.broker_trade_id,
                     detail=_fee_notification_detail(
                         fill,
-                        proceeds_estimated=proceeds_estimate is not None,
-                        costs_estimated=cost_estimate is not None,
+                        proceeds_estimate=proceeds_estimate,
+                        cost_estimate=cost_estimate,
+                        price_estimate=price_estimate,
                     ),
+                    estimated=price_estimate is not None,
                     occurred_at=fill.traded_at,
                 )
             )
@@ -810,6 +849,249 @@ class SQLiteFillBookingService:
             raise
         finally:
             connection.close()
+
+    def _price_zero_fill(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        fill: BrokerFill,
+    ) -> Tuple[BrokerFill, Optional[dict]]:
+        """Book a positive estimated price without changing the broker evidence ID."""
+
+        existing = connection.execute(
+            "SELECT price_units, price_source FROM fills WHERE fill_id = ?",
+            (fill.fill_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["price_source"] != FillPriceSource.ZERO_PRICE_ESTIMATE.value:
+                return fill, None  # Historical raw-zero fill: preserve replay.
+            return replace(
+                fill,
+                price_units=existing["price_units"],
+                price_source=FillPriceSource.ZERO_PRICE_ESTIMATE,
+            ), {"basis": "EXISTING_LEDGER_ESTIMATE", "price_units": existing["price_units"]}
+
+        order = self._select_order(connection, fill.order_id)
+        if order["strategy_account_id"] != account_id:
+            raise FillConflictError("fill order belongs to another strategy account")
+        payload = _intent_payload(connection, order["intent_id"])
+        references = payload.get("reference_prices_units")
+        reference = references.get(fill.security) if isinstance(references, dict) else None
+        if type(reference) is int and reference > 0:
+            estimated_price = reference
+            basis = "INTENT_REFERENCE_PRICE"
+        elif type(order["limit_price_units"]) is int and order["limit_price_units"] > 0:
+            estimated_price = order["limit_price_units"]
+            basis = "ORDER_LIMIT_PRICE"
+        elif fill.side is OrderSide.SELL:
+            position = self._select_position(connection, account_id, fill.security)
+            estimated_price = position.avg_cost_price_units
+            basis = "POSITION_COST_FALLBACK"
+        else:
+            estimated_price = 0
+            basis = "ORDER_RESERVED_BUDGET"
+
+        capped = False
+        if fill.side is OrderSide.BUY:
+            reserved = self._order_reserved_units(connection, account_id, fill.order_id)
+            budget = max(0, reserved - _known_fee_units(fill))
+            remaining = order["requested_qty"] - order["filled_qty"]
+            if estimated_price <= 0 and remaining > 0:
+                budget = budget * fill.quantity // remaining
+            affordable_price = budget * PRICE_SCALE // (fill.quantity * MONEY_SCALE)
+            if estimated_price > affordable_price:
+                estimated_price = affordable_price
+                capped = True
+            elif estimated_price <= 0:
+                estimated_price = affordable_price
+        if estimated_price <= 0:
+            # No defensible monetary estimate exists.  Keep the pre-existing
+            # raw-zero path rather than inventing a nominal price.
+            return fill, None
+        return replace(
+            fill,
+            price_units=estimated_price,
+            price_source=FillPriceSource.ZERO_PRICE_ESTIMATE,
+        ), {
+            "basis": basis,
+            "price_units": estimated_price,
+            "capped_to_order_reservation": capped,
+        }
+
+    def _correct_fill_price(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        account: StrategyAccount,
+        original: sqlite3.Row,
+        fill: BrokerFill,
+        expected_ledger_version: int,
+    ) -> FillBookingResult:
+        """Upgrade one previously estimated fill using the same broker trade ID."""
+
+        if account.ledger_version != expected_ledger_version:
+            raise VersionConflictError("strategy account ledger version changed")
+        entry = connection.execute(
+            """
+            SELECT amount_units, payload_json FROM ledger_entries
+            WHERE strategy_account_id = ? AND reference_type = 'order'
+              AND reference_id = ?
+              AND json_extract(payload_json, '$.fill_id') = ?
+              AND entry_type IN ('BUY_FILL_BOOKED', 'SELL_FILL_BOOKED')
+            """,
+            (account_id, fill.order_id, fill.fill_id),
+        ).fetchone()
+        if entry is None:
+            raise LedgerInvariantError("estimated fill ledger entry is missing")
+        original_payload = json.loads(entry["payload_json"])
+        if not isinstance(original_payload, dict):
+            raise LedgerInvariantError("estimated fill ledger payload is invalid")
+
+        new_commission = (
+            fill.commission_units
+            if fill.commission_units is not None
+            else original["commission_units"] if original["commission_known"] else None
+        )
+        new_tax = (
+            fill.tax_units
+            if fill.tax_units is not None
+            else original["tax_units"] if original["tax_known"] else None
+        )
+        known_fees = (new_commission or 0) + (new_tax or 0)
+        actual_gross = _trade_value_units(fill.price_units, fill.quantity)
+        actual_cash_delta = (
+            -(actual_gross + known_fees)
+            if fill.side is OrderSide.BUY
+            else actual_gross - known_fees
+        )
+        prior_proceeds_correction = 0
+        if fill.side is OrderSide.SELL:
+            prior_proceeds_correction = connection.execute(
+                """
+                SELECT COALESCE(SUM(amount_units), 0) FROM ledger_entries
+                WHERE strategy_account_id = ? AND reference_type = 'fill'
+                  AND reference_id = ?
+                  AND entry_type = 'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                """,
+                (account_id, fill.fill_id),
+            ).fetchone()[0]
+        cash_correction = (
+            actual_cash_delta - entry["amount_units"] - prior_proceeds_correction
+        )
+        cash_after = account.cash_units + cash_correction
+        if cash_after < account.reserved_cash_units:
+            raise LedgerInvariantError(
+                "verified fill price exceeds available strategy cash"
+            )
+
+        realized_correction = cash_correction if fill.side is OrderSide.SELL else 0
+        if fill.side is OrderSide.BUY:
+            lot = connection.execute(
+                "SELECT * FROM position_lots WHERE source_fill_id = ?",
+                (fill.fill_id,),
+            ).fetchone()
+            if lot is None or lot["strategy_account_id"] != account_id:
+                raise LedgerInvariantError("estimated buy lot is missing")
+            original_qty = lot["original_qty"]
+            remaining_qty = lot["remaining_qty"]
+            old_cost = (
+                _trade_value_units(lot["cost_price_units"], original_qty)
+                if original["price_source"] == FillPriceSource.ZERO_FALLBACK.value
+                else _trade_value_units(original["price_units"], original_qty)
+                + original["commission_units"] + original["tax_units"]
+            )
+            new_cost = actual_gross + known_fees
+            old_remaining = _round_div(old_cost * remaining_qty, original_qty)
+            new_remaining = _round_div(new_cost * remaining_qty, original_qty)
+            realized_correction = -(
+                (new_cost - new_remaining) - (old_cost - old_remaining)
+            )
+            connection.execute(
+                "UPDATE position_lots SET cost_price_units = ? WHERE lot_id = ?",
+                (_cost_price_units(new_cost, original_qty), lot["lot_id"]),
+            )
+
+        connection.execute(
+            """
+            UPDATE fills SET price_units = ?, price_source = 'BROKER_TRADE',
+                price_known = 1, fill_fingerprint = ?,
+                commission_units = ?, commission_known = ?,
+                tax_units = ?, tax_known = ?
+            WHERE fill_id = ?
+            """,
+            (
+                fill.price_units, fill.fingerprint,
+                new_commission or 0, int(new_commission is not None),
+                new_tax or 0, int(new_tax is not None), fill.fill_id,
+            ),
+        )
+        if fill.side is OrderSide.BUY:
+            position = self._refresh_position(
+                connection, account_id, fill.security, fill.traded_at.date()
+            )
+        else:
+            position = self._select_position(connection, account_id, fill.security)
+
+        next_version = account.ledger_version + 1
+        next_event_seq = account.event_seq + 1
+        timestamp = _timestamp()
+        updated = connection.execute(
+            """
+            UPDATE strategy_accounts
+            SET cash_units = ?, ledger_version = ?, event_seq = ?, updated_at = ?
+            WHERE strategy_account_id = ? AND ledger_version = ? AND event_seq = ?
+            """,
+            (
+                cash_after, next_version, next_event_seq, timestamp,
+                account_id, account.ledger_version, account.event_seq,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise VersionConflictError("strategy account changed")
+        payload = {
+            "fill_id": fill.fill_id,
+            "broker_trade_id": fill.broker_trade_id,
+            "previous_price_source": original["price_source"],
+            "verified_price_units": fill.price_units,
+            "cash_correction_units": cash_correction,
+            "realized_pnl_units": realized_correction,
+        }
+        payload_json = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        connection.execute(
+            """
+            INSERT INTO ledger_entries(
+                strategy_account_id, event_seq, entry_type, amount_units,
+                cash_after_units, reserved_after_units, reference_type,
+                reference_id, payload_json, created_at
+            ) VALUES (?, ?, 'FILL_PRICE_CORRECTED', ?, ?, ?, 'fill', ?, ?, ?)
+            """,
+            (
+                account_id, next_event_seq, cash_correction, cash_after,
+                account.reserved_cash_units, fill.fill_id, payload_json, timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO strategy_events(
+                strategy_account_id, event_seq, event_type, payload_json, created_at
+            ) VALUES (?, ?, 'BROKER_FILL_PRICE_CORRECTED', ?, ?)
+            """,
+            (account_id, next_event_seq, payload_json, timestamp),
+        )
+        updated_account = _account_from_row(
+            self._select_account(connection, account_id)
+        )
+        order = self._select_order(connection, fill.order_id)
+        return FillBookingResult(
+            account=updated_account,
+            position=position,
+            order_state=OrderState(order["state"]),
+            realized_pnl_units=realized_correction,
+            duplicate=False,
+            corrected=True,
+        )
 
     def finalize_order(
         self,
@@ -982,10 +1264,18 @@ class SQLiteFillBookingService:
                 "price_source", "price_known",
             )
         )
-        if actual != expected or (
+        price_upgrade = (
+            not row["price_known"]
+            and fill.price_known
+            and fill.price_source is FillPriceSource.BROKER_TRADE
+            and row["fill_id"] == fill.fill_id
+            and actual[:5] == expected[:5]
+            and actual[6] == expected[6]
+        )
+        if not price_upgrade and (actual != expected or (
             fill.broker_trade_id is None
             and row["fill_fingerprint"] != fill.fingerprint
-        ):
+        )):
             raise FillConflictError("broker fill id was reused with different fields")
         for units_field, known_field, incoming in (
             ("commission_units", "commission_known", fill.commission_units),
@@ -1113,7 +1403,9 @@ class SQLiteFillBookingService:
                 (consumed, lot["lot_id"]),
             )
             original_cost = (
-                _trade_value_units(lot["source_price_units"], lot["original_qty"])
+                _trade_value_units(lot["cost_price_units"], lot["original_qty"])
+                if lot["source_price_units"] == 0
+                else _trade_value_units(lot["source_price_units"], lot["original_qty"])
                 + lot["source_commission_units"]
                 + lot["source_tax_units"]
             )
