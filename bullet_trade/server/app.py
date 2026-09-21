@@ -18,12 +18,17 @@ import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 from bullet_trade.core.globals import log
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.utils.portfolio_printer import render_account_overview
-from bullet_trade.server.feishu_notifier import FeishuNotifier
+from bullet_trade.server.feishu_notifier import (
+    FeishuNotifier,
+    TargetBuyPlanNotification,
+    TradeNotification,
+    format_strategy_event_log,
+)
 from bullet_trade.server.strategy import (
     BrokerCapabilityProfile,
     BrokerContractError,
@@ -159,7 +164,10 @@ class ServerApplication:
                 self.config.feishu_webhook_url,
                 self.config.feishu_signing_secret,
             )
-            if self.config.feishu_webhook_url
+            if (
+                self.config.strategy_notify_feishu
+                and self.config.feishu_webhook_url
+            )
             else None
         )
         if self.config.strategy_database_path and self.adapters.broker_adapter:
@@ -204,7 +212,7 @@ class ServerApplication:
                 self.adapters.broker_adapter,
                 capabilities,
                 self.adapters.data_adapter,
-                self.feishu_notifier.queue_message if self.feishu_notifier else None,
+                self._publish_strategy_event,
                 durable_broker_history=durable_broker_history,
             )
             if (
@@ -215,6 +223,7 @@ class ServerApplication:
                     "StrategyLedger 模拟账户验证模式已开启；能力证明门禁暂时关闭，"
                     "仍仅允许策略白名单执行"
                 )
+
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
                 account_key = ctx.config.key or "default"
@@ -234,6 +243,19 @@ class ServerApplication:
                 self.config.dashboard_token,
                 self._dashboard_payload,
             )
+
+    def _publish_strategy_event(
+        self,
+        notification: Union[TradeNotification, TargetBuyPlanNotification],
+    ) -> Dict[str, bool]:
+        """Always write the event locally, then fan out to optional Feishu."""
+
+        log.info(format_strategy_event_log(notification))
+        feishu_queued = False
+        if self.feishu_notifier is not None:
+            self.feishu_notifier.queue_message(notification)
+            feishu_queued = True
+        return {"local_logged": True, "feishu_queued": feishu_queued}
 
     @property
     def _idempotency_lock_guard(self) -> asyncio.Lock:

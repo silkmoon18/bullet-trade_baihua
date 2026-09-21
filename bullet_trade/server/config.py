@@ -72,6 +72,7 @@ class ServerConfig:
     strategy_buy_fee_buffer: float = 5.0
     strategy_unpriced_fill_policy: str = "STRICT"
     strategy_capabilities_path: Optional[str] = None
+    strategy_notify_feishu: bool = True
     feishu_webhook_url: Optional[str] = None
     feishu_signing_secret: str = ""
     dashboard_enabled: bool = False
@@ -380,6 +381,9 @@ def build_server_config(args) -> ServerConfig:
             get_env("QMT_STRATEGY_UNPRICED_FILL_POLICY")
         ),
         strategy_capabilities_path=get_env("QMT_STRATEGY_CAPABILITIES_FILE"),
+        strategy_notify_feishu=get_env_bool(
+            "QMT_STRATEGY_NOTIFY_FEISHU", True
+        ),
         feishu_webhook_url=get_env("FEISHU_WEBHOOK_URL"),
         feishu_signing_secret=get_env("FEISHU_SIGNING_SECRET", "") or "",
         dashboard_enabled=get_env_bool("QMT_DASHBOARD_ENABLED", False),

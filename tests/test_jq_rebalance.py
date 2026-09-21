@@ -116,6 +116,57 @@ def test_native_rebalance_submits_once_without_waiting_for_failed_sell(helper, m
     assert not hasattr(runtime, "on_bar")
     assert not hasattr(runtime, "_jq_plan")
     assert not hasattr(jq.g, "bt_jq_plan")
+    assert any("策略目标比例 | BUY 比例=50.00%" in item for item in jq.messages)
+    assert any("策略目标比例汇总 | 部署=70.00%" in item for item in jq.messages)
+
+
+def test_qmt_rebalance_logs_server_planned_orders(helper, monkeypatch):
+    messages = []
+    namespace = {
+        "g": NS(),
+        "log": NS(
+            info=messages.append,
+            warn=messages.append,
+            error=messages.append,
+        ),
+    }
+    state = {
+        "mode": "QMT_REMOTE",
+        "strategy_id": "test",
+        "jq_account_enabled": False,
+        "qmt_account_enabled": True,
+        "production_ready": True,
+        "jq_log_enabled": True,
+    }
+    runtime = helper.JoinQuantRuntime(state, namespace)
+    runtime._qmt_callback_allowed = lambda *args: True
+    runtime.advance_targets = lambda context: True
+    runtime.send_target_buy_plan = lambda *args, **kwargs: None
+    portfolio = NS(total_value=10000.0, positions={})
+    monkeypatch.setattr(helper, "get_portfolio", lambda **kwargs: portfolio)
+    runtime.submit_targets = lambda *args, **kwargs: {
+        "intent": {"intent_id": "intent-1", "state": "EXECUTING"},
+        "planned_orders": [{
+            "security": "510050.XSHG",
+            "side": "BUY",
+            "quantity": 1000,
+            "limit_price_units": 2500000,
+            "execution_type": "LIMIT",
+        }],
+    }
+    context = NS(current_dt=datetime.now(), portfolio=portfolio)
+
+    runtime.execute_rebalance(
+        context, {"510050.XSHG": 0.25}, {"510050.XSHG": 2.5}, "open-test"
+    )
+
+    assert any("策略目标比例" in item and "25.00%" in item for item in messages)
+    assert any(
+        "QMT买入计划" in item
+        and "数量=1000" in item
+        and "预计金额=2500.00" in item
+        for item in messages
+    )
 
 
 def test_pending_sell_does_not_create_a_helper_sell_buy_state_machine(helper):

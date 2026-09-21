@@ -89,6 +89,7 @@ def _state(mode, run_type, **extra):
         "strategy_id": STRATEGY_ID,
         "jq_account_enabled": jq_enabled,
         "qmt_account_enabled": qmt_enabled,
+        "jq_log_enabled": True,
         "enabled": mode != "BACKTEST",
         "orders_enabled": True,
         "production_ready": False,
@@ -678,7 +679,25 @@ def test_runtime_facade_builds_round_lot_plan_and_logs_notification(
     }
     assert result["accepted"] is True
     assert sent == [([item], "2026-08-20 09:30:00")]
-    assert any("计划卡片已提交" in message for message in logger.messages)
+    assert any("计划已记录" in message for message in logger.messages)
+    assert any(
+        "参考价买入计划" in message and "数量=1000" in message
+        for message in logger.messages
+    )
+
+
+def test_runtime_facade_can_disable_joinquant_log(helper):
+    logger = types.SimpleNamespace(messages=[])
+    logger.info = logger.messages.append
+    logger.warn = logger.messages.append
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ", "sim_trade", jq_log_enabled=False),
+        {"g": types.SimpleNamespace(), "log": logger},
+    )
+
+    runtime._log("info", "hidden")
+
+    assert logger.messages == []
 
 
 def test_runtime_facade_notification_failure_does_not_escape(

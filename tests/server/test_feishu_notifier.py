@@ -8,6 +8,7 @@ from bullet_trade.server.feishu_notifier import (
     TargetBuyPlanItem,
     TargetBuyPlanNotification,
     TradeNotification,
+    format_strategy_event_log,
     reconciliation_notification,
 )
 from bullet_trade.server.strategy.domain import SHANGHAI_TZ
@@ -139,6 +140,35 @@ def test_target_buy_plan_card_lists_items_and_total_amount():
     footer = elements[6]["text"]["content"]
     assert "¥3250.00" in footer
     assert "不代表已提交委托或已经成交" in footer
+
+
+def test_strategy_event_local_log_contains_plan_items():
+    message = format_strategy_event_log(TargetBuyPlanNotification(
+        strategy_id="good_etf", mode="QMT_REMOTE",
+        items=(TargetBuyPlanItem(
+            "510050.XSHG", 1000, "2500.00", "2.5000", "上证50ETF"
+        ),),
+    ))
+
+    assert "TARGET_BUY_PLAN" in message
+    assert "上证50ETF（510050.XSHG）" in message
+    assert "数量=1000" in message
+    assert "单价=2.5000" in message
+    assert "金额=2500.00" in message
+
+
+def test_strategy_event_local_log_contains_fill_fields():
+    message = format_strategy_event_log(TradeNotification(
+        event="FILLED", strategy_id="good_etf",
+        security="510050.XSHG", security_name="上证50ETF",
+        side="BUY", status="FILLED", quantity=1000,
+        price="2.5000", amount="2500.00", estimated=True,
+    ))
+
+    assert "event=FILLED" in message
+    assert "上证50ETF（510050.XSHG）" in message
+    assert "数量=1000" in message
+    assert "价格口径=估算" in message
 
 
 def test_legacy_notifier_is_drop_in_compatible(monkeypatch):

@@ -9,6 +9,7 @@
 ```dotenv
 QMT_STRATEGY_TRADING_ENABLED=false
 QMT_STRATEGY_ENABLED_IDS=good_etf_remote
+QMT_STRATEGY_NOTIFY_FEISHU=true
 ```
 
 ## 1. 准备专用账户和目录

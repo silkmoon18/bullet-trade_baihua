@@ -17,6 +17,7 @@ DEFAULT_PROFILE = "qmt-main"
 # - profile：填写PROFILES中存在的名称；省略时使用DEFAULT_PROFILE。
 # - jq_account_enabled：bool；True时维护聚宽模拟账户。
 # - qmt_account_enabled：bool；True时维护QMT StrategyLedger账户。
+# - jq_log_enabled：bool；True时把helper事件写入聚宽日志，默认True。
 # - 两者可同时为True，但不能同时为False。
 # - 省略或找不到策略key时默认为JQ=True、QMT=False。
 # - 回测始终由run_type自动识别，只运行聚宽账户；无需额外配置。
@@ -25,6 +26,7 @@ STRATEGIES = {
         "profile": "qmt-main",
         "jq_account_enabled": True,
         "qmt_account_enabled": False,
+        "jq_log_enabled": True,
     },
 }
 

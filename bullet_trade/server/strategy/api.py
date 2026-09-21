@@ -704,9 +704,11 @@ class SQLiteStrategyAPI:
             payload.get("occurred_at"), datetime.now(SHANGHAI_TZ)
         )
         accepted = False
+        local_logged = False
+        feishu_queued = False
         if self.notification_handler is not None:
             try:
-                self.notification_handler(
+                delivery = self.notification_handler(
                     TargetBuyPlanNotification(
                         strategy_id=strategy_id,
                         mode=mode,
@@ -715,10 +717,15 @@ class SQLiteStrategyAPI:
                     )
                 )
                 accepted = True
+                if isinstance(delivery, Mapping):
+                    local_logged = bool(delivery.get("local_logged"))
+                    feishu_queued = bool(delivery.get("feishu_queued"))
             except Exception:
                 accepted = False
         return {
             "accepted": accepted,
+            "local_logged": local_logged,
+            "feishu_queued": feishu_queued,
             "item_count": len(items),
             "total_amount": float(total),
         }

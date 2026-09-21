@@ -90,6 +90,7 @@ _STRATEGY_ALLOWED_FIELDS = {
     "profile",
     "jq_account_enabled",
     "qmt_account_enabled",
+    "jq_log_enabled",
 }
 
 _SENSITIVE_NAME_SUFFIXES = (
@@ -286,6 +287,10 @@ def _validate_profile_shape(
         if type(jq_enabled) is not bool or type(qmt_enabled) is not bool:
             raise ValidationError(
                 "{} strategy account switches must be bool".format(source_name)
+            )
+        if type(settings.get("jq_log_enabled", True)) is not bool:
+            raise ValidationError(
+                "{} strategy jq_log_enabled must be bool".format(source_name)
             )
         if not jq_enabled and not qmt_enabled:
             raise ValidationError(

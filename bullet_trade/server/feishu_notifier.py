@@ -60,6 +60,69 @@ class TargetBuyPlanNotification:
     occurred_at: Optional[datetime] = None
 
 
+def format_strategy_event_log(
+    notification: Union[TradeNotification, TargetBuyPlanNotification],
+) -> str:
+    """Render one structured strategy event for the server's local log.
+
+    The local log is the primary audit trail. Feishu is only an optional
+    delivery channel for the same event.
+    """
+
+    if isinstance(notification, TargetBuyPlanNotification):
+        total = sum(
+            (Decimal(str(item.amount)) for item in notification.items),
+            Decimal("0"),
+        )
+        lines = [
+            "策略事件 | TARGET_BUY_PLAN | strategy_id={} | mode={} | "
+            "标的数={} | 总金额={:.2f}".format(
+                notification.strategy_id,
+                notification.mode,
+                len(notification.items),
+                total,
+            )
+        ]
+        for item in notification.items:
+            lines.append(
+                "策略计划明细 | strategy_id={} | 标的={} | 数量={} | "
+                "单价={} | 金额={}".format(
+                    notification.strategy_id,
+                    _security_title(item.security, item.security_name),
+                    item.quantity,
+                    _display(item.reference_price, 4),
+                    _display(item.amount),
+                )
+            )
+        return "\n".join(lines)
+
+    fields = [
+        "策略事件",
+        "event={}".format(notification.event),
+        "strategy_id={}".format(notification.strategy_id),
+        "标的={}".format(
+            _security_title(notification.security, notification.security_name)
+        ),
+        "方向={}".format(notification.side),
+        "状态={}".format(notification.status),
+    ]
+    if notification.quantity is not None:
+        fields.append("数量={}".format(notification.quantity))
+    if notification.price is not None:
+        fields.append("单价={}".format(_display(notification.price, 4)))
+    if notification.amount is not None:
+        fields.append("金额={}".format(_display(notification.amount)))
+    if notification.estimated:
+        fields.append("价格口径=估算")
+    if notification.order_id:
+        fields.append("order_id={}".format(notification.order_id))
+    if notification.trade_id:
+        fields.append("trade_id={}".format(notification.trade_id))
+    if notification.detail:
+        fields.append("描述={}".format(notification.detail.replace("\n", " | ")))
+    return " | ".join(fields)
+
+
 def _signature(timestamp: int, secret: str) -> str:
     text = "{}\n{}".format(timestamp, secret)
     digest = hmac.new(

@@ -748,6 +748,8 @@ def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
 
     assert result == {
         "accepted": True,
+        "local_logged": False,
+        "feishu_queued": False,
         "item_count": 2,
         "total_amount": 3250.0,
     }

@@ -135,7 +135,12 @@ _PROFILE_OPTIONAL_FIELDS = frozenset(
 )
 _PROFILE_ALLOWED_FIELDS = _PROFILE_REQUIRED_FIELDS | _PROFILE_OPTIONAL_FIELDS
 _STRATEGY_ALLOWED_FIELDS = frozenset(
-    {"profile", "jq_account_enabled", "qmt_account_enabled"}
+    {
+        "profile",
+        "jq_account_enabled",
+        "qmt_account_enabled",
+        "jq_log_enabled",
+    }
 )
 
 # 本代 helper 实例标记；namespace 记录中的 token 不同即为上一代遗留。
@@ -1210,11 +1215,14 @@ def _load_runtime_configuration(
             settings.get("jq_account_enabled", True),
             settings.get("qmt_account_enabled", False),
         )
+        if type(settings.get("jq_log_enabled", True)) is not bool:
+            raise RuntimeError("STRATEGIES.jq_log_enabled必须是bool")
 
     selected = strategies.get(strategy_id, {})
     profile = selected.get("profile", default_profile)
     jq_account_enabled = selected.get("jq_account_enabled", True)
     qmt_account_enabled = selected.get("qmt_account_enabled", False)
+    jq_log_enabled = selected.get("jq_log_enabled", True)
     mode = _mode_from_account_switches(
         jq_account_enabled, qmt_account_enabled
     )
@@ -1281,6 +1289,7 @@ def _load_runtime_configuration(
         "mode": mode,
         "jq_account_enabled": jq_account_enabled,
         "qmt_account_enabled": qmt_account_enabled,
+        "jq_log_enabled": jq_log_enabled,
         "profile": profile,
         "connection": {
             "host": host,
@@ -1469,6 +1478,11 @@ def install_strategy_runtime(
         expected_api_version,
         run_type,
         validate_remote,
+        (
+            runtime_config["jq_log_enabled"]
+            if runtime_config is not None
+            else True
+        ),
     )
     if _active_state is not None:
         if _active_signature != signature:
@@ -1499,6 +1513,7 @@ def install_strategy_runtime(
             profile_module=(profile_module if validate_remote else None),
             validate_remote=validate_remote,
         )
+
     elif mode == "JQ":
         if run_type != "sim_trade":
             raise RuntimeError(
@@ -1546,6 +1561,12 @@ def install_strategy_runtime(
             profile=profile,
             profile_module=profile_module,
         )
+
+    state["jq_log_enabled"] = (
+        runtime_config["jq_log_enabled"]
+        if runtime_config is not None
+        else True
+    )
 
     _active_signature = signature
     _active_state = dict(state)
@@ -1606,6 +1627,8 @@ class JoinQuantRuntime:
             setattr(global_state, "bt_runtime", self.state)
 
     def _log(self, level: str, message: str) -> None:
+        if self.state.get("jq_log_enabled", True) is not True:
+            return
         if self._namespace is None:
             return
         logger = self._namespace.get("log")
@@ -2047,6 +2070,24 @@ class JoinQuantRuntime:
         notification_items = []
         qmt_submitted = False
 
+        for security, raw_weight in weights.items():
+            self._log(
+                "info",
+                "策略目标比例 | {} 比例={:.2%}".format(
+                    _security_label(security), float(raw_weight)
+                ),
+            )
+        self._log(
+            "info",
+            "策略目标比例汇总 | 部署={:.2%} 现金={:.2%}".format(
+                sum(float(value) for value in weights.values()),
+                max(
+                    0.0,
+                    1.0 - sum(float(value) for value in weights.values()),
+                ),
+            )
+        )
+
         qmt_callback_allowed = (
             self.qmt_account_enabled
             and self._qmt_callback_allowed(context, "调仓执行")
@@ -2148,6 +2189,31 @@ class JoinQuantRuntime:
                     },
                 ),
             )
+            for order in qmt_result.get("planned_orders", ()):
+                if type(order) is not dict:
+                    continue
+                price_units = order.get("limit_price_units")
+                price = (
+                    float(price_units) / 1000000.0
+                    if type(price_units) is int and price_units > 0
+                    else None
+                )
+                quantity = int(order.get("quantity", 0))
+                amount = price * quantity if price is not None else None
+                side = str(order.get("side") or "未知")
+                self._log(
+                    "info",
+                    "QMT{}计划 | {} 方向={} 数量={} 单价={} "
+                    "预计金额={} 执行方式={}".format(
+                        "买入" if side == "BUY" else "卖出",
+                        _security_label(str(order.get("security") or "")),
+                        side,
+                        quantity,
+                        "{:.4f}".format(price) if price is not None else "市价",
+                        "{:.2f}".format(amount) if amount is not None else "待成交确定",
+                        order.get("execution_type") or "未知",
+                    ),
+                )
         elif qmt_result is not None and qmt_result.get(
             "skipped_active_intent"
         ):
@@ -2394,11 +2460,27 @@ class JoinQuantRuntime:
             if result.get("accepted"):
                 self._log(
                     "info",
-                    "策略目标买入计划卡片已提交 | 标的数={} 总金额={:.2f}".format(
+                    "策略目标买入计划已记录 | 标的数={} 总金额={:.2f} "
+                    "本地日志={} 飞书={}".format(
                         result.get("item_count", len(items)),
                         float(result.get("total_amount", 0.0)),
+                        "是" if result.get("local_logged") else "未知",
+                        "已入队" if result.get("feishu_queued") else "关闭",
                     ),
                 )
+                for item in items:
+                    self._log(
+                        "info",
+                        "参考价买入计划 | {} 数量={} 单价={:.4f} 金额={:.2f}".format(
+                            _security_label(
+                                str(item.get("security") or ""),
+                                item.get("security_name", ""),
+                            ),
+                            int(item.get("quantity", 0)),
+                            float(item.get("reference_price", 0.0)),
+                            float(item.get("amount", 0.0)),
+                        ),
+                    )
             else:
                 self._log(
                     "warn", "策略目标买入计划卡片未启用或发送队列未接受"
