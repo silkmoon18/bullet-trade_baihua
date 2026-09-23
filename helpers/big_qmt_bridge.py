@@ -118,6 +118,7 @@ def _trade(row):
         trade_id=_id(_get(row, "m_strTradeID")),
         order_id=_id(_get(row, "m_strOrderSysID")), security=_security(row),
         amount=_get(row, "m_nVolume"), price=_get(row, "m_dTradePrice") or _get(row, "m_dPrice"),
+        deal_balance=_get(row, "m_dTradeAmount"),
         side={23: "BUY", 24: "SELL"}.get(_get(row, "m_nOpType"), ""),
         time=_date_time(row, "m_strTradeDate", "m_strTradeTime"),
         order_remark=remark, remark=remark,

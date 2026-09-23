@@ -333,6 +333,19 @@ async def test_ensure_account_and_real_snapshot(api):
 
 
 @pytest.mark.asyncio
+async def test_existing_ledger_rejects_different_physical_qmt_account(api):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    another_account = AccountContext(AccountConfig("default", "another-qmt-account"))
+
+    with pytest.raises(LedgerInvariantError, match="physical account binding changed"):
+        await service.ensure_account(another_account, "default", {"strategy_id": "good_etf"})
+    with pytest.raises(LedgerInvariantError, match="physical account binding changed"):
+        await service.startup_check(another_account, "default")
+    assert broker.order_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_startup_rebinds_all_but_reconciles_only_enabled_strategy(
     api, monkeypatch
 ):

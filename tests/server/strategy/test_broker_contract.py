@@ -261,6 +261,22 @@ def test_zero_trade_price_uses_positive_deal_balance():
     assert evidence.price_known is True
 
 
+def test_material_price_amount_disagreement_uses_native_deal_amount():
+    trade = {
+        "trade_id": "T-amount", "trade_id_source": "broker", "order_id": "O-1",
+        "security": "561760.XSHG", "amount": 3000, "price": 0.912,
+        "deal_balance": 4134.0, "side": "SELL", "time": "2026-09-23 09:31:00",
+    }
+    evidence = normalize_trade_evidence(trade, {})
+    assert evidence.price_units == 1_378_000
+    assert evidence.price_source is FillPriceSource.BROKER_TRADE
+
+    # No independent deal amount means the broker price cannot be corrected
+    # merely because it differs from the strategy's reference price.
+    del trade["deal_balance"]
+    assert normalize_trade_evidence(trade, {}).price_units == 912_000
+
+
 def test_conservative_policy_uses_full_order_protection_price():
     trade = {
         "trade_id": "T-estimated",
@@ -460,9 +476,11 @@ def test_big_qmt_normalization_marks_native_ids_and_fee_presence():
             "m_strTradeID": "T-time",
             "m_strTradeDate": "20260810",
             "m_strTradeTime": "100000",
+            "raw": {"m_dTradeAmount": 138.0},
         }
     )
     assert native_time["time"] == "2026-08-10 10:00:00"
+    assert native_time["deal_balance"] == 138.0
 
     missing = _normalize_trade({"m_strOrderSysID": "O-2"})
     assert missing["trade_id_source"] == "missing"

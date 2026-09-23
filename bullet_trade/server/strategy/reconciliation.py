@@ -29,6 +29,7 @@ from .domain import (
     ReconciliationState,
     as_shanghai_time,
     money_to_units,
+    price_to_units,
     UnpricedFillPolicy,
 )
 from .fill_booking import SQLiteFillBookingService
@@ -331,6 +332,7 @@ class SQLiteReconciliationService:
                 )
         blockers = []
         booked_trade_ids = []
+        price_amount_disagreements = []
         ignored_broker_order_count = 0
         ignored_broker_trade_count = 0
         local_orders, all_orders_by_client_tag, booked_order_links = self._local_orders(
@@ -492,6 +494,20 @@ class SQLiteReconciliationService:
                 )
                 if not result.duplicate:
                     booked_trade_ids.append(evidence.broker_trade_id)
+                    if evidence.price_known and linked_trade.get("price") not in (None, ""):
+                        try:
+                            reported_price_units = price_to_units(
+                                str(linked_trade["price"])
+                            )
+                        except (ArithmeticError, TypeError, ValueError):
+                            reported_price_units = 0
+                        if reported_price_units > 0 and reported_price_units != evidence.price_units:
+                            price_amount_disagreements.append({
+                                "security": evidence.security,
+                                "broker_trade_id": evidence.broker_trade_id,
+                                "reported_price_units": reported_price_units,
+                                "amount_derived_price_units": evidence.price_units,
+                            })
             except (BrokerContractError, RepositoryError, ValueError) as exc:
                 blockers.append(
                     "trade_error:{}:{}".format(
@@ -569,6 +585,15 @@ class SQLiteReconciliationService:
             item.security: (max(item.total_qty, 0), max(item.sellable_qty, 0))
             for item in snapshot.positions
         }
+        unassigned_broker_positions = {
+            security: {
+                "broker_total_qty": broker_total,
+                "strategy_owned_qty": owned_positions.get(security, (0, 0))[0],
+                "unassigned_qty": broker_total - owned_positions.get(security, (0, 0))[0],
+            }
+            for security, (broker_total, _) in sorted(broker_positions.items())
+            if broker_total > owned_positions.get(security, (0, 0))[0]
+        }
         deferred_sellable_shortages = []
         sellable_limits = {}
         for security, (owned_total, owned_sellable) in sorted(owned_positions.items()):
@@ -594,6 +619,7 @@ class SQLiteReconciliationService:
         details = {
             "blockers": sorted(set(blockers)),
             "booked_trade_ids": booked_trade_ids,
+            "price_amount_disagreements": price_amount_disagreements,
             "adopted_order_ids": adopted_order_ids,
             "rejected_orders": rejected_orders,
             "broker_order_count": len(snapshot.orders),
@@ -606,6 +632,7 @@ class SQLiteReconciliationService:
             "unknown_fee_order_count": unknown_fee_order_count,
             "unknown_fee_cash_tolerance_units": unknown_fee_cash_tolerance,
             "strategy_owned_position_count": len(owned_positions),
+            "unassigned_broker_positions": unassigned_broker_positions,
             "strategy_frozen_sell_qty": frozen_sell_qty,
             "deferred_broker_sellable_shortages": sorted(
                 set(deferred_sellable_shortages)

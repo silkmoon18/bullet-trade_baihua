@@ -93,6 +93,7 @@ def test_native_fields_and_unknown_fee_are_not_invented(script):
     assert script._order({})["order_id"] == ""
     assert script._order({"m_strOrderSysID": "0"})["order_id"] == ""
     assert script._trade({"m_strTradeID": -1})["trade_id"] == ""
+    assert script._trade({"m_dTradeAmount": 1398.0})["deal_balance"] == 1398.0
     order = script._order({"m_dLimitPrice": 1.002, "m_dTradedPrice": 1.001, "m_strOrderRemark": "bt:tag"})
     assert (order["price"], order["order_price"], order["order_remark"]) == (1.001, 1.002, "bt:tag")
 

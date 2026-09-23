@@ -2658,6 +2658,12 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("trade_price") or item.get("m_dTradePrice"))
+    if item.get("deal_balance") is None:
+        native_amount = item.get("m_dTradeAmount")
+        if native_amount is None:
+            native_amount = raw.get("m_dTradeAmount")
+        if native_amount is not None:
+            item["deal_balance"] = native_amount
     trade_time = _big_qmt_trade_datetime(item, raw)
     if trade_time:
         item["trade_time"] = trade_time

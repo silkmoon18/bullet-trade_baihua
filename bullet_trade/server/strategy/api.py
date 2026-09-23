@@ -418,6 +418,7 @@ class SQLiteStrategyAPI:
 
     async def startup_check(self, account_context: object, account_key: str) -> bool:
         physical_id = self._physical_id(account_key)
+        self._ensure_physical_account(physical_id, account_context)
         connection = connect_database(self.database_path)
         try:
             rows = connection.execute(
@@ -805,6 +806,22 @@ class SQLiteStrategyAPI:
                         "QMT当前可卖={}；不足部分等待，不阻断整账户".format(limits[security])
                         if security in limits else "可卖限制已解除",
                     )
+        unassigned = result.details.get("unassigned_broker_positions", {})
+        prior_unassigned = (
+            previous.details.get("unassigned_broker_positions", {})
+            if previous is not None else {}
+        )
+        if unassigned != prior_unassigned:
+            logger.warning(
+                "QMT未归属持仓变化 | strategy_id=%s | positions=%s | "
+                "仅提示、不自动归属或卖出；请核对QMT持仓与委托成交",
+                strategy_id, unassigned,
+            )
+        for discrepancy in result.details.get("price_amount_disagreements", ()):
+            logger.warning(
+                "QMT成交价与成交金额不一致，按券商成交金额核算 | strategy_id=%s | %s",
+                strategy_id, discrepancy,
+            )
         changed_blocker = (
             result.state.value == "BLOCKED"
             and (previous is None or previous.state.value != "BLOCKED"
@@ -979,6 +996,7 @@ class SQLiteStrategyAPI:
     def _bind_runtime(
         self, strategy_id: str, account_context: object, account_key: str
     ) -> None:
+        self._ensure_physical_account(self._physical_id(account_key), account_context)
         try:
             self._event_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1424,19 +1442,24 @@ class SQLiteStrategyAPI:
             return None
 
     def _ensure_physical_account(self, physical_id: str, account_context: object) -> None:
+        config = getattr(account_context, "config", None)
+        broker_ref = str(getattr(config, "account_id", physical_id))
         connection = connect_database(self.database_path)
         try:
-            exists = connection.execute(
-                "SELECT 1 FROM physical_accounts WHERE physical_account_id = ?",
+            existing = connection.execute(
+                "SELECT broker_kind, broker_account_ref FROM physical_accounts WHERE physical_account_id = ?",
                 (physical_id,),
             ).fetchone()
         finally:
             connection.close()
-        if exists is None:
-            config = getattr(account_context, "config", None)
-            broker_ref = str(getattr(config, "account_id", physical_id))
+        if existing is None:
             self.repository.create_physical_account(
                 physical_id, "QMT", broker_ref
+            )
+        elif existing["broker_kind"] != "QMT" or existing["broker_account_ref"] != broker_ref:
+            raise LedgerInvariantError(
+                "QMT physical account binding changed; stop trading and create "
+                "a separate ledger for the new account, do not reuse the old strategy id"
             )
 
     def _held_securities(self, strategy_id: str) -> Sequence[str]:

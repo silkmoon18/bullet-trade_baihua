@@ -145,6 +145,31 @@ def test_matching_empty_account_is_ready(tmp_path):
     assert reconciliation.latest(PHYSICAL_ID) == result
 
 
+def test_extra_physical_position_is_reported_but_not_assigned_or_blocked(tmp_path):
+    database, _, _, reconciliation = _services(tmp_path)
+    result = reconciliation.synchronize(
+        ACCOUNT_ID,
+        PHYSICAL_ID,
+        _snapshot("20000", positions=(BrokerPositionSnapshot(SECURITY, 2400, 2400),)),
+    )
+    assert result.state is ReconciliationState.READY
+    assert result.details["unassigned_broker_positions"] == {
+        SECURITY: {
+            "broker_total_qty": 2400,
+            "strategy_owned_qty": 0,
+            "unassigned_qty": 2400,
+        }
+    }
+    connection = connect_database(database)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM positions WHERE strategy_account_id = ?",
+            (ACCOUNT_ID,),
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
 def test_latest_reconciliation_is_scoped_to_strategy_account(tmp_path):
     _, _, capital, reconciliation = _services(tmp_path)
     capital.ensure_strategy_account(
@@ -199,6 +224,31 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert replay_without_broker_order.details["booked_trade_ids"] == ()
     account = repository.get_strategy_account(ACCOUNT_ID)
     assert account.cash_units == money_to_units("7995")
+
+
+def test_native_deal_amount_correction_is_visible_and_replay_safe(tmp_path):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("3100"), 0, "buy-1")
+    trade = dict(_broker_trade(), deal_balance=3000.0)
+    snapshot = _snapshot(
+        "16995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),), trades=(trade,),
+    )
+
+    first = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+    second = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+
+    assert first.state is ReconciliationState.READY
+    assert first.details["price_amount_disagreements"] == ({
+        "security": SECURITY, "broker_trade_id": "trade-1",
+        "reported_price_units": 2_000_000,
+        "amount_derived_price_units": 3_000_000,
+    },)
+    assert second.state is ReconciliationState.READY
+    assert second.details["price_amount_disagreements"] == ()
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("6995")
 
 
 def test_t0_fund_fill_is_booked_as_immediately_sellable(tmp_path):

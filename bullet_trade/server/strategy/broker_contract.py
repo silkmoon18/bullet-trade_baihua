@@ -430,8 +430,17 @@ def normalize_trade_evidence(
         trade.get("trade_price"),
         trade.get("avg_price"),
     )
+    amount_price_units = _price_from_deal_balance(trade, quantity)
     if price_units is None:
-        price_units = _price_from_deal_balance(trade, quantity)
+        price_units = amount_price_units
+    elif amount_price_units is not None:
+        # A genuine broker-reported deal amount is an independent check on the
+        # price field.  A material disagreement should not book the wrong cash.
+        # Ignore differences up to 5% or 0.001 per share, whichever is larger,
+        # so ordinary rounding and small fee differences do not reprice fills.
+        difference = abs(price_units - amount_price_units)
+        if difference > max(price_units // 20, 1000):
+            price_units = amount_price_units
     price_source = FillPriceSource.BROKER_TRADE
     price_known = True
     if price_units is None and unpriced_fill_policy in (
