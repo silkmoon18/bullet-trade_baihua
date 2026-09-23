@@ -150,6 +150,57 @@ def test_buy_snapshot_uses_real_cash_fees_and_mark(ledger_services):
     assert snapshot.positions[0].sellable_qty == 1000
 
 
+def test_legacy_price_amount_conflict_replay_marks_returns_estimated_until_resolved(ledger_services):
+    _, repository, capital, booking, valuation = ledger_services
+    original = _buy(capital, booking)
+    fill = _fill("f-buy", "buy-1", OrderSide.BUY, 1000, "2.10", "5")
+    conflicted = BrokerFill(
+        fill_id=fill.fill_id, order_id=fill.order_id,
+        fingerprint="fp-conflict", broker_trade_id=fill.broker_trade_id,
+        security=fill.security, side=fill.side, quantity=fill.quantity,
+        price_units=fill.price_units, commission_units=fill.commission_units,
+        tax_units=fill.tax_units, traded_at=fill.traded_at,
+        price_source=FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE,
+        price_known=False,
+    )
+    reclassified = booking.book_fill(
+        "good-etf", conflicted, original.account.ledger_version,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    replay = booking.book_fill(
+        "good-etf", conflicted, reclassified.account.ledger_version,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    snapshot = valuation.create_snapshot(
+        "good-etf", {SECURITY: _mark()}, AS_OF, timedelta(minutes=1)
+    )
+    assert reclassified.reclassified is True
+    assert replay.duplicate is True
+    assert replay.reclassified is False
+    assert repository.get_strategy_account("good-etf").cash_units == money_to_units("7995")
+    assert snapshot.estimated_buy_cost_units == money_to_units("2000")
+    assert snapshot.performance_ready is False
+
+    verified = BrokerFill(
+        fill_id=fill.fill_id, order_id=fill.order_id,
+        fingerprint="fp-verified", broker_trade_id=fill.broker_trade_id,
+        security=fill.security, side=fill.side, quantity=fill.quantity,
+        price_units=fill.price_units, commission_units=fill.commission_units,
+        tax_units=fill.tax_units, traded_at=fill.traded_at,
+    )
+    corrected = booking.book_fill(
+        "good-etf", verified, reclassified.account.ledger_version,
+        sellable_from_trade_date=date(2026, 8, 11),
+    )
+    precise = valuation.create_snapshot(
+        "good-etf", {SECURITY: _mark()}, AS_OF, timedelta(minutes=1)
+    )
+    assert corrected.corrected is True
+    assert corrected.account.cash_units == money_to_units("7895")
+    assert precise.estimated_buy_cost_units == 0
+    assert precise.performance_ready is True
+
+
 def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
     _, _, capital, booking, valuation = ledger_services
     booking.register_order(_order("buy-1", OrderSide.BUY, 1000))
@@ -190,7 +241,11 @@ def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
     assert payload["total_pnl"] is None
 
 
-@pytest.mark.parametrize("source", [FillPriceSource.ORDER_PRICE_FALLBACK, FillPriceSource.ZERO_FALLBACK])
+@pytest.mark.parametrize("source", [
+    FillPriceSource.ORDER_PRICE_FALLBACK,
+    FillPriceSource.ZERO_FALLBACK,
+    FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE,
+])
 def test_estimated_fill_price_blocks_performance(ledger_services, source):
     _, _, capital, booking, valuation = ledger_services
     booking.register_order(_order("buy-estimated", OrderSide.BUY, 1000))
@@ -262,6 +317,10 @@ def test_estimated_fill_price_blocks_performance(ledger_services, source):
     payload = SQLiteStrategyAPI._snapshot_payload(snapshot)
     assert payload["unknown_price_fill_count"] == 1
     assert payload["nav"] is None
+    if source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE:
+        assert snapshot.estimated_buy_cost_units == money_to_units("2000")
+        assert payload["performance_estimated"] is True
+        assert payload["returns_note"] == "非精确收益：成交价为估算或费用未知"
 
 
 def test_sell_snapshot_reconciles_realized_and_unrealized_pnl(ledger_services):

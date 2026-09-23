@@ -58,6 +58,7 @@ class OrderState(str, Enum):
 
 class FillPriceSource(str, Enum):
     BROKER_TRADE = "BROKER_TRADE"
+    PRICE_AMOUNT_CONFLICT_ESTIMATE = "PRICE_AMOUNT_CONFLICT_ESTIMATE"
     ORDER_PRICE_FALLBACK = "ORDER_PRICE_FALLBACK"
     ZERO_FALLBACK = "ZERO_FALLBACK"
     ZERO_PRICE_ESTIMATE = "ZERO_PRICE_ESTIMATE"
@@ -289,6 +290,8 @@ class BrokerFill:
     broker_trade_id: Optional[str] = None
     price_source: FillPriceSource = FillPriceSource.BROKER_TRADE
     price_known: bool = True
+    reported_price_units: Optional[int] = None
+    reported_amount_units: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_int(self.quantity, "quantity", minimum=1)
@@ -306,6 +309,10 @@ class BrokerFill:
             raise ValueError("price_known must be boolean")
         if self.price_known != (self.price_source is FillPriceSource.BROKER_TRADE):
             raise ValueError("price_known does not match price_source")
+        if self.reported_price_units is not None:
+            _require_int(self.reported_price_units, "reported_price_units", minimum=1)
+        if self.reported_amount_units is not None:
+            _require_int(self.reported_amount_units, "reported_amount_units", minimum=1)
         object.__setattr__(self, "traded_at", as_shanghai_time(self.traded_at))
 
 

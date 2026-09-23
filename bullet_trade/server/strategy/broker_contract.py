@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union, cast
 
 from .domain import (
+    MONEY_SCALE,
+    PRICE_SCALE,
     SHANGHAI_TZ,
     FillPriceSource,
     OrderSide,
@@ -206,6 +208,8 @@ class BrokerTradeEvidence:
     traded_at: datetime
     price_source: FillPriceSource
     price_known: bool
+    reported_price_units: Optional[int] = field(default=None, repr=False, compare=False)
+    reported_amount_units: Optional[int] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.broker_trade_id or not self.broker_order_id or not self.security:
@@ -321,7 +325,7 @@ def _positive_int(value: object) -> Optional[int]:
 
 def _price_from_deal_balance(
     trade: Mapping[str, object], quantity: int
-) -> Optional[int]:
+) -> Optional[Tuple[int, int]]:
     for key in ("deal_balance", "traded_amount", "trade_value", "amount_value"):
         value = trade.get(key)
         if value in (None, ""):
@@ -334,7 +338,7 @@ def _price_from_deal_balance(
         except (ArithmeticError, TypeError, ValueError):
             continue
         if units > 0:
-            return units
+            return units, money_to_units(balance)
     return None
 
 
@@ -430,19 +434,30 @@ def normalize_trade_evidence(
         trade.get("trade_price"),
         trade.get("avg_price"),
     )
-    amount_price_units = _price_from_deal_balance(trade, quantity)
+    deal_amount = _price_from_deal_balance(trade, quantity)
+    amount_price_units = deal_amount[0] if deal_amount is not None else None
+    reported_price_units = price_units
+    reported_amount_units = deal_amount[1] if deal_amount is not None else None
+    price_conflict = False
     if price_units is None:
         price_units = amount_price_units
-    elif amount_price_units is not None:
-        # A genuine broker-reported deal amount is an independent check on the
-        # price field.  A material disagreement should not book the wrong cash.
-        # Ignore differences up to 5% or 0.001 per share, whichever is larger,
-        # so ordinary rounding and small fee differences do not reprice fills.
-        difference = abs(price_units - amount_price_units)
-        if difference > max(price_units // 20, 1000):
+    elif deal_amount is not None:
+        # Both values come from the same broker report; neither proves that
+        # the other is correct. Compare gross amounts, allowing only display
+        # rounding (one cent or one internal price quantum per share).
+        reported_gross = Decimal(price_units) * quantity / PRICE_SCALE
+        amount_gross = Decimal(deal_amount[1]) / MONEY_SCALE
+        tolerance = max(Decimal("0.01"), Decimal(quantity) / PRICE_SCALE)
+        if abs(reported_gross - amount_gross) > tolerance:
+            price_conflict = True
+            # Retain the historical cash estimate to avoid a behavior change
+            # during execution, but never call this an accurate broker price.
             price_units = amount_price_units
     price_source = FillPriceSource.BROKER_TRADE
     price_known = True
+    if price_conflict:
+        price_source = FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+        price_known = False
     if price_units is None and unpriced_fill_policy in (
         UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
         UnpricedFillPolicy.ZERO_FALLBACK,
@@ -492,6 +507,8 @@ def normalize_trade_evidence(
         traded_at=traded_at,
         price_source=price_source,
         price_known=price_known,
+        reported_price_units=reported_price_units if price_conflict else None,
+        reported_amount_units=reported_amount_units if price_conflict else None,
     )
 
 

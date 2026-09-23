@@ -819,7 +819,7 @@ class SQLiteStrategyAPI:
             )
         for discrepancy in result.details.get("price_amount_disagreements", ()):
             logger.warning(
-                "QMT成交价与成交金额不一致，按券商成交金额核算 | strategy_id=%s | %s",
+                "QMT成交价与成交金额不一致，金额仅作估算、收益非精确 | strategy_id=%s | %s",
                 strategy_id, discrepancy,
             )
         changed_blocker = (

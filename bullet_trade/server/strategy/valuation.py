@@ -251,7 +251,10 @@ class SQLiteValuationService:
                 SELECT e.entry_type, e.amount_units, e.payload_json
                 FROM ledger_entries e
                 JOIN fills f ON f.fill_id = CASE
-                    WHEN e.entry_type = 'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                    WHEN e.entry_type IN (
+                        'SELL_PROCEEDS_ESTIMATE_CORRECTION',
+                        'FILL_PRICE_EVIDENCE_RECLASSIFIED'
+                    )
                     THEN e.reference_id
                     ELSE json_extract(e.payload_json, '$.fill_id')
                 END
@@ -259,7 +262,8 @@ class SQLiteValuationService:
                 WHERE e.strategy_account_id = ? AND o.strategy_account_id = ?
                   AND e.entry_type IN (
                       'BUY_FILL_BOOKED', 'SELL_FILL_BOOKED',
-                      'SELL_PROCEEDS_ESTIMATE_CORRECTION'
+                      'SELL_PROCEEDS_ESTIMATE_CORRECTION',
+                      'FILL_PRICE_EVIDENCE_RECLASSIFIED'
                   )
                   AND f.price_known = 0
                 """,
@@ -277,7 +281,9 @@ class SQLiteValuationService:
                     unconfirmed_cash_credit += amount
                     continue
                 estimate_payload = json.loads(estimate_row["payload_json"])
-                if estimate_row["entry_type"] == "SELL_FILL_BOOKED":
+                if (estimate_row["entry_type"] == "SELL_FILL_BOOKED"
+                        or (estimate_row["entry_type"] == "FILL_PRICE_EVIDENCE_RECLASSIFIED"
+                            and estimate_payload.get("side") == "SELL")):
                     amount = estimate_payload.get("estimated_proceeds_units", 0)
                     if type(amount) is not int or amount < 0:
                         raise LedgerInvariantError("sell proceeds estimate is invalid")

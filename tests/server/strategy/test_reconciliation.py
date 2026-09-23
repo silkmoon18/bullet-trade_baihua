@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 from datetime import date, datetime
 
@@ -226,7 +227,7 @@ def test_known_fill_is_booked_then_reconciled_and_replay_is_noop(tmp_path):
     assert account.cash_units == money_to_units("7995")
 
 
-def test_native_deal_amount_correction_is_visible_and_replay_safe(tmp_path):
+def test_native_deal_amount_conflict_is_estimated_and_replay_safe(tmp_path):
     database, repository, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)
     booking.register_order(_order())
@@ -244,11 +245,62 @@ def test_native_deal_amount_correction_is_visible_and_replay_safe(tmp_path):
     assert first.details["price_amount_disagreements"] == ({
         "security": SECURITY, "broker_trade_id": "trade-1",
         "reported_price_units": 2_000_000,
+        "reported_amount_units": money_to_units("3000"),
         "amount_derived_price_units": 3_000_000,
+        "reclassified_existing_fill": False,
     },)
     assert second.state is ReconciliationState.READY
     assert second.details["price_amount_disagreements"] == ()
     assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("6995")
+    connection = connect_database(database)
+    try:
+        row = connection.execute(
+            "SELECT price_units, price_source, price_known FROM fills WHERE broker_trade_id = 'trade-1'"
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT payload_json FROM ledger_entries WHERE entry_type = 'BUY_FILL_BOOKED'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert tuple(row) == (3_000_000, "PRICE_AMOUNT_CONFLICT_ESTIMATE", 0)
+    assert json.loads(audit)["broker_reported_price_units"] == 2_000_000
+    assert json.loads(audit)["broker_reported_amount_units"] == money_to_units("3000")
+
+
+def test_old_verified_fill_becomes_estimated_on_conflicting_replay_without_rebooking(tmp_path):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    trade = _broker_trade()
+    original = _snapshot(
+        "17995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),), trades=(trade,),
+    )
+    assert reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, original).state is ReconciliationState.READY
+    cash_before = repository.get_strategy_account(ACCOUNT_ID).cash_units
+    conflict = _snapshot(
+        "17995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),), trades=(dict(trade, deal_balance=2100.0),),
+    )
+    first = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, conflict)
+    second = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, conflict)
+    assert first.state is ReconciliationState.READY
+    assert first.details["booked_trade_ids"] == ()
+    assert first.details["price_amount_disagreements"][0]["reclassified_existing_fill"] is True
+    assert second.state is ReconciliationState.READY
+    assert second.details["price_amount_disagreements"] == ()
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == cash_before
+    connection = connect_database(database)
+    try:
+        row = connection.execute(
+            "SELECT price_units, price_source, price_known FROM fills WHERE broker_trade_id = 'trade-1'"
+        ).fetchone()
+        count = connection.execute("SELECT COUNT(*) FROM fills").fetchone()[0]
+    finally:
+        connection.close()
+    assert tuple(row) == (2_000_000, "PRICE_AMOUNT_CONFLICT_ESTIMATE", 0)
+    assert count == 1
 
 
 def test_t0_fund_fill_is_booked_as_immediately_sellable(tmp_path):

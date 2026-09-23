@@ -21,6 +21,7 @@ from bullet_trade.server.strategy.domain import (
     FillPriceSource,
     OrderSide,
     UnpricedFillPolicy,
+    money_to_units,
 )
 
 
@@ -261,7 +262,7 @@ def test_zero_trade_price_uses_positive_deal_balance():
     assert evidence.price_known is True
 
 
-def test_material_price_amount_disagreement_uses_native_deal_amount():
+def test_material_price_amount_disagreement_is_an_estimate_not_verified():
     trade = {
         "trade_id": "T-amount", "trade_id_source": "broker", "order_id": "O-1",
         "security": "561760.XSHG", "amount": 3000, "price": 0.912,
@@ -269,12 +270,31 @@ def test_material_price_amount_disagreement_uses_native_deal_amount():
     }
     evidence = normalize_trade_evidence(trade, {})
     assert evidence.price_units == 1_378_000
-    assert evidence.price_source is FillPriceSource.BROKER_TRADE
+    assert evidence.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+    assert evidence.price_known is False
+    assert evidence.reported_price_units == 912_000
+    assert evidence.reported_amount_units == money_to_units("4134")
 
     # No independent deal amount means the broker price cannot be corrected
     # merely because it differs from the strategy's reference price.
     del trade["deal_balance"]
     assert normalize_trade_evidence(trade, {}).price_units == 912_000
+
+
+def test_price_amount_disagreement_uses_gross_cent_tolerance_not_price_percent():
+    trade = {
+        "trade_id": "T-rounding", "trade_id_source": "broker", "order_id": "O-1",
+        "security": "561760.XSHG", "amount": 100, "price": 1.399,
+        "deal_balance": 139.91, "side": "BUY", "time": "2026-09-23 09:31:00",
+    }
+    rounded = normalize_trade_evidence(trade, {})
+    assert rounded.price_source is FillPriceSource.BROKER_TRADE
+    assert rounded.price_units == 1_399_000
+
+    trade["deal_balance"] = 140.0
+    conflicted = normalize_trade_evidence(trade, {})
+    assert conflicted.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+    assert conflicted.price_known is False
 
 
 def test_conservative_policy_uses_full_order_protection_price():
@@ -341,7 +361,7 @@ def test_conservative_policy_rejects_partial_order_price_fallback():
 @pytest.mark.parametrize(
     "price, balance, order_price, expected_price, source",
     [
-        (2.5, 260, 2.7, 2_500_000, FillPriceSource.BROKER_TRADE),
+        (2.5, 260, 2.7, 2_600_000, FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE),
         (0, 260, 2.7, 2_600_000, FillPriceSource.BROKER_TRADE),
         (0, 0, 2.7, 2_700_000, FillPriceSource.ORDER_PRICE_FALLBACK),
         (0, 0, 0, 0, FillPriceSource.ZERO_FALLBACK),

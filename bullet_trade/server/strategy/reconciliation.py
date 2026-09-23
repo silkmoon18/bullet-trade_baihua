@@ -23,13 +23,13 @@ from .domain import (
     SHANGHAI_TZ,
     AccountStatus,
     BrokerFill,
+    FillPriceSource,
     OrderSide,
     OrderState,
     ReconciliationResult,
     ReconciliationState,
     as_shanghai_time,
     money_to_units,
-    price_to_units,
     UnpricedFillPolicy,
 )
 from .fill_booking import SQLiteFillBookingService
@@ -270,7 +270,13 @@ def _order_state(value: object) -> Optional[OrderState]:
 
 
 def _fingerprint(evidence: object) -> str:
-    text = repr(evidence).encode("utf-8")
+    identity = repr(evidence)
+    if getattr(evidence, "price_source", None) is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE:
+        identity += ":{}:{}".format(
+            getattr(evidence, "reported_price_units", None),
+            getattr(evidence, "reported_amount_units", None),
+        )
+    text = identity.encode("utf-8")
     return hashlib.sha256(text).hexdigest()
 
 
@@ -475,6 +481,8 @@ class SQLiteReconciliationService:
                     traded_at=evidence.traded_at,
                     price_source=evidence.price_source,
                     price_known=evidence.price_known,
+                    reported_price_units=evidence.reported_price_units,
+                    reported_amount_units=evidence.reported_amount_units,
                 )
                 account = self._ledger.get_strategy_account(account_id)
                 result = self._booking.book_fill(
@@ -494,20 +502,17 @@ class SQLiteReconciliationService:
                 )
                 if not result.duplicate:
                     booked_trade_ids.append(evidence.broker_trade_id)
-                    if evidence.price_known and linked_trade.get("price") not in (None, ""):
-                        try:
-                            reported_price_units = price_to_units(
-                                str(linked_trade["price"])
-                            )
-                        except (ArithmeticError, TypeError, ValueError):
-                            reported_price_units = 0
-                        if reported_price_units > 0 and reported_price_units != evidence.price_units:
-                            price_amount_disagreements.append({
-                                "security": evidence.security,
-                                "broker_trade_id": evidence.broker_trade_id,
-                                "reported_price_units": reported_price_units,
-                                "amount_derived_price_units": evidence.price_units,
-                            })
+                if (not result.duplicate or result.reclassified) and (
+                    evidence.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+                ):
+                    price_amount_disagreements.append({
+                        "security": evidence.security,
+                        "broker_trade_id": evidence.broker_trade_id,
+                        "reported_price_units": evidence.reported_price_units,
+                        "reported_amount_units": evidence.reported_amount_units,
+                        "amount_derived_price_units": evidence.price_units,
+                        "reclassified_existing_fill": result.reclassified,
+                    })
             except (BrokerContractError, RepositoryError, ValueError) as exc:
                 blockers.append(
                     "trade_error:{}:{}".format(
