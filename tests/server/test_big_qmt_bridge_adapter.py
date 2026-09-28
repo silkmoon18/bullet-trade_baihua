@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from bullet_trade.server.adapters.base import AccountRouter
-from bullet_trade.server.adapters.big_qmt import BigQmtBrokerAdapter, BigQmtGatewayError, _normalize_order, build_big_qmt_bundle
+from bullet_trade.server.adapters.big_qmt import (
+    BigQmtBrokerAdapter, BigQmtGatewayError, _fill_trade_sides_from_orders,
+    _normalize_order, build_big_qmt_bundle,
+)
 from bullet_trade.server.adapters.big_qmt_bridge import BridgeBrokerAdapter
 from bullet_trade.server.config import AccountConfig, ServerConfig
 
@@ -99,6 +102,57 @@ def test_factory_preserves_http_default(monkeypatch, tmp_path):
 @pytest.mark.parametrize("status, expected", [(53, "partly_canceled"), (54, "cancelled"), (55, "partly_filled")])
 def test_official_native_statuses(status, expected):
     assert _normalize_order({"raw_status": status})["status"] == expected
+
+
+def test_missing_trade_side_requires_matching_order_id_security_and_day():
+    orders = [
+        {"order_id": "O-1", "security": "159118.XSHE", "side": "BUY",
+         "order_time": "2026-09-28 10:00:00"},
+    ]
+    trades = [
+        {"order_id": "O-1", "security": "159118.XSHE", "side": "",
+         "time": "2026-09-28 10:00:00"},
+        {"order_id": "O-1", "security": "159119.XSHE", "side": "",
+         "time": "2026-09-28 10:00:00"},
+        {"order_id": "O-1", "security": "159118.XSHE", "side": "",
+         "time": "2026-09-29 10:00:00"},
+        {"order_id": "O-missing", "security": "159118.XSHE", "side": "",
+         "time": "2026-09-28 10:00:00"},
+        {"order_id": "O-1", "security": "159118.XSHE", "side": "SELL",
+         "time": "2026-09-28 10:00:00"},
+    ]
+    sides = [row["side"] for row in _fill_trade_sides_from_orders(trades, orders)]
+    assert sides == ["BUY", "", "", "", "SELL"]
+    conflicting = orders + [dict(orders[0], side="SELL")]
+    assert _fill_trade_sides_from_orders(trades[:1], conflicting)[0]["side"] == ""
+
+
+@pytest.mark.asyncio
+async def test_live_bridge_fills_missing_trade_sides_from_orders_and_history(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        today = time.strftime("%Y%m%d")
+        now = time.strftime("%H:%M:%S")
+        for number, op_type, offset in ((1, 23, 48), (2, 24, 49)):
+            order_id = "native-order-{}".format(number)
+            e.orders.append(dict(
+                m_strOrderSysID=order_id, m_strInstrumentID="159118",
+                m_strExchangeID="SZ", m_nOpType=op_type,
+                m_nVolumeTotalOriginal=100, m_nVolumeTraded=100,
+                m_nOrderStatus=56, m_strInsertDate=today, m_strInsertTime=now,
+            ))
+            e.trades.append(dict(
+                m_strOrderSysID=order_id, m_strTradeID="native-fill-{}".format(number),
+                m_strInstrumentID="159118", m_strExchangeID="SZ",
+                m_nDirection=48, m_nOffsetFlag=offset, m_nVolume=100,
+                m_dTradePrice=1.002, m_dTradeAmount=100.2,
+                m_strTradeDate=today, m_strTradeTime=now,
+            ))
+        live = await e.broker.list_trades(e.account)
+        assert [row["side"] for row in live] == ["BUY", "SELL"]
+        e.orders.clear()
+        e.trades.clear()
+        history = await e.broker.list_trades(e.account, {"include_history": True})
+        assert [row["side"] for row in history] == ["BUY", "SELL"]
 
 
 @pytest.mark.asyncio

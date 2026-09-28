@@ -115,6 +115,24 @@ def test_big_qmt_trade_promotes_native_trade_datetime() -> None:
     assert trade["time"] == expected
 
 
+@pytest.mark.asyncio
+async def test_trade_query_stays_available_when_side_order_lookup_fails():
+    client = _FakeGatewayClient({
+        "/trades": {"trades": [{
+            "trade_id": "T-1", "order_id": "O-1", "security": "159118.XSHE",
+            "amount": 100, "price": 1.002, "time": "2026-09-28 10:00:00",
+            "side": "",
+        }]},
+        "/orders": BigQmtGatewayError("order query unavailable", code="BRIDGE_TIMEOUT"),
+    })
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    trades = await BigQmtBrokerAdapter(config, router, client).list_trades(
+        router.get("default")
+    )
+    assert len(trades) == 1 and trades[0]["side"] == ""
+
+
 class _FakeGatewayClient:
     def __init__(self, responses, config=None):
         self.responses = responses

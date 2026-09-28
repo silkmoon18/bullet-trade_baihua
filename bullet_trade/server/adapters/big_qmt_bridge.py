@@ -17,7 +17,8 @@ from ..strategy.broker_history import SQLiteBrokerHistoryStore, merge_broker_row
 from .base import AdapterBundle, BROKER_CALL_MARKER_KEY
 from .big_qmt import (
     BigQmtBrokerAdapter, BigQmtDataAdapter, BigQmtGatewayClient, BigQmtGatewayError,
-    _filter_orders, _filter_trades, _normalize_order, _normalize_trade,
+    _fill_trade_sides_from_orders, _filter_orders, _filter_trades,
+    _normalize_order, _normalize_trade,
     _normalize_snapshot_tick, load_big_qmt_gateway_config,
 )
 
@@ -182,6 +183,9 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
             self._history.record_trades(account.config.key or "default", current)
             if (filters or {}).get("include_history"):
                 current = list(merge_broker_rows(current, self._history.list_trades(account.config.key or "default"), "trade_id"))
+                current = _fill_trade_sides_from_orders(
+                    current, list(self._history.list_orders(account.config.key or "default"))
+                )
         return _filter_trades(current, filters or {})
 
     async def place_order(self, account, payload):

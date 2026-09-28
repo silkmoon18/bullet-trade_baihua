@@ -1385,6 +1385,14 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             for item in _extract_list(data, "trades")
             if isinstance(item, dict)
         ]
+        if any(not str(trade.get("side") or "").strip() for trade in trades):
+            try:
+                orders = await self.list_orders(account)
+            except BigQmtGatewayError:
+                # The trade query must remain usable when the separate order
+                # query is unavailable. Unresolved sides stay unknown.
+                orders = []
+            trades = _fill_trade_sides_from_orders(trades, orders)
         return _filter_trades(trades, filters or {})
 
     async def get_order_status(self, account: AccountContext, order_id: str) -> Dict:
@@ -2710,6 +2718,50 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         item.setdefault("sub_account_id", sub_account_id)
         item.setdefault("virtual_account_id", sub_account_id)
     return item
+
+
+def _broker_row_day(value: Any) -> Optional[date]:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def _fill_trade_sides_from_orders(trades: List[Dict], orders: List[Dict]) -> List[Dict]:
+    """Use an exact same-day broker order to fill a missing trade side only."""
+    by_id: Dict[str, List[Dict]] = {}
+    for order in orders:
+        order_id = str(order.get("order_id") or "").strip()
+        if order_id and order_id != "0":
+            by_id.setdefault(order_id, []).append(order)
+
+    result = []
+    for trade in trades:
+        if str(trade.get("side") or "").strip():
+            result.append(trade)
+            continue
+        order_id = str(trade.get("order_id") or "").strip()
+        security = str(trade.get("security") or "").strip()
+        traded_day = _broker_row_day(trade.get("time") or trade.get("trade_time"))
+        sides = {
+            _normalize_big_qmt_order_side(order.get("side"))
+            for order in by_id.get(order_id, [])
+            if order_id != "0"
+            and security
+            and security == str(order.get("security") or "").strip()
+            and traded_day is not None
+            and traded_day == _broker_row_day(order.get("order_time"))
+        }
+        if len(sides) == 1 and "" not in sides:
+            result.append(dict(trade, side=sides.pop()))
+        else:
+            result.append(trade)
+    return result
 
 
 def _filter_orders(orders: List[Dict], filters: Dict) -> List[Dict]:
