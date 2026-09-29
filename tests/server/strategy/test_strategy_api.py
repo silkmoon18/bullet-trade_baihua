@@ -28,6 +28,7 @@ from bullet_trade.server.strategy import (
 from bullet_trade.server.strategy.schema import connect_database
 from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
 from bullet_trade.server.strategy.domain import IntentState, SHANGHAI_TZ
+from bullet_trade.server.strategy.reconciliation import BrokerAccountSnapshot
 
 
 SECURITY = "510050.XSHG"
@@ -91,6 +92,70 @@ async def test_target_ack_does_not_wait_for_native_submit_or_share_client_cancel
         assert tuple(db.execute("SELECT state, broker_order_id FROM strategy_orders").fetchone()) == ("SUBMITTED", "broker-1")
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_dispatch_reuses_recent_submit_reconciliation(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    observed_reads = []
+    original_collect = strategy_api_module.collect_async_broker_snapshot
+    original_place = broker.place_order
+
+    async def counted_collect(*args, **kwargs):
+        observed_reads.append(True)
+        return await original_collect(*args, **kwargs)
+
+    async def checked_place(*args, **kwargs):
+        # The submit reconciliation is still mandatory; the immediately
+        # following first order must not repeat the same full broker query.
+        assert len(observed_reads) == 1
+        return await original_place(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", counted_collect)
+    monkeypatch.setattr(broker, "place_order", checked_place)
+    await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "reuse-first-observation",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+    })
+    assert broker.order_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["changed", "stale"])
+async def test_first_dispatch_rechecks_when_prepared_snapshot_invalid(
+    api, monkeypatch, invalidate
+):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    observed_reads = []
+    original_collect = strategy_api_module.collect_async_broker_snapshot
+    original_place = broker.place_order
+
+    async def counted_collect(*args, **kwargs):
+        observed_reads.append(True)
+        return await original_collect(*args, **kwargs)
+
+    async def checked_place(*args, **kwargs):
+        assert len(observed_reads) == 2
+        return await original_place(*args, **kwargs)
+
+    async def changed_subscription(*args, **kwargs):
+        service._broker_state_revision += 1
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", counted_collect)
+    monkeypatch.setattr(broker, "place_order", checked_place)
+    if invalidate == "changed":
+        monkeypatch.setattr(service, "_sync_quote_subscriptions", changed_subscription)
+    else:
+        monkeypatch.setattr(
+            strategy_api_module, "FIRST_DISPATCH_SNAPSHOT_MAX_AGE_SECONDS", -1.0
+        )
+    await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "invalid-first-" + invalidate,
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+    })
+    assert broker.order_calls == 1
 
 
 @pytest.mark.asyncio
@@ -255,6 +320,93 @@ class FakeBroker:
 class FakeData:
     async def get_current_tick(self, security):
         return {"last_price": 10.0}
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_checks_account_and_warms_owned_quotes(api, monkeypatch):
+    service, broker, account, _ = api
+    calls = []
+
+    class PreopenData:
+        async def replace_execution_quotes(self, owner, symbols):
+            calls.append(("subscribe", owner, tuple(symbols)))
+
+        async def get_current_tick(self, security):
+            calls.append(("tick", security))
+            return {"lastPrice": 1.0, "timetag": datetime.now(SHANGHAI_TZ).isoformat()}
+
+    service.data_provider = PreopenData()
+    monkeypatch.setattr(service, "_held_securities", lambda strategy_id: (SECURITY,))
+    result = await service.prepare_session(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
+    )
+    assert result["reconciliation"]["state"] == "READY"
+    assert result["quote_ready"] is True
+    assert result["subscribed_holdings"] == 1
+    assert calls == [
+        ("subscribe", "preopen:good_etf", (SECURITY,)),
+        ("tick", SECURITY),
+    ]
+    assert broker.order_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bridge_data_marks_are_read_in_one_batch(api):
+    service, _, _, _ = api
+    now = datetime.now(SHANGHAI_TZ)
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    securities = ("510050.XSHG", "510300.XSHG")
+
+    class BatchedData:
+        supports_parallel_data_reads = True
+        started = []
+
+        async def get_current_tick(self, security):
+            self.started.append(security)
+            if len(self.started) == 2:
+                both_started.set()
+            await release.wait()
+            return {"lastPrice": 10.0, "timetag": now.isoformat()}
+
+    data = BatchedData()
+    service.data_provider = data
+    task = asyncio.create_task(service._marks({}, now, "good_etf", securities))
+    await asyncio.wait_for(both_started.wait(), 1)
+    release.set()
+    marks = await task
+    assert tuple(data.started) == securities
+    assert set(marks) == set(securities)
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_fill_quote_capture_is_time_matched_and_durable(api):
+    service, broker, _, _ = api
+    now = datetime.now(SHANGHAI_TZ)
+    remembered = []
+    broker.remember_trade_market_quote = lambda row: remembered.append(dict(row)) or True
+
+    class LiveData:
+        async def get_current_tick(self, security):
+            return {"lastPrice": 2.003, "timetag": now.isoformat()}
+
+    service.data_provider = LiveData()
+    snapshot = BrokerAccountSnapshot(
+        available_cash_units=money_to_units("10000"), positions=(), orders=(),
+        trades=({"trade_id": "T-new", "security": "159738.XSHE",
+                 "time": (now - timedelta(seconds=2)).isoformat()},),
+        as_of=now,
+    )
+    captured = await service._capture_fill_market_quotes(snapshot)
+    assert len(remembered) == 1
+    assert captured.trades[0]["_bt_market_last_price"] == 2.003
+    assert captured.trades[0]["_bt_market_quote_time"] == now.isoformat()
+
+    stale = replace(snapshot, trades=({"trade_id": "T-old", "security": "159738.XSHE",
+                                       "time": (now - timedelta(minutes=2)).isoformat()},))
+    unchanged = await service._capture_fill_market_quotes(stale)
+    assert "_bt_market_last_price" not in unchanged.trades[0]
+    assert len(remembered) == 1
 
 
 class CallbackData(FakeData):
@@ -733,6 +885,25 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     )["reconciliation"]["state"] == "READY"
 
 
+@pytest.mark.asyncio
+async def test_jq_submit_reuses_existing_daily_target_without_lookup_rpc(api):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    first = await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "open-20260929",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+        "reuse_existing": True,
+    })
+    repeated = await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "open-20260929",
+        "weights": {SECURITY: 0.25}, "marks": {SECURITY: 10},
+        "reuse_existing": True,
+    })
+    assert repeated["intent"]["intent_id"] == first["intent"]["intent_id"]
+    assert repeated["effective_weights"] == {SECURITY: 0.5}
+    assert broker.order_calls == 1
+
+
 def test_target_buy_plan_notification_does_not_trade_or_write_ledger(api):
     service, broker, _, notifications = api
 
@@ -1023,13 +1194,17 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
         await asyncio.sleep(0.01)
 
     assert broker.order_calls == 1
-    assert len(log_messages) == 1
-    assert log_messages[0].startswith(
+    quote_logs = [
+        message for message in log_messages
+        if message.startswith("StrategyLedger 首次收到执行行情")
+    ]
+    assert len(quote_logs) == 1
+    assert quote_logs[0].startswith(
         "StrategyLedger 首次收到执行行情 | 510050.XSHG | "
     )
-    assert "行情时间=" in log_messages[0]
-    assert "接收时间=" in log_messages[0]
-    assert "延迟=" in log_messages[0]
+    assert "行情时间=" in quote_logs[0]
+    assert "接收时间=" in quote_logs[0]
+    assert "延迟=" in quote_logs[0]
 
     last_log_at = service._quote_last_log_at[SECURITY]
     latest_quote = service._quote_cache[SECURITY]
@@ -1039,14 +1214,19 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
         last_log_at + timedelta(seconds=59),
         first=False,
     )
-    assert len(log_messages) == 1
+    assert len([
+        message for message in log_messages
+        if message.startswith("StrategyLedger 执行行情心跳")
+    ]) == 0
     service._log_execution_quote_heartbeat(
         SECURITY,
         latest_quote,
         last_log_at + timedelta(seconds=60),
         first=False,
     )
-    assert log_messages[1].startswith(
+    assert next(message for message in log_messages if message.startswith(
+        "StrategyLedger 执行行情心跳"
+    )).startswith(
         "StrategyLedger 执行行情心跳 | 510050.XSHG | "
     )
 

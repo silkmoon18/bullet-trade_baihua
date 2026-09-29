@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -175,12 +176,25 @@ async def collect_async_broker_snapshot(
 ) -> BrokerAccountSnapshot:
     """Collect the same snapshot from BulletTrade's async server adapter."""
 
-    account = await broker.get_account_info(account_context)
-    positions = await broker.get_positions(account_context)
-    orders = await broker.list_orders(
-        account_context, {"from_broker": True, "include_history": True}
-    )
-    trades = await broker.list_trades(account_context, {"include_history": True})
+    if getattr(broker, "supports_parallel_snapshot_reads", False):
+        # The local Big QMT bridge processes these independent read requests
+        # on one QMT thread. Queue them in one pump instead of waiting a timer
+        # interval after every reply. Other adapters keep the old ordering.
+        account, positions, orders, trades = await asyncio.gather(
+            broker.get_account_info(account_context),
+            broker.get_positions(account_context),
+            broker.list_orders(
+                account_context, {"from_broker": True, "include_history": True}
+            ),
+            broker.list_trades(account_context, {"include_history": True}),
+        )
+    else:
+        account = await broker.get_account_info(account_context)
+        positions = await broker.get_positions(account_context)
+        orders = await broker.list_orders(
+            account_context, {"from_broker": True, "include_history": True}
+        )
+        trades = await broker.list_trades(account_context, {"include_history": True})
     return _build_broker_snapshot(account, positions, orders, trades, as_of)
 
 
@@ -271,7 +285,10 @@ def _order_state(value: object) -> Optional[OrderState]:
 
 def _fingerprint(evidence: object) -> str:
     identity = repr(evidence)
-    if getattr(evidence, "price_source", None) is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE:
+    if getattr(evidence, "price_source", None) in (
+        FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE,
+        FillPriceSource.MARKET_QUOTE_ESTIMATE,
+    ):
         identity += ":{}:{}".format(
             getattr(evidence, "reported_price_units", None),
             getattr(evidence, "reported_amount_units", None),
@@ -339,6 +356,7 @@ class SQLiteReconciliationService:
         blockers = []
         booked_trade_ids = []
         price_amount_disagreements = []
+        market_price_disagreements = []
         ignored_broker_order_count = 0
         ignored_broker_trade_count = 0
         local_orders, all_orders_by_client_tag, booked_order_links = self._local_orders(
@@ -513,6 +531,18 @@ class SQLiteReconciliationService:
                         "amount_derived_price_units": evidence.price_units,
                         "reclassified_existing_fill": result.reclassified,
                     })
+                if (not result.duplicate or result.reclassified) and (
+                    evidence.price_source is FillPriceSource.MARKET_QUOTE_ESTIMATE
+                ):
+                    market_price_disagreements.append({
+                        "security": evidence.security,
+                        "broker_trade_id": evidence.broker_trade_id,
+                        "reported_price_units": evidence.reported_price_units,
+                        "reported_amount_units": evidence.reported_amount_units,
+                        "estimated_price_units": evidence.price_units,
+                        "quote_as_of": linked_trade.get("_bt_market_quote_time"),
+                        "reclassified_existing_fill": result.reclassified,
+                    })
             except (BrokerContractError, RepositoryError, ValueError) as exc:
                 blockers.append(
                     "trade_error:{}:{}".format(
@@ -625,6 +655,7 @@ class SQLiteReconciliationService:
             "blockers": sorted(set(blockers)),
             "booked_trade_ids": booked_trade_ids,
             "price_amount_disagreements": price_amount_disagreements,
+            "market_price_disagreements": market_price_disagreements,
             "adopted_order_ids": adopted_order_ids,
             "rejected_orders": rejected_orders,
             "broker_order_count": len(snapshot.orders),

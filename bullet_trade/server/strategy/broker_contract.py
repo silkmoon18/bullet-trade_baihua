@@ -27,6 +27,11 @@ class BrokerContractError(RuntimeError):
     """Raised when broker evidence cannot safely feed StrategyLedger."""
 
 
+# Only grossly impossible live fills are re-priced. Ordinary slippage is
+# deliberately left to the broker report.
+MARKET_PRICE_CONFLICT_PERCENT = 10
+
+
 class CapabilityState(str, Enum):
     SUPPORTED = "SUPPORTED"
     PROBE_REQUIRED = "PROBE_REQUIRED"
@@ -458,6 +463,31 @@ def normalize_trade_evidence(
     if price_conflict:
         price_source = FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
         price_known = False
+    traded_at = _broker_trade_time(trade.get("time") or trade.get("trade_time"))
+    # The bridge captures this quote when the trade callback arrives and keeps
+    # it with the durable broker observation. A later current price is not a
+    # valid substitute for the quote near the actual fill.
+    quote_units = _positive_price_units(trade.get("_bt_market_last_price"))
+    quote_time_raw = trade.get("_bt_market_quote_time")
+    if (
+        price_source is FillPriceSource.BROKER_TRADE
+        and price_units is not None
+        and quote_units is not None
+        and quote_time_raw
+    ):
+        try:
+            quote_time = _broker_trade_time(quote_time_raw)
+        except BrokerContractError:
+            quote_time = None
+        if (
+            quote_time is not None
+            and abs((quote_time - traded_at).total_seconds()) <= 10
+            and abs(price_units - quote_units) * 100
+            > quote_units * MARKET_PRICE_CONFLICT_PERCENT
+        ):
+            price_units = quote_units
+            price_source = FillPriceSource.MARKET_QUOTE_ESTIMATE
+            price_known = False
     if price_units is None and unpriced_fill_policy in (
         UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
         UnpricedFillPolicy.ZERO_FALLBACK,
@@ -494,7 +524,6 @@ def normalize_trade_evidence(
         ("commission_fee", "commission"),
     )
     tax_units = _optional_fee(trade, "tax_known", ("tax", "stamp_tax"))
-    traded_at = _broker_trade_time(trade.get("time") or trade.get("trade_time"))
     return BrokerTradeEvidence(
         broker_trade_id=trade_id,
         broker_order_id=order_id,
@@ -507,8 +536,12 @@ def normalize_trade_evidence(
         traded_at=traded_at,
         price_source=price_source,
         price_known=price_known,
-        reported_price_units=reported_price_units if price_conflict else None,
-        reported_amount_units=reported_amount_units if price_conflict else None,
+        reported_price_units=(
+            reported_price_units if not price_known else None
+        ),
+        reported_amount_units=(
+            reported_amount_units if not price_known else None
+        ),
     )
 
 

@@ -91,9 +91,12 @@ async def connected(monkeypatch, tmp_path):
 def test_factory_preserves_http_default(monkeypatch, tmp_path):
     bundle, account = make_bundle(monkeypatch, tmp_path)
     assert isinstance(bundle.broker_adapter, BridgeBrokerAdapter)
+    assert bundle.broker_adapter.supports_parallel_snapshot_reads is True
     monkeypatch.delenv("BIG_QMT_TRANSPORT")
     cfg = ServerConfig(accounts=[account.config])
-    assert type(build_big_qmt_bundle(cfg, AccountRouter(cfg.accounts)).broker_adapter) is BigQmtBrokerAdapter
+    http_broker = build_big_qmt_bundle(cfg, AccountRouter(cfg.accounts)).broker_adapter
+    assert type(http_broker) is BigQmtBrokerAdapter
+    assert not getattr(http_broker, "supports_parallel_snapshot_reads", False)
     monkeypatch.setenv("BIG_QMT_TRANSPORT", "typo")
     with pytest.raises(ValueError):
         build_big_qmt_bundle(cfg, AccountRouter(cfg.accounts))
@@ -182,6 +185,11 @@ async def test_roundtrip_native_query_submit_partial_fill_cancel_and_history(mon
         assert (await e.broker.list_orders(e.account))[0]["status"] == "partly_filled"
         fills = await e.broker.list_trades(e.account)
         assert len(fills) == 1 and fills[0]["commission_known"] is False
+        assert e.broker.remember_trade_market_quote(dict(
+            fills[0], _bt_market_last_price=1.003,
+            _bt_market_quote_time="{}+08:00".format(time.strftime("%Y-%m-%dT%H:%M:%S")),
+        ))
+        assert (await e.broker.list_trades(e.account, {"include_history": True}))[0]["_bt_market_last_price"] == 1.003
         cancel = await e.broker.cancel_order_request(e.account, {"order_id": result["order_id"]})
         assert cancel["value"] is True and cancel["status"] == "cancelled"
         e.orders.clear()
@@ -194,6 +202,7 @@ async def test_roundtrip_native_query_submit_partial_fill_cancel_and_history(mon
         store = rebuilt.broker_adapter._history
         assert store.list_orders("default")[0]["order_remark"] == tag
         assert len(store.list_trades("default")) == 1
+        assert store.list_trades("default")[0]["_bt_market_last_price"] == 1.003
 
 
 @pytest.mark.asyncio

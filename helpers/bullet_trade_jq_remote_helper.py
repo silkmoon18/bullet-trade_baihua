@@ -64,6 +64,7 @@ __all__ = [
     "PositionView",
     "AccountPortfolioView",
     "JoinQuantRuntime",
+    "prewarm_joinquant_qmt",
     "install_joinquant_runtime",
     "install_strategy_runtime",
     "ensure_account",
@@ -84,8 +85,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 20
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v20"
+STRATEGY_RUNTIME_API_VERSION = 21
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v21"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -151,6 +152,7 @@ _active_signature = None  # type: Optional[Tuple[Any, ...]]
 _active_state = None  # type: Optional[Dict[str, Any]]
 _active_profile = None  # type: Optional[Dict[str, Any]]
 _active_namespace = None  # type: Optional[Dict[str, Any]]
+_active_joinquant_runtime = None  # type: Optional[Any]
 _runtime_target_state = None  # type: Optional[Dict[str, Any]]
 _security_name_cache = {}  # type: Dict[str, str]
 _TERMINAL_INTENT_STATES = frozenset({"COMPLETED", "CANCELED", "FAILED"})
@@ -820,6 +822,7 @@ def submit_targets(
     as_of: Any = None,
     execution: Optional[ExecutionRequest] = None,
     security_names: Optional[Dict[str, str]] = None,
+    reuse_existing: bool = False,
 ) -> Dict[str, Any]:
     if _active_state is None or not _active_state.get("qmt_account_enabled"):
         raise RuntimeError("只有启用QMT账户后才可以提交真实组合目标")
@@ -832,6 +835,8 @@ def submit_targets(
         payload["as_of"] = as_of
     if security_names:
         payload["security_names"] = security_names
+    if reuse_existing:
+        payload["reuse_existing"] = True
     return _strategy_request("strategy.submit_targets", payload)
 
 
@@ -969,11 +974,6 @@ def submit_runtime_targets(
     """Submit one typed daily target and retain only restart state."""
 
     global _runtime_target_state
-    existing = get_intent(idempotency_key=idempotency_key)
-    if existing:
-        weights = dict(existing.get("weights", weights))
-        if type(existing.get("execution")) is dict:
-            execution = _execution_from_wire(existing["execution"])
     result = submit_targets(
         weights,
         idempotency_key,
@@ -981,7 +981,12 @@ def submit_runtime_targets(
         as_of=getattr(context, "current_dt", None),
         execution=execution,
         security_names=security_names,
+        reuse_existing=True,
     )
+    weights = dict(result.get("effective_weights", weights))
+    effective_execution = result.get("effective_execution")
+    if type(effective_execution) is dict:
+        execution = _execution_from_wire(effective_execution)
     _runtime_target_state = {
         "intent_id": result["intent"]["intent_id"],
         "idempotency_key": idempotency_key,
@@ -1001,8 +1006,6 @@ def advance_runtime_targets(context: Any) -> bool:
     global _runtime_target_state
     if _active_state is None or not _active_state.get("qmt_account_enabled"):
         return True
-    if _runtime_target_state is None:
-        _restore_runtime_targets()
     if _runtime_target_state is None:
         return True
     intent = get_intent(_runtime_target_state["intent_id"])
@@ -1619,6 +1622,37 @@ class JoinQuantRuntime:
         self._set_qmt_ready(True)
         self._log("info", "QMT账户重新对账通过，恢复QMT执行")
 
+    def prewarm_qmt(self, context: Any) -> None:
+        """Prepare QMT account and quote feed before the 09:30 decision."""
+
+        if not self.qmt_account_enabled or not self._qmt_callback_allowed(
+            context, "盘前准备"
+        ):
+            return
+        try:
+            ensured = _strategy_request(
+                "strategy.prepare_session",
+                {"initial_capital": self._qmt_initial_capital},
+            )
+            reconciliation = ensured.get("reconciliation", {})
+            if reconciliation.get("state") != "READY":
+                raise RuntimeError(
+                    "对账未就绪: {}".format(
+                        reconciliation.get("details", {}).get("blockers", [])
+                    )
+                )
+            _restore_runtime_targets()
+            self._set_qmt_ready(True)
+            self._log(
+                "info",
+                "QMT盘前准备完成 | 对账=READY 行情链路={}；09:30以新快照提交目标".format(
+                    "就绪" if ensured.get("quote_ready") else "未验证"
+                ),
+            )
+        except Exception as exc:
+            self._set_qmt_ready(False)
+            self._log("warn", "QMT盘前准备未就绪，09:30将重新检查：{}".format(exc))
+
     def _publish_state(self) -> None:
         if self._namespace is None:
             return
@@ -1694,6 +1728,12 @@ class JoinQuantRuntime:
         """Register the common ETF strategy schedule on JoinQuant."""
 
         run_daily = self._platform_api("run_daily")
+        if self.qmt_account_enabled:
+            run_daily(
+                prewarm_joinquant_qmt,
+                "09:20",
+                reference_security=reference_security,
+            )
         run_daily(
             before_market_open,
             "09:20",
@@ -1717,8 +1757,10 @@ class JoinQuantRuntime:
         )
         self._log(
             "info",
-            "任务调度完成 | 09:20 盘前预处理 | 09:30 开盘下单 | "
-            "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times)),
+            "任务调度完成 | {}09:20 盘前预处理 | 09:30 开盘下单 | ".format(
+                "09:20 QMT盘前准备 | " if self.qmt_account_enabled else ""
+            )
+            + "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times)),
         )
 
     def log_process_initialize(self) -> None:
@@ -2100,25 +2142,23 @@ class JoinQuantRuntime:
                 if not self.advance_targets(context):
                     result["qmt"] = {"skipped_active_intent": True}
                 else:
-                    qmt_portfolio = get_portfolio(
-                        as_of=getattr(context, "current_dt", None)
-                    )
-                    _record_runtime_portfolio(qmt_portfolio)
                     qmt_weights = dict(weights)
+                    qmt_marks = dict(marks)
+                    # Only an all-cash decision needs a separate read to name
+                    # the positions to close. For a nonempty target, the
+                    # server's fresh submit snapshot already contains them.
                     if not qmt_weights:
+                        qmt_portfolio = get_portfolio(
+                            as_of=getattr(context, "current_dt", None)
+                        )
+                        _record_runtime_portfolio(qmt_portfolio)
                         qmt_weights = {
                             security: 0.0
                             for security in qmt_portfolio.positions
                         }
-                    qmt_marks = dict(marks)
-                    for security, position in qmt_portfolio.positions.items():
-                        qmt_marks.setdefault(security, float(position.price))
-                    qmt_security_names = _security_names(
-                        set(qmt_weights) | set(qmt_portfolio.positions)
-                    )
-                    notification_items = self._target_buy_plan_items(
-                        qmt_portfolio, weights, marks
-                    )
+                        for security, position in qmt_portfolio.positions.items():
+                            qmt_marks.setdefault(security, float(position.price))
+                    qmt_security_names = _security_names(qmt_weights)
                     if qmt_weights:
                         result["qmt"] = self.submit_targets(
                             context,
@@ -2129,6 +2169,23 @@ class JoinQuantRuntime:
                             qmt_security_names,
                         )
                         qmt_submitted = True
+                        try:
+                            accepted_snapshot = result["qmt"].get("snapshot")
+                            qmt_portfolio = (
+                                PortfolioView(accepted_snapshot)
+                                if isinstance(accepted_snapshot, dict)
+                                else get_portfolio(
+                                    as_of=getattr(context, "current_dt", None)
+                                )
+                            )
+                            notification_items = self._target_buy_plan_items(
+                                qmt_portfolio, weights, marks
+                            )
+                        except Exception as exc:
+                            self._log(
+                                "warn",
+                                "QMT目标已提交，但计划卡片未生成：{}".format(exc),
+                            )
             except Exception as exc:
                 result["errors"].append(("QMT", str(exc)))
                 self._log(
@@ -2496,6 +2553,14 @@ class JoinQuantRuntime:
             return None
 
 
+def prewarm_joinquant_qmt(context: Any) -> None:
+    """Top-level JQ scheduler callback, so saved schedules survive restarts."""
+
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        runtime.prewarm_qmt(context)
+
+
 def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
@@ -2539,6 +2604,8 @@ def install_joinquant_runtime(
     runtime = JoinQuantRuntime(
         state, namespace, qmt_initial_capital=qmt_initial_capital
     )
+    global _active_joinquant_runtime
+    _active_joinquant_runtime = runtime
     runtime._publish_state()
     if not validate_remote:
         # Account initialization and reconciliation are runtime concerns.

@@ -209,6 +209,14 @@ def test_estimated_price_migration_preserves_legacy_zero_and_accepts_marked_esti
                 '510050.XSHG', 'BUY', 100, 2000000, 0, 0, '2026-09-07', '2026-09-07',
                 0, 0, 'PRICE_AMOUNT_CONFLICT_ESTIMATE', 0)
         """)
+        connection.execute("""
+            INSERT INTO fills(fill_id, order_id, broker_trade_id, fill_fingerprint,
+                security, side, quantity, price_units, commission_units, tax_units,
+                traded_at, booked_at, commission_known, tax_known, price_source, price_known)
+            VALUES ('market', 'o', 'trade-market', 'fingerprint-market',
+                '510050.XSHG', 'BUY', 100, 2000000, 0, 0, '2026-09-07', '2026-09-07',
+                0, 0, 'MARKET_QUOTE_ESTIMATE', 0)
+        """)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE fills SET price_known = 1 WHERE fill_id = 'estimate'")
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

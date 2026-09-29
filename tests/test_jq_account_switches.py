@@ -385,6 +385,70 @@ def test_parallel_rebalance_sizes_each_account_from_its_own_total_and_notifies_q
     }]
 
 
+def test_nonempty_qmt_target_reuses_submit_snapshot_for_plan(helper, monkeypatch):
+    _config(monkeypatch, {
+        "jq_account_enabled": True,
+        "qmt_account_enabled": True,
+    })
+    namespace = {
+        name: (lambda *args, **kwargs: None)
+        for name in helper._RUNTIME_MUTATION_NAMES
+    }
+    context = _context()
+    context.current_dt = "2026-08-28 09:30:00"
+    context.portfolio = _portfolio(10_000)
+    runtime = helper.install_joinquant_runtime(
+        namespace,
+        context=context,
+        strategy_id=STRATEGY_ID,
+        qmt_initial_capital=10_000,
+        profile_module=PROFILE_MODULE,
+    )
+    monkeypatch.setattr(helper, "advance_runtime_targets", lambda context: True)
+    monkeypatch.setattr(
+        helper, "get_portfolio", lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("redundant QMT snapshot request")
+        )
+    )
+    snapshot = {
+        "account_id": STRATEGY_ID,
+        "as_of": context.current_dt,
+        "snapshot_version": "test",
+        "ledger_version": 1,
+        "cash": 20_000.0,
+        "reserved_cash": 0.0,
+        "available_cash": 20_000.0,
+        "positions_value": 0.0,
+        "total_value": 20_000.0,
+        "starting_cash": 20_000.0,
+        "performance_ready": False,
+        "positions": {},
+    }
+    monkeypatch.setattr(
+        helper, "submit_runtime_targets",
+        lambda *args, **kwargs: {
+            "intent": {"intent_id": "i-1", "state": "EXECUTING"},
+            "snapshot": snapshot,
+        },
+    )
+    notified = []
+    monkeypatch.setattr(
+        helper, "notify_target_buy_plan",
+        lambda items, occurred_at=None: (
+            notified.append(items)
+            or {"accepted": True, "item_count": len(items), "total_amount": 10_000}
+        ),
+    )
+
+    result = runtime.execute_rebalance(
+        context, {"510300.XSHG": 0.5}, {"510300.XSHG": 10.0},
+        "open-20260828", helper.ExecutionRequest(),
+    )
+
+    assert result["qmt"]["intent"]["intent_id"] == "i-1"
+    assert notified[0][0]["amount"] == 10_000.0
+
+
 def test_parallel_notification_uses_qmt_channel_only(helper, monkeypatch):
     _config(monkeypatch, {
         "jq_account_enabled": True,

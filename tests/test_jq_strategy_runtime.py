@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 20,
+        "api_version": 21,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -128,9 +128,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 20
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 21
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v20"
+        "bullet-trade-joinquant-runtime-helper-v21"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -258,6 +258,88 @@ def test_runtime_owns_platform_setup_and_schedule(helper):
         "14:50",
         "14:55",
     ]
+
+
+def test_qmt_schedule_prewarms_without_changing_decision_callbacks(helper):
+    calls = []
+    namespace = {
+        "run_daily": lambda callback, *args, **kwargs: calls.append(
+            (callback, args, kwargs)
+        ),
+        "log": types.SimpleNamespace(info=lambda message: None),
+    }
+    runtime = helper.JoinQuantRuntime(
+        _state("QMT_REMOTE", "sim_trade"), namespace, qmt_initial_capital=10000
+    )
+    callbacks = [lambda context: None for _ in range(4)]
+    runtime.schedule_daily(
+        callbacks[0], callbacks[1], callbacks[2], ("10:30",), callbacks[3]
+    )
+
+    assert calls[0][0] is helper.prewarm_joinquant_qmt
+    assert calls[0][1] == ("09:20",)
+    assert calls[1][0] is callbacks[0]
+    assert calls[2][0] is callbacks[1]
+    assert [call[2].get("time") for call in calls[3:]] == ["10:30", "14:55"]
+
+
+def test_qmt_prewarm_checks_account_and_quote_feed(helper, monkeypatch):
+    logs = []
+    runtime = helper.JoinQuantRuntime(
+        _state("QMT_REMOTE", "sim_trade"),
+        {"log": types.SimpleNamespace(
+            info=lambda message: logs.append(("info", message)),
+            warn=lambda message: logs.append(("warn", message)),
+        )},
+        qmt_initial_capital=10000,
+    )
+    context = object()
+    calls = []
+    monkeypatch.setattr(helper, "_active_state", runtime.state)
+    monkeypatch.setattr(
+        runtime, "_qmt_callback_allowed", lambda current, operation: True
+    )
+    monkeypatch.setattr(
+        helper, "_strategy_request", lambda action, payload: (
+            calls.append((action, payload)) or (
+                {"reconciliation": {"state": "READY"}, "quote_ready": True}
+                if action == "strategy.prepare_session" else {}
+            )
+        ),
+    )
+
+    runtime.prewarm_qmt(context)
+
+    assert calls == [
+        ("strategy.prepare_session", {"initial_capital": 10000}),
+        ("strategy.get_intent", {}),
+    ]
+    assert runtime.state["production_ready"] is True
+    assert any("行情链路=就绪" in message for _, message in logs)
+    assert any("09:30以新快照提交目标" in message for _, message in logs)
+
+
+def test_qmt_prewarm_failure_does_not_stop_jq_decision(helper, monkeypatch):
+    warnings = []
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ_QMT_PARALLEL", "sim_trade", production_ready=True),
+        {"log": types.SimpleNamespace(warn=warnings.append)},
+        qmt_initial_capital=10000,
+    )
+    monkeypatch.setattr(
+        runtime, "_qmt_callback_allowed", lambda current, operation: True
+    )
+    monkeypatch.setattr(
+        helper, "_strategy_request", lambda action, payload: (_ for _ in ()).throw(
+            RuntimeError("bridge offline")
+        ),
+    )
+
+    runtime.prewarm_qmt(object())
+
+    assert runtime.state["production_ready"] is False
+    assert len(warnings) == 1
+    assert "09:30将重新检查" in warnings[0]
 
 
 def test_execution_value_objects_are_typed_and_immutable(helper):

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -14,7 +16,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, cast
 
 from bullet_trade.core.pricing import infer_price_cage_board
 
-from .broker_contract import BrokerCapabilityProfile
+from .broker_contract import BrokerCapabilityProfile, BrokerContractError, _broker_trade_time
 from ..feishu_notifier import (
     TargetBuyPlanItem,
     TargetBuyPlanNotification,
@@ -46,7 +48,11 @@ from .planner_executor import (
     SQLiteTargetExecutionService,
     TargetPlanningError,
 )
-from .reconciliation import SQLiteReconciliationService, collect_async_broker_snapshot
+from .reconciliation import (
+    BrokerAccountSnapshot,
+    SQLiteReconciliationService,
+    collect_async_broker_snapshot,
+)
 from .repository import (
     AccountNotFoundError,
     LedgerInvariantError,
@@ -60,10 +66,20 @@ DatabasePath = Union[str, Path]
 logger = logging.getLogger(__name__)
 EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 VALUATION_MARK_MAX_IDLE_AGE = timedelta(days=10)
+FIRST_DISPATCH_SNAPSHOT_MAX_AGE_SECONDS = 2.0
 
 
 class ReconciliationNotReadyError(RuntimeError):
     """Expected execution pause; the reconciliation notification explains it."""
+
+
+@dataclass(frozen=True)
+class _PreparedDispatchSnapshot:
+    strategy_id: str
+    account_key: str
+    broker_snapshot: BrokerAccountSnapshot
+    observed_at: float
+    state_revision: int
 
 
 def _uses_quote_execution(
@@ -149,6 +165,7 @@ class SQLiteStrategyAPI:
         self._event_loop = None
         self._runtime_bindings = {}
         self._quote_cache = {}
+        self._preopen_quote_owners = set()
         self._quote_last_received_at = {}
         self._quote_last_log_at = {}
         self._seen_tick_symbols = set()
@@ -156,6 +173,9 @@ class SQLiteStrategyAPI:
         self._resume_locks = {}
         self._sellable_waits = {}
         self._dispatch_lock = asyncio.Lock()
+        self._broker_revision_lock = threading.Lock()
+        self._broker_state_revision = 0
+        self._broker_event_revision = 0
         self._background_tasks = set()
         self._submission_tasks = {}
         self._closed = False
@@ -256,6 +276,46 @@ class SQLiteStrategyAPI:
             "reconciliation": _json_value(result),
         }
 
+    async def prepare_session(
+        self,
+        account_context: object,
+        account_key: str,
+        payload: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """09:20 reconcile locally and warm quotes without broker orders."""
+
+        result = await self.ensure_account(account_context, account_key, payload)
+        if result["reconciliation"]["state"] != "READY":
+            return dict(result, quote_ready=False, subscribed_holdings=0)
+        strategy_id = self._strategy_id(payload)
+        securities = tuple(sorted(self._held_securities(strategy_id)))
+        subscribe = getattr(self.data_provider, "replace_execution_quotes", None)
+        tick_fn = getattr(self.data_provider, "get_current_tick", None)
+        quote_ready = False
+        subscribed_holdings = 0
+        try:
+            if securities and callable(subscribe):
+                await subscribe("preopen:" + strategy_id, securities)
+                self._preopen_quote_owners.add(strategy_id)
+                subscribed_holdings = len(securities)
+            if callable(tick_fn):
+                # The new target is unknown until 09:30. Probe one held symbol
+                # or the reference index, without using its pre-open price to
+                # trade or blocking the decision if the feed is unavailable.
+                tick = await tick_fn(securities[0] if securities else "000300.XSHG")
+                quote_as_of = self._tick_as_of(tick)
+                quote_ready = (
+                    float(self._tick_price(tick)) > 0
+                    and -5 <= (datetime.now(SHANGHAI_TZ) - quote_as_of).total_seconds() <= 60
+                )
+        except Exception as exc:
+            logger.warning("QMT盘前行情准备未完成 | strategy_id=%s | %s", strategy_id, exc)
+        return dict(
+            result,
+            quote_ready=quote_ready,
+            subscribed_holdings=subscribed_holdings,
+        )
+
     async def get_snapshot(
         self,
         account_context: object,
@@ -283,6 +343,7 @@ class SQLiteStrategyAPI:
     ) -> Dict[str, object]:
         if self._closed:
             raise RuntimeError("StrategyLedger is shutting down")
+        target_received_at = time.monotonic()
         strategy_id = self._strategy_id(payload)
         self._bind_runtime(strategy_id, account_context, account_key)
         key = str(payload.get("idempotency_key") or "").strip()
@@ -307,11 +368,31 @@ class SQLiteStrategyAPI:
             execution_request = execution_request_from_wire(raw_execution)
         else:
             raise ValueError("execution must be an object")
+        if payload.get("reuse_existing") is True:
+            # The JQ runtime previously made a separate RPC for this lookup.
+            # Keep its restart/idempotency behaviour inside the submit RPC so
+            # a new 09:30 decision reaches the server without a preflight RTT.
+            existing = self.get_intent({
+                "strategy_id": strategy_id, "idempotency_key": key,
+            })
+            if existing:
+                weights = cast(Mapping[str, object], existing["weights"])
+                execution_request = execution_request_from_wire(
+                    cast(Mapping[str, object], existing["execution"])
+                )
+                payload = dict(payload, weights=weights)
         if not self._can_dispatch_now():
             raise RuntimeError("当前非发单时段，目标未提交；仅在工作日09:30-11:30、13:00-15:00发单")
-        snapshot, reconciliation, marks = await self._refresh(
-            account_context, account_key, strategy_id, payload, require_ready=True
+        event_revision, _ = self._broker_revisions()
+        broker_snapshot = await collect_async_broker_snapshot(
+            cast(Any, self.broker), account_context
         )
+        observed_at = time.monotonic()
+        snapshot, reconciliation, marks = await self._refresh(
+            account_context, account_key, strategy_id, payload,
+            require_ready=True, broker_snapshot=broker_snapshot,
+        )
+        _, state_revision = self._broker_revisions()
         if any(_uses_quote_execution(execution_request, security) for security in marks):
             replace_quotes = getattr(
                 self.data_provider, "replace_execution_quotes", None
@@ -330,9 +411,16 @@ class SQLiteStrategyAPI:
             )
             cancel_requested_order_ids.append(broker_order_id)
         if cancel_requested_order_ids:
-            snapshot, reconciliation, marks = await self._refresh(
-                account_context, account_key, strategy_id, payload, require_ready=True
+            event_revision, _ = self._broker_revisions()
+            broker_snapshot = await collect_async_broker_snapshot(
+                cast(Any, self.broker), account_context
             )
+            observed_at = time.monotonic()
+            snapshot, reconciliation, marks = await self._refresh(
+                account_context, account_key, strategy_id, payload,
+                require_ready=True, broker_snapshot=broker_snapshot,
+            )
+            _, state_revision = self._broker_revisions()
         quotes = await self._execution_quotes(
             execution_request, tuple(marks), snapshot.as_of
         )
@@ -358,9 +446,24 @@ class SQLiteStrategyAPI:
         # No await between the durable plan and scheduling its server-owned
         # execution. A client timeout/disconnect must not cancel broker submit.
         intent_id = advance.intent.intent_id
+        current_event_revision, current_state_revision = self._broker_revisions()
+        prepared = (
+            _PreparedDispatchSnapshot(
+                strategy_id, account_key, broker_snapshot, observed_at,
+                state_revision,
+            )
+            if event_revision == current_event_revision
+            and state_revision == current_state_revision
+            else None
+        )
         self._queue_target_execution(intent_id, self._execute_accepted_target(
-            intent_id, account_context, account_key, dict(payload), quotes
+            intent_id, account_context, account_key, dict(payload), quotes,
+            prepared, target_received_at,
         ))
+        logger.info(
+            "QMT目标已接受 | strategy_id=%s | 接收至接受=%.0fms | 首笔委托异步发出",
+            strategy_id, (time.monotonic() - target_received_at) * 1000,
+        )
         # Include reservations created by planning, but do not wait for a new
         # broker observation. This is an acceptance snapshot, not a fill report.
         accepted_snapshot = self.valuation.create_snapshot(
@@ -378,6 +481,8 @@ class SQLiteStrategyAPI:
             "cancel_requested_order_ids": cancel_requested_order_ids,
             "snapshot": self._snapshot_payload(accepted_snapshot),
             "reconciliation": _json_value(reconciliation),
+            "effective_weights": _json_value(weights),
+            "effective_execution": execution_request_to_wire(execution_request),
         }
 
     def _queue_target_execution(self, intent_id, awaitable):
@@ -394,7 +499,10 @@ class SQLiteStrategyAPI:
 
         task.add_done_callback(finished)
 
-    async def _execute_accepted_target(self, intent_id, account_context, account_key, payload, quotes):
+    async def _execute_accepted_target(
+        self, intent_id, account_context, account_key, payload, quotes,
+        prepared_snapshot=None, target_received_at=None,
+    ):
         strategy_id = self._strategy_id(payload)
         async with self._resume_locks[strategy_id]:
             await self._sync_quote_subscriptions(strategy_id)
@@ -402,11 +510,21 @@ class SQLiteStrategyAPI:
             async def submitter(order_payload):
                 return await cast(Any, self.broker).place_order(account_context, dict(order_payload))
 
-            await self._dispatch_pending(submitter, strategy_id)
+            await self._dispatch_pending(
+                submitter, strategy_id, prepared_snapshot=prepared_snapshot,
+                target_received_at=target_received_at,
+            )
             # Immediate fills/rejections still enter the ledger, just outside
             # the RPC. Later native callbacks drive any remaining orders.
             _, reconciliation, _ = await self._refresh(account_context, account_key, strategy_id, payload)
             self._record_reconciliation_rejections(intent_id, reconciliation, quotes)
+            subscribe = getattr(self.data_provider, "replace_execution_quotes", None)
+            if strategy_id in self._preopen_quote_owners and callable(subscribe):
+                try:
+                    await subscribe("preopen:" + strategy_id, ())
+                    self._preopen_quote_owners.discard(strategy_id)
+                except Exception as exc:
+                    logger.warning("QMT盘前行情订阅清理失败 | strategy_id=%s | %s", strategy_id, exc)
             await self._sync_quote_subscriptions(strategy_id)
 
     async def close(self) -> None:
@@ -732,12 +850,14 @@ class SQLiteStrategyAPI:
         }
 
     async def _refresh(
-        self, account_context, account_key, strategy_id, payload, *, require_ready=False
+        self, account_context, account_key, strategy_id, payload, *,
+        require_ready=False, broker_snapshot=None,
     ):
         physical_id = self._physical_id(account_key)
-        broker_snapshot = await collect_async_broker_snapshot(
-            cast(Any, self.broker), account_context
-        )
+        if broker_snapshot is None:
+            broker_snapshot = await collect_async_broker_snapshot(
+                cast(Any, self.broker), account_context
+            )
         reconciliation = await self._synchronize(
             strategy_id, physical_id, broker_snapshot
         )
@@ -785,6 +905,7 @@ class SQLiteStrategyAPI:
 
     async def _synchronize(self, strategy_id, physical_id, broker_snapshot):
         previous = self.reconciliation.latest(physical_id, strategy_id)
+        broker_snapshot = await self._capture_fill_market_quotes(broker_snapshot)
         settlement_cycles = await self._settlement_cycles(broker_snapshot)
         result = self.reconciliation.synchronize(
             strategy_id,
@@ -792,6 +913,7 @@ class SQLiteStrategyAPI:
             broker_snapshot,
             settlement_cycles=settlement_cycles,
         )
+        self._record_broker_change()
         self.startup_ready = result.state.value == "READY"
         limits = dict(result.details.get("broker_sellable_limits", {}))
         old_limits = self._sellable_waits.get(strategy_id, {})
@@ -822,6 +944,12 @@ class SQLiteStrategyAPI:
                 "QMT成交价与成交金额不一致，金额仅作估算、收益非精确 | strategy_id=%s | %s",
                 strategy_id, discrepancy,
             )
+        for discrepancy in result.details.get("market_price_disagreements", ()):
+            logger.warning(
+                "QMT成交价与同期行情严重不符，行情价仅作估算、收益非精确 | "
+                "strategy_id=%s | %s",
+                strategy_id, discrepancy,
+            )
         changed_blocker = (
             result.state.value == "BLOCKED"
             and (previous is None or previous.state.value != "BLOCKED"
@@ -846,6 +974,59 @@ class SQLiteStrategyAPI:
                 pass
         return result
 
+    async def _capture_fill_market_quotes(self, broker_snapshot):
+        """Persist one live quote close to a new Big QMT trade callback."""
+        remember = getattr(self.broker, "remember_trade_market_quote", None)
+        tick_fn = getattr(self.data_provider, "get_current_tick", None)
+        if not callable(remember) or not callable(tick_fn):
+            return broker_snapshot
+        now = datetime.now(SHANGHAI_TZ)
+        rows = []
+        ticks = {}
+        for trade in broker_snapshot.trades:
+            row = dict(trade)
+            if row.get("_bt_market_quote_time"):
+                rows.append(row)
+                continue
+            try:
+                traded_at = _broker_trade_time(row.get("time") or row.get("trade_time"))
+            except BrokerContractError:
+                rows.append(row)
+                continue
+            age = (now - traded_at).total_seconds()
+            security = str(row.get("security") or "")
+            if not security or not -1 <= age <= 20:
+                rows.append(row)
+                continue
+            if security not in ticks:
+                try:
+                    ticks[security] = await tick_fn(security)
+                except Exception:
+                    ticks[security] = None
+            tick = ticks[security]
+            try:
+                quote_as_of = self._tick_as_of(tick)
+                quote_price = self._tick_price(tick)
+            except (TypeError, ValueError, OverflowError):
+                rows.append(row)
+                continue
+            received_at = datetime.now(SHANGHAI_TZ)
+            if (
+                not -1 <= (received_at - quote_as_of).total_seconds() <= 10
+                or abs((quote_as_of - traded_at).total_seconds()) > 10
+            ):
+                rows.append(row)
+                continue
+            row["_bt_market_last_price"] = float(quote_price)
+            row["_bt_market_quote_time"] = quote_as_of.isoformat()
+            # The durable observation must exist before an estimated fill can
+            # be booked; later broker queries then replay the same evidence.
+            if remember(row):
+                rows.append(row)
+            else:
+                rows.append(dict(trade))
+        return replace(broker_snapshot, trades=tuple(rows))
+
     async def _settlement_cycles(
         self, broker_snapshot
     ) -> Mapping[str, int]:
@@ -864,15 +1045,28 @@ class SQLiteStrategyAPI:
             for trade in broker_snapshot.trades
             if isinstance(trade, Mapping)
         }
+        ordered = sorted(item for item in securities if item)
+        if getattr(self.data_provider, "supports_parallel_data_reads", False):
+            cycles = await asyncio.gather(
+                *(resolver(security) for security in ordered),
+                return_exceptions=True,
+            )
+        else:
+            cycles = []
+            for security in ordered:
+                try:
+                    cycles.append(await resolver(security))
+                except Exception as exc:
+                    cycles.append(exc)
         result = {}
-        for security in sorted(item for item in securities if item):
-            try:
-                cycle = await resolver(security)
-            except Exception as exc:
+        for security, cycle in zip(ordered, cycles):
+            if isinstance(cycle, asyncio.CancelledError):
+                raise cycle
+            if isinstance(cycle, Exception):
                 logger.warning(
                     "StrategyLedger无法识别%s结算周期，保守按T+1: %s",
                     security,
-                    exc,
+                    cycle,
                 )
                 continue
             if type(cycle) is int and cycle in (0, 1):
@@ -906,11 +1100,14 @@ class SQLiteStrategyAPI:
             str(item) for item in target_securities
         }
         missing = [security for security in sorted(required) if security not in marks]
-        for security in missing:
-            tick_fn = getattr(self.data_provider, "get_current_tick", None)
-            if tick_fn is None:
-                raise ValueError("missing mark: {}".format(security))
-            tick = await tick_fn(security)
+        tick_fn = getattr(self.data_provider, "get_current_tick", None)
+        if missing and tick_fn is None:
+            raise ValueError("missing mark: {}".format(missing[0]))
+        if getattr(self.data_provider, "supports_parallel_data_reads", False):
+            ticks = await asyncio.gather(*(tick_fn(security) for security in missing))
+        else:
+            ticks = [await tick_fn(security) for security in missing]
+        for security, tick in zip(missing, ticks):
             price = self._tick_price(tick)
             mark_as_of = self._tick_as_of(tick)
             if not self._valuation_mark_is_fresh(
@@ -1017,6 +1214,9 @@ class SQLiteStrategyAPI:
     def _on_broker_event(
         self, account_key: str, event: str, payload: object = None
     ) -> None:
+        # A callback may arrive while the accepted target waits for its
+        # background worker. Never reuse a snapshot taken before that event.
+        self._record_broker_change(event=True)
         loop = self._event_loop
         if loop is None or loop.is_closed():
             return
@@ -1273,20 +1473,46 @@ class SQLiteStrategyAPI:
                 item.get("reason") or "券商未返回原因",
             )
 
-    async def _dispatch_pending(self, submitter, strategy_account_id: str):
+    async def _dispatch_pending(
+        self, submitter, strategy_account_id: str, *,
+        prepared_snapshot=None, target_received_at=None,
+    ):
         dispatched = []
         async with self._dispatch_lock:
             while self._can_dispatch_now():
                 binding = self._runtime_bindings.get(strategy_account_id)
                 if binding is None:
                     break
-                broker_snapshot = await collect_async_broker_snapshot(
-                    cast(Any, self.broker), binding[0]
+                age = (
+                    time.monotonic() - prepared_snapshot.observed_at
+                    if prepared_snapshot is not None else -1.0
                 )
-                reconciliation = await self._synchronize(
-                    strategy_account_id, self._physical_id(binding[1]), broker_snapshot
+                reuse_prepared = (
+                    prepared_snapshot is not None
+                    and prepared_snapshot.strategy_id == strategy_account_id
+                    and prepared_snapshot.account_key == binding[1]
+                    and prepared_snapshot.state_revision == self._broker_revisions()[1]
+                    and 0 <= age <= FIRST_DISPATCH_SNAPSHOT_MAX_AGE_SECONDS
                 )
-                if reconciliation.state.value != "READY" or not self._can_dispatch_now():
+                if reuse_prepared:
+                    broker_snapshot = prepared_snapshot.broker_snapshot
+                else:
+                    broker_snapshot = await collect_async_broker_snapshot(
+                        cast(Any, self.broker), binding[0]
+                    )
+                    reconciliation = await self._synchronize(
+                        strategy_account_id, self._physical_id(binding[1]),
+                        broker_snapshot,
+                    )
+                    if reconciliation.state.value != "READY":
+                        break
+                if prepared_snapshot is not None:
+                    logger.info(
+                        "QMT首笔快照 | strategy_id=%s | 复用=%s | 快照年龄=%.0fms",
+                        strategy_account_id, reuse_prepared, age * 1000,
+                    )
+                prepared_snapshot = None  # Only the first order may reuse it.
+                if not self._can_dispatch_now():
                     break
                 dispatch = await self.planner.dispatch_next(
                     submitter, strategy_account_id,
@@ -1296,8 +1522,25 @@ class SQLiteStrategyAPI:
                 )
                 if dispatch is None:
                     break
+                self._record_broker_change()
+                if not dispatched and target_received_at is not None:
+                    logger.info(
+                        "QMT首笔提交处理完成 | strategy_id=%s | 接收至处理完成=%.0fms",
+                        strategy_account_id,
+                        (time.monotonic() - target_received_at) * 1000,
+                    )
                 dispatched.append(dispatch)
         return tuple(dispatched)
+
+    def _broker_revisions(self) -> Tuple[int, int]:
+        with self._broker_revision_lock:
+            return self._broker_event_revision, self._broker_state_revision
+
+    def _record_broker_change(self, *, event: bool = False) -> None:
+        with self._broker_revision_lock:
+            self._broker_state_revision += 1
+            if event:
+                self._broker_event_revision += 1
 
     def _strategy_reconciliation_enabled(self, strategy_account_id: str) -> bool:
         if not self.config.trading_enabled:

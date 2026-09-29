@@ -227,6 +227,7 @@ class JoinQuantRuntime:
     def account_portfolios(self, context: Context) -> Tuple[AccountPortfolioView, ...]: ...
     def log_account_snapshots(self, context: Context) -> None: ...
     def ensure_ready(self, qmt_initial_capital: Any, context: Context) -> Any: ...
+    def prewarm_qmt(self, context: Context) -> None: ...
     def submit_targets(
         self,
         context: Context,
@@ -284,6 +285,9 @@ class JoinQuantRuntime:
     ) -> Dict[str, Any]: ...
 
 
+def prewarm_joinquant_qmt(context: Context) -> None: ...
+
+
 def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
@@ -308,6 +312,7 @@ def submit_targets(
     as_of: Any = ...,
     execution: Optional[ExecutionRequest] = ...,
     security_names: Optional[Dict[str, str]] = ...,
+    reuse_existing: bool = ...,
 ) -> Dict[str, Any]: ...
 def notify_target_buy_plan(
     items: Any,

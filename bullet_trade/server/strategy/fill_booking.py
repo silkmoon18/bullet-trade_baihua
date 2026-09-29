@@ -37,6 +37,10 @@ from .schema import connect_database
 
 
 DatabasePath = Union[str, Path]
+BROKER_CONFLICT_ESTIMATES = (
+    FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE,
+    FillPriceSource.MARKET_QUOTE_ESTIMATE,
+)
 
 
 class FillBookingError(RepositoryError):
@@ -207,6 +211,8 @@ def _fee_notification_detail(
         )
     elif fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE:
         detail += "；券商成交价与成交金额不一致，按成交金额暂估；收益为非精确收益"
+    elif fill.price_source is FillPriceSource.MARKET_QUOTE_ESTIMATE:
+        detail += "；券商成交价与同期行情严重不符，按成交附近最新价暂估；收益为非精确收益"
     elif fill.price_source is FillPriceSource.ZERO_FALLBACK:
         detail += "；成交价和成交金额缺失"
         if proceeds_estimate is not None:
@@ -527,14 +533,30 @@ class SQLiteFillBookingService:
             if duplicate is not None:
                 account = _account_from_row(self._select_account(connection, account_id))
                 if (duplicate["price_known"] and
-                        fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE):
+                        fill.price_source is FillPriceSource.MARKET_QUOTE_ESTIMATE):
+                    # The original broker price has already changed cash and
+                    # position cost. Relabeling it as a quote estimate without
+                    # revising those numbers would produce a false ledger.
+                    raise FillConflictError(
+                        "market quote arrived after broker fill was booked; "
+                        "historical price correction requires review"
+                    )
+                if (duplicate["price_known"] and
+                        fill.price_source in BROKER_CONFLICT_ESTIMATES):
                     reclassified = self._reclassify_conflicting_fill(
                         connection, account_id, account, duplicate, fill,
                         expected_ledger_version,
                     )
                     connection.commit()
                     return reclassified
-                if not duplicate["price_known"] and fill.price_known:
+                unchanged_market_report = (
+                    duplicate["price_source"] == FillPriceSource.MARKET_QUOTE_ESTIMATE.value
+                    and fill.price_known
+                    and self._same_market_conflict_report(duplicate, fill)
+                )
+                # A later query without the captured quote must not turn the
+                # unchanged, implausible broker price into a correction.
+                if not unchanged_market_report and not duplicate["price_known"] and fill.price_known:
                     corrected = self._correct_fill_price(
                         connection, account_id, account, duplicate, fill,
                         expected_ledger_version,
@@ -756,9 +778,11 @@ class SQLiteFillBookingService:
                 else:
                     payload["estimated_proceeds_units"] = gross_units
                     payload["credited_proceeds_estimate_units"] = gross_units
-            if fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE:
+            if fill.price_source in BROKER_CONFLICT_ESTIMATES:
                 payload["broker_reported_price_units"] = fill.reported_price_units
                 payload["broker_reported_amount_units"] = fill.reported_amount_units
+                if fill.price_source is FillPriceSource.MARKET_QUOTE_ESTIMATE:
+                    payload["market_quote_estimate_price_units"] = fill.price_units
                 if fill.side is OrderSide.BUY:
                     payload["estimated_cost_units"] = gross_units
                 else:
@@ -829,12 +853,12 @@ class SQLiteFillBookingService:
                     quantity=fill.quantity,
                     price=(
                         None if not fill.price_known and price_estimate is None
-                        and fill.price_source is not FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+                        and fill.price_source not in BROKER_CONFLICT_ESTIMATES
                         else price_units_to_display(fill.price_units)
                     ),
                     amount=(
                         None if not fill.price_known and price_estimate is None
-                        and fill.price_source is not FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+                        and fill.price_source not in BROKER_CONFLICT_ESTIMATES
                         else money_units_to_display(
                             gross_units + fee_units
                             if fill.side is OrderSide.BUY
@@ -850,7 +874,7 @@ class SQLiteFillBookingService:
                         price_estimate=price_estimate,
                     ),
                     estimated=(price_estimate is not None or
-                               fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE),
+                               fill.price_source in BROKER_CONFLICT_ESTIMATES),
                     occurred_at=fill.traded_at,
                 )
             )
@@ -961,7 +985,7 @@ class SQLiteFillBookingService:
             """UPDATE fills SET price_source = ?, price_known = 0,
                    fill_fingerprint = ? WHERE fill_id = ?""",
             (
-                FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE.value,
+                fill.price_source.value,
                 fill.fingerprint,
                 fill.fill_id,
             ),
@@ -1333,12 +1357,17 @@ class SQLiteFillBookingService:
         row = connection.execute(
             """
             SELECT f.*, json_extract(e.payload_json, '$.realized_pnl_units')
-                   AS realized_pnl_units
+                   AS realized_pnl_units,
+                   json_extract(e.payload_json, '$.broker_reported_price_units')
+                   AS original_reported_price_units,
+                   json_extract(e.payload_json, '$.broker_reported_amount_units')
+                   AS original_reported_amount_units
             FROM fills f
             JOIN strategy_orders o ON o.order_id = f.order_id
             JOIN ledger_entries e
               ON e.strategy_account_id = o.strategy_account_id
              AND e.reference_type = 'order' AND e.reference_id = f.order_id
+             AND e.entry_type IN ('BUY_FILL_BOOKED', 'SELL_FILL_BOOKED')
              AND json_extract(e.payload_json, '$.fill_id') = f.fill_id
             WHERE f.fill_fingerprint = ?
                OR (
@@ -1383,20 +1412,26 @@ class SQLiteFillBookingService:
         )
         price_conflict_reclassification = (
             row["price_known"]
-            and fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+            and fill.price_source in BROKER_CONFLICT_ESTIMATES
             and row["fill_id"] == fill.fill_id
             and actual[:5] == expected[:5]
             and actual[6] == expected[6]
         )
         price_conflict_replay = (
-            row["price_source"] == FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE.value
-            and fill.price_source is FillPriceSource.PRICE_AMOUNT_CONFLICT_ESTIMATE
+            row["price_source"] in tuple(source.value for source in BROKER_CONFLICT_ESTIMATES)
+            and fill.price_source.value == row["price_source"]
             and row["fill_fingerprint"] == fill.fingerprint
             and row["fill_id"] == fill.fill_id
             and actual[:5] == expected[:5]
             and actual[6] == expected[6]
         )
-        if not (price_upgrade or price_conflict_reclassification or price_conflict_replay) and (actual != expected or (
+        unchanged_market_report = (
+            row["price_source"] == FillPriceSource.MARKET_QUOTE_ESTIMATE.value
+            and fill.price_known and self._same_market_conflict_report(row, fill)
+            and row["fill_id"] == fill.fill_id
+            and actual[:5] == expected[:5] and actual[6] == expected[6]
+        )
+        if not (price_upgrade or price_conflict_reclassification or price_conflict_replay or unchanged_market_report) and (actual != expected or (
             fill.broker_trade_id is None
             and row["fill_fingerprint"] != fill.fingerprint
         )):
@@ -1414,6 +1449,17 @@ class SQLiteFillBookingService:
                     "broker fill id was reused with different known fees"
                 )
         return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _same_market_conflict_report(row: sqlite3.Row, fill: BrokerFill) -> bool:
+        reported_price = row["original_reported_price_units"]
+        reported_amount = row["original_reported_amount_units"]
+        return (
+            reported_price is not None and reported_price == fill.price_units
+        ) or (
+            reported_price is None and reported_amount is not None
+            and reported_amount == _trade_value_units(fill.price_units, fill.quantity)
+        )
 
     def _book_buy_position(
         self,

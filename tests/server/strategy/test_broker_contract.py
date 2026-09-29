@@ -22,6 +22,7 @@ from bullet_trade.server.strategy.domain import (
     OrderSide,
     UnpricedFillPolicy,
     money_to_units,
+    price_to_units,
 )
 
 
@@ -279,6 +280,30 @@ def test_material_price_amount_disagreement_is_an_estimate_not_verified():
     # merely because it differs from the strategy's reference price.
     del trade["deal_balance"]
     assert normalize_trade_evidence(trade, {}).price_units == 912_000
+
+
+def test_consistent_broker_price_far_from_fill_time_quote_is_estimated():
+    trade = {
+        "trade_id": "T-market-anomaly", "trade_id_source": "broker",
+        "order_id": "O-1", "security": "159738.XSHE", "amount": 1500,
+        "price": 0.887, "deal_balance": 1330.5, "side": "SELL",
+        "time": "2026-09-24 09:31:30",
+        "_bt_market_last_price": 2.003,
+        "_bt_market_quote_time": "2026-09-24T09:31:31+08:00",
+    }
+    evidence = normalize_trade_evidence(trade, {})
+    assert evidence.price_source is FillPriceSource.MARKET_QUOTE_ESTIMATE
+    assert evidence.price_units == price_to_units("2.003")
+    assert evidence.price_known is False
+    assert evidence.reported_price_units == price_to_units("0.887")
+    assert evidence.reported_amount_units == money_to_units("1330.5")
+
+    # Ordinary slippage and a quote from much later must not change a fill.
+    trade["price"], trade["deal_balance"] = 1.995, 2992.5
+    assert normalize_trade_evidence(trade, {}).price_source is FillPriceSource.BROKER_TRADE
+    trade["price"], trade["deal_balance"] = 0.887, 1330.5
+    trade["_bt_market_quote_time"] = "2026-09-24T09:32:00+08:00"
+    assert normalize_trade_evidence(trade, {}).price_source is FillPriceSource.BROKER_TRADE
 
 
 def test_price_amount_disagreement_uses_gross_cent_tolerance_not_price_percent():

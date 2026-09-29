@@ -395,6 +395,78 @@ def test_trusted_sell_price_is_untouched_by_the_estimate(services):
     assert "proceeds_estimate" not in payload
 
 
+def test_market_quote_estimated_sell_keeps_raw_report_and_does_not_reverify_it(services):
+    repository, capital, original_booking = services
+    notices = []
+    booking = SQLiteFillBookingService(original_booking.database_path, notices.append)
+    _insert_intent(booking, "intent-sell", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-sell")
+    booking.register_order(_order("sell-1", OrderSide.SELL, 1000, intent_id="intent-sell"))
+    estimated = replace(
+        _fill("market-sell", "sell-1", OrderSide.SELL, 1000, price="2.00"),
+        price_source=FillPriceSource.MARKET_QUOTE_ESTIMATE,
+        price_known=False,
+        reported_price_units=price_to_units("0.90"),
+        reported_amount_units=money_to_units("900"),
+    )
+    result = booking.book_fill("good-etf", estimated, 2)
+    assert result.account.cash_units == money_to_units("9990")
+    payload = _ledger_payload(booking, "SELL_FILL_BOOKED", "sell-1")
+    assert payload["broker_reported_price_units"] == price_to_units("0.90")
+    assert payload["market_quote_estimate_price_units"] == price_to_units("2.00")
+    assert notices[-1].estimated is True
+    assert "同期行情严重不符" in notices[-1].detail
+    valuation = SQLiteValuationService(booking.database_path).create_snapshot(
+        "good-etf", {}, datetime(2026, 8, 10, 15, tzinfo=SHANGHAI_TZ), timedelta(days=1)
+    )
+    assert valuation.performance_ready is False
+    assert "estimated_fill_prices" in valuation.performance_blockers
+
+    # Losing the captured quote on a later query must not "correct" the
+    # estimate back to the unchanged anomalous broker report.
+    raw_replay = replace(
+        estimated, price_units=price_to_units("0.90"),
+        price_source=FillPriceSource.BROKER_TRADE, price_known=True,
+        reported_price_units=None, reported_amount_units=None,
+    )
+    replay = booking.book_fill("good-etf", raw_replay, result.account.ledger_version)
+    assert replay.duplicate
+    assert replay.account.cash_units == result.account.cash_units
+
+    corrected_report = replace(raw_replay, price_units=price_to_units("2.01"))
+    corrected = booking.book_fill("good-etf", corrected_report, replay.account.ledger_version)
+    assert corrected.account.cash_units == money_to_units("10000")
+    assert notices[-1].event == "FILL_PRICE_CORRECTED"
+
+
+def test_late_market_quote_does_not_relabel_already_booked_cash(services):
+    repository, capital, booking = services
+    _insert_intent(booking, "intent-sell", {})
+    _seed_long_position(repository, capital, booking, intent_id="intent-sell")
+    booking.register_order(_order("sell-1", OrderSide.SELL, 1000, intent_id="intent-sell"))
+    reported = _fill("late-quote", "sell-1", OrderSide.SELL, 1000, price="0.90")
+    booked = booking.book_fill("good-etf", reported, 2)
+    estimated = replace(
+        reported,
+        price_units=price_to_units("2.00"),
+        price_source=FillPriceSource.MARKET_QUOTE_ESTIMATE,
+        price_known=False,
+        reported_price_units=price_to_units("0.90"),
+        reported_amount_units=money_to_units("900"),
+    )
+    with pytest.raises(FillConflictError, match="historical price correction"):
+        booking.book_fill("good-etf", estimated, booked.account.ledger_version)
+    assert repository.get_strategy_account("good-etf").cash_units == booked.account.cash_units
+    connection = connect_database(booking.database_path)
+    try:
+        row = connection.execute(
+            "SELECT price_source FROM fills WHERE fill_id = ?", ("late-quote",)
+        ).fetchone()
+        assert row["price_source"] == FillPriceSource.BROKER_TRADE.value
+    finally:
+        connection.close()
+
+
 def test_zero_price_sell_estimate_funds_pending_buy(services):
     """参考价暂估回款可推动卖出后买入，不把成交价伪装为已知。"""
 

@@ -692,6 +692,8 @@ class ServerApplication:
         account_context = self.router.get(resolved_key)
         if method == "ensure_account":
             return await self.strategy_api.ensure_account(account_context, resolved_key, payload)
+        if method == "prepare_session":
+            return await self.strategy_api.prepare_session(account_context, resolved_key, payload)
         if method == "get_snapshot":
             return await self.strategy_api.get_snapshot(account_context, resolved_key, payload)
         if method == "submit_targets":

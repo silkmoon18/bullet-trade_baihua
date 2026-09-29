@@ -56,6 +56,10 @@ class BridgeClient(BigQmtGatewayClient):
 
 
 class BridgeDataAdapter(BigQmtDataAdapter):
+    # Independent reads can be queued in one bridge pump; the QMT script
+    # still executes each request on its own thread in arrival order.
+    supports_parallel_data_reads = True
+
     def __init__(self, client):
         super().__init__(client)
         self._tick_listeners = []
@@ -134,6 +138,8 @@ class BridgeDataAdapter(BigQmtDataAdapter):
 
 
 class BridgeBrokerAdapter(BigQmtBrokerAdapter):
+    supports_parallel_snapshot_reads = True
+
     def __init__(self, config, router, client):
         super().__init__(config, router, client)
         self._listeners = []
@@ -153,6 +159,14 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
 
     def has_durable_broker_history(self):
         return self._history is not None
+
+    def remember_trade_market_quote(self, trade):
+        """Keep the fill-time quote beside the broker report across restarts."""
+        if self._history is None:
+            return False
+        return self._history.record_trade(
+            self._account.config.key or "default", trade
+        )
 
     def _event(self, event, payload):
         if event == "tick":

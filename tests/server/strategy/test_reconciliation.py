@@ -267,6 +267,42 @@ def test_native_deal_amount_conflict_is_estimated_and_replay_safe(tmp_path):
     assert json.loads(audit)["broker_reported_amount_units"] == money_to_units("3000")
 
 
+def test_market_quote_conflict_is_estimated_and_raw_replay_cannot_restore_bad_price(tmp_path):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    trade = dict(
+        _broker_trade(), price=0.90, deal_balance=900.0,
+        _bt_market_last_price=2.0,
+        _bt_market_quote_time="2026-08-11T10:00:01+08:00",
+    )
+    snapshot = _snapshot(
+        "19100", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),), trades=(trade,),
+    )
+    first = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+    assert first.state is ReconciliationState.READY
+    assert first.details["market_price_disagreements"][0]["estimated_price_units"] == price_to_units("2")
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("7995")
+
+    replay = reconciliation.synchronize(
+        ACCOUNT_ID, PHYSICAL_ID,
+        _snapshot("19100", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+                  orders=(_broker_order(),),
+                  trades=(dict(_broker_trade(), price=0.90, deal_balance=900.0),)),
+    )
+    assert replay.state is ReconciliationState.READY
+    assert replay.details["booked_trade_ids"] == ()
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("7995")
+    connection = connect_database(database)
+    try:
+        row = connection.execute("SELECT price_units, price_source, price_known FROM fills").fetchone()
+    finally:
+        connection.close()
+    assert tuple(row) == (price_to_units("2"), "MARKET_QUOTE_ESTIMATE", 0)
+
+
 def test_old_verified_fill_becomes_estimated_on_conflicting_replay_without_rebooking(tmp_path):
     database, repository, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)
@@ -1073,6 +1109,65 @@ def test_async_server_adapter_snapshot_is_supported():
 
     assert snapshot.available_cash_units == money_to_units("10000")
     assert snapshot.positions == (BrokerPositionSnapshot(SECURITY, 100, 50, "上证50ETF"),)
+
+
+def test_async_broker_snapshot_starts_independent_reads_together():
+    async def collect():
+        started = set()
+        all_started = asyncio.Event()
+
+        async def read(name, value):
+            started.add(name)
+            if len(started) == 4:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), 0.2)
+            return value
+
+        class Adapter:
+            supports_parallel_snapshot_reads = True
+
+            async def get_account_info(self, account):
+                return await read("account", {"available_cash": 10000.0})
+
+            async def get_positions(self, account):
+                return await read("positions", [])
+
+            async def list_orders(self, account, filters=None):
+                return await read("orders", [])
+
+            async def list_trades(self, account, filters=None):
+                return await read("trades", [])
+
+        snapshot = await collect_async_broker_snapshot(Adapter(), object())
+        assert started == {"account", "positions", "orders", "trades"}
+        assert snapshot.available_cash_units == money_to_units("10000")
+
+    asyncio.run(collect())
+
+
+def test_async_broker_snapshot_keeps_unmarked_adapters_serial():
+    calls = []
+
+    class Adapter:
+        async def get_account_info(self, account):
+            calls.append("account")
+            return {"available_cash": 10000.0}
+
+        async def get_positions(self, account):
+            calls.append("positions")
+            return []
+
+        async def list_orders(self, account, filters=None):
+            calls.append("orders")
+            return []
+
+        async def list_trades(self, account, filters=None):
+            calls.append("trades")
+            return []
+
+    asyncio.run(collect_async_broker_snapshot(Adapter(), object()))
+
+    assert calls == ["account", "positions", "orders", "trades"]
 
 
 def test_async_snapshot_keeps_unrelated_signed_qmt_position():
