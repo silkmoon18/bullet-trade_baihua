@@ -104,6 +104,18 @@ def test_reporting_failure_does_not_repeat_or_fail_native_orders(helper):
     assert jq.calls == [("BUY", 5000)]
 
 
+def test_decision_error_reporting_does_not_change_failure_fallback(helper):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+
+    def broken_log(message):
+        raise OSError("logger unavailable")
+
+    runtime._namespace["log"] = NS(error=broken_log)
+    runtime.log_strategy_failure("selection", ValueError("missing data"))
+    assert jq.calls == []
+
+
 def test_parallel_accounts_submit_before_qmt_notification_snapshot_read(helper, monkeypatch):
     jq = JQ()
     runtime = jq.runtime(helper)

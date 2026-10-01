@@ -160,7 +160,6 @@ def test_open_variant_does_not_fallback_when_auction_price_unavailable(
 
     assert runtime.rebalances == []
     assert runtime.prepared_rebalances == []
-    assert any("跳过本轮执行" in message for message in strategy.log.messages)
 
 
 def test_open_variant_does_not_reselect_or_submit_at_0930(monkeypatch):
@@ -180,7 +179,6 @@ def test_open_variant_does_not_reselect_or_submit_at_0930(monkeypatch):
     assert runtime.rebalances == []
     assert runtime.prepared_rebalances == []
     assert runtime.staged_advances == [context]
-    assert any("非09:26决策回调" in message for message in strategy.log.messages)
 
 
 def test_open_variant_submits_empty_sell_all_target_when_no_discount(monkeypatch):

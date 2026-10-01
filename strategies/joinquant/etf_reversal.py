@@ -161,13 +161,10 @@ def before_market_open(context: 'Context') -> None:
         g.reversal_candidates = pd.DataFrame(
             rows, columns=['code', 'recent_return', 'close', 'trend_ma', 'avg_money']
         ).sort_values(['recent_return', 'code'], kind='mergesort')
-        log.info('日线反转 | 数据截止={} | 候选={} | 周期={}交易日'.format(
-            as_of, len(rows), HOLD_DAYS,
-        ))
     except Exception as exc:
         # 数据失败不能解释成空仓信号，也不能沿用昨天的缓存。
         g.reversal_candidates = None
-        log.error('日线反转数据准备失败，跳过本轮：{}'.format(exc))
+        _runtime.log_strategy_failure('盘前数据', exc)
 
 
 def market_open(context: 'Context') -> Optional[Tuple[Dict[str, float], Dict[str, float]]]:
@@ -179,7 +176,6 @@ def market_open(context: 'Context') -> Optional[Tuple[Dict[str, float], Dict[str
     try:
         candidates = g.reversal_candidates
         if candidates.empty:
-            log.info('本轮无日线超跌信号，提交空仓目标')
             return {}, {}
         current = get_current_data()
         weights = {}  # type: Dict[str, float]
@@ -194,15 +190,11 @@ def market_open(context: 'Context') -> Optional[Tuple[Dict[str, float], Dict[str
                 continue
             weights[code] = DEPLOY_RATIO / MAX_HOLD_NUM
             marks[code] = price
-            log.info('入选={} | {}日收益={:.2%} | 昨收={:.3f} MA{}={:.3f}'.format(
-                code, REVERSAL_DAYS, row['recent_return'], row['close'],
-                TREND_DAYS, row['trend_ma'],
-            ))
             if len(weights) == MAX_HOLD_NUM:
                 break
         return weights, marks
     except Exception as exc:
-        log.error('日线反转选股失败，跳过本轮：{}'.format(exc))
+        _runtime.log_strategy_failure('选股', exc)
         return None
 
 

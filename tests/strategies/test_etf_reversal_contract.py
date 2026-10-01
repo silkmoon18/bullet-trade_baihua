@@ -27,6 +27,7 @@ def strategy(monkeypatch):
     spec = importlib.util.spec_from_file_location('etf_reversal_test', PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._runtime = types.SimpleNamespace(log_strategy_failure=lambda phase, error: None)
     module.g.reversal_signal_date = None
     module.g.reversal_candidates = None
     module.g.reversal_rebalance_today = False

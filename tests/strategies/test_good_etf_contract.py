@@ -77,6 +77,9 @@ class _Runtime:
         self.strategy_events = []
         self.prepared_candidates = []
 
+    def log_strategy_failure(self, phase, error):
+        self.strategy_events.append((phase, str(error)))
+
     def prepare_rebalance_candidates(self, context, securities):
         self.prepared_candidates.append(tuple(securities))
 
@@ -280,6 +283,7 @@ def _load_strategy(monkeypatch, helper_module=real_helper, strategy_path=STRATEG
     spec = importlib.util.spec_from_file_location(name, strategy_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._runtime = _Runtime(real_helper.RuntimeMode.BACKTEST)
     return module
 
 
@@ -343,6 +347,23 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
 def test_risk_check_times_are_top_level_configuration(monkeypatch):
     strategy = _load_strategy(monkeypatch)
     assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
+
+
+@pytest.mark.parametrize("filename", ["good_etf.py", "good_etf_open_0925.py", "etf_reversal.py"])
+def test_strategy_diagnostics_and_account_execution_remain_in_helper(filename):
+    source = (STRATEGY_PATH.parent / filename).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = [node.func for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    assert not any(
+        isinstance(call, ast.Attribute) and isinstance(call.value, ast.Name)
+        and call.value.id == "log" for call in calls
+    )
+    assert not any(
+        isinstance(call, ast.Attribute) and call.attr in {"security_label", "log_strategy_event", "now", "perf_counter"}
+        for call in calls
+    )
+    for forbidden in (".portfolio", ".jq_account_enabled", ".qmt_account_enabled", "socket", "notify_target_buy_plan"):
+        assert forbidden not in source
 
 
 def test_strategy_has_no_minute_order_continuation(monkeypatch):

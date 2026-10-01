@@ -2133,6 +2133,10 @@ class JoinQuantRuntime:
     def log_strategy_event(self, message: str) -> None:
         self._log("info", "[策略通知] {}".format(message))
 
+    def log_strategy_failure(self, phase: str, error: Any) -> None:
+        """Format decision diagnostics here without changing its fallback."""
+        self._flush_logs((("error", "策略决策异常 | {} | {}".format(phase, error)),))
+
     def portfolio(self, context: Any) -> Any:
         return runtime_portfolio(context)
 
