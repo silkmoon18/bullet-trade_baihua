@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 21,
+        "api_version": 22,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -128,9 +128,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 21
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 22
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v21"
+        "bullet-trade-joinquant-runtime-helper-v22"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -283,6 +283,59 @@ def test_qmt_schedule_prewarms_without_changing_decision_callbacks(helper):
     assert [call[2].get("time") for call in calls[3:]] == ["10:30", "14:55"]
 
 
+def test_optional_0928_decision_runs_between_preparation_and_execution(helper):
+    calls = []
+    namespace = {
+        "run_daily": lambda callback, *args, **kwargs: calls.append(
+            (callback, args, kwargs)
+        ),
+        "log": types.SimpleNamespace(info=lambda message: None),
+    }
+    runtime = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), namespace)
+    callbacks = [lambda context: None for _ in range(5)]
+
+    runtime.schedule_daily(
+        callbacks[0], callbacks[1], callbacks[2], ("10:30",), callbacks[3],
+        opening_decision=callbacks[4],
+    )
+
+    assert [call[0] for call in calls[:3]] == [
+        callbacks[0], callbacks[4], callbacks[1],
+    ]
+    assert [call[1] for call in calls[:3]] == [
+        ("09:20",), ("09:28",), ("09:30",),
+    ]
+
+
+def test_0926_schedule_moves_single_decision_and_order_callback(helper):
+    calls, logs = [], []
+    namespace = {
+        "run_daily": lambda callback, *args, **kwargs: calls.append((callback, args, kwargs)),
+        "log": types.SimpleNamespace(info=logs.append),
+    }
+    runtime = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), namespace)
+    callbacks = [lambda context: None for _ in range(4)]
+    runtime.schedule_daily(
+        callbacks[0], callbacks[1], callbacks[2], ("10:30",), callbacks[3],
+        market_open_time="09:26",
+    )
+    assert [call[1] for call in calls[:2]] == [("09:20",), ("09:26",)]
+    assert sum(call[0] is callbacks[1] for call in calls) == 1
+    assert "09:26 下单" in logs[0]
+
+
+def test_helper_absolute_limits_round_trip_with_server_contract(helper):
+    from bullet_trade.server.strategy.execution import execution_request_from_wire
+    prices = {"510050.XSHG": 1_201_000}
+    request = helper.ExecutionRequest(style=helper.LimitExecution(0, prices))
+    prices["510050.XSHG"] = 0
+    wire = helper._execution_to_wire(request)
+    server = execution_request_from_wire(wire)
+    assert server.style.limit_prices == {"510050.XSHG": 1_201_000}
+    assert helper._execution_from_wire(wire) == request
+    assert hash(request) == hash(helper._execution_from_wire(wire))
+
+
 def test_qmt_prewarm_checks_account_and_quote_feed(helper, monkeypatch):
     logs = []
     runtime = helper.JoinQuantRuntime(
@@ -316,7 +369,7 @@ def test_qmt_prewarm_checks_account_and_quote_feed(helper, monkeypatch):
     ]
     assert runtime.state["production_ready"] is True
     assert any("行情链路=就绪" in message for _, message in logs)
-    assert any("09:30以新快照提交目标" in message for _, message in logs)
+    assert any("执行时以新快照提交目标" in message for _, message in logs)
 
 
 def test_qmt_prewarm_failure_does_not_stop_jq_decision(helper, monkeypatch):
@@ -339,7 +392,7 @@ def test_qmt_prewarm_failure_does_not_stop_jq_decision(helper, monkeypatch):
 
     assert runtime.state["production_ready"] is False
     assert len(warnings) == 1
-    assert "09:30将重新检查" in warnings[0]
+    assert "执行时将重新检查" in warnings[0]
 
 
 def test_execution_value_objects_are_typed_and_immutable(helper):

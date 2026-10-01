@@ -178,6 +178,7 @@ class SQLiteStrategyAPI:
         self._broker_event_revision = 0
         self._background_tasks = set()
         self._submission_tasks = {}
+        self._opening_resume_tasks = {}
         self._closed = False
         self.repository = SQLiteStrategyRepository(self.database_path)
         self.repository.initialize()
@@ -381,8 +382,9 @@ class SQLiteStrategyAPI:
                     cast(Mapping[str, object], existing["execution"])
                 )
                 payload = dict(payload, weights=weights)
-        if not self._can_dispatch_now():
-            raise RuntimeError("当前非发单时段，目标未提交；仅在工作日09:30-11:30、13:00-15:00发单")
+        preopen_limit = self._can_submit_preopen_limit(execution_request)
+        if not self._can_dispatch_now() and not preopen_limit:
+            raise RuntimeError("当前非发单时段，目标未提交；普通目标仅在工作日09:30-11:30、13:00-15:00发单；显式限价目标可在09:26-09:30预委托")
         event_revision, _ = self._broker_revisions()
         broker_snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
@@ -460,6 +462,9 @@ class SQLiteStrategyAPI:
             intent_id, account_context, account_key, dict(payload), quotes,
             prepared, target_received_at,
         ))
+        if preopen_limit:
+            self._schedule_open_resume(strategy_id)
+            logger.info("QMT盘前目标已接受 | strategy_id=%s | 限价单尝试券商预委托；市价卖单等待09:30，继续先卖后买", strategy_id)
         logger.info(
             "QMT目标已接受 | strategy_id=%s | 接收至接受=%.0fms | 首笔委托异步发出",
             strategy_id, (time.monotonic() - target_received_at) * 1000,
@@ -574,9 +579,13 @@ class SQLiteStrategyAPI:
         if self.startup_ready:
             for strategy_id in reconcile_ids:
                 await self._sync_quote_subscriptions(strategy_id)
-                if self.config.trading_enabled and self._can_dispatch_now():
+                if self.config.trading_enabled and (
+                    self._can_dispatch_now() or self._can_preopen_dispatch(strategy_id)
+                ):
                     for intent in self.planner.active_intents(strategy_id):
                         self._queue_target_execution(intent.intent_id, self._resume_intent(intent.intent_id))
+                    if self._can_preopen_dispatch(strategy_id):
+                        self._schedule_open_resume(strategy_id)
         return self.startup_ready
 
     def get_intent(self, payload: Mapping[str, object]) -> Dict[str, object]:
@@ -1383,7 +1392,9 @@ class SQLiteStrategyAPI:
         if binding is None:
             return
         now = datetime.now(SHANGHAI_TZ)
-        if not self._can_dispatch_now():
+        if not self._can_dispatch_now() and not self._can_submit_preopen_limit(
+            intent.execution_request
+        ):
             # Late/reconnect callbacks still book fills; they must not plan or
             # dispatch the unfinished daytime target using an old closing tick.
             broker_snapshot = await collect_async_broker_snapshot(
@@ -1466,7 +1477,9 @@ class SQLiteStrategyAPI:
                 "StrategyLedger 委托拒绝处理 | %s | %s | 原因=%s",
                 item.get("security"),
                 (
-                    "等待新行情确认原定限价进入价格笼子后重试"
+                    "盘前限价委托被明确拒绝，等待09:30按原限价重试一次"
+                    if item.get("retry_after_open")
+                    else "等待新行情确认原定限价进入价格笼子后重试"
                     if item.get("retryable") is True
                     else "非价格笼子拒单，不自动重试"
                 ),
@@ -1479,7 +1492,7 @@ class SQLiteStrategyAPI:
     ):
         dispatched = []
         async with self._dispatch_lock:
-            while self._can_dispatch_now():
+            while self._can_dispatch_now() or self._can_preopen_dispatch(strategy_account_id):
                 binding = self._runtime_bindings.get(strategy_account_id)
                 if binding is None:
                     break
@@ -1512,13 +1525,16 @@ class SQLiteStrategyAPI:
                         strategy_account_id, reuse_prepared, age * 1000,
                     )
                 prepared_snapshot = None  # Only the first order may reuse it.
-                if not self._can_dispatch_now():
+                preopen_limit = not self._can_dispatch_now() and self._can_preopen_dispatch(strategy_account_id)
+                if not self._can_dispatch_now() and not preopen_limit:
                     break
+                dispatch_options = {"limit_orders_only": True} if preopen_limit else {}
                 dispatch = await self.planner.dispatch_next(
                     submitter, strategy_account_id,
                     sellable_limits={
                         p.security: max(0, p.sellable_qty) for p in broker_snapshot.positions
                     },
+                    **dispatch_options,
                 )
                 if dispatch is None:
                     break
@@ -1755,6 +1771,54 @@ class SQLiteStrategyAPI:
 
     def _can_dispatch_now(self) -> bool:
         return self._is_execution_session(datetime.now(SHANGHAI_TZ))
+
+    @staticmethod
+    def _is_limit_preopen_session(value: datetime) -> bool:
+        value = value.astimezone(SHANGHAI_TZ)
+        minutes = value.hour * 60 + value.minute
+        return value.weekday() < 5 and 9 * 60 + 26 <= minutes < 9 * 60 + 30
+
+    def _can_submit_preopen_limit(self, request: ExecutionRequest) -> bool:
+        return (
+            isinstance(request.style, LimitExecution)
+            and request.style.preopen
+            and self._is_limit_preopen_session(datetime.now(SHANGHAI_TZ))
+        )
+
+    def _can_preopen_dispatch(self, strategy_id: str) -> bool:
+        return any(
+            self._can_submit_preopen_limit(intent.execution_request)
+            and not self.planner.intent_cancel_requested(intent.intent_id)
+            for intent in self.planner.active_intents(strategy_id)
+        )
+
+    def _schedule_open_resume(self, strategy_id: str) -> None:
+        """Wake once at the open; never hold an account lock while waiting."""
+        existing = self._opening_resume_tasks.get(strategy_id)
+        if existing is not None and not existing.done():
+            return
+        now = datetime.now(SHANGHAI_TZ)
+        if not self._is_limit_preopen_session(now):
+            return
+        delay = (now.replace(hour=9, minute=30, second=0, microsecond=0) - now).total_seconds()
+
+        async def resume_at_open():
+            await asyncio.sleep(delay)
+            if self._closed or not self._can_dispatch_now():
+                return
+            for intent in self.planner.active_intents(strategy_id):
+                await self._resume_intent(intent.intent_id)
+
+        task = self._schedule_background(resume_at_open())
+        if task is None:
+            return
+        self._opening_resume_tasks[strategy_id] = task
+
+        def finished(done):
+            if self._opening_resume_tasks.get(strategy_id) is done:
+                self._opening_resume_tasks.pop(strategy_id, None)
+
+        task.add_done_callback(finished)
 
     def _valuation_mark_max_age(self, now: datetime) -> timedelta:
         current = self._as_of(now, None)

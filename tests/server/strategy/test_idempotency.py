@@ -90,6 +90,22 @@ def test_sellable_filter_keeps_blocked_order_pending_and_claims_other_security(o
     assert recovered.operation_id == first.operation.operation_id
 
 
+def test_preopen_limit_filter_never_claims_market_sell(operation_repository):
+    repository = operation_repository
+    market = repository.create_operation("good-etf", "broker.place_order", "market", {
+        "side": "SELL", "security": "510050.XSHG", "amount": 100,
+        "style": {"type": "market"},
+    })
+    limit = repository.create_operation("good-etf", "broker.place_order", "limit", {
+        "side": "BUY", "security": "510300.XSHG", "amount": 100,
+        "style": {"type": "limit", "price": "1.201"},
+    })
+    claim = repository.claim_next("good-etf", limit_orders_only=True)
+    assert claim.operation_id == limit.operation.operation_id
+    assert repository.claim_next("good-etf", limit_orders_only=True) is None
+    assert repository.claim_next("good-etf").operation_id == market.operation.operation_id
+
+
 def test_same_key_with_different_payload_conflicts(operation_repository):
     _create(operation_repository, amount=100)
     with pytest.raises(IdempotencyConflictError, match="different payload"):

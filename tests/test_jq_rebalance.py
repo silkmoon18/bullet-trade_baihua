@@ -229,3 +229,82 @@ def test_risk_exit_still_uses_native_order_without_rebalance_plan(helper):
     assert jq.calls == [("BUY", 0)]
     assert "BUY" not in jq.positions
     assert not hasattr(jq.g, "bt_jq_plan")
+
+
+def test_explicit_open_limit_only_changes_buy_order_style(helper):
+    jq = JQ(cash=5000, holdings={"OLD": 100, "TRIM": 400})
+    runtime = jq.runtime(helper)
+    styles = []
+    helper._active_namespace["get_current_data"] = lambda: pytest.fail("Do not refresh fixed buy limits")
+    helper._active_namespace["LimitOrderStyle"] = lambda price: NS(price=price)
+    helper._active_namespace["order_target_value"] = lambda security, value, style=None: styles.append(
+        (security, value, getattr(style, "price", None))
+    )
+    result = runtime.execute_rebalance(
+        jq.context, {"BUY": 0.5, "TRIM": 0.2}, jq.prices, "open-fixed-limit",
+        buy_limit_prices={"BUY": 9.731, "TRIM": 9.621},
+    )
+    assert result["errors"] == []
+    assert jq.calls == [("OLD", 0)]
+    assert styles == [("BUY", 5000.0, 9.731), ("TRIM", 2000.0, None)]
+    assert not hasattr(runtime, "on_bar")
+
+
+@pytest.mark.parametrize("price", [None, 0, -1, float("nan"), float("inf")])
+def test_invalid_buy_limit_never_falls_back_to_market_order(helper, price):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+    with pytest.raises(ValueError, match="无有效买入限价"):
+        runtime.execute_rebalance(
+            jq.context, {"BUY": 0.5}, jq.prices, "invalid", buy_limit_prices={"BUY": price},
+        )
+    assert jq.calls == []
+
+
+def test_missing_buy_limit_never_falls_back_to_market_order(helper):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+    with pytest.raises(ValueError, match="无有效买入限价"):
+        runtime.execute_rebalance(
+            jq.context, {"BUY": 0.5}, jq.prices, "missing", buy_limit_prices={},
+        )
+    assert jq.calls == []
+
+
+def test_qmt_receives_fixed_open_limit_without_price_refresh_or_markup(helper, monkeypatch):
+    messages = []
+    namespace = {"g": NS(), "log": NS(info=messages.append, warn=messages.append, error=messages.append)}
+    state = {"mode": "QMT_REMOTE", "strategy_id": "test", "jq_account_enabled": False,
+             "qmt_account_enabled": True, "production_ready": True, "jq_log_enabled": True}
+    runtime = helper.JoinQuantRuntime(state, namespace)
+    runtime._qmt_callback_allowed = lambda *args: True
+    runtime.advance_targets = lambda context: True
+    runtime.send_target_buy_plan = lambda *args, **kwargs: None
+    portfolio = NS(total_value=10000.0, positions={})
+    monkeypatch.setattr(helper, "get_portfolio", lambda **kwargs: portfolio)
+    monkeypatch.setattr(runtime, "_platform_api", lambda *args: pytest.fail("QMT must keep the supplied price"))
+    captured = []
+
+    def submit(context, weights, marks, key, execution, names):
+        captured.append((weights, marks, execution))
+        return {"intent": {"intent_id": "intent-1", "state": "EXECUTING"}}
+
+    runtime.submit_targets = submit
+    weights = {"510050.XSHG": 0.5}
+    marks = {"510050.XSHG": 2.731}
+    result = runtime.execute_rebalance(
+        NS(current_dt=datetime(2026, 9, 30, 9, 26), portfolio=portfolio),
+        weights, marks, "open-fixed", buy_limit_prices=dict(marks),
+    )
+
+    assert result["errors"] == []
+    submitted_weights, submitted_marks, execution = captured[0]
+    assert submitted_weights == weights
+    assert submitted_marks == marks  # The same selected auction price still sizes the target.
+    assert execution.style.limit_prices == {"510050.XSHG": 2_731_000}
+    assert execution.style.price_band_ppm == 0
+    assert execution.style.preopen is True
+    original = helper.default_etf_rebalance_execution()
+    assert execution.sell_style == original.sell_style
+    assert execution.follow_up == original.follow_up
+    assert execution.repricing == original.repricing

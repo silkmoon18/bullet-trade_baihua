@@ -261,6 +261,7 @@ class SQLiteOperationRepository:
     def claim_next(
         self, strategy_account_id: Optional[str] = None,
         *, sellable_limits: Optional[Mapping[str, int]] = None,
+        limit_orders_only: bool = False,
     ) -> Optional[OutboxClaim]:
         """Atomically claim the oldest dispatchable outbox row.
 
@@ -287,8 +288,10 @@ class SQLiteOperationRepository:
             ).fetchall()
             row = None
             for candidate in candidates:
+                payload = json.loads(candidate["payload_json"]).get("payload", {})
+                if limit_orders_only and payload.get("style", {}).get("type") != "limit":
+                    continue
                 if sellable_limits is not None:
-                    payload = json.loads(candidate["payload_json"]).get("payload", {})
                     if (
                         payload.get("side") == "SELL"
                         and int(payload["amount"]) > sellable_limits.get(payload["security"], 0)

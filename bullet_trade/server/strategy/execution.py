@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
+from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Union
 
 
@@ -45,15 +46,25 @@ def _require_band(value: int, field_name: str) -> None:
 
 @dataclass(frozen=True)
 class LimitExecution:
-    """Limit price derived from each security's reference price."""
+    """Reference-price limit, optionally overridden per security (price units)."""
 
     price_band_ppm: int = 0
     execution_type: ExecutionType = field(
         default=ExecutionType.LIMIT, init=False
     )
+    limit_prices: Mapping[str, int] = field(default_factory=dict, hash=False)
+    preopen: bool = False
 
     def __post_init__(self) -> None:
         _require_band(self.price_band_ppm, "price_band_ppm")
+        if type(self.preopen) is not bool:
+            raise TypeError("preopen must be a bool")
+        if not isinstance(self.limit_prices, Mapping) or any(
+            type(code) is not str or not code or type(price) is not int or price <= 0
+            for code, price in self.limit_prices.items()
+        ):
+            raise ValueError("limit_prices must map securities to positive integer price units")
+        object.__setattr__(self, "limit_prices", MappingProxyType(dict(self.limit_prices)))
 
 
 @dataclass(frozen=True)
@@ -190,6 +201,10 @@ def _style_to_wire(style: ExecutionStyle) -> Dict[str, object]:
     style_wire: Dict[str, object] = {"type": style.execution_type.value}
     if isinstance(style, (LimitExecution, MarketableLimitExecution)):
         style_wire["price_band_ppm"] = style.price_band_ppm
+        if isinstance(style, LimitExecution) and style.limit_prices:
+            style_wire["limit_prices"] = dict(style.limit_prices)
+        if isinstance(style, LimitExecution) and style.preopen:
+            style_wire["preopen"] = True
     elif isinstance(style, ConditionalLimitExecution):
         style_wire["price_band_ppm"] = style.price_band_ppm
         style_wire["price_mode"] = style.price_mode.value
@@ -249,10 +264,12 @@ def _style_from_wire(raw_style: object, label: str) -> ExecutionStyle:
     )
     if execution_type is ExecutionType.LIMIT:
         _require_exact_fields(
-            raw_style, frozenset({"type", "price_band_ppm"}), "limit style"
+            raw_style, frozenset({"type", "price_band_ppm", "limit_prices", "preopen"}), "limit style"
         )
         style: ExecutionStyle = LimitExecution(
-            _wire_band(raw_style, "price_band_ppm")
+            _wire_band(raw_style, "price_band_ppm"),
+            limit_prices=raw_style.get("limit_prices", {}),
+            preopen=raw_style.get("preopen", False),
         )
     elif execution_type is ExecutionType.CONDITIONAL_LIMIT:
         _require_exact_fields(

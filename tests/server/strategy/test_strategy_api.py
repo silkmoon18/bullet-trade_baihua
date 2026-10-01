@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,6 +210,106 @@ def execution_clock(monkeypatch):
     # Existing execution cases test trading-time behaviour, independently of
     # the developer's wall clock. Session-specific cases override this below.
     monkeypatch.setattr(SQLiteStrategyAPI, "_can_dispatch_now", lambda self: True)
+    monkeypatch.setattr(SQLiteStrategyAPI, "_is_limit_preopen_session", staticmethod(lambda value: False))
+
+
+@pytest.mark.parametrize("day,hour,minute,allowed", [
+    (7, 9, 25, False), (7, 9, 26, True), (7, 9, 29, True),
+    (7, 9, 30, False), (7, 13, 26, False), (12, 9, 26, False),
+])
+def test_limit_preopen_session_boundaries(day, hour, minute, allowed, monkeypatch):
+    monkeypatch.undo()
+    assert SQLiteStrategyAPI._is_limit_preopen_session(
+        datetime(2026, 9, day, hour, minute, tzinfo=SHANGHAI_TZ)
+    ) is allowed
+
+
+@pytest.mark.asyncio
+async def test_preopen_absolute_limit_is_submitted_once_before_open(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
+    scheduled = []
+    monkeypatch.setattr(service, "_schedule_open_resume", scheduled.append)
+    payloads = []
+    original = broker.place_order
+
+    async def place_order(account, payload):
+        payloads.append(payload)
+        return await original(account, payload)
+
+    monkeypatch.setattr(broker, "place_order", place_order)
+    request = {
+        "strategy_id": "good_etf", "idempotency_key": "preopen-limit",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+        "execution": execution_request_to_wire(ExecutionRequest(
+            style=LimitExecution(0, limit_prices={SECURITY: price_to_units("12.001")}, preopen=True),
+            sell_style=MarketExecution(15_000),
+        )),
+    }
+    await submit_and_drain(service, account, "default", request)
+    await submit_and_drain(service, account, "default", request)
+    assert broker.order_calls == 1
+    assert payloads[0]["style"] == {"type": "limit", "price": "12.001"}
+    assert payloads[0]["amount"] == 500
+    assert scheduled == ["good_etf", "good_etf"]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_preopen_does_not_open_other_strategy_market_targets(api, monkeypatch):
+    service, broker, account, _ = api
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
+    with pytest.raises(RuntimeError, match="非发单时段"):
+        await service.submit_targets(account, "default", {
+            "strategy_id": "good_etf", "idempotency_key": "ordinary-preopen",
+            "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+        })
+    assert broker.order_calls == 0
+    assert service.planner.active_intents() == ()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_preopen_has_one_server_owned_open_wakeup_without_holding_lock(api, monkeypatch):
+    service, _, _, _ = api
+    clock = datetime(2026, 9, 30, 9, 26, tzinfo=SHANGHAI_TZ)
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return clock
+
+    monkeypatch.setattr(strategy_api_module, "datetime", Clock)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
+    monkeypatch.setattr(service.planner, "active_intents",
+                        lambda strategy_id: (SimpleNamespace(intent_id="pending"),))
+    entered, release = asyncio.Event(), asyncio.Event()
+    delays, resumed = [], []
+
+    async def sleep(delay):
+        delays.append(delay)
+        entered.set()
+        await release.wait()
+
+    async def resume(intent_id):
+        resumed.append(intent_id)
+
+    monkeypatch.setattr(strategy_api_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(service, "_resume_intent", resume)
+    service._schedule_open_resume("good_etf")
+    service._schedule_open_resume("good_etf")
+    await asyncio.wait_for(entered.wait(), 1)
+    assert delays == [240]
+    assert len(service._opening_resume_tasks) == 1
+    assert all(not lock.locked() for lock in service._resume_locks.values())
+    release.set()
+    await drain_execution(service)
+    assert resumed == ["pending"]
+    assert service._opening_resume_tasks == {}
+    await service.close()
 
 
 @pytest.mark.parametrize("day,hour,minute,allowed", [
@@ -1610,6 +1711,66 @@ async def _seed_sellable_position(api, monkeypatch, available):
     monkeypatch.setattr(broker, "place_order", place_order)
     notifications.clear()
     return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_cash", [False, True])
+async def test_preopen_rotation_defers_market_sell_then_keeps_sell_before_buy(api, monkeypatch, all_cash):
+    service, broker, account, _ = api
+    calls = await _seed_sellable_position(api, monkeypatch, 500)
+    new_security = "510300.XSHG"
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
+    wakeups = []
+    monkeypatch.setattr(service, "_schedule_open_resume", wakeups.append)
+    result = await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "preopen-rotation",
+        "weights": {SECURITY: 0} if all_cash else {new_security: 0.5},
+        "marks": {SECURITY: 10} if all_cash else {new_security: 10},
+        "execution": execution_request_to_wire(ExecutionRequest(
+            style=LimitExecution(0, limit_prices={} if all_cash else {
+                new_security: price_to_units("12.001"),
+            }, preopen=True), sell_style=MarketExecution(15_000),
+        )),
+    })
+    assert calls == []
+    assert wakeups == ["good_etf"]
+    assert result["planned_orders"][0]["side"] == "SELL"
+    db = connect_database(service.database_path)
+    try:
+        assert tuple(db.execute("SELECT state, attempt_count FROM outbox WHERE state='PENDING'").fetchone()) == ("PENDING", 0)
+    finally:
+        db.close()
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: True)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: False)
+    await service._resume_intent(result["intent"]["intent_id"])
+    await service._resume_intent(result["intent"]["intent_id"])
+    assert [(p["side"], p["amount"]) for p in calls] == [("SELL", 500)]
+    assert calls[0]["style"]["type"] == "market"
+    assert not any(p["side"] == "BUY" for p in calls)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_preopen_lower_limit_liquidation_sends_one_sell_and_no_buy(api, monkeypatch):
+    service, broker, account, _ = api
+    calls = await _seed_sellable_position(api, monkeypatch, 500)
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
+    monkeypatch.setattr(service, "_schedule_open_resume", lambda strategy_id: None)
+    request = {
+        "strategy_id": "good_etf", "idempotency_key": "opening:sell",
+        "weights": {SECURITY: 0}, "marks": {SECURITY: 10},
+        "execution": execution_request_to_wire(ExecutionRequest(
+            style=LimitExecution(0, {SECURITY: price_to_units("9")}, preopen=True),
+        )),
+    }
+    await submit_and_drain(service, account, "default", request)
+    await submit_and_drain(service, account, "default", request)
+    assert [(row["side"], row["amount"]) for row in calls] == [("SELL", 500)]
+    assert calls[0]["style"] == {"type": "limit", "price": "9"}
+    assert broker.order_calls == 2  # Seed buy plus exactly one liquidation sell.
+    await service.close()
 
 
 @pytest.mark.asyncio

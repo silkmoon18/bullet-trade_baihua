@@ -353,7 +353,7 @@ class SQLiteTargetExecutionService:
                 continue
             execution_quote = (quotes or {}).get(security)
             if not self._rejection_allows_quote(
-                intent.intent_id, security, execution_quote
+                intent.intent_id, security, execution_quote, now
             ):
                 waiting_for_trigger = True
                 continue
@@ -485,8 +485,12 @@ class SQLiteTargetExecutionService:
         strategy_account_id: Optional[str] = None,
         *,
         sellable_limits: Optional[Mapping[str, int]] = None,
+        limit_orders_only: bool = False,
     ) -> Optional[DispatchResult]:
-        claim = self._operations.claim_next(strategy_account_id, sellable_limits=sellable_limits)
+        claim = self._operations.claim_next(
+            strategy_account_id, sellable_limits=sellable_limits,
+            limit_orders_only=limit_orders_only,
+        )
         if claim is None:
             return None
         envelope = json.loads(claim.payload_json)
@@ -830,6 +834,8 @@ class SQLiteTargetExecutionService:
             )
             return None, protect, style.execution_type
         price = self._boundary_price(reference_price, side, style.price_band_ppm)
+        if isinstance(style, LimitExecution):
+            price = style.limit_prices.get(security, price)
         if isinstance(style, ConditionalLimitExecution):
             if quote is None:
                 return None
@@ -1026,6 +1032,19 @@ class SQLiteTargetExecutionService:
                 is not None
                 and is_price_cage_rejection(reason)
             )
+            retry_after_open = None
+            if isinstance(style, LimitExecution) and style.preopen and any(
+                text in reason for text in (
+                    "非交易时段", "非交易时间", "不在交易时间", "交易时间外",
+                    "非连续竞价", "未开市", "不支持预委托",
+                )
+            ):
+                order = self._find_order(order_id)
+                if order is not None and order["state"] == OrderState.REJECTED.value:
+                    submitted = datetime.fromisoformat(order["submitted_at"] or order["created_at"])
+                    submitted = submitted.astimezone(SHANGHAI_TZ)
+                    if 9 * 60 + 26 <= submitted.hour * 60 + submitted.minute < 9 * 60 + 30:
+                        retry_after_open = submitted.replace(hour=9, minute=30, second=0, microsecond=0).isoformat()
             blocks[security] = {
                 "local_order_id": order_id,
                 "reason": reason,
@@ -1033,6 +1052,7 @@ class SQLiteTargetExecutionService:
                 "retry_after_quote": (
                     quote.as_of.isoformat() if quote is not None else None
                 ),
+                "retry_after_open": retry_after_open,
             }
             handled.add(order_id)
             recorded.append(
@@ -1040,6 +1060,7 @@ class SQLiteTargetExecutionService:
                     "security": security,
                     "reason": reason,
                     "retryable": retryable,
+                    "retry_after_open": retry_after_open,
                 }
             )
         if not recorded:
@@ -1050,13 +1071,18 @@ class SQLiteTargetExecutionService:
         return tuple(recorded)
 
     def _rejection_allows_quote(
-        self, intent_id: str, security: str, quote: Optional[MarketQuote]
+        self, intent_id: str, security: str, quote: Optional[MarketQuote],
+        now: Optional[datetime] = None,
     ) -> bool:
         item = self._intent_payload(intent_id).get(
             "execution_rejections", {}
         ).get(security)
         if not isinstance(item, Mapping):
             return True
+        if item.get("retry_after_open"):
+            retry_at = datetime.fromisoformat(str(item["retry_after_open"]))
+            current = now or datetime.now(SHANGHAI_TZ)
+            return current.date() == retry_at.date() and current >= retry_at
         if item.get("retryable") is not True or quote is None:
             return False
         raw_after = item.get("retry_after_quote")
@@ -1160,7 +1186,7 @@ class SQLiteTargetExecutionService:
             return False
         if any(row["security"] == security for row in working):
             return False
-        if not self._rejection_allows_quote(intent_id, security, quote):
+        if not self._rejection_allows_quote(intent_id, security, quote, current):
             return False
         style = (
             intent.execution_request.sell_style

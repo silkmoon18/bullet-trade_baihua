@@ -58,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 21,
+            "api_version": 22,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -70,6 +70,8 @@ class _Runtime:
         self.order_calls = []
         self.notifications = []
         self.rebalances = []
+        self.prepared_rebalances = []
+        self.staged_advances = []
         self.platform_configured = False
         self.schedules = []
         self.strategy_events = []
@@ -85,7 +87,15 @@ class _Runtime:
         risk_check_times,
         after_market_check,
         reference_security="000300.XSHG",
+        opening_decision=None,
+        opening_decision_time="09:28",
+        market_open_time="09:30",
+        sell_then_buy=False,
     ):
+        self.opening_decision = opening_decision
+        self.opening_decision_time = opening_decision_time
+        self.market_open_time = market_open_time
+        self.sell_then_buy = sell_then_buy
         self.schedules.append(
             (
                 before_market_open,
@@ -139,7 +149,15 @@ class _Runtime:
         self.submissions.append((context, weights, marks, key, execution))
         return {"intent": {"intent_id": "intent-1", "state": "PLANNED"}}
 
-    def execute_rebalance(self, context, weights, marks, key, execution=None):
+    def prepare_sell_then_buy(self, context, weights, marks, key, buy_not_before="09:30"):
+        self.prepared_rebalances.append((context, weights, marks, key, buy_not_before))
+
+    def advance_sell_then_buy(self, context):
+        self.staged_advances.append(context)
+
+    def execute_rebalance(self, context, weights, marks, key, execution=None,
+                          buy_limit_prices=None):
+        self.buy_limit_prices = buy_limit_prices
         execution = execution or real_helper.default_etf_rebalance_execution()
         self.rebalances.append((context, weights, marks, key, execution))
         result = {"qmt": None, "jq_orders": [], "errors": []}
@@ -238,7 +256,7 @@ def _helper_with_install(runtime, calls):
     return helper
 
 
-def _load_strategy(monkeypatch, helper_module=real_helper):
+def _load_strategy(monkeypatch, helper_module=real_helper, strategy_path=STRATEGY_PATH):
     jqdata = types.ModuleType("jqdata")
     jqdata.g = types.SimpleNamespace()
     jqdata.log = _Log()
@@ -248,7 +266,7 @@ def _load_strategy(monkeypatch, helper_module=real_helper):
         sys.modules, "bullet_trade_jq_remote_helper", helper_module
     )
     name = "good_etf_contract_{}".format(uuid.uuid4().hex)
-    spec = importlib.util.spec_from_file_location(name, STRATEGY_PATH)
+    spec = importlib.util.spec_from_file_location(name, strategy_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -336,7 +354,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf_remote",
         "qmt_initial_capital": 10000,
-        "expected_api_version": 21,
+        "expected_api_version": 22,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -466,6 +484,10 @@ def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
     before, market, risk, times, after, reference = runtime.schedules[0]
     assert before is strategy.before_market_open
     assert market is strategy.market_open
+    assert strategy.OPEN_DECISION_TIME == "09:30"
+    assert runtime.market_open_time == strategy.OPEN_DECISION_TIME
+    assert runtime.opening_decision is None
+    assert runtime.sell_then_buy is False
     assert risk is strategy.handle_risk_management
     assert times == strategy.RISK_CHECK_TIMES
     assert after is strategy.after_market_check

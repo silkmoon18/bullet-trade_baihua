@@ -131,6 +131,57 @@ def test_weight_target_creates_one_lot_rounded_buy_and_reserves_cash(tmp_path):
         connection.close()
 
 
+def test_absolute_buy_limit_does_not_change_reference_sizing_or_market_sells(tmp_path):
+    _, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    request = ExecutionRequest(
+        style=LimitExecution(0, limit_prices={A: price_to_units("12.001")}),
+        sell_style=MarketExecution(15_000),
+    )
+    result = planner.submit_target_weights(
+        ACCOUNT, "absolute-limit", {A: 0.5}, snapshot, marks, as_of,
+        execution_request=request,
+    )
+    assert result.intent.targets[A] == 500  # 5000 / opening mark 10, not / 12.001.
+    assert result.orders[0].quantity == 500
+    assert result.orders[0].limit_price_units == price_to_units("12.001")
+    price, protect, execution_type = planner._prepare_execution(
+        request, OrderSide.SELL, price_to_units("10"), None, A,
+    )
+    assert price is None
+    assert protect == price_to_units("9.85")
+    assert execution_type is ExecutionType.MARKET
+
+
+@pytest.mark.parametrize("reason,retry", [("当前非交易时段，未开市", True), ("可用资金不足", False)])
+def test_preopen_known_rejection_waits_for_open_not_quote_or_blind_retry(tmp_path, reason, retry):
+    as_of = datetime(2026, 9, 30, 9, 26, tzinfo=SHANGHAI_TZ)
+    database, repository, _, _, planner, snapshot, marks, _ = _setup(tmp_path, as_of)
+    result = planner.submit_target_weights(
+        ACCOUNT, "preopen-reject", {A: 0.5}, snapshot, marks, as_of,
+        execution_request=ExecutionRequest(style=LimitExecution(0, limit_prices={A: price_to_units("11")}, preopen=True)),
+    )
+    order_id = result.orders[0].order_id
+    account = repository.get_strategy_account(ACCOUNT)
+    SQLiteFillBookingService(database).finalize_order(
+        ACCOUNT, order_id, OrderState.REJECTED, account.ledger_version,
+    )
+    db = connect_database(database)
+    try:
+        db.execute("UPDATE strategy_orders SET submitted_at=? WHERE order_id=?", (as_of.isoformat(), order_id))
+        db.commit()
+    finally:
+        db.close()
+    recorded = planner.record_rejected_orders(result.intent.intent_id, [{
+        "local_order_id": order_id, "intent_id": result.intent.intent_id,
+        "security": A, "reason": reason,
+    }], {})
+    assert bool(recorded[0]["retry_after_open"]) is retry
+    assert planner._rejection_allows_quote(result.intent.intent_id, A, None, as_of) is False
+    assert planner._rejection_allows_quote(
+        result.intent.intent_id, A, None, as_of.replace(hour=9, minute=30),
+    ) is retry
+
+
 def test_planning_uses_own_latest_reconciliation_not_another_strategy(tmp_path):
     database, _, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
     connection = connect_database(database)

@@ -10,9 +10,11 @@
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
 # 统一策略脚本：同一组选股决策可独立驱动聚宽和QMT账户。
+# 开盘价变体：09:26选股并清仓，09:30起确认清仓后买入；执行交给helper。
 
 # 导入必要的库
 import datetime  # 显式导入，保证复制到聚宽后可直接运行
+import math
 from typing import Any, Dict, List, TYPE_CHECKING
 
 from jqdata import *
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     from joinquant_typing import Context  # noqa: F401
 
 # ===== 部署契约 =====
-STRATEGY_ID = 'good_etf_remote'
+STRATEGY_ID = 'good_etf_open_0925'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
 _EXPECTED_RUNTIME_API_VERSION = 22
@@ -46,7 +48,8 @@ DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、�
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 QMT_INITIAL_CAPITAL = 10000     # 分配给QMT策略虚拟账户的固定初始资金；不影响聚宽账户资金
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
-OPEN_DECISION_TIME = '09:30'  # 选股并立即提交目标
+OPEN_DECISION_TIME = '09:26'  # 按当日开盘价选股，交给helper清仓
+BUY_START_TIME = '09:30'     # 各账户确认清仓后才能买入；未清仓继续等待
 
 _runtime: Any = None
 
@@ -111,11 +114,14 @@ def initialize(context: 'Context') -> None:
 
     _runtime.schedule_daily(
         before_market_open,
-        market_open,
+        execute_opening_plan,
         handle_risk_management,
         RISK_CHECK_TIMES,
         after_market_check,
-        market_open_time=OPEN_DECISION_TIME,
+        opening_decision=market_open,
+        opening_decision_time=OPEN_DECISION_TIME,
+        market_open_time=BUY_START_TIME,
+        sell_then_buy=True,
     )
 
 
@@ -213,10 +219,13 @@ def before_market_open(context: 'Context') -> None:
 
 
 def market_open(context: 'Context') -> None:
-    """开盘执行：选股并按当前执行模式处理目标权重。"""
-    log.info('===== 开盘选股下单开始 =====')
+    """集合竞价结束后按开盘价选股，锁定目标并交给helper清仓。"""
+    log.info(f'===== {OPEN_DECISION_TIME}开盘价选股开始 =====')
+    if context.current_dt.strftime('%H:%M') != OPEN_DECISION_TIME:
+        log.warn(f'非{OPEN_DECISION_TIME}决策回调，跳过；不使用其他时间的行情代替')
+        return
     try:
-        # 若盘前预处理未执行（聚宽在 09:20~09:30 间重启会错过），现场补跑一次
+        # 若盘前预处理未执行（聚宽在盘前预处理和决策之间重启会错过），现场补跑一次
         if g.fund_list is None:
             log.warn('盘前预处理数据缺失，现场补跑 before_market_open')
             before_market_open(context)
@@ -228,9 +237,23 @@ def market_open(context: 'Context') -> None:
         df = g.fund_list.copy()
         current_data = get_current_data()
 
-        # 获取实时最新价（开盘时的真实价格，无未来函数）
+        # 09:26读取已可用的当日开盘价；不退回最新价或昨收价。
         dataframe_codes: List[str] = df.index.tolist()
-        df['last_price'] = [current_data[code].last_price for code in dataframe_codes]
+        opening_prices: Dict[str, float] = {}
+        for code in dataframe_codes:
+            try:
+                price = float(current_data[code].day_open)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                opening_prices[code] = price
+        if len(opening_prices) != len(dataframe_codes):
+            log.warn(f'无有效当日开盘价，剔除ETF {len(dataframe_codes) - len(opening_prices)} 只')
+        if not opening_prices:
+            log.warn('全部候选ETF均无有效当日开盘价，跳过本轮执行')
+            return
+        df = df.loc[list(opening_prices)]
+        df['open_price'] = [opening_prices[code] for code in df.index]
 
         # 剔除停牌/涨停标的（避免选中后委托无法成交，浪费名额）
         if SKIP_SUSPENDED_LIMITUP:
@@ -238,7 +261,7 @@ def market_open(context: 'Context') -> None:
             keep_codes: List[str] = df.index.tolist()
             for code in keep_codes:
                 cd = current_data[code]
-                if cd.paused or df.loc[code, 'last_price'] >= cd.high_limit:
+                if cd.paused or df.loc[code, 'open_price'] >= cd.high_limit:
                     continue
                 keep.append(code)
             skipped = len(df) - len(keep)
@@ -247,7 +270,7 @@ def market_open(context: 'Context') -> None:
             df = df.loc[keep]
 
         # 计算折价率（<0为折价，核心选股逻辑）
-        df['premium'] = (df['last_price'] / df['unit_net_value'] - 1) * 100
+        df['premium'] = (df['open_price'] / df['unit_net_value'] - 1) * 100
 
         # 筛选折价ETF，按折价率升序排列（折价最深的排最前）
         before_count = len(df)
@@ -262,7 +285,7 @@ def market_open(context: 'Context') -> None:
         for code in order_fund_codes:
             row = selected_funds.loc[code]
             log.info(f'候选明细 | {_runtime.security_label(code)} 折价率={row["premium"]:.2f}% '
-                     f'最新价={row["last_price"]:.3f} 净值={row["unit_net_value"]:.4f}')
+                     f'当日开盘价={row["open_price"]:.3f} 净值={row["unit_net_value"]:.4f}')
         if order_fund_codes:
             _runtime.log_strategy_event(
                 f'选中折价ETF {len(order_fund_codes)} 只: {selected_labels}'
@@ -277,23 +300,29 @@ def market_open(context: 'Context') -> None:
             for code, weight in zip(order_fund_codes, raw_weights)
         }
         marks = {
-            code: float(selected_funds.loc[code, 'last_price'])
+            code: float(selected_funds.loc[code, 'open_price'])
             for code in order_fund_codes
         }
         key = 'open-{}'.format(context.current_dt.strftime('%Y%m%d'))
-        _runtime.execute_rebalance(
+        _runtime.prepare_sell_then_buy(
             context,
             target_weights,
             marks,
             key,
+            buy_not_before=BUY_START_TIME,
         )
-        if selected_funds.empty:
+        if not target_weights:
             message = '无折价ETF可选，已提交全部卖出目标，今日不再买入'
             log.warn(message)
             _runtime.log_strategy_event(message)
 
     except Exception as e:
-        log.error(f"开盘执行异常：{e}")
+        log.error(f"{OPEN_DECISION_TIME}选股及执行异常：{e}")
+
+
+def execute_opening_plan(context: 'Context') -> None:
+    """不重新选股；由helper分别确认各账户清仓并提交一次买入。"""
+    _runtime.advance_sell_then_buy(context)
 
 
 def handle_risk_management(context: 'Context') -> None:

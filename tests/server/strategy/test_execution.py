@@ -18,6 +18,7 @@ from bullet_trade.server.strategy import (
     "execution_request",
     [
         ExecutionRequest(style=LimitExecution(2_000)),
+        ExecutionRequest(style=LimitExecution(0, limit_prices={"510050.XSHG": 1_101_000}, preopen=True)),
         ExecutionRequest(
             style=ConditionalLimitExecution(
                 3_000, ConditionalLimitPriceMode.BOUNDARY
@@ -78,3 +79,9 @@ def test_execution_request_rejects_plain_string_enums():
 
     with pytest.raises(TypeError, match="sell_style"):
         ExecutionRequest(sell_style="MARKET")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("prices", [None, {"A": 0}, {"A": True}, {"A": 1.01}, {"": 1000}])
+def test_absolute_limit_price_validation(prices):
+    with pytest.raises(ValueError, match="limit_prices"):
+        LimitExecution(limit_prices=prices)

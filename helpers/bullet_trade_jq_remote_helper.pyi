@@ -52,8 +52,15 @@ class ConditionalLimitPriceMode(str, Enum):
 
 
 class LimitExecution:
-    def __new__(cls, price_band_ppm: int = ...) -> LimitExecution: ...
+    def __new__(
+        cls, price_band_ppm: int = ...,
+        limit_prices: Optional[Dict[str, int]] = ...,
+        preopen: bool = ...,
+    ) -> LimitExecution: ...
     price_band_ppm: int
+    @property
+    def limit_prices(self) -> Dict[str, int]: ...
+    preopen: bool
     execution_type: ExecutionType
 
 
@@ -220,6 +227,10 @@ class JoinQuantRuntime:
         risk_check_times: Tuple[str, ...],
         after_market_check: Callable[[Any], Any],
         reference_security: str = ...,
+        opening_decision: Optional[Callable[[Any], Any]] = ...,
+        opening_decision_time: str = ...,
+        market_open_time: str = ...,
+        sell_then_buy: bool = ...,
     ) -> None: ...
     def log_process_initialize(self) -> None: ...
     def log_strategy_event(self, message: str) -> None: ...
@@ -244,7 +255,9 @@ class JoinQuantRuntime:
     def advance_targets(self, context: Context) -> bool: ...
     def cancel_targets(self) -> bool: ...
     def cancel_orders(self) -> int: ...
-    def order_target(self, security: str, amount: int) -> Any: ...
+    def order_target(
+        self, security: str, amount: int, limit_price: Optional[float] = ...,
+    ) -> Any: ...
     def order_target_value(
         self,
         security: str,
@@ -273,7 +286,17 @@ class JoinQuantRuntime:
         marks: Dict[str, Any],
         idempotency_key: str,
         execution: Optional[ExecutionRequest] = ...,
+        buy_limit_prices: Optional[Dict[str, float]] = ...,
     ) -> Dict[str, Any]: ...
+    def prepare_sell_then_buy(
+        self,
+        context: Context,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        buy_not_before: str = ...,
+    ) -> None: ...
+    def advance_sell_then_buy(self, context: Context) -> None: ...
     def execute_risk_management(
         self,
         context: Context,
@@ -286,6 +309,7 @@ class JoinQuantRuntime:
 
 
 def prewarm_joinquant_qmt(context: Context) -> None: ...
+def advance_joinquant_sell_then_buy(context: Context) -> None: ...
 
 
 def install_joinquant_runtime(
@@ -344,7 +368,9 @@ def submit_runtime_targets(
 def advance_runtime_targets(context: Context) -> bool: ...
 def cancel_runtime_targets() -> bool: ...
 def cancel_runtime_orders() -> int: ...
-def runtime_order_target(security: str, amount: int) -> Any: ...
+def runtime_order_target(
+    security: str, amount: int, limit_price: Optional[float] = ...,
+) -> Any: ...
 def runtime_order_target_value(
     security: str,
     target_value: float,

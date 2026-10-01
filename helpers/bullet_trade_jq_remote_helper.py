@@ -65,6 +65,7 @@ __all__ = [
     "AccountPortfolioView",
     "JoinQuantRuntime",
     "prewarm_joinquant_qmt",
+    "advance_joinquant_sell_then_buy",
     "install_joinquant_runtime",
     "install_strategy_runtime",
     "ensure_account",
@@ -85,8 +86,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 21
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v21"
+STRATEGY_RUNTIME_API_VERSION = 22
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v22"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -335,18 +336,32 @@ def _check_band(value: int, field_name: str) -> None:
 
 
 _LimitExecutionTuple = namedtuple(
-    "LimitExecution", ("price_band_ppm", "execution_type")
+    "LimitExecution", ("price_band_ppm", "execution_type", "limit_price_items", "preopen")
 )
 
 
 class LimitExecution(_LimitExecutionTuple):
     __slots__ = ()
 
-    def __new__(cls, price_band_ppm: int = 0) -> "LimitExecution":
+    def __new__(
+        cls, price_band_ppm: int = 0,
+        limit_prices: Optional[Dict[str, int]] = None,
+        preopen: bool = False,
+    ) -> "LimitExecution":
         _check_band(price_band_ppm, "price_band_ppm")
+        if type(preopen) is not bool:
+            raise TypeError("preopen必须是bool")
+        prices = dict(limit_prices or {})
+        if any(not isinstance(code, str) or not code or type(price) is not int
+               or price <= 0 for code, price in prices.items()):
+            raise ValueError("limit_prices必须为标的到正整数价格单位的映射")
         return _LimitExecutionTuple.__new__(
-            cls, price_band_ppm, ExecutionType.LIMIT
+            cls, price_band_ppm, ExecutionType.LIMIT, tuple(sorted(prices.items())), preopen
         )
+
+    @property
+    def limit_prices(self) -> Dict[str, int]:
+        return dict(self.limit_price_items)
 
 
 _ConditionalLimitExecutionTuple = namedtuple(
@@ -494,6 +509,10 @@ def _style_to_wire(style: Any) -> Dict[str, Any]:
     style_wire = {"type": style.execution_type.value}
     if isinstance(style, (LimitExecution, MarketableLimitExecution)):
         style_wire["price_band_ppm"] = style.price_band_ppm
+        if isinstance(style, LimitExecution) and style.limit_prices:
+            style_wire["limit_prices"] = dict(style.limit_prices)
+        if isinstance(style, LimitExecution) and style.preopen:
+            style_wire["preopen"] = True
     elif isinstance(style, ConditionalLimitExecution):
         style_wire["price_band_ppm"] = style.price_band_ppm
         style_wire["price_mode"] = style.price_mode.value
@@ -523,7 +542,10 @@ def _style_from_wire(raw_style: Any) -> Any:
         raise RuntimeError("服务器执行类型无效")
     execution_type = ExecutionType(raw_style.get("type"))
     if execution_type is ExecutionType.LIMIT:
-        return LimitExecution(int(raw_style["price_band_ppm"]))
+        return LimitExecution(
+            int(raw_style["price_band_ppm"]), raw_style.get("limit_prices"),
+            raw_style.get("preopen", False),
+        )
     if execution_type is ExecutionType.CONDITIONAL_LIMIT:
         return ConditionalLimitExecution(
             int(raw_style["price_band_ppm"]),
@@ -1063,13 +1085,20 @@ def cancel_runtime_orders() -> int:
     return len(orders)
 
 
-def runtime_order_target(security: str, amount: int) -> Any:
+def runtime_order_target(
+    security: str, amount: int, limit_price: Optional[float] = None
+) -> Any:
     if _active_namespace is None:
         raise RuntimeError("策略namespace不可用")
     order_target_fn = _active_namespace.get("order_target")
     if not callable(order_target_fn):
         raise RuntimeError("聚宽order_target不可用")
-    return order_target_fn(security, amount)
+    if limit_price is None:
+        return order_target_fn(security, amount)
+    style_type = _active_namespace.get("LimitOrderStyle")
+    if not callable(style_type):
+        raise RuntimeError("聚宽LimitOrderStyle不可用")
+    return order_target_fn(security, amount, style=style_type(limit_price))
 
 
 def runtime_order_target_value(
@@ -1623,7 +1652,7 @@ class JoinQuantRuntime:
         self._log("info", "QMT账户重新对账通过，恢复QMT执行")
 
     def prewarm_qmt(self, context: Any) -> None:
-        """Prepare QMT account and quote feed before the 09:30 decision."""
+        """Prepare QMT account and quote feed before the opening decision."""
 
         if not self.qmt_account_enabled or not self._qmt_callback_allowed(
             context, "盘前准备"
@@ -1645,13 +1674,13 @@ class JoinQuantRuntime:
             self._set_qmt_ready(True)
             self._log(
                 "info",
-                "QMT盘前准备完成 | 对账=READY 行情链路={}；09:30以新快照提交目标".format(
+                "QMT盘前准备完成 | 对账=READY 行情链路={}；执行时以新快照提交目标".format(
                     "就绪" if ensured.get("quote_ready") else "未验证"
                 ),
             )
         except Exception as exc:
             self._set_qmt_ready(False)
-            self._log("warn", "QMT盘前准备未就绪，09:30将重新检查：{}".format(exc))
+            self._log("warn", "QMT盘前准备未就绪，执行时将重新检查：{}".format(exc))
 
     def _publish_state(self) -> None:
         if self._namespace is None:
@@ -1724,6 +1753,10 @@ class JoinQuantRuntime:
         risk_check_times: Tuple[str, ...],
         after_market_check: Callable[[Any], Any],
         reference_security: str = "000300.XSHG",
+        opening_decision: Optional[Callable[[Any], Any]] = None,
+        opening_decision_time: str = "09:28",
+        market_open_time: str = "09:30",
+        sell_then_buy: bool = False,
     ) -> None:
         """Register the common ETF strategy schedule on JoinQuant."""
 
@@ -1739,11 +1772,24 @@ class JoinQuantRuntime:
             "09:20",
             reference_security=reference_security,
         )
+        if opening_decision is not None:
+            run_daily(
+                opening_decision,
+                opening_decision_time,
+                reference_security=reference_security,
+            )
         run_daily(
             market_open,
-            "09:30",
+            market_open_time,
             reference_security=reference_security,
         )
+        if sell_then_buy:
+            # Explicit opt-in only: native/default JQ execution is unchanged.
+            run_daily(
+                advance_joinquant_sell_then_buy,
+                time="every_bar",
+                reference_security=reference_security,
+            )
         for risk_time in risk_check_times:
             run_daily(
                 risk_management,
@@ -1757,8 +1803,11 @@ class JoinQuantRuntime:
         )
         self._log(
             "info",
-            "任务调度完成 | {}09:20 盘前预处理 | 09:30 开盘下单 | ".format(
-                "09:20 QMT盘前准备 | " if self.qmt_account_enabled else ""
+            "任务调度完成 | {}09:20 盘前预处理 | {}{} 下单 | ".format(
+                "09:20 QMT盘前准备 | " if self.qmt_account_enabled else "",
+                "{} 锁定选股 | ".format(opening_decision_time)
+                if opening_decision is not None else "",
+                market_open_time,
             )
             + "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times)),
         )
@@ -2020,8 +2069,10 @@ class JoinQuantRuntime:
     def cancel_orders(self) -> int:
         return cancel_runtime_orders()
 
-    def order_target(self, security: str, amount: int) -> Any:
-        return runtime_order_target(security, amount)
+    def order_target(
+        self, security: str, amount: int, limit_price: Optional[float] = None
+    ) -> Any:
+        return runtime_order_target(security, amount, limit_price=limit_price)
 
     def order_target_value(
         self,
@@ -2097,6 +2148,234 @@ class JoinQuantRuntime:
                 items.append(item)
         return items
 
+    def _log_qmt_planned_orders(self, result: Dict[str, Any]) -> None:
+        for order in result.get("planned_orders", ()):
+            if type(order) is not dict:
+                continue
+            price_units = order.get("limit_price_units")
+            price = (
+                float(price_units) / 1000000.0
+                if type(price_units) is int and price_units > 0 else None
+            )
+            quantity = int(order.get("quantity", 0))
+            amount = price * quantity if price is not None else None
+            side = str(order.get("side") or "未知")
+            self._log("info", "QMT{}计划 | {} 方向={} 数量={} 单价={} "
+                      "预计金额={} 执行方式={}".format(
+                          "买入" if side == "BUY" else "卖出",
+                          _security_label(str(order.get("security") or "")),
+                          side, quantity,
+                          "{:.4f}".format(price) if price is not None else "市价",
+                          "{:.2f}".format(amount) if amount is not None else "待成交确定",
+                          order.get("execution_type") or "未知",
+                      ))
+
+    def prepare_sell_then_buy(
+        self,
+        context: Any,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        buy_not_before: str = "09:30",
+    ) -> None:
+        """Opt-in liquidation plan. Persist only plain data in JQ's saved g.
+
+        All old strategy holdings, including selected securities, are sold.
+        QMT still owns its order lifecycle; JQ buys are one native batch only.
+        """
+
+        buy_not_before = time.strftime("%H:%M", time.strptime(buy_not_before, "%H:%M"))
+        target_weights = {code: float(value) for code, value in weights.items()}
+        if any(not math.isfinite(value) or value < 0 for value in target_weights.values()):
+            raise ValueError("目标权重必须是有限非负数")
+        target_marks = {code: float(marks[code]) for code in target_weights}
+        if any(not math.isfinite(value) or value <= 0 for value in target_marks.values()):
+            raise ValueError("目标参考价必须是有限正数")
+        saved = self._saved_plan_namespace()
+        day = context.current_dt.strftime("%Y-%m-%d")
+        plan = getattr(saved, "bt_sell_then_buy", None)
+        if plan and plan["day"] == day and plan["key"] == idempotency_key:
+            if (plan["weights"], plan["marks"], plan["buy_not_before"]) != (
+                target_weights, target_marks, buy_not_before
+            ):
+                raise RuntimeError("同一清仓买入计划的决策发生变化")
+            self.advance_sell_then_buy(context)
+            return
+        if plan and plan["day"] == day:
+            raise RuntimeError("当日已有清仓买入计划，不能重复建立")
+        qmt_allowed = self.qmt_account_enabled and self._qmt_callback_allowed(
+            context, "清仓计划"
+        )
+        plan = {
+            "day": day, "key": idempotency_key,
+            "weights": target_weights, "marks": target_marks,
+            "buy_not_before": buy_not_before,
+            "jq": "START" if self.jq_account_enabled else "DONE",
+            # A replay-created plan must never become a live QMT order later.
+            "qmt": "CANCEL_OLD" if qmt_allowed else "DONE",
+        }
+        saved.bt_sell_then_buy = plan
+        for code, weight in target_weights.items():
+            self._log("info", "策略目标比例 | {} 比例={:.2%}".format(
+                _security_label(code), weight
+            ))
+        self._log("info", "清仓后买入计划已锁定 | 最早买入={} | 两账户独立确认清仓".format(
+            buy_not_before
+        ))
+        self.advance_sell_then_buy(context)
+
+    def _liquidation_limits(self, positions: Any) -> Dict[str, float]:
+        quotes = self._platform_api("get_current_data")()
+        limits = {}
+        for code, position in positions.items():
+            if position.total_amount <= 0:
+                continue
+            price = float(quotes[code].low_limit)
+            if not math.isfinite(price) or price <= 0:
+                raise RuntimeError("无法取得有效跌停价，未提交清仓：{}".format(
+                    _security_label(code)
+                ))
+            limits[code] = price
+        return limits
+
+    def _advance_jq_sell_then_buy(self, context: Any, plan: Dict[str, Any]) -> None:
+        if plan["jq"] in ("DONE", "BUY_SENT", "FAILED"):
+            return
+        if plan["jq"] == "START":
+            self.cancel_orders()
+            limits = self._liquidation_limits(context.portfolio.positions)
+            # An uncertain native submission must not be blindly repeated.
+            plan["jq"] = "FAILED"
+            for code, price in limits.items():
+                order = self.order_target(code, 0, limit_price=price)
+                self._log("info", "JQ清仓限价已提交 | {} 跌停价={:.3f}".format(
+                    _security_label(code), price
+                ))
+                if order is None:
+                    raise RuntimeError("JQ未接受清仓委托：{}".format(_security_label(code)))
+            plan["jq"] = "SELLING"
+        if context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
+            return
+        if any(pos.total_amount > 0 for pos in context.portfolio.positions.values()):
+            self._log("info", "JQ等待清仓成交，尚未全部卖出，不提交买单")
+            return
+        if self._platform_api("get_open_orders")():
+            self._log("info", "JQ等待清仓委托终结，不提交买单")
+            return
+        if not plan["weights"]:
+            plan["jq"] = "DONE"
+            return
+        portfolio = context.portfolio
+        if not self.qmt_account_enabled:
+            self.send_target_buy_plan(
+                self._target_buy_plan_items(portfolio, plan["weights"], plan["marks"]),
+                occurred_at=context.current_dt,
+            )
+        planning_total = float(portfolio.total_value)
+        plan["jq"] = "BUY_SENT"
+        # Do not add minute buy retries or QMT's premium to native JQ orders.
+        for code, weight in plan["weights"].items():
+            target_value = planning_total * weight
+            order = self.order_target_value(code, target_value)
+            self._log("info", "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
+                _security_label(code), target_value, getattr(order, "order_id", None)
+            ))
+        self._log("info", "JQ清仓已确认，原生市价买入已提交一次")
+
+    def _advance_qmt_sell_then_buy(self, context: Any, plan: Dict[str, Any]) -> None:
+        if plan["qmt"] in ("DONE", "BUY_SENT"):
+            return
+        if not self._qmt_callback_allowed(context, "清仓后买入"):
+            return
+        self._retry_qmt_readiness(context)
+        if plan["qmt"] == "CANCEL_OLD":
+            if not self.cancel_targets():
+                return  # An old target must stop before a new liquidation.
+            plan["qmt"] = "SELL_SUBMITTING"
+        if plan["qmt"] == "SELL_SUBMITTING":
+            portfolio = get_portfolio(as_of=context.current_dt)
+            if "sell_limits" not in plan:
+                limits = self._liquidation_limits(portfolio.positions)
+                # Execution limits are not valuation marks: a lower-limit
+                # sell must not mark the whole old portfolio down by 10%.
+                sell_marks = {
+                    code: float(portfolio.positions[code].price) for code in limits
+                }
+                if any(not math.isfinite(price) or price <= 0 for price in sell_marks.values()):
+                    raise RuntimeError("QMT清仓参考行情无效，等待有效账户快照")
+                plan["sell_marks"] = sell_marks
+                plan["sell_limits"] = limits
+            limits = plan["sell_limits"]
+            if limits:
+                execution = ExecutionRequest(
+                    style=LimitExecution(
+                        0, {code: int(round(price * 1_000_000)) for code, price in limits.items()},
+                        preopen=True,
+                    ),
+                    follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
+                    repricing=RepricingPolicy.KEEP_ORIGINAL,
+                )
+                result = self.submit_targets(
+                    context, {code: 0.0 for code in limits}, plan["sell_marks"],
+                    plan["key"] + ":sell", execution, _security_names(limits),
+                )
+                self._log_qmt_planned_orders(result)
+                self._log("info", "QMT策略归属持仓清仓目标已提交 | 跌停价限价卖出")
+            plan["qmt"] = "SELLING"
+        if context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
+            return
+        if plan["qmt"] == "SELLING":
+            if not self.advance_targets(context):
+                return
+            portfolio = get_portfolio(as_of=context.current_dt)
+            if any(pos.total_amount > 0 for pos in portfolio.positions.values()):
+                self._log("info", "QMT等待清仓成交，尚未全部卖出，不提交买单")
+                return
+            if not plan["weights"]:
+                plan["qmt"] = "DONE"
+                return
+            plan["qmt"] = "BUY_SUBMITTING"
+        # Stable key also recovers an RPC timeout without creating a new intent.
+        result = self.submit_targets(
+            context, plan["weights"], plan["marks"], plan["key"] + ":buy",
+            default_etf_rebalance_execution(), _security_names(plan["weights"]),
+        )
+        plan["qmt"] = "BUY_SENT"
+        self._log_qmt_planned_orders(result)
+        self._log("info", "QMT清仓已确认，买入目标已提交 | 固定参考价上浮0.2%")
+        snapshot = result.get("snapshot")
+        portfolio = PortfolioView(snapshot) if isinstance(snapshot, dict) else get_portfolio(
+            as_of=context.current_dt
+        )
+        self.send_target_buy_plan(
+            self._target_buy_plan_items(portfolio, plan["weights"], plan["marks"]),
+            occurred_at=context.current_dt,
+        )
+
+    def _saved_plan_namespace(self) -> Any:
+        saved = self._namespace.get("g") if self._namespace is not None else None
+        if saved is None:
+            raise RuntimeError("聚宽g不可用，无法保存清仓后买入计划")
+        return saved
+
+    def advance_sell_then_buy(self, context: Any) -> None:
+        """Resume only today's explicit plan; never reselect or repeat JQ buys."""
+
+        plan = getattr(self._saved_plan_namespace(), "bt_sell_then_buy", None)
+        if not plan or plan["day"] != context.current_dt.strftime("%Y-%m-%d"):
+            return
+        # Sell orders remain native/server-owned outside this callback window.
+        if not ("09:26" <= context.current_dt.strftime("%H:%M") < "15:00"):
+            return
+        for account, advance in (
+            ("JQ", self._advance_jq_sell_then_buy),
+            ("QMT", self._advance_qmt_sell_then_buy),
+        ):
+            try:
+                advance(context, plan)
+            except Exception as exc:
+                self._log("error", "{}清仓后买入异常：{}".format(account, exc))
+
     def execute_rebalance(
         self,
         context: Any,
@@ -2104,10 +2383,34 @@ class JoinQuantRuntime:
         marks: Dict[str, Any],
         idempotency_key: str,
         execution: Optional[ExecutionRequest] = None,
+        buy_limit_prices: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Apply one decision independently to QMT and JQ enabled accounts."""
 
         execution = execution or default_etf_rebalance_execution()
+        if buy_limit_prices is not None:
+            # Keep decision/valuation marks unchanged. An absolute order
+            # limit must not become the position-sizing reference price.
+            limits = {}
+            for security, weight in weights.items():
+                if float(weight) <= 0:
+                    continue
+                try:
+                    price = float(buy_limit_prices[security])
+                except (KeyError, TypeError, ValueError):
+                    raise ValueError("无有效买入限价，无法提交限价买单：{}".format(security)) from None
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError("无有效买入限价，无法提交限价买单：{}".format(security))
+                limits[security] = int(round(price * 1_000_000))
+                self._log("info", "买入限价 | {} 限价={:.3f} 选股参考价={:.3f}".format(
+                    _security_label(security), price, float(marks[security]),
+                ))
+            execution = ExecutionRequest(
+                style=LimitExecution(0, limits, preopen=True),
+                sell_style=execution.sell_style or execution.style,
+                follow_up=execution.follow_up,
+                repricing=execution.repricing,
+            )
         result = {"qmt": None, "jq_orders": [], "errors": []}
         notification_items = []
         qmt_submitted = False
@@ -2221,9 +2524,15 @@ class JoinQuantRuntime:
                 planning_total = float(jq_portfolio.total_value)
                 for security, raw_weight in weights.items():
                     target_value = planning_total * float(raw_weight)
-                    order_obj = self.order_target_value(
-                        security, target_value
-                    )
+                    if buy_limit_prices is not None and target_value > self._position_value(
+                        jq_portfolio.positions.get(security), float(marks.get(security, 0.0))
+                    ):
+                        limit_price = execution.style.limit_prices[security] / 1_000_000
+                        order_obj = self.order_target_value(
+                            security, target_value, limit_price=limit_price
+                        )
+                    else:
+                        order_obj = self.order_target_value(security, target_value)
                     result["jq_orders"].append(
                         (security, target_value, order_obj)
                     )
@@ -2246,31 +2555,7 @@ class JoinQuantRuntime:
                     },
                 ),
             )
-            for order in qmt_result.get("planned_orders", ()):
-                if type(order) is not dict:
-                    continue
-                price_units = order.get("limit_price_units")
-                price = (
-                    float(price_units) / 1000000.0
-                    if type(price_units) is int and price_units > 0
-                    else None
-                )
-                quantity = int(order.get("quantity", 0))
-                amount = price * quantity if price is not None else None
-                side = str(order.get("side") or "未知")
-                self._log(
-                    "info",
-                    "QMT{}计划 | {} 方向={} 数量={} 单价={} "
-                    "预计金额={} 执行方式={}".format(
-                        "买入" if side == "BUY" else "卖出",
-                        _security_label(str(order.get("security") or "")),
-                        side,
-                        quantity,
-                        "{:.4f}".format(price) if price is not None else "市价",
-                        "{:.2f}".format(amount) if amount is not None else "待成交确定",
-                        order.get("execution_type") or "未知",
-                    ),
-                )
+            self._log_qmt_planned_orders(qmt_result)
         elif qmt_result is not None and qmt_result.get(
             "skipped_active_intent"
         ):
@@ -2551,6 +2836,14 @@ class JoinQuantRuntime:
                 ),
             )
             return None
+
+
+def advance_joinquant_sell_then_buy(context: Any) -> None:
+    """Serializable scheduler entry for an explicitly opted-in staged plan."""
+
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        runtime.advance_sell_then_buy(context)
 
 
 def prewarm_joinquant_qmt(context: Any) -> None:
