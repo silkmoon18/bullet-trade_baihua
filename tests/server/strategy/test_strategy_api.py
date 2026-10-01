@@ -452,6 +452,113 @@ async def test_prepare_session_checks_account_and_warms_owned_quotes(api, monkey
 
 
 @pytest.mark.asyncio
+async def test_prepare_session_subscribes_union_of_holdings_and_candidates_without_orders(api, monkeypatch):
+    service, broker, account, _ = api
+    subscribed = []
+
+    class PreopenData:
+        async def replace_execution_quotes(self, owner, symbols):
+            subscribed.append((owner, tuple(symbols)))
+
+        async def get_current_tick(self, security):
+            return {"lastPrice": 10, "timetag": datetime.now(SHANGHAI_TZ).isoformat()}
+
+    service.data_provider = PreopenData()
+    monkeypatch.setattr(service, "_held_securities", lambda strategy_id: (SECURITY,))
+    result = await service.prepare_session(account, "default", {
+        "strategy_id": "good_etf", "candidate_securities": [
+            "510300.XSHG", SECURITY, "510300.XSHG", "159915.XSHE"
+        ],
+    })
+    assert subscribed == [("preopen:good_etf", ("159915.XSHE", SECURITY, "510300.XSHG"))]
+    assert result["subscribed_holdings"] == 1
+    assert result["subscribed_candidates"] == 3
+    assert result["quote_ready"] is True
+    assert broker.order_calls == 0
+    assert service.planner.active_intents() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidates", [None, "510050.XSHG", {"code": SECURITY}, [1], [" "], [SECURITY] * 5001])
+async def test_invalid_candidate_payload_is_rejected_before_account_mutation(api, monkeypatch, candidates):
+    service, broker, account, _ = api
+
+    async def ensure(*args):
+        pytest.fail("invalid candidate payload must not create or reconcile an account")
+
+    monkeypatch.setattr(service, "ensure_account", ensure)
+    with pytest.raises(ValueError, match="candidate_securities"):
+        await service.prepare_session(account, "default", {
+            "strategy_id": "good_etf", "candidate_securities": candidates,
+        })
+    assert broker.order_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_candidate_subscription_is_not_reported_as_prepared(api, monkeypatch):
+    service, broker, account, _ = api
+
+    class FailedData:
+        async def replace_execution_quotes(self, owner, symbols):
+            raise OSError("feed unavailable")
+
+        async def get_current_tick(self, security):
+            pytest.fail("subscription failed")
+
+    service.data_provider = FailedData()
+    result = await service.prepare_session(account, "default", {
+        "strategy_id": "good_etf", "candidate_securities": [SECURITY],
+    })
+    assert result["reconciliation"]["state"] == "READY"
+    assert result["subscribed_candidates"] == 0
+    assert result["quote_ready"] is False
+    # A failed cleanup stays tracked so a later target submission can retry it.
+    assert "good_etf" in service._preopen_quote_owners
+    assert broker.order_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holdings", [(SECURITY,), ()])
+async def test_candidate_subscription_quota_restores_safe_owner_set(api, monkeypatch, holdings):
+    service, broker, account, _ = api
+
+    class LimitedData:
+        def __init__(self):
+            self.owners = {"execution:other": {"159915.XSHE"}}
+            self.applied = {"159915.XSHE"}
+
+        async def replace_execution_quotes(self, owner, symbols):
+            # Match provider semantics: desired ownership changes before RPC.
+            if symbols:
+                self.owners[owner] = set(symbols)
+            else:
+                self.owners.pop(owner, None)
+            desired = set().union(*self.owners.values())
+            if len(desired) > 2:
+                raise ValueError("subscription quota exceeded")
+            self.applied = desired
+
+        async def get_current_tick(self, security):
+            assert security in self.applied
+            return {"lastPrice": 10, "timetag": datetime.now(SHANGHAI_TZ).isoformat()}
+
+    data = LimitedData()
+    service.data_provider = data
+    monkeypatch.setattr(service, "_held_securities", lambda strategy_id: holdings)
+    result = await service.prepare_session(account, "default", {
+        "strategy_id": "good_etf", "candidate_securities": [SECURITY, "510300.XSHG"],
+    })
+    assert data.applied == {"159915.XSHE", *holdings}
+    assert data.owners.get("preopen:good_etf", set()) == set(holdings)
+    assert result["subscribed_holdings"] == len(holdings)
+    assert result["subscribed_candidates"] == len(holdings)
+    assert result["quote_ready"] is bool(holdings)
+    assert ("good_etf" in service._preopen_quote_owners) is bool(holdings)
+    assert broker.order_calls == 0
+    assert service.planner.active_intents() == ()
+
+
+@pytest.mark.asyncio
 async def test_bridge_data_marks_are_read_in_one_batch(api):
     service, _, _, _ = api
     now = datetime.now(SHANGHAI_TZ)

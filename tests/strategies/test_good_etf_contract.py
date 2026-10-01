@@ -58,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 22,
+            "api_version": 23,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -75,6 +75,10 @@ class _Runtime:
         self.platform_configured = False
         self.schedules = []
         self.strategy_events = []
+        self.prepared_candidates = []
+
+    def prepare_rebalance_candidates(self, context, securities):
+        self.prepared_candidates.append(tuple(securities))
 
     def configure_platform(self, benchmark="000300.XSHG"):
         self.platform_configured = True
@@ -91,10 +95,15 @@ class _Runtime:
         opening_decision_time="09:28",
         market_open_time="09:30",
         sell_then_buy=False,
+
+
+        *,
+        open_decision_time="09:30",
+        open_order_time=None,
     ):
         self.opening_decision = opening_decision
         self.opening_decision_time = opening_decision_time
-        self.market_open_time = market_open_time
+        self.market_open_time = open_decision_time if open_order_time is not None else market_open_time
         self.sell_then_buy = sell_then_buy
         self.schedules.append(
             (
@@ -104,6 +113,8 @@ class _Runtime:
                 risk_check_times,
                 after_market_check,
                 reference_security,
+                open_decision_time,
+                open_order_time,
             )
         )
 
@@ -321,6 +332,12 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
         "handle_risk_management",
         "after_market_check",
     }
+    for parameter in ("OPEN_DECISION_TIME", "OPEN_ORDER_TIME"):
+        definitions = [
+            node for node in tree.body if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == parameter for target in node.targets)
+        ]
+        assert len(definitions) == 1, "experiment parameter must not be overwritten: " + parameter
 
 
 def test_risk_check_times_are_top_level_configuration(monkeypatch):
@@ -354,7 +371,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf_remote",
         "qmt_initial_capital": 10000,
-        "expected_api_version": 22,
+        "expected_api_version": 23,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -419,9 +436,9 @@ def test_hk_short_name_fix_preserves_remaining_filters_ranking_and_weights(
 
     strategy.before_market_open(context)
     assert strategy.g.fund_list.index.tolist() == codes[1:4]
-    strategy.market_open(context)
-    assert len(runtime.rebalances) == 1
-    _, weights, marks, _, _ = runtime.rebalances[0]
+    assert runtime.prepared_candidates == [tuple(codes[1:4])]
+    weights, marks = strategy.market_open(context)
+    assert runtime.rebalances == []
     premiums = [abs(price / 2.0 - 1) * 100 for price in prices.values()]
     assert list(weights) == codes[1:4]
     assert weights == {
@@ -481,7 +498,7 @@ def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
 
     assert runtime.platform_configured is True
     assert len(runtime.schedules) == 1
-    before, market, risk, times, after, reference = runtime.schedules[0]
+    before, market, risk, times, after, reference, decision_time, order_time = runtime.schedules[0]
     assert before is strategy.before_market_open
     assert market is strategy.market_open
     assert strategy.OPEN_DECISION_TIME == "09:30"
@@ -492,6 +509,8 @@ def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
     assert times == strategy.RISK_CHECK_TIMES
     assert after is strategy.after_market_check
     assert reference == "000300.XSHG"
+    assert decision_time == strategy.OPEN_DECISION_TIME == "09:30"
+    assert order_time == strategy.OPEN_ORDER_TIME == "09:30"
     assert strategy.g.fund_list is None
 
 
@@ -516,17 +535,15 @@ def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
         strategy, "get_current_data", lambda: current_data, raising=False
     )
 
-    strategy.market_open(
+    weights, marks = strategy.market_open(
         types.SimpleNamespace(
             current_dt=pd.Timestamp("2026-08-19 09:30:00")
         )
     )
 
-    assert len(runtime.rebalances) == 1
-    _, weights, marks, key, _ = runtime.rebalances[0]
+    assert runtime.rebalances == []
     assert weights == {"510001.XSHG": 0.95}
     assert marks == {"510001.XSHG": 1.0}
-    assert key == "open-20260819"
 
 
 def test_market_open_preserves_discount_ranking_filters_and_weights(
@@ -569,14 +586,13 @@ def test_market_open_preserves_discount_ranking_filters_and_weights(
         strategy, "get_current_data", lambda: current_data, raising=False
     )
 
-    strategy.market_open(
+    weights, marks = strategy.market_open(
         types.SimpleNamespace(
             current_dt=pd.Timestamp("2026-08-19 09:30:00")
         )
     )
 
-    assert len(runtime.rebalances) == 1
-    _, weights, marks, key, _ = runtime.rebalances[0]
+    assert runtime.rebalances == []
     assert list(weights) == codes[:3]
     assert weights == pytest.approx({
         "510001.XSHG": 50.0 / 85.0 * 0.95,
@@ -588,7 +604,91 @@ def test_market_open_preserves_discount_ranking_filters_and_weights(
         "510002.XSHG": 1.5,
         "510003.XSHG": 1.8,
     }
-    assert key == "open-20260819"
+
+
+@pytest.mark.parametrize("delay_minutes", [0, 1, 5, 15])
+def test_scheduled_delay_freezes_selection_weights_marks_and_jq_amounts(
+    monkeypatch, delay_minutes
+):
+    strategy = _load_strategy(monkeypatch)
+    codes = ["51000{}.XSHG".format(i) for i in range(1, 6)]
+    strategy.g.fund_list = pd.DataFrame(
+        {"unit_net_value": [2.0] * len(codes)}, index=codes
+    )
+    quotes = {
+        code: types.SimpleNamespace(last_price=price, paused=False, high_limit=3.0)
+        for code, price in zip(codes, [1.0, 1.5, 1.8, 2.1, 0.5])
+    }
+    quotes[codes[4]].paused = True
+    quote_times = []
+    schedules = {}
+    orders = []
+    observed = []
+    context = types.SimpleNamespace(
+        current_dt=pd.Timestamp("2026-09-08 09:30:00"),
+        portfolio=types.SimpleNamespace(total_value=10000.0, positions={}),
+    )
+
+    def current_data():
+        quote_times.append(context.current_dt)
+        return quotes
+
+    monkeypatch.setattr(strategy, "get_current_data", current_data, raising=False)
+    monkeypatch.setattr(strategy, "run_daily", lambda callback, time, **kw: schedules.setdefault(time, callback),
+                        raising=False)
+    runtime = real_helper.JoinQuantRuntime(
+        {"mode": "BACKTEST", "jq_account_enabled": True, "qmt_account_enabled": False},
+        strategy.__dict__,
+    )
+    strategy._runtime = runtime
+    monkeypatch.setattr(real_helper, "_active_joinquant_runtime", runtime)
+    monkeypatch.setattr(runtime, "cancel_orders", lambda: 0)
+    monkeypatch.setattr(runtime, "order_target_value", lambda code, amount: orders.append((code, amount)))
+    monkeypatch.setattr(runtime, "send_target_buy_plan", lambda *args, **kwargs: None)
+    execute = runtime.execute_rebalance
+
+    def record_execution(ctx, weights, marks, key, **kwargs):
+        observed.append((dict(weights), dict(marks), key))
+        return execute(ctx, weights, marks, key, **kwargs)
+
+    monkeypatch.setattr(runtime, "execute_rebalance", record_execution)
+    order_time = (context.current_dt + pd.Timedelta(minutes=delay_minutes)).strftime("%H:%M")
+    runtime.schedule_daily(
+        strategy.before_market_open, strategy.market_open, strategy.handle_risk_management,
+        strategy.RISK_CHECK_TIMES, strategy.after_market_check,
+        open_decision_time="09:30", open_order_time=order_time,
+    )
+    schedules["09:30"](context)
+    if delay_minutes:
+        assert orders == []
+        # Reranking now would pick the former premium ETF and exclude the old leader.
+        quotes[codes[0]].last_price = 2.2
+        quotes[codes[3]].last_price = 0.1
+        context.portfolio.total_value = 15000.0
+        context.current_dt += pd.Timedelta(minutes=delay_minutes)
+        schedules[order_time](context)
+
+    premiums = [abs(price / 2.0 - 1) * 100 for price in [1.0, 1.5, 1.8]]
+    expected_weights = {
+        code: value / sum(premiums) * 0.95
+        for code, value in zip(codes[:3], premiums)
+    }
+    assert observed == [(expected_weights, dict(zip(codes[:3], [1.0, 1.5, 1.8])), "open-20260908")]
+    assert orders == [(code, 10000.0 * weight) for code, weight in expected_weights.items()]
+    assert quote_times == [pd.Timestamp("2026-09-08 09:30:00")]
+    assert runtime.execute_prepared_rebalance(context) is None
+    assert len(orders) == 3
+
+
+def test_initialize_passes_custom_decision_and_order_times(monkeypatch):
+    runtime = _Runtime(real_helper.RuntimeMode.JQ)
+    strategy = _load_strategy(monkeypatch, _helper_with_install(runtime, []))
+    monkeypatch.setattr(strategy, "OPEN_DECISION_TIME", "09:31")
+    monkeypatch.setattr(strategy, "OPEN_ORDER_TIME", "09:45")
+
+    strategy.initialize(_Context())
+
+    assert runtime.schedules[0][-2:] == ("09:31", "09:45")
 
 
 def test_remote_stop_loss_preempts_waiting_rebalance(monkeypatch):

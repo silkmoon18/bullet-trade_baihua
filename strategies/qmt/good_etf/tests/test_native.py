@@ -568,8 +568,7 @@ def test_direct_parity_with_existing_joinquant_strategy(mod, monkeypatch):
     old.get_current_data = lambda: quotes
     context = types.SimpleNamespace(previous_date=NOW.date() - dt.timedelta(days=1), current_dt=NOW)
     old.before_market_open(context)
-    old.market_open(context)
-    _, weights, marks, _, _ = old._runtime.rebalances[0]
+    weights, marks = old.market_open(context)
     class Data:
         def universe(self, _):
             return [(code.replace("XSHG", "SH"), name, "") for code, name in zip(codes, names)]

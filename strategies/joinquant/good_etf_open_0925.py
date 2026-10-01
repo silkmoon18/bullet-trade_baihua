@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 STRATEGY_ID = 'good_etf_open_0925'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 22
+_EXPECTED_RUNTIME_API_VERSION = 23
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -210,6 +210,7 @@ def before_market_open(context: 'Context') -> None:
 
         # 合并净值数据并存储到全局变量
         g.fund_list = df.merge(nav_df, left_index=True, right_index=True)
+        _runtime.prepare_rebalance_candidates(context, g.fund_list.index.tolist())
         elapsed = (datetime.datetime.now() - start_time).total_seconds()
         log.info(f'盘前预处理完成 | 候选ETF {len(g.fund_list)} 只 | 耗时 {elapsed:.1f}s')
 

@@ -285,22 +285,51 @@ class SQLiteStrategyAPI:
     ) -> Dict[str, object]:
         """09:20 reconcile locally and warm quotes without broker orders."""
 
+        raw_candidates = payload.get("candidate_securities", ())
+        if not isinstance(raw_candidates, (tuple, list)) or len(raw_candidates) > 5000:
+            raise ValueError("candidate_securities must be a list of at most 5000 codes")
+        if any(not isinstance(code, str) or not code.strip() for code in raw_candidates):
+            raise ValueError("candidate_securities must contain nonempty strings")
+        candidates = set(code.strip() for code in raw_candidates)
         result = await self.ensure_account(account_context, account_key, payload)
         if result["reconciliation"]["state"] != "READY":
-            return dict(result, quote_ready=False, subscribed_holdings=0)
+            return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
         strategy_id = self._strategy_id(payload)
-        securities = tuple(sorted(self._held_securities(strategy_id)))
+        holdings = set(self._held_securities(strategy_id))
+        securities = tuple(sorted(holdings | candidates))
         subscribe = getattr(self.data_provider, "replace_execution_quotes", None)
         tick_fn = getattr(self.data_provider, "get_current_tick", None)
         quote_ready = False
         subscribed_holdings = 0
+        subscribed_candidates = 0
         try:
             if securities and callable(subscribe):
-                await subscribe("preopen:" + strategy_id, securities)
+                # Providers may update their desired owner set before the
+                # upstream subscription succeeds. A rejected candidate batch
+                # must not leave that oversized set in subsequent order feeds.
                 self._preopen_quote_owners.add(strategy_id)
-                subscribed_holdings = len(securities)
+                prepared = ()
+                attempted = set()
+                for symbols in (securities, tuple(sorted(holdings))):
+                    if not symbols or symbols in attempted:
+                        continue
+                    attempted.add(symbols)
+                    try:
+                        await subscribe("preopen:" + strategy_id, symbols)
+                    except Exception as exc:
+                        logger.warning("QMT盘前订阅未完成 | strategy_id=%s | %s", strategy_id, exc)
+                    else:
+                        prepared = symbols
+                        break
+                if not prepared:
+                    await subscribe("preopen:" + strategy_id, ())
+                    self._preopen_quote_owners.discard(strategy_id)
+                    return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
+                securities = prepared
+                subscribed_holdings = len(holdings.intersection(prepared))
+                subscribed_candidates = len(candidates.intersection(prepared))
             if callable(tick_fn):
-                # The new target is unknown until 09:30. Probe one held symbol
+                # The target remains unknown. Probe a subscribed symbol
                 # or the reference index, without using its pre-open price to
                 # trade or blocking the decision if the feed is unavailable.
                 tick = await tick_fn(securities[0] if securities else "000300.XSHG")
@@ -315,6 +344,7 @@ class SQLiteStrategyAPI:
             result,
             quote_ready=quote_ready,
             subscribed_holdings=subscribed_holdings,
+            subscribed_candidates=subscribed_candidates,
         )
 
     async def get_snapshot(

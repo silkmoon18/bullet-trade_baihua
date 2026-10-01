@@ -77,6 +77,73 @@ def test_export_is_deterministic_and_preserves_source_bytes(tmp_path):
         assert output.read_bytes() == source.read_bytes()
 
 
+def test_reversal_export_selects_its_identity_and_preserves_validated_sources(tmp_path):
+    exporter = _load_export_module()
+    destination = tmp_path / "reversal"
+    manifest = exporter.export_joinquant(ROOT, destination, strategy="etf_reversal")
+    files, _, identity = exporter._repository_snapshot(ROOT, "etf_reversal")
+    assert identity == {"strategy_id": "etf_reversal_daily"}
+    assert manifest["files"] == files
+    assert {path.name for path in destination.iterdir()} == {
+        "etf_reversal.py", "bullet_trade_jq_remote_helper.py",
+        "jq_runtime_config.example.py", "manifest.json",
+    }
+    for spec in exporter._artifacts_for_strategy("etf_reversal"):
+        assert (destination / spec.output).read_bytes() == (ROOT / spec.source).read_bytes()
+    second = tmp_path / "second"
+    assert exporter.export_joinquant(ROOT, second, strategy="etf_reversal") == manifest
+
+
+def test_reversal_export_cli_validation_and_unknown_strategy_fail_closed(tmp_path):
+    exporter = _load_export_module()
+    result = subprocess.run(
+        [sys.executable, str(EXPORT_SCRIPT), "--strategy", "etf_reversal", "--validate-only"],
+        cwd=str(ROOT), check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "JOINQUANT_EXPORT_VALIDATION_OK 3 files" in result.stdout
+    with pytest.raises(exporter.ValidationError, match="unknown JoinQuant strategy"):
+        exporter.export_joinquant(ROOT, tmp_path / "invalid", strategy="../other")
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_exported_reversal_imports_with_standalone_helper_and_no_local_typings(tmp_path):
+    exporter = _load_export_module()
+    destination = tmp_path / "reversal"
+    exporter.export_joinquant(ROOT, destination, strategy="etf_reversal")
+    code = """
+import builtins
+import importlib.util
+import sys
+import types
+from pathlib import Path
+root = Path({path!r})
+sys.path.insert(0, str(root))
+original_import = builtins.__import__
+def restricted_import(name, *args, **kwargs):
+    if name == 'joinquant_typing' or name.startswith('bullet_trade'):
+        if name != 'bullet_trade_jq_remote_helper':
+            raise ModuleNotFoundError(name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = restricted_import
+jq = types.ModuleType('jqdata')
+jq.__all__ = []
+sys.modules['jqdata'] = jq
+spec = importlib.util.spec_from_file_location('reversal_upload', root / 'etf_reversal.py')
+strategy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(strategy)
+assert strategy.STRATEGY_ID == 'etf_reversal_daily'
+assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 23
+assert strategy.VALIDATE_REMOTE_DURING_BACKTEST is False
+assert strategy.OPEN_DECISION_TIME == strategy.OPEN_ORDER_TIME == '09:35'
+strategy._validate_parameters()
+print('REVERSAL_IMPORT_OK')
+""".format(path=str(destination))
+    result = _run_cleanroom(code)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "REVERSAL_IMPORT_OK"
+
+
 def test_exported_helper_imports_without_dataclasses_module(tmp_path):
     exporter = _load_export_module()
     destination = tmp_path / "export"
@@ -454,7 +521,7 @@ def test_private_profile_rejects_contract_drift_and_code(tmp_path, body, message
 def test_cli_reports_stable_io_error_on_stderr(monkeypatch, capsys):
     exporter = _load_export_module()
 
-    def fail_export(repo, destination, private_profile=None):
+    def fail_export(repo, destination, private_profile=None, *, strategy="good_etf"):
         raise OSError("sensitive local path")
 
     monkeypatch.setattr(exporter, "export_joinquant", fail_export)
@@ -488,7 +555,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 22
+assert helper.STRATEGY_RUNTIME_API_VERSION == 23
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 3
 assert profile['DEFAULT_PROFILE'] == 'qmt-main'
@@ -567,7 +634,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == [22]
+assert called == [23]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

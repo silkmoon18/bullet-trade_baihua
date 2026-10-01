@@ -231,7 +231,20 @@ class JoinQuantRuntime:
         opening_decision_time: str = ...,
         market_open_time: str = ...,
         sell_then_buy: bool = ...,
+        *,
+        open_decision_time: Optional[str] = ...,
+        open_order_time: Optional[str] = ...,
     ) -> None: ...
+    def prepare_rebalance(
+        self,
+        context: Context,
+        decide: Callable[
+            [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
+        ],
+    ) -> None: ...
+    def execute_prepared_rebalance(
+        self, context: Context
+    ) -> Optional[Dict[str, Any]]: ...
     def log_process_initialize(self) -> None: ...
     def log_strategy_event(self, message: str) -> None: ...
     def portfolio(self, context: Context) -> Any: ...
@@ -239,6 +252,7 @@ class JoinQuantRuntime:
     def log_account_snapshots(self, context: Context) -> None: ...
     def ensure_ready(self, qmt_initial_capital: Any, context: Context) -> Any: ...
     def prewarm_qmt(self, context: Context) -> None: ...
+    def prepare_rebalance_candidates(self, context: Context, securities: Any) -> None: ...
     def submit_targets(
         self,
         context: Context,
@@ -287,6 +301,8 @@ class JoinQuantRuntime:
         idempotency_key: str,
         execution: Optional[ExecutionRequest] = ...,
         buy_limit_prices: Optional[Dict[str, float]] = ...,
+        *,
+        jq_planning_total: Optional[float] = ...,
     ) -> Dict[str, Any]: ...
     def prepare_sell_then_buy(
         self,

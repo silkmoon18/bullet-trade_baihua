@@ -5,9 +5,11 @@
 """
 
 import importlib
+import pickle
 import socket
 import sys
 import types
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -81,7 +83,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 22,
+        "api_version": 23,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -128,9 +130,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 22
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 23
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v22"
+        "bullet-trade-joinquant-runtime-helper-v23"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -276,11 +278,13 @@ def test_qmt_schedule_prewarms_without_changing_decision_callbacks(helper):
         callbacks[0], callbacks[1], callbacks[2], ("10:30",), callbacks[3]
     )
 
-    assert calls[0][0] is helper.prewarm_joinquant_qmt
-    assert calls[0][1] == ("09:20",)
-    assert calls[1][0] is callbacks[0]
-    assert calls[2][0] is callbacks[1]
-    assert [call[2].get("time") for call in calls[3:]] == ["10:30", "14:55"]
+    assert calls[0][0] is callbacks[0]
+    assert calls[1][0] is helper.prewarm_joinquant_qmt
+    assert calls[1][1] == ("09:20",)
+    assert calls[2][0] is helper._prewarm_joinquant_rpc
+    assert calls[2][1] == ("09:29",)
+    assert calls[3][0] is callbacks[1]
+    assert [call[2].get("time") for call in calls[4:]] == ["10:30", "14:55"]
 
 
 def test_optional_0928_decision_runs_between_preparation_and_execution(helper):
@@ -334,6 +338,100 @@ def test_helper_absolute_limits_round_trip_with_server_contract(helper):
     assert server.style.limit_prices == {"510050.XSHG": 1_201_000}
     assert helper._execution_from_wire(wire) == request
     assert hash(request) == hash(helper._execution_from_wire(wire))
+
+
+
+
+@pytest.mark.parametrize("decision_time,order_time", [
+    ("09:35", "09:30"),
+    ("09:29", "09:35"),
+    ("09:30", "09:60"),
+    ("09:30", "12:00"),
+    ("9:30", "09:35"),
+    ("09:30", "15:00"),
+])
+def test_split_schedule_rejects_invalid_times_before_registration(helper, decision_time, order_time):
+    calls = []
+    runtime = helper.JoinQuantRuntime(
+        _state("JQ", "sim_trade"),
+        {"run_daily": lambda *args, **kwargs: calls.append((args, kwargs))},
+    )
+    callback = lambda context: None
+    with pytest.raises(ValueError):
+        runtime.schedule_daily(
+            callback, callback, callback, ("10:30",), callback,
+            open_decision_time=decision_time, open_order_time=order_time,
+        )
+    assert calls == []
+
+
+def test_split_schedule_uses_picklable_callbacks_and_restores_both_steps(helper, monkeypatch):
+    schedules = {}
+    selections = []
+    submitted = []
+    global_state = types.SimpleNamespace()
+
+    def choose(context):
+        selections.append(context.current_dt)
+        return {"BUY": 0.5}, {"BUY": 10.0}
+
+    namespace = {
+        "g": global_state,
+        "choose": choose,
+        "run_daily": lambda callback, time, **kwargs: schedules.setdefault(time, callback),
+    }
+    runtime = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), namespace)
+    callback = lambda context: None
+    runtime.schedule_daily(
+        callback, choose, callback, ("10:30",), callback,
+        open_decision_time="09:30", open_order_time="09:35",
+    )
+    decision_callback = pickle.loads(pickle.dumps(schedules["09:30"]))
+    order_callback = pickle.loads(pickle.dumps(schedules["09:35"]))
+    context = types.SimpleNamespace(
+        current_dt=datetime(2026, 9, 8, 9, 30),
+        portfolio=types.SimpleNamespace(total_value=10000.0),
+    )
+    # A fresh facade must restore the named strategy callback before selection.
+    namespace["g"] = pickle.loads(pickle.dumps(namespace["g"]))
+    restored = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), namespace)
+    monkeypatch.setattr(helper, "_active_joinquant_runtime", restored)
+    decision_callback(context)
+    assert selections == [context.current_dt]
+    assert submitted == []
+
+    # Restart again between selection and submission; preserve the old sizing capital.
+    namespace["g"] = pickle.loads(pickle.dumps(namespace["g"]))
+    restored = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), namespace)
+    monkeypatch.setattr(helper, "_active_joinquant_runtime", restored)
+    monkeypatch.setattr(restored, "execute_rebalance", lambda *args, **kwargs: submitted.append((args, kwargs)))
+    context.current_dt += timedelta(minutes=5)
+    context.portfolio.total_value = 15000.0
+    order_callback(context)
+
+    assert len(selections) == 1
+    assert submitted == [
+        ((context, {"BUY": 0.5}, {"BUY": 10.0}, "open-20260908"), {"jq_planning_total": 10000.0})
+    ]
+    order_callback(context)
+    assert len(submitted) == 1
+
+
+def test_qmt_decision_freezes_marks_without_reading_jq_capital(helper, monkeypatch):
+    runtime = helper.JoinQuantRuntime(_state("QMT_REMOTE", "sim_trade"))
+    context = types.SimpleNamespace(current_dt=datetime(2026, 9, 8, 9, 30))
+    marks = {"BUY": 10.0}
+    runtime.prepare_rebalance(context, lambda ctx: ({"BUY": 0.95}, marks))
+    marks["BUY"] = 20.0
+    submitted = []
+    monkeypatch.setattr(runtime, "execute_rebalance", lambda *args, **kwargs: submitted.append((args, kwargs)))
+    context.current_dt += timedelta(minutes=5)
+
+    runtime.execute_prepared_rebalance(context)
+
+    assert submitted == [
+        ((context, {"BUY": 0.95}, {"BUY": 10.0}, "open-20260908"), {"jq_planning_total": None})
+    ]
 
 
 def test_qmt_prewarm_checks_account_and_quote_feed(helper, monkeypatch):

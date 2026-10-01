@@ -57,6 +57,21 @@ ARTIFACTS: Sequence[ArtifactSpec] = (
 )
 
 _ARTIFACT_ROLES = frozenset(spec.role for spec in ARTIFACTS)
+STRATEGY_SOURCES = {
+    "good_etf": "strategies/joinquant/good_etf.py",
+    "etf_reversal": "strategies/joinquant/etf_reversal.py",
+}
+
+
+def _artifacts_for_strategy(strategy: str) -> Sequence[ArtifactSpec]:
+    if strategy not in STRATEGY_SOURCES:
+        raise ValidationError("unknown JoinQuant strategy: {}".format(strategy))
+    return (
+        ArtifactSpec(
+            role="strategy", source=STRATEGY_SOURCES[strategy],
+            output=strategy + ".py", upload_name=strategy + ".py",
+        ),
+    ) + tuple(ARTIFACTS[1:])
 
 _SENSITIVE_POSITIONAL_CALLS: Mapping[str, Mapping[int, str]] = {
     "configure": {0: "host", 1: "token"},
@@ -496,12 +511,13 @@ def validate_private_profile(
 
 def _repository_snapshot(
     repo: Path,
+    strategy: str = "good_etf",
 ) -> tuple:
     repo = repo.resolve()
     results = []
     contents: Dict[str, bytes] = {}
     identity: Dict[str, object] = {}
-    for spec in ARTIFACTS:
+    for spec in _artifacts_for_strategy(strategy):
         source = repo / spec.source
         if not source.is_file():
             raise ValidationError("missing export source: {}".format(spec.source))
@@ -535,8 +551,8 @@ def _repository_snapshot(
     return results, contents, identity
 
 
-def validate_repository(repo: Path) -> List[Dict[str, object]]:
-    results, _, _ = _repository_snapshot(repo)
+def validate_repository(repo: Path, strategy: str = "good_etf") -> List[Dict[str, object]]:
+    results, _, _ = _repository_snapshot(repo, strategy)
     return results
 
 
@@ -581,13 +597,15 @@ def export_joinquant(
     repo: Path,
     destination: Path,
     private_profile: Optional[Path] = None,
+    *,
+    strategy: str = "good_etf",
 ) -> Dict[str, object]:
     repo = repo.resolve()
     destination = destination.absolute()
     if _has_reparse_component(destination):
         raise ValidationError("destination must not use a symlink or reparse point")
     destination = destination.resolve()
-    files, contents, identity = _repository_snapshot(repo)
+    files, contents, identity = _repository_snapshot(repo, strategy)
     if private_profile is not None:
         validate_private_profile(private_profile, identity)
     if destination.exists():
@@ -597,7 +615,7 @@ def export_joinquant(
         tempfile.mkdtemp(prefix=".joinquant-export-", dir=str(destination.parent))
     )
     try:
-        for spec, entry in zip(ARTIFACTS, files):
+        for spec, entry in zip(_artifacts_for_strategy(strategy), files):
             target = temporary / spec.output
             with target.open("wb") as stream:
                 stream.write(contents[spec.source])
@@ -627,6 +645,10 @@ def main() -> int:
     )
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--strategy", choices=tuple(STRATEGY_SOURCES), default="good_etf",
+        help="strategy to validate/export (default: good_etf)",
+    )
+    parser.add_argument(
         "--private-profile",
         help="validate a private jq_runtime_config.py without copying it",
     )
@@ -638,7 +660,7 @@ def main() -> int:
             Path(args.private_profile).absolute() if args.private_profile else None
         )
         if args.validate_only:
-            files, _, identity = _repository_snapshot(repo)
+            files, _, identity = _repository_snapshot(repo, args.strategy)
             if private_path is not None:
                 private_result = validate_private_profile(private_path, identity)
                 print(
@@ -651,7 +673,9 @@ def main() -> int:
         destination = Path(args.output)
         if not destination.is_absolute():
             destination = repo / destination
-        export_joinquant(repo, destination, private_profile=private_path)
+        export_joinquant(
+            repo, destination, private_profile=private_path, strategy=args.strategy
+        )
         if private_path is not None:
             print("JOINQUANT_PRIVATE_PROFILE_OK")
         print("JOINQUANT_EXPORT_OK {}".format(destination.resolve()))

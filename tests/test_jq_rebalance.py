@@ -308,3 +308,92 @@ def test_qmt_receives_fixed_open_limit_without_price_refresh_or_markup(helper, m
     assert execution.sell_style == original.sell_style
     assert execution.follow_up == original.follow_up
     assert execution.repricing == original.repricing
+
+
+def test_delayed_decision_survives_g_restore_and_uses_native_current_price(helper):
+    jq = JQ(cash=5000, holdings={"OLD": 500})
+    runtime = jq.runtime(helper)
+    weights, marks = {"BUY": 0.5}, {"BUY": 10.0}
+    runtime.prepare_rebalance(jq.context, lambda context: (weights, marks))
+    assert jq.calls == []
+    # Mutating the caller's data must not change the frozen decision.
+    weights["BUY"] = 0.9
+    marks["BUY"] = 1.0
+    jq.g = pickle.loads(pickle.dumps(jq.g))
+    restored = jq.runtime(helper)
+    jq.context.current_dt += timedelta(minutes=5)
+    jq.prices.update(OLD=20.0, BUY=12.0)
+    jq.refresh()
+    plans = []
+    restored.send_target_buy_plan = lambda items, **kwargs: plans.extend(items)
+
+    result = restored.execute_prepared_rebalance(jq.context)
+
+    assert result["errors"] == []
+    assert jq.calls == [("OLD", 0), ("BUY", 5000)]  # Original 10000 capital, not the current 15000.
+    assert jq.positions["BUY"].total_amount == 400  # Native execution at 12, not frozen mark 10.
+    assert plans[0]["amount"] == 5000
+    assert plans[0]["reference_price"] == 10.0
+    assert restored.execute_prepared_rebalance(jq.context) is None
+    assert len(jq.calls) == 2
+    assert not hasattr(restored, "on_bar")
+    assert not hasattr(jq.g, "bt_jq_plan")
+
+
+@pytest.mark.parametrize("failed_decision", ["none", "exception"])
+def test_failed_selection_clears_previous_snapshot_and_does_not_reselect(helper, failed_decision):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+    runtime.prepare_rebalance(jq.context, lambda context: ({"BUY": 0.5}, {"BUY": 10.0}))
+
+    def decide(context):
+        if failed_decision == "exception":
+            raise RuntimeError("data unavailable")
+        return None
+
+    runtime.prepare_rebalance(jq.context, decide)
+    jq.context.current_dt += timedelta(minutes=5)
+    assert runtime.execute_prepared_rebalance(jq.context) is None
+    assert jq.calls == []
+
+
+def test_empty_decision_liquidates_at_order_time_while_missing_decision_skips(helper):
+    jq = JQ(cash=5000, holdings={"OLD": 500})
+    runtime = jq.runtime(helper)
+    assert runtime.execute_prepared_rebalance(jq.context) is None
+    assert jq.calls == []
+    runtime.prepare_rebalance(jq.context, lambda context: ({}, {}))
+    assert jq.calls == []
+    jq.context.current_dt += timedelta(minutes=5)
+
+    runtime.execute_prepared_rebalance(jq.context)
+
+    assert jq.calls == [("OLD", 0)]
+
+
+def test_previous_day_decision_is_never_executed(helper):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+    runtime.prepare_rebalance(jq.context, lambda context: ({"BUY": 0.5}, {"BUY": 10.0}))
+    jq.context.current_dt += timedelta(days=1)
+
+    assert runtime.execute_prepared_rebalance(jq.context) is None
+    assert jq.calls == []
+    assert jq.g.bt_open_decision is None
+
+
+def test_delayed_submission_does_not_wait_for_sell_or_retry_partial_buy(helper):
+    jq = JQ(cash=1000, holdings={"OLD": 900})
+    jq.pending.add("OLD")
+    runtime = jq.runtime(helper)
+    runtime.prepare_rebalance(jq.context, lambda context: ({"BUY": 0.8}, {"BUY": 10.0}))
+    jq.context.current_dt += timedelta(minutes=5)
+
+    runtime.execute_prepared_rebalance(jq.context)
+
+    assert jq.calls == [("OLD", 0), ("BUY", 8000)]
+    assert jq.positions["BUY"].total_amount == 100
+    assert len(jq.open) == 1
+    jq.context.current_dt += timedelta(minutes=1)
+    assert runtime.execute_prepared_rebalance(jq.context) is None
+    assert len(jq.calls) == 2

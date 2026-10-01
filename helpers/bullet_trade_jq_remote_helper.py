@@ -34,6 +34,7 @@ import math
 import socket
 import ssl
 import struct
+import threading
 import time
 import uuid
 from collections import namedtuple
@@ -86,8 +87,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 22
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v22"
+STRATEGY_RUNTIME_API_VERSION = 23
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v23"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -156,6 +157,11 @@ _active_namespace = None  # type: Optional[Dict[str, Any]]
 _active_joinquant_runtime = None  # type: Optional[Any]
 _runtime_target_state = None  # type: Optional[Dict[str, Any]]
 _security_name_cache = {}  # type: Dict[str, str]
+_rpc_connection = None  # type: Optional[Dict[str, Any]]
+_rpc_lock = threading.RLock()
+_RPC_IDLE_MAX_SECONDS = 90.0
+_RPC_IDLE_PROBE_SECONDS = 20.0
+_rpc_stats = {"connections": 0, "reused": 0}
 _TERMINAL_INTENT_STATES = frozenset({"COMPLETED", "CANCELED", "FAILED"})
 _QMT_CALLBACK_WINDOW_START_SECONDS = 9 * 60 * 60 + 15 * 60
 _QMT_CALLBACK_WINDOW_END_SECONDS = 15 * 60 * 60
@@ -701,12 +707,84 @@ def _read_message(sock: socket.socket) -> Dict[str, Any]:
     return result
 
 
+def _close_rpc_connection() -> None:
+    global _rpc_connection
+    connection, _rpc_connection = _rpc_connection, None
+    if connection is not None:
+        try:
+            connection["socket"].close()
+        except Exception:
+            pass
+
+
+def _get_rpc_connection(profile: Dict[str, Any]) -> Any:
+    """Caller holds _rpc_lock; no socket or credential is persisted in g."""
+
+    global _rpc_connection
+    signature = tuple(profile.get(key) for key in (
+        "host", "port", "token", "tls_cert", "account_key"
+    ))
+    if _rpc_connection is not None:
+        if (
+            _rpc_connection["signature"] == signature
+            and time.monotonic() - _rpc_connection["last_used"] <= _RPC_IDLE_MAX_SECONDS
+        ):
+            sock = _rpc_connection["socket"]
+            sock.settimeout(float(profile["rpc_timeout"]))
+            _rpc_stats["reused"] += 1
+            return sock
+        _close_rpc_connection()
+    sock = socket.create_connection(
+        (profile["host"], profile["port"]),
+        timeout=min(float(profile["rpc_timeout"]), 10.0),
+    )
+    try:
+        set_option = getattr(sock, "setsockopt", None)
+        if callable(set_option):
+            set_option(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            set_option(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        tls_cert = profile.get("tls_cert")
+        if tls_cert:
+            context = ssl.create_default_context(cafile=tls_cert)
+            sock = context.wrap_socket(sock, server_hostname=profile["host"])
+        sock.settimeout(float(profile["rpc_timeout"]))
+        _send_message(sock, {
+            "type": "handshake", "token": profile["token"], "protocol": 1,
+            "features": ["strategy_ledger_v1"],
+            "account_key": profile.get("account_key"),
+        })
+        if _read_message(sock).get("type") != "handshake_ack":
+            raise RuntimeError("服务器握手失败")
+    except Exception:
+        sock.close()
+        raise
+    _rpc_connection = {
+        "signature": signature, "socket": sock, "last_used": time.monotonic(),
+    }
+    _rpc_stats["connections"] += 1
+    return sock
+
+
 def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # A persistent connection has one response reader. Serialize complete RPCs.
+    with _rpc_lock:
+        return _strategy_request_locked(action, payload)
+
+
+def _ping_rpc_connection(sock: Any) -> None:
+    ping_id = uuid.uuid4().hex
+    _send_message(sock, {"type": "ping", "id": ping_id})
+    response = _read_message(sock)
+    if response.get("type") != "pong" or response.get("id") != ping_id:
+        raise RuntimeError("连接保活响应不匹配")
+    _rpc_connection["last_used"] = time.monotonic()
+
+
+def _strategy_request_locked(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if _active_profile is None or _active_state is None:
         raise RuntimeError("策略运行时尚未安装")
     profile = _active_profile
     timeout = float(profile["rpc_timeout"])
-    connect_timeout = min(timeout, 10.0)
     safe_retry = action not in (
         "strategy.submit_targets",
         "strategy.cancel_intent",
@@ -715,38 +793,18 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     last_error = None  # type: Optional[Exception]
 
     for attempt in range(1, _RPC_ATTEMPTS + 1):
-        raw_sock = None
-        sock = None
-        phase = "连接"
+        phase = "连接/应用握手"
         request_may_have_been_sent = False
         try:
-            raw_sock = socket.create_connection(
-                (profile["host"], profile["port"]), timeout=connect_timeout
-            )
-            sock = raw_sock
-            tls_cert = profile.get("tls_cert")
-            if tls_cert:
-                phase = "TLS握手"
-                context = ssl.create_default_context(cafile=tls_cert)
-                sock = context.wrap_socket(
-                    raw_sock, server_hostname=profile["host"]
-                )
+            sock = _get_rpc_connection(profile)
             sock.settimeout(timeout)
-
-            phase = "应用握手"
-            _send_message(
-                sock,
-                {
-                    "type": "handshake",
-                    "token": profile["token"],
-                    "protocol": 1,
-                    "features": ["strategy_ledger_v1"],
-                    "account_key": profile.get("account_key"),
-                },
-            )
-            handshake = _read_message(sock)
-            if handshake.get("type") != "handshake_ack":
-                raise RuntimeError("服务器握手失败")
+            if not safe_retry and (
+                time.monotonic() - _rpc_connection["last_used"] >= _RPC_IDLE_PROBE_SECONDS
+            ):
+                # A ping has no order side effects. A dead idle socket can be
+                # replaced before any business bytes are sent, never after.
+                phase = "连接保活"
+                _ping_rpc_connection(sock)
 
             request_id = uuid.uuid4().hex
             request_payload = dict(payload)
@@ -783,10 +841,14 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             result = response.get("payload")
             if not isinstance(result, dict):
                 raise RuntimeError("服务器响应payload无效")
+            if _rpc_connection is not None:
+                _rpc_connection["last_used"] = time.monotonic()
             return result
         except _ServerResponseError as exc:
+            _close_rpc_connection()
             raise RuntimeError(str(exc)) from None
         except Exception as exc:
+            _close_rpc_connection()
             if not safe_retry and request_may_have_been_sent:
                 raise _AmbiguousRequestError(
                     "{}在{}阶段失败：请求可能已执行，已停止自动重发；"
@@ -802,13 +864,6 @@ def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 )
                 time.sleep(_RPC_RETRY_INTERVAL_SECONDS)
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
     raise RuntimeError(
         "{}请求失败：{}阶段连续尝试{}次仍未成功（{}）".format(
             action, phase, _RPC_ATTEMPTS,
@@ -1630,6 +1685,56 @@ class JoinQuantRuntime:
         self._namespace = namespace
         self._qmt_initial_capital = qmt_initial_capital
         self._qmt_readiness_attempted = False
+        self._prepared_rebalance = None  # type: Optional[Dict[str, Any]]
+        self._open_schedule = None  # type: Optional[Dict[str, str]]
+        self._open_decision_callback = None  # type: Optional[Callable[[Any], Any]]
+        self._captured_logs = None  # type: Optional[list]
+        self._pending_rebalance_logs = []  # type: list
+        self._rebalance_timing = None  # type: Optional[Dict[str, Any]]
+        self._pending_decision_ms = None  # type: Optional[float]
+        self._rebalance_started = 0.0
+
+    def prepare_rebalance_candidates(self, context: Any, securities: Any) -> None:
+        """Cache only candidate codes/names; no price, target or order is prepared."""
+
+        clock = _strategy_clock_parts(getattr(context, "current_dt", None))
+        if clock is None:
+            raise ValueError("候选准备日期不可用")
+        codes = tuple(dict.fromkeys(str(code) for code in securities))
+        prepared = {
+            "date": clock[:3], "securities": codes,
+            "security_names": _security_names(codes),
+        }
+        global_state = (self._namespace or {}).get("g")
+        if global_state is not None:
+            setattr(global_state, "bt_rebalance_candidates", prepared)
+
+    def _prepared_candidates(self, context: Any) -> Tuple[str, ...]:
+        global_state = (self._namespace or {}).get("g")
+        prepared = getattr(global_state, "bt_rebalance_candidates", None)
+        clock = _strategy_clock_parts(getattr(context, "current_dt", None))
+        if not prepared or clock is None or tuple(prepared["date"]) != clock[:3]:
+            return ()
+        _security_name_cache.update(prepared.get("security_names", {}))
+        return tuple(prepared["securities"])
+
+    def _prewarm_rpc(self, context: Any) -> None:
+        if not self.qmt_account_enabled or not self._qmt_callback_allowed(context, "连接预热"):
+            return
+        try:
+            if _active_profile is None:
+                raise RuntimeError("连接配置尚未安装")
+            with _rpc_lock:
+                _get_rpc_connection(_active_profile)
+                # Opening a new connection resets transport state; warming an
+                # existing one also detects server/NAT idle disconnects safely.
+                sock = _rpc_connection["socket"]
+                _ping_rpc_connection(sock)
+            self._log("info", "开盘RPC连接预热完成")
+        except Exception as exc:
+            with _rpc_lock:
+                _close_rpc_connection()
+            self._log("warn", "开盘RPC连接预热失败，将在请求前重新连接：{}".format(type(exc).__name__))
 
     def _set_qmt_ready(self, ready: bool) -> None:
         global _active_state
@@ -1659,9 +1764,13 @@ class JoinQuantRuntime:
         ):
             return
         try:
+            candidates = self._prepared_candidates(context)
+            payload = {"initial_capital": self._qmt_initial_capital}
+            if candidates:
+                payload["candidate_securities"] = list(candidates)
             ensured = _strategy_request(
                 "strategy.prepare_session",
-                {"initial_capital": self._qmt_initial_capital},
+                payload,
             )
             reconciliation = ensured.get("reconciliation", {})
             if reconciliation.get("state") != "READY":
@@ -1691,6 +1800,9 @@ class JoinQuantRuntime:
 
     def _log(self, level: str, message: str) -> None:
         if self.state.get("jq_log_enabled", True) is not True:
+            return
+        if self._captured_logs is not None:
+            self._captured_logs.append((level, message))
             return
         if self._namespace is None:
             return
@@ -1757,32 +1869,80 @@ class JoinQuantRuntime:
         opening_decision_time: str = "09:28",
         market_open_time: str = "09:30",
         sell_then_buy: bool = False,
+        *,
+        open_decision_time: Optional[str] = None,
+        open_order_time: Optional[str] = None,
     ) -> None:
-        """Register the common ETF strategy schedule on JoinQuant."""
+        """Register ETF callbacks, optionally separating decision and execution.
 
-        run_daily = self._platform_api("run_daily")
+        With open_order_time, market_open returns (weights, marks) or None.
+        Without it, the original combined callback contract remains available.
+        """
+
+        open_decision_time = open_decision_time or market_open_time
+        if open_order_time is not None:
+            if opening_decision is not None or sell_then_buy:
+                raise ValueError("冻结选股实验不能同时启用独立清仓买入流程")
+            self._validate_open_time(open_decision_time)
+            self._validate_open_time(open_order_time)
+            if open_order_time < open_decision_time:
+                raise ValueError("下单时间不得早于选股时间")
+        warmup_times = set()
         if self.qmt_account_enabled:
-            run_daily(
-                prewarm_joinquant_qmt,
-                "09:20",
-                reference_security=reference_security,
-            )
+            for target_time in (
+                opening_decision_time if opening_decision is not None else open_decision_time,
+                open_order_time or open_decision_time,
+            ):
+                try:
+                    parsed = time.strptime(target_time, "%H:%M")
+                except ValueError:
+                    continue  # Preserve legacy JoinQuant aliases such as "open".
+                minutes = parsed.tm_hour * 60 + parsed.tm_min - 1
+                warmup_times.add("{:02d}:{:02d}".format(minutes // 60, minutes % 60))
+        run_daily = self._platform_api("run_daily")
         run_daily(
             before_market_open,
             "09:20",
             reference_security=reference_security,
         )
+        if self.qmt_account_enabled:
+            # Register after preprocessing so its candidate list is available.
+            run_daily(prewarm_joinquant_qmt, "09:20", reference_security=reference_security)
+            for warmup_time in sorted(warmup_times):
+                run_daily(_prewarm_joinquant_rpc, warmup_time, reference_security=reference_security)
         if opening_decision is not None:
             run_daily(
                 opening_decision,
                 opening_decision_time,
                 reference_security=reference_security,
             )
-        run_daily(
-            market_open,
-            market_open_time,
-            reference_security=reference_security,
-        )
+        if open_order_time is None:
+            run_daily(
+                market_open,
+                open_decision_time,
+                reference_security=reference_security,
+            )
+        else:
+            self._open_decision_callback = market_open
+            self._open_schedule = {
+                "callback_name": market_open.__name__,
+                "decision_time": open_decision_time,
+                "order_time": open_order_time,
+            }
+            global_state = (self._namespace or {}).get("g")
+            if global_state is not None:
+                setattr(global_state, "bt_open_schedule", dict(self._open_schedule))
+            run_daily(
+                _decide_joinquant_open_rebalance,
+                open_decision_time,
+                reference_security=reference_security,
+            )
+            if open_order_time != open_decision_time:
+                run_daily(
+                    _submit_joinquant_open_rebalance,
+                    open_order_time,
+                    reference_security=reference_security,
+                )
         if sell_then_buy:
             # Explicit opt-in only: native/default JQ execution is unchanged.
             run_daily(
@@ -1804,12 +1964,160 @@ class JoinQuantRuntime:
         self._log(
             "info",
             "任务调度完成 | {}09:20 盘前预处理 | {}{} 下单 | ".format(
-                "09:20 QMT盘前准备 | " if self.qmt_account_enabled else "",
+                "09:20 QMT盘前准备 | {} RPC连接预热 | ".format("/".join(sorted(warmup_times)))
+                if self.qmt_account_enabled else "",
                 "{} 锁定选股 | ".format(opening_decision_time)
                 if opening_decision is not None else "",
-                market_open_time,
+                open_order_time or open_decision_time,
             )
-            + "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times)),
+            + "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times))
+            + " | 选股={} 下单={}".format(
+                open_decision_time, open_order_time or open_decision_time
+            ),
+        )
+
+    def _run_open_decision(self, context: Any) -> None:
+        global_state = (self._namespace or {}).get("g")
+        schedule = (
+            getattr(global_state, "bt_open_schedule", None)
+            if global_state is not None else self._open_schedule
+        )
+        if schedule is None:
+            self._store_prepared_rebalance(None)
+            self._log("warn", "没有选股调度配置，跳过选股")
+            return
+        callback = (self._namespace or {}).get(schedule["callback_name"])
+        if not callable(callback):
+            callback = self._open_decision_callback
+        if not callable(callback):
+            self._store_prepared_rebalance(None)
+            self._log("warn", "选股回调不可用，跳过选股")
+            return
+        self.prepare_rebalance(context, callback)
+        if schedule["order_time"] == schedule["decision_time"]:
+            self.execute_prepared_rebalance(context)
+
+    @staticmethod
+    def _validate_open_time(value: str) -> None:
+        if (
+            not isinstance(value, str)
+            or len(value) != 5
+            or value[2] != ":"
+            or not (value[:2] + value[3:]).isdigit()
+            or not (
+                "09:30" <= value <= "11:29"
+                or "13:00" <= value <= "14:59"
+            )
+            or int(value[3:]) > 59
+        ):
+            raise ValueError("选股/下单时间必须是盘中HH:MM")
+
+    def _store_prepared_rebalance(
+        self, decision: Optional[Dict[str, Any]]
+    ) -> None:
+        self._prepared_rebalance = decision
+        global_state = (self._namespace or {}).get("g")
+        if global_state is not None:
+            # A serializable decision snapshot, not an order continuation plan.
+            setattr(global_state, "bt_open_decision", decision)
+
+    def prepare_rebalance(
+        self,
+        context: Any,
+        decide: Callable[
+            [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
+        ],
+    ) -> None:
+        """Freeze one account-neutral decision and the JQ sizing capital."""
+
+        self._store_prepared_rebalance(None)
+        started = time.perf_counter()
+        captured = []
+        self._captured_logs = captured
+        prepared = False
+        try:
+            clock = _strategy_clock_parts(getattr(context, "current_dt", None))
+            if clock is None:
+                raise ValueError("选股时间不可用")
+            self._prepared_candidates(context)  # Restore cached names after restart.
+            decision = decide(context)
+            if decision is None:
+                self._log("warn", "本次选股未生成有效目标，将跳过下单")
+                return
+            weights, marks = decision
+            snapshot = {
+                "decision_clock": clock,
+                "weights": dict(weights),
+                "marks": dict(marks),
+                "jq_planning_total": (
+                    float(context.portfolio.total_value)
+                    if self.jq_account_enabled else None
+                ),
+            }
+            self._log(
+                "info",
+                "选股目标已冻结 | 时间={} | 标的数={} 部署={:.2%}".format(
+                    getattr(context, "current_dt", None), len(weights),
+                    sum(float(weight) for weight in weights.values()),
+                ),
+            )
+            snapshot["decision_logs"] = list(captured)
+            snapshot["decision_elapsed_ms"] = (time.perf_counter() - started) * 1000
+            self._store_prepared_rebalance(snapshot)
+            prepared = True
+        except Exception as exc:
+            self._store_prepared_rebalance(None)
+            self._log("error", "选股目标冻结失败，跳过下单：{}".format(exc))
+        finally:
+            self._captured_logs = None
+            if not prepared:
+                self._flush_logs(captured)
+
+    def _flush_logs(self, entries: Any) -> None:
+        for level, message in entries:
+            try:
+                self._log(level, message)
+            except Exception:
+                # Reporting failure cannot change a completed submission.
+                pass
+
+    def execute_prepared_rebalance(
+        self, context: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Submit the same-day snapshot once, without reranking or retries."""
+
+        global_state = (self._namespace or {}).get("g")
+        snapshot = (
+            getattr(global_state, "bt_open_decision", None)
+            if global_state is not None else self._prepared_rebalance
+        )
+        clock = _strategy_clock_parts(getattr(context, "current_dt", None))
+        if snapshot is None or clock is None:
+            self._log("warn", "没有当日有效选股目标，跳过下单；不会在下单时重新选股")
+            return None
+        decision_clock = snapshot["decision_clock"]
+        if clock[:3] != decision_clock[:3]:
+            self._store_prepared_rebalance(None)
+            self._log("warn", "选股目标已过期，跳过下单")
+            return None
+        if clock < decision_clock:
+            self._log("warn", "尚未到选股时间，跳过下单")
+            return None
+        self._store_prepared_rebalance(None)
+        self._pending_decision_ms = snapshot.get("decision_elapsed_ms")
+        self._pending_rebalance_logs = list(snapshot.get("decision_logs", ()))
+        self._pending_rebalance_logs.append((
+            "info", "执行冻结目标 | 选股时间={} 下单时间={}".format(
+                "{:02d}:{:02d}:{:02d}".format(*decision_clock[3:]),
+                getattr(context, "current_dt", None),
+            ),
+        ))
+        return self.execute_rebalance(
+            context,
+            snapshot["weights"],
+            snapshot["marks"],
+            "open-{:04d}{:02d}{:02d}".format(*clock[:3]),
+            jq_planning_total=snapshot["jq_planning_total"],
         )
 
     def log_process_initialize(self) -> None:
@@ -2130,8 +2438,12 @@ class JoinQuantRuntime:
         portfolio: Any,
         weights: Dict[str, Any],
         marks: Dict[str, Any],
+        planning_total: Optional[float] = None,
     ) -> Any:
-        total_value = float(portfolio.total_value)
+        total_value = (
+            float(portfolio.total_value)
+            if planning_total is None else float(planning_total)
+        )
         items = []
         for security, raw_weight in weights.items():
             weight = float(raw_weight)
@@ -2384,6 +2696,69 @@ class JoinQuantRuntime:
         idempotency_key: str,
         execution: Optional[ExecutionRequest] = None,
         buy_limit_prices: Optional[Dict[str, float]] = None,
+        *,
+        jq_planning_total: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Submit before emitting diagnostics or doing notification RPCs."""
+
+        self._rebalance_started = time.perf_counter()
+        rpc_before = dict(_rpc_stats)
+        self._captured_logs = list(self._pending_rebalance_logs)
+        self._pending_rebalance_logs = []
+        self._rebalance_timing = {
+            "decision_ms": self._pending_decision_ms,
+            "first_jq_order_ms": None, "orders_ms": None, "notification_ms": None,
+            "qmt_submit_ms": None, "qmt_accepted_ms": None,
+        }
+        self._pending_decision_ms = None
+        try:
+            return self._execute_rebalance(
+                context, weights, marks, idempotency_key, execution,
+                buy_limit_prices=buy_limit_prices,
+                jq_planning_total=jq_planning_total,
+            )
+        finally:
+            timing = self._rebalance_timing
+            timing["rpc_connections"] = _rpc_stats["connections"] - rpc_before["connections"]
+            timing["rpc_reused"] = _rpc_stats["reused"] - rpc_before["reused"]
+            timing["as_of"] = str(getattr(context, "current_dt", ""))
+            entries, self._captured_logs = self._captured_logs, None
+            logging_started = time.perf_counter()
+            self._flush_logs(entries or ())
+            timing["logs_ms"] = (time.perf_counter() - logging_started) * 1000
+            timing["total_ms"] = (time.perf_counter() - self._rebalance_started) * 1000
+            global_state = (self._namespace or {}).get("g")
+            if global_state is not None:
+                setattr(global_state, "bt_last_rebalance_timing", dict(timing))
+            def display(value: Any) -> str:
+                return "未发生" if value is None else "{:.1f}ms".format(value)
+            self._flush_logs((("info", (
+                "调仓耗时 | 选股={} 执行至首个JQ接口调用={} "
+                "QMT提交={} QMT接受={} 提交阶段={} 通知={} 日志={} RPC新建={} 复用={}"
+            ).format(
+                display(timing["decision_ms"]), display(timing["first_jq_order_ms"]),
+                display(timing["qmt_submit_ms"]), display(timing["qmt_accepted_ms"]),
+                display(timing["orders_ms"]), display(timing["notification_ms"]),
+                display(timing["logs_ms"]),
+                timing["rpc_connections"], timing["rpc_reused"],
+            )),))
+
+    def _note_first_jq_order(self) -> None:
+        if self._rebalance_timing["first_jq_order_ms"] is None:
+            self._rebalance_timing["first_jq_order_ms"] = (
+                time.perf_counter() - self._rebalance_started
+            ) * 1000
+
+    def _execute_rebalance(
+        self,
+        context: Any,
+        weights: Dict[str, Any],
+        marks: Dict[str, Any],
+        idempotency_key: str,
+        execution: Optional[ExecutionRequest] = None,
+        buy_limit_prices: Optional[Dict[str, float]] = None,
+        *,
+        jq_planning_total: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Apply one decision independently to QMT and JQ enabled accounts."""
 
@@ -2463,6 +2838,9 @@ class JoinQuantRuntime:
                             qmt_marks.setdefault(security, float(position.price))
                     qmt_security_names = _security_names(qmt_weights)
                     if qmt_weights:
+                        self._rebalance_timing["qmt_submit_ms"] = (
+                            time.perf_counter() - self._rebalance_started
+                        ) * 1000
                         result["qmt"] = self.submit_targets(
                             context,
                             qmt_weights,
@@ -2472,23 +2850,9 @@ class JoinQuantRuntime:
                             qmt_security_names,
                         )
                         qmt_submitted = True
-                        try:
-                            accepted_snapshot = result["qmt"].get("snapshot")
-                            qmt_portfolio = (
-                                PortfolioView(accepted_snapshot)
-                                if isinstance(accepted_snapshot, dict)
-                                else get_portfolio(
-                                    as_of=getattr(context, "current_dt", None)
-                                )
-                            )
-                            notification_items = self._target_buy_plan_items(
-                                qmt_portfolio, weights, marks
-                            )
-                        except Exception as exc:
-                            self._log(
-                                "warn",
-                                "QMT目标已提交，但计划卡片未生成：{}".format(exc),
-                            )
+                        self._rebalance_timing["qmt_accepted_ms"] = (
+                            time.perf_counter() - self._rebalance_started
+                        ) * 1000
             except Exception as exc:
                 result["errors"].append(("QMT", str(exc)))
                 self._log(
@@ -2496,34 +2860,29 @@ class JoinQuantRuntime:
                     "QMT调仓执行异常：{}".format(exc),
                 )
 
-        if qmt_submitted:
-            self.send_target_buy_plan(
-                notification_items,
-                occurred_at=getattr(context, "current_dt", None),
-            )
-
         if self.jq_account_enabled:
             try:
                 jq_portfolio = context.portfolio
                 if not self.qmt_account_enabled:
                     notification_items = self._target_buy_plan_items(
-                        jq_portfolio, weights, marks
-                    )
-                    self.send_target_buy_plan(
-                        notification_items,
-                        occurred_at=getattr(context, "current_dt", None),
+                        jq_portfolio, weights, marks, jq_planning_total
                     )
                 self.cancel_orders()
                 selected = set(weights)
                 for security in list(jq_portfolio.positions.keys()):
                     if security not in selected:
+                        self._note_first_jq_order()
                         order_obj = self.order_target(security, 0)
                         result["jq_orders"].append(
                             (security, 0.0, order_obj)
                         )
-                planning_total = float(jq_portfolio.total_value)
+                planning_total = (
+                    float(jq_portfolio.total_value)
+                    if jq_planning_total is None else float(jq_planning_total)
+                )
                 for security, raw_weight in weights.items():
                     target_value = planning_total * float(raw_weight)
+                    self._note_first_jq_order()
                     if buy_limit_prices is not None and target_value > self._position_value(
                         jq_portfolio.positions.get(security), float(marks.get(security, 0.0))
                     ):
@@ -2542,6 +2901,30 @@ class JoinQuantRuntime:
                     "error",
                     "JQ调仓执行异常：{}".format(exc),
                 )
+        self._rebalance_timing["orders_ms"] = (
+            time.perf_counter() - self._rebalance_started
+        ) * 1000
+        notification_started = time.perf_counter()
+        if qmt_submitted:
+            try:
+                accepted_snapshot = result["qmt"].get("snapshot")
+                qmt_portfolio = (
+                    PortfolioView(accepted_snapshot)
+                    if isinstance(accepted_snapshot, dict)
+                    else get_portfolio(as_of=getattr(context, "current_dt", None))
+                )
+                notification_items = self._target_buy_plan_items(
+                    qmt_portfolio, weights, marks
+                )
+            except Exception as exc:
+                self._log("warn", "QMT目标已提交，但计划卡片未生成：{}".format(exc))
+        if qmt_submitted or (self.jq_account_enabled and not self.qmt_account_enabled):
+            self.send_target_buy_plan(
+                notification_items, occurred_at=getattr(context, "current_dt", None),
+            )
+        self._rebalance_timing["notification_ms"] = (
+            time.perf_counter() - notification_started
+        ) * 1000
         qmt_result = result.get("qmt")
         if qmt_result is not None and "intent" in qmt_result:
             self._log(
@@ -2846,12 +3229,36 @@ def advance_joinquant_sell_then_buy(context: Any) -> None:
         runtime.advance_sell_then_buy(context)
 
 
+def _decide_joinquant_open_rebalance(context: Any) -> None:
+    """Top-level callback; restore its strategy entry from g after a restart."""
+
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        runtime._run_open_decision(context)
+
+
+def _submit_joinquant_open_rebalance(context: Any) -> None:
+    """Top-level callback; submit the saved decision through the active facade."""
+
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        runtime.execute_prepared_rebalance(context)
+
+
 def prewarm_joinquant_qmt(context: Any) -> None:
     """Top-level JQ scheduler callback, so saved schedules survive restarts."""
 
     runtime = _active_joinquant_runtime
     if runtime is not None:
         runtime.prewarm_qmt(context)
+
+
+def _prewarm_joinquant_rpc(context: Any) -> None:
+    """09:29 connection-only warmup; never reconciles or submits a target."""
+
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        runtime._prewarm_rpc(context)
 
 
 def install_joinquant_runtime(
