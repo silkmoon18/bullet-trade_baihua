@@ -240,11 +240,31 @@ def test_initialize_delegates_schedule_and_backtest_needs_no_remote_profile(monk
     monkeypatch.setattr(helper, 'install_joinquant_runtime', install)
     strategy.initialize(context())
     assert installed[0]['validate_remote_during_backtest'] is False
-    assert installed[0]['expected_api_version'] == 23
+    assert installed[0]['expected_api_version'] == 25
     assert installed[0]['strategy_id'] == 'etf_reversal_daily'
     args, kwargs = scheduled[0]
     assert args[3] == ()
-    assert kwargs == {'open_decision_time': '09:35', 'open_order_time': '09:35'}
+    assert kwargs == {'open_decision_time': '09:35', 'open_order_time': '09:35', 'replace_existing': True}
+
+
+def test_process_initialize_preserves_reversal_signals_and_replaces_schedule(monkeypatch, strategy):
+    scheduled = []
+    runtime = types.SimpleNamespace(
+        schedule_daily=lambda *args, **kw: scheduled.append((args, kw)),
+        log_process_initialize=lambda: None,
+    )
+    saved_candidates = object()
+    strategy.g.reversal_candidates = saved_candidates
+    strategy.g.reversal_signal_date = context().previous_date
+    strategy.g.reversal_rebalance_today = True
+    monkeypatch.setattr(helper, 'install_joinquant_runtime', lambda *args, **kwargs: runtime)
+    strategy.process_initialize(context())
+    assert scheduled[0][1] == {
+        'open_decision_time': '09:35', 'open_order_time': '09:35', 'replace_existing': True,
+    }
+    assert strategy.g.reversal_candidates is saved_candidates
+    assert strategy.g.reversal_signal_date == context().previous_date
+    assert strategy.g.reversal_rebalance_today is True
 
 
 @pytest.mark.parametrize('parameter,value', [('HOLD_DAYS', 0), ('REVERSAL_DAYS', 1.5),

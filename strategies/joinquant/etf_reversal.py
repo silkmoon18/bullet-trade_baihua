@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from joinquant_typing import Context
 
 STRATEGY_ID = 'etf_reversal_daily'
-_EXPECTED_RUNTIME_API_VERSION = 23
+_EXPECTED_RUNTIME_API_VERSION = 25
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 VALIDATE_REMOTE_DURING_BACKTEST = False
 QMT_INITIAL_CAPITAL = 10000
@@ -69,16 +69,23 @@ def initialize(context: 'Context') -> None:
     g.reversal_signal_date = None
     g.reversal_candidates = None
     g.reversal_rebalance_today = False
+    _declare_schedule()
+
+
+def _declare_schedule() -> None:
+    """只声明当前决策日程；替换旧调度由helper处理。"""
     _runtime.schedule_daily(
         before_market_open, market_open, handle_risk_management, (),
         after_market_check,
         open_decision_time=OPEN_DECISION_TIME, open_order_time=OPEN_ORDER_TIME,
+        replace_existing=True,
     )
 
 
 def process_initialize(context: 'Context') -> None:
     _install_runtime(context)
     _validate_parameters()
+    _declare_schedule()
     _runtime.log_process_initialize()
 
 

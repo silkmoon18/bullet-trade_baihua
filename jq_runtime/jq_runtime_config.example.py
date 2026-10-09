@@ -9,10 +9,13 @@ is ignored by Git; never commit credentials.
 PROFILE_SCHEMA_VERSION = 3
 
 # 必须填写下方PROFILES中已经存在的profile名称，例如"qmt-main"。
-# 未在STRATEGIES中声明的策略使用该连接，并安全地默认只启用JQ账户。
+# 显式ID未匹配STRATEGIES时使用该连接，并默认只启用JQ账户。
 DEFAULT_PROFILE = "qmt-main"
 
-# STRATEGIES的key必须与各策略脚本顶部的STRATEGY_ID完全一致：
+# 策略可以不写STRATEGY_ID：此时只运行JQ，不读取本配置或连接服务器。
+# 写了ID才精确匹配STRATEGIES的同名key；不自动选择唯一项或默认ID。
+# 使用QMT或服务器通知时，须显式指定ID；独立策略使用不同ID。
+# STRATEGIES的key是稳定的账本身份，不随策略代码或名称变化：
 # - 允许字符：字母、数字、点、下划线、连字符；长度1~128；必须唯一。
 # - profile：填写PROFILES中存在的名称；省略时使用DEFAULT_PROFILE。
 # - jq_account_enabled：bool；True时维护聚宽模拟账户。
@@ -22,7 +25,7 @@ DEFAULT_PROFILE = "qmt-main"
 # - 省略或找不到策略key时默认为JQ=True、QMT=False。
 # - 回测始终由run_type自动识别，只运行聚宽账户；无需额外配置。
 STRATEGIES = {
-    "good_etf_remote": {
+    "good_etf_remote_1000_20261008": {
         "profile": "qmt-main",
         "jq_account_enabled": True,
         "qmt_account_enabled": False,

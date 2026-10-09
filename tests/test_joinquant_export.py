@@ -133,7 +133,7 @@ spec = importlib.util.spec_from_file_location('reversal_upload', root / 'etf_rev
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 assert strategy.STRATEGY_ID == 'etf_reversal_daily'
-assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 23
+assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 25
 assert strategy.VALIDATE_REMOTE_DURING_BACKTEST is False
 assert strategy.OPEN_DECISION_TIME == strategy.OPEN_ORDER_TIME == '09:35'
 strategy._validate_parameters()
@@ -433,11 +433,12 @@ def test_profile_template_rejects_invalid_shapes(tmp_path, body, message):
 def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_path):
     exporter = _load_export_module()
     identity = _repository_identity(exporter)
+    strategy_id = identity["strategy_id"]
     private_profile = tmp_path / "jq_runtime_config.py"
     private_profile.write_text(
         "PROFILE_SCHEMA_VERSION = 3\n"
         "DEFAULT_PROFILE = 'qmt-main'\n"
-        "STRATEGIES = {'good_etf_remote': {'profile': 'qmt-main', "
+        "STRATEGIES = {" + repr(strategy_id) + ": {'profile': 'qmt-main', "
         "'jq_account_enabled': True, 'qmt_account_enabled': True}}\n"
         "PROFILES = {'qmt-main': {"
         "'host': '10.0.0.8', "
@@ -451,12 +452,58 @@ def test_private_profile_is_validated_without_exposing_or_copying_secrets(tmp_pa
     assert result == {
         "profile": "qmt-main",
         "profile_schema_version": 3,
-        "strategy_id": "good_etf_remote",
+        "strategy_id": strategy_id,
         "jq_account_enabled": True,
         "qmt_account_enabled": True,
     }
     assert list(tmp_path.iterdir()) == [private_profile]
     assert "hard-coded-real-token" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "strategies",
+    [
+        {"only": {"qmt_account_enabled": True}},
+        {"first": {}, "second": {"qmt_account_enabled": True}},
+        {},
+    ],
+)
+def test_export_keeps_omitted_id_local_exactly_like_helper(tmp_path, strategies):
+    exporter = _load_export_module()
+    identity = exporter._strategy_identity("def initialize(context): pass\n", "strategy.py")
+    assert identity == {"strategy_id": None}
+    profile = tmp_path / "jq_runtime_config.py"
+    profile.write_text(
+        "PROFILE_SCHEMA_VERSION = 3\nDEFAULT_PROFILE = 'main'\n"
+        + "STRATEGIES = " + repr(strategies) + "\n"
+        + "PROFILES = {'main': {'host': '127.0.0.1', 'token': 'test-token'}}\n",
+        encoding="utf-8",
+    )
+    result = exporter.validate_private_profile(profile, identity)
+    assert result == {
+        "profile": None, "profile_schema_version": 3, "strategy_id": None,
+        "jq_account_enabled": True, "qmt_account_enabled": False,
+    }
+
+
+@pytest.mark.parametrize("declaration", ["STRATEGY_ID = ''", "STRATEGY_ID = None", "STRATEGY_ID = make_id()"])
+def test_export_does_not_treat_invalid_explicit_identity_as_omitted(declaration):
+    exporter = _load_export_module()
+    with pytest.raises(exporter.ValidationError, match="STRATEGY_ID is invalid"):
+        exporter._strategy_identity(declaration + "\n", "strategy.py")
+
+
+def test_export_does_not_support_automatic_default_id(tmp_path):
+    exporter = _load_export_module()
+    profile = tmp_path / "jq_runtime_config.py"
+    profile.write_text(
+        "PROFILE_SCHEMA_VERSION = 3\nDEFAULT_PROFILE = 'main'\n"
+        "DEFAULT_STRATEGY_ID = 'missing'\nSTRATEGIES = {'only': {}}\n"
+        "PROFILES = {'main': {'host': '127.0.0.1', 'token': 'test-token'}}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(exporter.ValidationError, match="unknown profile assignment"):
+        exporter.validate_private_profile(profile, {"strategy_id": None})
 
 
 @pytest.mark.parametrize(
@@ -555,7 +602,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 23
+assert helper.STRATEGY_RUNTIME_API_VERSION == 25
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 3
 assert profile['DEFAULT_PROFILE'] == 'qmt-main'
@@ -634,7 +681,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == [23]
+assert called == [25]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

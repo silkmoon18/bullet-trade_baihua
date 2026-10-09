@@ -29,10 +29,9 @@ if TYPE_CHECKING:
     from joinquant_typing import Context  # noqa: F401
 
 # ===== 部署契约 =====
-STRATEGY_ID = 'good_etf_remote'
-
+STRATEGY_ID = 'good_etf_remote_1000_20261008'  # 可省略；使用QMT时须与私有配置的key一致
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 23
+_EXPECTED_RUNTIME_API_VERSION = 25
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -107,6 +106,11 @@ def initialize(context: 'Context') -> None:
     # 全局状态初始化，防止盘前预处理尚未运行时访问报 AttributeError
     g.fund_list = None
 
+    _declare_schedule()
+
+
+def _declare_schedule() -> None:
+    """只声明当前决策日程；替换旧调度由helper处理。"""
     _runtime.schedule_daily(
         before_market_open,
         market_open,
@@ -115,6 +119,7 @@ def initialize(context: 'Context') -> None:
         after_market_check,
         open_decision_time=OPEN_DECISION_TIME,
         open_order_time=OPEN_ORDER_TIME,
+        replace_existing=True,
     )
 
 
@@ -123,6 +128,7 @@ def process_initialize(context: 'Context') -> None:
     聚宽重启/代码刷新时调用，幂等恢复运行模式。
     """
     _install_runtime(context)
+    _declare_schedule()
     _runtime.log_process_initialize()
 
 

@@ -58,8 +58,8 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 23,
-            "strategy_id": "good_etf_remote",
+            "api_version": 25,
+            "strategy_id": "good_etf_remote_1000_20261008",
             "mode": mode.value,
         }
         self._portfolio = portfolio
@@ -103,11 +103,13 @@ class _Runtime:
         *,
         open_decision_time="09:30",
         open_order_time=None,
+        replace_existing=False,
     ):
         self.opening_decision = opening_decision
         self.opening_decision_time = opening_decision_time
         self.market_open_time = open_decision_time if open_order_time is not None else market_open_time
         self.sell_then_buy = sell_then_buy
+        self.replace_existing = replace_existing
         self.schedules.append(
             (
                 before_market_open,
@@ -328,6 +330,7 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
     assert len(source.splitlines()) <= 520
     assert functions == {
         "_install_runtime",
+        "_declare_schedule",
         "_load_tracked_index_names",
         "initialize",
         "process_initialize",
@@ -386,13 +389,14 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
 
     assert state is None  # The strategy must not read runtime bookkeeping state.
     assert strategy._runtime is runtime
+    assert strategy.STRATEGY_ID == "good_etf_remote_1000_20261008"
     namespace, kwargs = calls[0]
     assert namespace is strategy.__dict__
     assert kwargs == {
         "context": context,
-        "strategy_id": "good_etf_remote",
+        "strategy_id": strategy.STRATEGY_ID,
         "qmt_initial_capital": 1000,
-        "expected_api_version": 23,
+        "expected_api_version": 25,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
@@ -518,6 +522,7 @@ def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
     strategy.initialize(context)
 
     assert runtime.platform_configured is True
+    assert runtime.replace_existing is True
     assert len(runtime.schedules) == 1
     before, market, risk, times, after, reference, decision_time, order_time = runtime.schedules[0]
     assert before is strategy.before_market_open
@@ -533,6 +538,77 @@ def test_initialize_delegates_platform_setup_and_scheduling_to_runtime(
     assert decision_time == strategy.OPEN_DECISION_TIME == "09:30"
     assert order_time == strategy.OPEN_ORDER_TIME == "09:30"
     assert strategy.g.fund_list is None
+
+
+@pytest.mark.parametrize("filename", ["good_etf.py", "good_etf_open_0925.py"])
+def test_process_initialize_redeclares_schedule_without_resetting_state(monkeypatch, filename):
+    runtime = _Runtime(real_helper.RuntimeMode.JQ)
+    strategy = _load_strategy(
+        monkeypatch, _helper_with_install(runtime, []), STRATEGY_PATH.parent / filename
+    )
+    saved_pool, saved_decision = object(), object()
+    strategy.g.fund_list = saved_pool
+    strategy.g.bt_open_decision = saved_decision
+    strategy.process_initialize(_Context())
+    strategy.process_initialize(_Context())
+    assert len(runtime.schedules) == 2
+    assert runtime.schedules[0] == runtime.schedules[1]
+    assert runtime.replace_existing is True
+    assert strategy.g.fund_list is saved_pool
+    assert strategy.g.bt_open_decision is saved_decision
+    assert runtime.platform_configured is False
+    assert runtime.rebalances == runtime.order_calls == []
+
+
+def test_old_saved_schedule_is_migrated_to_execution_entry_without_changing_decisions(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    codes = ["510001.XSHG", "510002.XSHG", "510003.XSHG"]
+    pool = pd.DataFrame({"unit_net_value": [2.0] * 3}, index=codes)
+    strategy.g.fund_list = pool
+    saved_decision = object()
+    strategy.g.bt_open_decision = saved_decision
+    quotes = {code: types.SimpleNamespace(last_price=price, paused=False, high_limit=3.0)
+              for code, price in zip(codes, [1.7, 1.9, 1.8])}
+    monkeypatch.setattr(strategy, "get_current_data", lambda: quotes, raising=False)
+    portfolio = types.SimpleNamespace(total_value=10000, positions={"OLD": object()})
+    context = types.SimpleNamespace(current_dt=pd.Timestamp("2026-10-09 09:30:00"), portfolio=portfolio)
+    schedules = [("09:30", strategy.market_open)]
+    cleared, executions = [], []
+    def register(callback, *args, **kwargs):
+        schedules.append((args[0] if args else kwargs["time"], callback))
+    def clear():
+        cleared.append(True)
+        schedules.clear()
+    monkeypatch.setattr(strategy, "run_daily", register, raising=False)
+    monkeypatch.setattr(strategy, "unschedule_all", clear, raising=False)
+    runtime = real_helper.JoinQuantRuntime({
+        "mode": "JQ", "jq_account_enabled": True, "qmt_account_enabled": False,
+    }, strategy.__dict__)
+    strategy._runtime = runtime
+    monkeypatch.setattr(strategy, "_install_runtime", lambda ctx: None)
+    monkeypatch.setattr(real_helper, "_active_joinquant_runtime", runtime)
+    monkeypatch.setattr(runtime, "execute_rebalance", lambda *args, **kwargs: executions.append((args, kwargs)))
+
+    # The restored legacy entry returns a valid decision but never reaches execution.
+    old_weights, old_marks = schedules[0][1](context)
+    assert len(old_weights) == 3
+    assert executions == []
+    for _ in range(2):
+        strategy.process_initialize(context)
+        assert len(schedules) == 6
+        assert strategy.g.fund_list is pool
+        assert strategy.g.bt_open_decision is saved_decision
+        assert context.portfolio is portfolio
+        assert executions == []
+    assert len(cleared) == 2
+    opening = [callback for at, callback in schedules if at == "09:30"]
+    assert opening == [real_helper._decide_joinquant_open_rebalance]
+    assert [at for at, _ in schedules] == ["09:20", "09:30", "10:30", "13:30", "14:50", "14:55"]
+    opening[0](context)
+    assert len(executions) == 1
+    assert executions[0][0][1:3] == (old_weights, old_marks)
+    assert executions[0][1] == {"jq_planning_total": 10000.0}
+    assert "调度入口 | 时间=09:30 回调=_decide_joinquant_open_rebalance" in strategy.log.messages
 
 
 def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):

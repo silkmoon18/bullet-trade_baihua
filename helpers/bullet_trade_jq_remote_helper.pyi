@@ -174,7 +174,7 @@ class _StrategyRuntimeRequiredState(TypedDict):
     profile: Optional[str]
     mode: _RuntimeMode
     run_type: str
-    strategy_id: str
+    strategy_id: Optional[str]
     jq_account_enabled: bool
     qmt_account_enabled: bool
     enabled: bool
@@ -199,7 +199,7 @@ def install_strategy_runtime(
     *,
     context: Context,
     mode: _RuntimeMode,
-    strategy_id: str,
+    strategy_id: Optional[str],
     expected_api_version: int = ...,
     profile_module: str = ...,
     validate_remote: bool = ...,
@@ -234,6 +234,7 @@ class JoinQuantRuntime:
         *,
         open_decision_time: Optional[str] = ...,
         open_order_time: Optional[str] = ...,
+        replace_existing: bool = ...,
     ) -> None: ...
     def prepare_rebalance(
         self,
@@ -333,7 +334,7 @@ def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
     context: Context,
-    strategy_id: str,
+    strategy_id: Optional[str] = ...,
     qmt_initial_capital: Any,
     profile_module: str = ...,
     validate_remote_during_backtest: bool = ...,

@@ -33,7 +33,7 @@ def test_open_variant_is_standalone_and_preserves_other_decisions(monkeypatch):
         node.name: node for node in variant.body if isinstance(node, ast.FunctionDef)
     }
     assert set(variant_functions) == set(original_functions) | {"execute_opening_plan"}
-    for name in set(original_functions) - {"initialize", "market_open"}:
+    for name in set(original_functions) - {"initialize", "_declare_schedule", "market_open"}:
         assert ast.dump(variant_functions[name]) == ast.dump(original_functions[name])
 
     source = OPEN_VARIANT.read_text(encoding="utf-8")
@@ -49,10 +49,11 @@ def test_open_variant_is_standalone_and_preserves_other_decisions(monkeypatch):
     for name in (
         "MAX_HOLD_NUM", "MIN_MONEY", "MAX_MONEY", "STOP_LOSS_RATIO",
         "TAKE_PROFIT_RATIO", "DEPLOY_RATIO", "SKIP_SUSPENDED_LIMITUP",
-        "RISK_CHECK_TIMES", "QMT_INITIAL_CAPITAL",
+        "RISK_CHECK_TIMES",
     ):
         original_strategy = _load_strategy(monkeypatch)
         assert getattr(strategy, name) == getattr(original_strategy, name)
+    assert strategy.QMT_INITIAL_CAPITAL == 10000  # The independent variant's budget did not change.
 
 
 def test_open_variant_registers_0926_decision_and_0930_execution(monkeypatch):

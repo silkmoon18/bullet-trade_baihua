@@ -6,7 +6,7 @@
 
 1. 复制`jq_runtime_config.example.py`并命名为`jq_runtime_config.py`；可保存在本目录（已被Git忽略）或仓库外受限目录。
 2. 在私有文件的`PROFILES`中填写服务器地址、token，以及可选的账户定位和TLS证书名；在`STRATEGIES`中按`strategy_id`选择连接并分别开关JQ/QMT账户。
-3. 保持`PROFILE_SCHEMA_VERSION = 3`；策略脚本只声明唯一`STRATEGY_ID`，不再声明profile或模式。
+3. 保持`PROFILE_SCHEMA_VERSION = 3`；策略可以不声明`STRATEGY_ID`，此时只运行JQ。声明ID后才按同名配置选择账户，不在策略中解析配置或模式。
 4. 从仓库根运行 `python -X utf8 scripts/export_joinquant.py --validate-only --private-profile <仓库外文件>`；
    该校验不执行、不复制且不输出其中的秘密。
 5. 将已校验私有文件以 `jq_runtime_config.py` 的名字上传到聚宽研究根目录。
@@ -27,7 +27,19 @@
 
 可选字段仅为 `port`、`account_key`、`tls_cert` 和 `rpc_timeout`。`PROFILES`和单个profile必须是普通`dict`，字段名和字符串值必须是普通`str`。未知字段会被拒绝且不会回显字段名；配置导入或属性读取的意外异常使用固定消息且不保留异常链，避免日志/异常采集器通过错误文本或`__context__`取回 token。
 
-为避免配置笔误造成无限等待，schema v3限制`rpc_timeout`为5至300秒。一个profile可以被多个不同策略复用；每个独立策略的`STRATEGY_ID`仍必须全局唯一。
+为避免配置笔误造成无限等待，schema v3限制`rpc_timeout`为5至300秒。一个profile可以被多个不同策略复用；每个独立策略的有效账本ID仍必须全局唯一。
+
+## 不在策略中写ID（helper API24）
+
+`install_joinquant_runtime(..., qmt_initial_capital=1000)`可以省略`strategy_id`。仅接受显式传入的ID或策略namespace中的`STRATEGY_ID`（显式参数优先）；不从config自动选取ID，不支持`DEFAULT_STRATEGY_ID`，也不生成本地替代ID。
+
+未传ID且未声明`STRATEGY_ID`时，模拟交易只启用JQ账户，回测仍使用JQ历史撮合；不读取私有配置、不连接服务器、不发送服务器飞书卡片，也不做远程预检（即使预检开关为True）。聚宽原生日志和下单保留，不会误用配置中的任何QMT账本。
+
+写了ID则只精确匹配`STRATEGIES`中的同名key；找不到时沿用原有JQ-only默认值，不转用其他key。需要QMT时必须显式指定配置中的ID。当前GoodETF保留`STRATEGY_ID = 'good_etf_remote_1000_20261008'`，继续绑定已经创建的1000元账本，无需再次重建。多个独立QMT策略各自使用不同ID。低层安装允许本地JQ/无远程预检回测使用`strategy_id=None`，QMT及远程预检仍要求明确ID。
+
+当前helper为API25，保留API24引入的可选ID语义。升级时一起更新研究根目录helper及配套策略，并冷启动；共享helper的其他策略也需同步配套API25源码。私有配置schema保持3，现有连接与账户开关不变。导出门禁与helper一致：无ID不匹配、显式ID精确匹配；私有文件不会复制到公开导出物。
+
+API25在恢复时重新声明并替换聚宽当前策略的全部定时任务，避免旧模拟交易仍直接调用只返回权重的选股函数。实际取消/注册和入口日志由helper管理，策略不直接调用平台调度接口；资金、持仓、冻结决策和QMT账本保留，恢复不主动补跑错过的交易。详见[调度恢复](../strategies/joinquant/README.md#旧模拟交易的调度恢复api25)。
 
 ## 模式边界
 
@@ -35,12 +47,13 @@
 
 | 聚宽环境 | 有效执行模式 | helper/profile | 交易行为 |
 |---|---|---|---|
+| 未声明ID的回测/`sim_trade` | `BACKTEST` / `JQ` | 仅需helper，不读取profile | 聚宽原生撮合/交易；不连接服务器或发送服务器通知 |
 | `simple_backtest`、`full_backtest` | `ExecutionMode.BACKTEST` | 需要helper；仅远程预检开启时读取profile | 聚宽历史撮合；远程快照只写日志，不参与历史决策，也不提交远程目标 |
 | `sim_trade` + JQ开、QMT关 | `JQ` | 需要helper/profile | 聚宽原生下单、撤单、模拟撮合和指标；维持现有JQ目标计划通知 |
 | `sim_trade` + JQ关、QMT开 | `QMT_REMOTE` | 需要helper/profile | 只读取StrategyLedger并提交QMT目标；阻断聚宽原生交易函数 |
 | `sim_trade` + JQ开、QMT开 | `JQ_QMT_PARALLEL` | 需要helper/profile | 同一决策分别按两个账户自己的资产、持仓和成本执行；只发送QMT通知 |
 
-账户开关和连接在私有配置中按策略独立设置。找不到策略键时使用`DEFAULT_PROFILE`并默认JQ开、QMT关，不会静默进入QMT下单：
+账户开关和连接在私有配置中按策略独立设置。显式指定的ID找不到配置键时使用`DEFAULT_PROFILE`并默认JQ开、QMT关，不会静默进入QMT下单；省略ID时必须按上方规则确定唯一身份：
 
 ```python
 PROFILE_SCHEMA_VERSION = 3

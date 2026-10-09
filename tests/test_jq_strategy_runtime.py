@@ -83,7 +83,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 23,
+        "api_version": 25,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -130,9 +130,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 23
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 25
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v23"
+        "bullet-trade-joinquant-runtime-helper-v25"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -285,6 +285,63 @@ def test_qmt_schedule_prewarms_without_changing_decision_callbacks(helper):
     assert calls[2][1] == ("09:29",)
     assert calls[3][0] is callbacks[1]
     assert [call[2].get("time") for call in calls[4:]] == ["10:30", "14:55"]
+
+
+@pytest.mark.parametrize("mode", ["JQ", "QMT_REMOTE", "JQ_QMT_PARALLEL"])
+def test_schedule_replacement_is_idempotent_and_preserves_decision_state(helper, mode):
+    schedules, cleared, executions = [], [], []
+    schedules.append(("09:30", lambda context: executions.append("old")))
+    saved = types.SimpleNamespace(fund_list=object(), bt_open_decision=object(), bt_sell_then_buy=object())
+    original_state = vars(saved).copy()
+    def register(callback, *args, **kwargs):
+        schedules.append((args[0] if args else kwargs["time"], callback))
+    def clear():
+        cleared.append(True)
+        schedules.clear()
+    namespace = {"g": saved, "run_daily": register, "unschedule_all": clear}
+    callback = lambda context: executions.append("new")
+    previous = None
+    for _ in range(3):
+        runtime = helper.JoinQuantRuntime(_state(mode, "sim_trade"), namespace)
+        runtime.schedule_daily(
+            callback, callback, callback, ("10:30",), callback,
+            open_decision_time="09:30", open_order_time="09:30", replace_existing=True,
+        )
+        assert schedules == previous or previous is None
+        previous = list(schedules)
+        assert [fn for at, fn in schedules if at == "09:30"] == [helper._decide_joinquant_open_rebalance]
+        assert all(getattr(saved, key) is value for key, value in original_state.items())
+    assert len(cleared) == 3
+    assert executions == []
+
+
+@pytest.mark.parametrize("invalid", ["time", "callback"])
+def test_invalid_schedule_replacement_does_not_remove_old_schedule(helper, invalid):
+    actions = []
+    runtime = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), {
+        "run_daily": lambda *args, **kwargs: actions.append("register"),
+        "unschedule_all": lambda: actions.append("clear"),
+    })
+    callback = lambda context: None
+    with pytest.raises(ValueError):
+        runtime.schedule_daily(
+            callback, None if invalid == "callback" else callback,
+            callback, (), callback,
+            open_decision_time="12:30" if invalid == "time" else "09:30",
+            open_order_time="09:30", replace_existing=True,
+        )
+    assert actions == []
+
+
+def test_schedule_replacement_requires_platform_clear_api(helper):
+    schedules = []
+    runtime = helper.JoinQuantRuntime(_state("JQ", "sim_trade"), {
+        "run_daily": lambda *args, **kwargs: schedules.append(args),
+    })
+    callback = lambda context: None
+    with pytest.raises(RuntimeError, match="unschedule_all"):
+        runtime.schedule_daily(callback, callback, callback, (), callback, replace_existing=True)
+    assert schedules == []
 
 
 def test_optional_0928_decision_runs_between_preparation_and_execution(helper):
@@ -621,6 +678,144 @@ def test_joinquant_runtime_facade_backtest_does_not_load_profile_by_default(
 
     assert runtime.mode is helper.RuntimeMode.BACKTEST
     assert runtime.state["reason"] == "backtest"
+
+
+def test_omitted_id_does_not_select_only_private_strategy_and_preserves_reinstall(helper, monkeypatch):
+    _profile_module(monkeypatch, strategies={"deployed_etf_1000": {
+        "jq_account_enabled": True, "qmt_account_enabled": True,
+    }})
+    namespace = {}
+    kwargs = {"context": _context("sim_trade"), "qmt_initial_capital": 1000,
+              "profile_module": PROFILE_MODULE}
+    first = helper.install_joinquant_runtime(namespace, **kwargs)
+    second = helper.install_joinquant_runtime(namespace, **kwargs)
+    assert first.state["strategy_id"] is second.state["strategy_id"] is None
+    assert first.mode is helper.RuntimeMode.JQ
+    assert first.jq_account_enabled and not first.qmt_account_enabled
+    assert first.state["profile"] is None
+    assert helper._active_profile is None
+    assert second.state == first.state
+
+
+@pytest.mark.parametrize("strategies", [
+    {}, {"first": {}, "second": {}},
+    {"jq_local": {"jq_account_enabled": False, "qmt_account_enabled": True}},
+])
+def test_omitted_id_never_matches_configured_accounts(helper, monkeypatch, strategies):
+    _profile_module(monkeypatch, strategies=strategies)
+    runtime = helper.install_joinquant_runtime(
+        {}, context=_context("sim_trade"), qmt_initial_capital=1000,
+        profile_module=PROFILE_MODULE,
+    )
+    assert runtime.state["strategy_id"] is None
+    assert runtime.mode is helper.RuntimeMode.JQ
+    assert helper._active_profile is None
+
+
+def test_explicit_id_and_namespace_declaration_match_only_exact_key(helper, monkeypatch):
+    _profile_module(monkeypatch, strategies={
+        "first": {}, "second": {"qmt_account_enabled": True},
+    })
+    namespace = {"STRATEGY_ID": "first"}
+    runtime = helper.install_joinquant_runtime(
+        namespace, context=_context("sim_trade"), qmt_initial_capital=1000,
+        profile_module=PROFILE_MODULE,
+    )
+    assert runtime.state["strategy_id"] == "first"
+    assert runtime.mode is helper.RuntimeMode.JQ
+    namespace["STRATEGY_ID"] = "second"
+    runtime = helper.install_joinquant_runtime(
+        namespace, context=_context("sim_trade"), strategy_id="first",
+        qmt_initial_capital=1000, profile_module=PROFILE_MODULE,
+    )
+    assert runtime.state["strategy_id"] == "first"
+    assert runtime.mode is helper.RuntimeMode.JQ
+
+
+@pytest.mark.parametrize("run_type", ["simple_backtest", "full_backtest", "sim_trade"])
+@pytest.mark.parametrize("validate_remote", [False, True])
+def test_omitted_id_needs_no_private_module_or_remote_preflight(helper, monkeypatch, run_type, validate_remote):
+    def unexpected_remote_call(*args, **kwargs):
+        pytest.fail("An anonymous strategy must not access any remote account")
+    for method in ("ensure_account", "get_portfolio", "get_reconciliation", "ensure_runtime_ready"):
+        monkeypatch.setattr(helper, method, unexpected_remote_call)
+    native_calls = []
+    def native_target_value(*args, **kwargs):
+        native_calls.append((args, kwargs))
+        return "native-target-order"
+    native_order = lambda *args, **kwargs: "native-order"
+    namespace = {"order": native_order, "order_target_value": native_target_value}
+    runtime = helper.install_joinquant_runtime(
+        namespace, context=_context(run_type), qmt_initial_capital=1000,
+        profile_module="nonexistent_private_configuration",
+        validate_remote_during_backtest=validate_remote,
+    )
+    assert runtime.mode is (helper.RuntimeMode.JQ if run_type == "sim_trade" else helper.RuntimeMode.BACKTEST)
+    assert runtime.state["strategy_id"] is None
+    assert "remote_validation" not in runtime.state
+    assert not runtime.state.get("remote_validation_enabled")
+    assert helper._active_profile is None
+    assert namespace["order"] is native_order
+    assert runtime.order_target_value("000001.XSHE", 500) == "native-target-order"
+    assert native_calls == [(("000001.XSHE", 500), {"style": None})]
+
+
+def test_unmatched_explicit_id_does_not_select_another_account(helper, monkeypatch):
+    _profile_module(monkeypatch, strategies={
+        "existing_etf_1000": {"jq_account_enabled": False, "qmt_account_enabled": True},
+    })
+    runtime = helper.install_joinquant_runtime(
+        {}, context=_context("sim_trade"), strategy_id="unmatched",
+        qmt_initial_capital=1000, profile_module=PROFILE_MODULE,
+    )
+    assert runtime.state["strategy_id"] == "unmatched"
+    assert runtime.mode is helper.RuntimeMode.JQ
+
+
+def test_changing_explicit_id_does_not_rebind_running_ledger(helper, monkeypatch):
+    _profile_module(monkeypatch, strategies={"first": {}, "second": {}})
+    namespace = {"STRATEGY_ID": "first"}
+    kwargs = {"context": _context("sim_trade"), "qmt_initial_capital": 1000,
+              "profile_module": PROFILE_MODULE}
+    helper.install_joinquant_runtime(namespace, **kwargs)
+    namespace["STRATEGY_ID"] = "second"
+    with pytest.raises(RuntimeError, match="签名|重启"):
+        helper.install_joinquant_runtime(namespace, **kwargs)
+    assert helper._active_state["strategy_id"] == "first"
+
+
+@pytest.mark.parametrize("value", [None, "", "bad id"])
+def test_invalid_namespace_id_is_not_treated_as_anonymous(helper, value):
+    with pytest.raises(RuntimeError, match="strategy_id"):
+        helper.install_joinquant_runtime(
+            {"STRATEGY_ID": value}, context=_context("sim_trade"), qmt_initial_capital=1000,
+        )
+
+
+@pytest.mark.parametrize("mode, validate_remote", [
+    ("QMT_REMOTE", False), ("JQ_QMT_PARALLEL", False), ("BACKTEST", True),
+])
+def test_low_level_remote_runtime_requires_explicit_id(helper, mode, validate_remote):
+    with pytest.raises(RuntimeError, match="必须显式提供strategy_id"):
+        helper.install_strategy_runtime(
+            {}, context=_context("sim_trade"), mode=mode, strategy_id=None,
+            validate_remote=validate_remote,
+        )
+
+
+def test_anonymous_plan_notification_is_skipped_without_remote_calls_or_warnings(helper, monkeypatch):
+    warnings = []
+    runtime = helper.install_joinquant_runtime(
+        {"log": types.SimpleNamespace(warn=warnings.append)},
+        context=_context("sim_trade"), qmt_initial_capital=1000,
+    )
+    monkeypatch.setattr(helper, "_strategy_request", lambda *args, **kwargs: pytest.fail("unexpected RPC"))
+    items = [{"security": "000001.XSHE", "quantity": 100}]
+    assert runtime.send_target_buy_plan(items) is None
+    assert runtime.notify_target_buy_plan(items) == {
+        "accepted": False, "reason": "strategy_id_not_set",
+    }
+    assert warnings == []
 
 
 def test_backtest_remote_validation_is_reused_after_runtime_reinstall(

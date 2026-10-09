@@ -5,13 +5,15 @@
 
     import bullet_trade_jq_remote_helper as bt
 
-    state = bt.install_strategy_runtime(
+    runtime = bt.install_joinquant_runtime(
         globals(),
         context=context,
-        mode="BACKTEST",
-        strategy_id=STRATEGY_ID,
-        validate_remote=True,
+        qmt_initial_capital=1000,
+        validate_remote_during_backtest=True,
     )
+
+省略strategy_id且未声明STRATEGY_ID时，只运行JQ，不读取私有配置或连接服务器；
+显式ID只匹配STRATEGIES中的同名键，不自动选择其他策略的账本。
 
 职责边界：
 
@@ -87,8 +89,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 23
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v23"
+STRATEGY_RUNTIME_API_VERSION = 25
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v25"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -925,6 +927,8 @@ def notify_target_buy_plan(
 
     if _active_state is None or _active_state.get("mode") == "BACKTEST":
         raise RuntimeError("只有聚宽模拟交易可以发送策略目标计划")
+    if _active_state.get("strategy_id") is None:
+        return {"accepted": False, "reason": "strategy_id_not_set"}
     payload = {
         # 服务器通知协议只区分通知归属：QMT启用时只发送QMT计划，
         # 否则维持原有JQ计划通知；并行运行不重复发送两份卡片。
@@ -1244,10 +1248,19 @@ def _validate_profile_module_name(value: Any) -> str:
 
 def _load_runtime_configuration(
     profile_module: str,
-    strategy_id: str,
+    strategy_id: Optional[str],
 ) -> Dict[str, Any]:
-    """Resolve one strategy to its account switches and connection profile."""
+    """Match only an explicit ID; an anonymous strategy stays local."""
 
+    if strategy_id is None:
+        return {
+            "mode": "JQ",
+            "jq_account_enabled": True,
+            "qmt_account_enabled": False,
+            "jq_log_enabled": True,
+            "profile": None,
+            "connection": None,
+        }
     strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
     load_failed = False
@@ -1435,7 +1448,7 @@ def _build_strategy_runtime_state(
     *,
     mode: str,
     run_type: str,
-    strategy_id: str,
+    strategy_id: Optional[str],
     profile: Optional[str],
     profile_module: Optional[str] = None,
     blocked_mutations: Tuple[str, ...] = (),
@@ -1504,7 +1517,7 @@ def install_strategy_runtime(
     *,
     context: Any,
     mode: str,
-    strategy_id: str,
+    strategy_id: Optional[str],
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
     profile_module: str = "jq_runtime_config",
     validate_remote: bool = False,
@@ -1534,7 +1547,11 @@ def install_strategy_runtime(
         raise RuntimeError("validate_remote必须是bool")
     if validate_remote and mode != "BACKTEST":
         raise RuntimeError("validate_remote仅用于BACKTEST远程预检")
-    strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
+    if strategy_id is None:
+        if mode not in ("JQ", "BACKTEST") or validate_remote:
+            raise RuntimeError("QMT交易和远程预检必须显式提供strategy_id")
+    else:
+        strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     profile_module = _validate_profile_module_name(profile_module)
 
     record = namespace.get(_RUNTIME_STATE_KEY)
@@ -1872,11 +1889,14 @@ class JoinQuantRuntime:
         *,
         open_decision_time: Optional[str] = None,
         open_order_time: Optional[str] = None,
+        replace_existing: bool = False,
     ) -> None:
         """Register ETF callbacks, optionally separating decision and execution.
 
         With open_order_time, market_open returns (weights, marks) or None.
         Without it, the original combined callback contract remains available.
+        replace_existing replaces this strategy's saved platform schedules only;
+        it never runs callbacks or clears portfolio/decision state.
         """
 
         open_decision_time = open_decision_time or market_open_time
@@ -1887,6 +1907,11 @@ class JoinQuantRuntime:
             self._validate_open_time(open_order_time)
             if open_order_time < open_decision_time:
                 raise ValueError("下单时间不得早于选股时间")
+        callbacks = [before_market_open, market_open, risk_management, after_market_check]
+        if opening_decision is not None:
+            callbacks.append(opening_decision)
+        if not all(callable(callback) for callback in callbacks):
+            raise ValueError("调度回调必须可调用")
         warmup_times = set()
         if self.qmt_account_enabled:
             for target_time in (
@@ -1899,7 +1924,18 @@ class JoinQuantRuntime:
                     continue  # Preserve legacy JoinQuant aliases such as "open".
                 minutes = parsed.tm_hour * 60 + parsed.tm_min - 1
                 warmup_times.add("{:02d}:{:02d}".format(minutes // 60, minutes % 60))
-        run_daily = self._platform_api("run_daily")
+        platform_run_daily = self._platform_api("run_daily")
+        if replace_existing:
+            self._platform_api("unschedule_all")()
+        registered = []
+
+        def run_daily(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+            platform_run_daily(callback, *args, **kwargs)
+            registered.append((
+                args[0] if args else kwargs["time"],
+                getattr(callback, "__name__", type(callback).__name__),
+            ))
+
         run_daily(
             before_market_open,
             "09:20",
@@ -1975,6 +2011,11 @@ class JoinQuantRuntime:
                 open_decision_time, open_order_time or open_decision_time
             ),
         )
+        if replace_existing:
+            for scheduled_time, callback_name in registered:
+                self._log(
+                    "info", "调度入口 | 时间={} 回调={}".format(scheduled_time, callback_name)
+                )
 
     def _run_open_decision(self, context: Any) -> None:
         global_state = (self._namespace or {}).get("g")
@@ -3180,7 +3221,10 @@ class JoinQuantRuntime:
     ) -> Optional[Dict[str, Any]]:
         """Send a plan card without allowing notification failure to stop trading."""
 
-        if not items or self.mode is RuntimeMode.BACKTEST:
+        if (
+            not items or self.mode is RuntimeMode.BACKTEST
+            or self.state.get("strategy_id") is None
+        ):
             return None
         try:
             result = self.notify_target_buy_plan(
@@ -3269,28 +3313,35 @@ def install_joinquant_runtime(
     namespace: Dict[str, Any],
     *,
     context: Any,
-    strategy_id: str,
+    strategy_id: Optional[str] = None,
     qmt_initial_capital: Any,
     profile_module: str = "jq_runtime_config",
     validate_remote_during_backtest: bool = False,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
 ) -> JoinQuantRuntime:
-    """Resolve the platform run type, install one mode, and run optional preflight."""
+    """Install the facade; no ID means local JQ without a config lookup."""
 
     run_type = str(_run_type_from_context(context) or "").strip().lower()
+    if type(namespace) is not dict:
+        raise RuntimeError("策略namespace必须是普通dict（请传入globals()）")
+    if type(validate_remote_during_backtest) is not bool:
+        raise RuntimeError("validate_remote_during_backtest必须是bool")
+    if strategy_id is None and "STRATEGY_ID" in namespace:
+        strategy_id = _validate_runtime_identifier(
+            namespace["STRATEGY_ID"], "strategy_id"
+        )
+    elif strategy_id is not None:
+        strategy_id = _validate_runtime_identifier(strategy_id, "strategy_id")
     if run_type in ("simple_backtest", "full_backtest"):
         mode = RuntimeMode.BACKTEST
-        validate_remote = validate_remote_during_backtest
+        validate_remote = (
+            validate_remote_during_backtest and strategy_id is not None
+        )
     elif run_type == "sim_trade":
-        switches = get_configured_account_switches(
-            strategy_id, profile_module
+        config = _load_runtime_configuration(
+            profile_module, strategy_id
         )
-        mode = RuntimeMode(
-            _mode_from_account_switches(
-                switches["jq_account_enabled"],
-                switches["qmt_account_enabled"],
-            )
-        )
+        mode = RuntimeMode(config["mode"])
         validate_remote = False
     else:
         raise RuntimeError(

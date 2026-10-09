@@ -1,10 +1,20 @@
 # 聚宽策略工作区
 
-本目录保存可复制到聚宽策略编辑器的策略源码：原`good_etf.py`在09:30选股并下单；`good_etf_open_0925.py`保留历史文件名，现为09:26开盘价选股/跌停价清仓、09:30起确认清仓后买入。两者都要求API23单文件helper，选股、排序和权重公式一致，但价格数据边界和执行时序不同。
+本目录保存可复制到聚宽策略编辑器的策略源码：原`good_etf.py`在09:30选股并下单；`good_etf_open_0925.py`保留历史文件名，现为09:26开盘价选股/跌停价清仓、09:30起确认清仓后买入。两者都要求API25单文件helper，选股、排序和权重公式一致，但价格数据边界和执行时序不同。
 
-另有[`etf_reversal.py`](etf_reversal.py)，使用昨日信号、趋势过滤、每5交易日轮换，依赖同一单文件helper API23。其参考来源、规则、费用及延迟实验步骤见[`etf_reversal.md`](etf_reversal.md)，尚未取得聚宽行情回测业绩。
+另有[`etf_reversal.py`](etf_reversal.py)，使用昨日信号、趋势过滤、每5交易日轮换，依赖同一单文件helper API25。其参考来源、规则、费用及延迟实验步骤见[`etf_reversal.md`](etf_reversal.md)，尚未取得聚宽行情回测业绩。
 
 导出新策略使用`python scripts/export_joinquant.py --strategy etf_reversal --output dist/joinquant-etf-reversal`；不指定`--strategy`时仍导出GoodETF。
+
+## 当前1000元重开配置（2026-10-08）
+
+默认GoodETF显式声明`STRATEGY_ID = 'good_etf_remote_1000_20261008'`，仅匹配私有配置中的同名key；`QMT_INITIAL_CAPITAL=1000`。服务器已建立无持仓、无委托的新账本，初始NAV=1、收益=0，只允许新ID交易；旧账本已退出运行并保留恢复副本。实际私有配置启用JQ/QMT双账户，示例配置不是实际连接配置，不要用示例覆盖私有文件。
+
+聚宽研究根目录更新单文件`helpers/bullet_trade_jq_remote_helper.py`（API25），配套完整替换本目录`good_etf.py`。当前源码已填入新账本ID，不需要再次修改；已同步的私有配置无需重复上传。若也希望JQ空仓重新开始，可新建模拟交易；若保留现有JQ持仓，API25支持更新后重启当前模拟交易并迁移旧调度。JQ初始资金不必为1000元，QMT的1000元参数不会修改聚宽账户资金，两个账户独立维护。不要将该重开身份用于独立09:26变体；服务器/QMT bridge无需额外修改。
+
+策略可以不写ID，此时只运行JQ，不读取私有配置或进行远程预检；写了ID才精确匹配config，不自动选择唯一项或默认ID。需要QMT时须显式指定ID，各独立策略使用不同ID。详见[省略ID规则](../../jq_runtime/README.md#不在策略中写idhelper-api24)。
+
+执行及恢复位置见[1000元重开记录](../../docs/live-ledger/45-goodetf-latency.md#2026-10-08-1000元重新开始服务器已完成聚宽待新建模拟交易)。
 
 ## 迁移映射
 
@@ -38,7 +48,19 @@ helper在09:20触发QMT盘前账户对账，提前恢复旧目标、预订阅候
 
 当前仓库代码具备回测、JQ模拟、QMT远程和JQ+QMT并行链路。真实资金启用前仍必须在目标QMT环境完成模拟与小额人工验收，并由用户明确放行。
 
-## 下单链路提速（helper API23）
+## 旧模拟交易的调度恢复（API25）
+
+旧模拟交易可能保存直接调用`market_open`的09:30任务；新版该函数只生成权重和参考价，真正执行由helper入口负责。只更新函数源码或重建RPC运行时，不会把旧日程迁移为新入口；因此可能选出标的却没有提交目标。本地已复现该兼容缺口，不能以此代替聚宽侧实际日程和成交验收。
+
+三份策略各自用薄函数`_declare_schedule`声明自己的日程，首次`initialize`及每次`process_initialize`均调用它。helper的`schedule_daily(..., replace_existing=True)`先校验开盘配置和回调，再通过`unschedule_all`清理当前策略的全部定时任务并重新注册；若本策略还有自定义日程，也必须纳入这一声明。平台每次注册都会新增任务，不能在旧任务上直接追加。重复恢复只保留一组日程，正常的09:26独立清仓变体和反转周期不变。
+
+恢复不调用`initialize`，不清`g`中的候选/信号/冻结决策，不清JQ资金、持仓或QMT账本；注册不执行回调、不补当日错过的09:30目标，也不新增JQ买入补单。日程中的helper回调仍是可序列化的顶层函数；运行时恢复后引用当前策略的决策入口。
+
+手动更新清单：暂停相关聚宽模拟交易，上传`helpers/bullet_trade_jq_remote_helper.py`至研究根目录，完整替换正在使用的策略源码，再启动同一模拟交易。共享helper的`good_etf_open_0925.py`、`etf_reversal.py`如也在运行，必须一起更新。`.pyi`仅用于本地IDE，不上传；私有配置、服务器和QMT bridge无需变更。不要只手改期望API版本。
+
+验收日志应显示`helper API=25`、`任务调度完成`，以及普通GoodETF的`调度入口 | 时间=09:30 回调=_decide_joinquant_open_rebalance`。随后在正常执行时间核对冻结目标、JQ调用及服务器QMT目标；未到时间时不能把恢复日志当作已成交证据。
+
+## 下单链路提速（当前helper API25）
 
 盘前helper保存候选代码及名称，QMT服务器预订阅候选与已有持仓的行情。选股/下单回调前一分钟预热RPC连接，默认09:29；独立09:26变体则在09:25、09:29预热。正常请求复用同一经过认证的连接，空闲超过90秒、身份变化或异常后丢弃连接；可能已发送的写请求不自动重发。预热只准备连接和行情订阅，执行时仍按原规则取得新券商快照并检查行情时效。
 
@@ -46,9 +68,9 @@ helper在09:20触发QMT盘前账户对账，提前恢复旧目标、预订阅候
 
 日志`调仓耗时`及`g.bt_last_rebalance_timing`包含决策耗时、执行开始至首个JQ接口调用/QMT目标提交与接受的耗时，以及通知、日志和连接次数。JQ接口调用与QMT接受目标均不代表已成交，实际服务器发单需对照原有执行日志。先保持两个时间均为09:30对比性能，再仅改下单时间做延迟实验；代码提速的收益影响尚未取得聚宽/QMT实测。
 
-使用时同时更新策略与研究根目录helper（API23）；候选行情预订阅还需更新服务器的`strategy.prepare_session`实现。本次只生成本地导出物，尚未部署。设计及验证记录见[GoodETF下单链路提速](../../docs/live-ledger/45-goodetf-latency.md)。
+使用时同时更新策略与研究根目录helper（API25）；候选行情预订阅还需服务器的`strategy.prepare_session`实现。链路优化代码已部署到当前fork服务器，2026-10-08服务及QMT链路复核READY；可选ID及调度恢复仅修改聚宽侧代码，不要求再更新服务器或重建账本。聚宽侧上传及实际执行需单独验收。设计及验证记录见[GoodETF下单链路提速](../../docs/live-ledger/45-goodetf-latency.md)。
 
-## 选股与下单时间实验（helper API23）
+## 选股与下单时间实验（当前helper API25）
 
 策略顶部独立配置两个时间，默认均为`09:30`。同一时间由helper在一次回调内先选股、再下单，避免依赖同分钟回调的注册顺序。
 
@@ -63,7 +85,7 @@ OPEN_ORDER_TIME = '09:35'     # 使用冻结结果下单，实验5分钟延迟
 
 该配置也影响聚宽脚本驱动的QMT目标提交时间：QMT继续使用冻结参考价对应的原有限价，目标金额仍由服务器按QMT提交时的账户资产计算。QMT先卖后买和续单规则保持原样。这次没有修改完整QMT本地版策略。
 
-使用时同步更新`good_etf.py`和研究根目录的单文件`bullet_trade_jq_remote_helper.py`（API23），按下文导出和冷启动流程操作；私有连接配置与账户开关无需修改。
+使用时同步更新`good_etf.py`和研究根目录的单文件`bullet_trade_jq_remote_helper.py`（API25），按下文导出和冷启动流程操作；私有连接配置与账户开关无需修改。
 
 helper按D021不防御同进程恶意Python代码；旧版远程交易API（`configure`/`install_jq_compat`/`RemoteBrokerClient`/order系列）与全部同进程对抗机制已在L00删除。同一进程内同签名重装幂等返回；签名漂移或检测到上一代helper遗留记录即失败关闭，必须使用干净进程重启，禁止reload或热补丁。
 
@@ -74,7 +96,7 @@ helper按D021不防御同进程恶意Python代码；旧版远程交易API（`con
 1. 参考[`jq_runtime`说明](../../jq_runtime/README.md)，在仓库外的私有文件中维护连接配置。
 2. 本目录策略源码保持 `from jqdata import *` 和顶层helper导入；本地和聚宽使用同一个策略文件，
    不维护本地专用分支。
-3. 在仓库源码中审查顶部的`VALIDATE_REMOTE_DURING_BACKTEST`、`STRATEGY_ID`和`QMT_INITIAL_CAPITAL`；回测自动使用`BACKTEST`。模拟交易在私有`jq_runtime_config.py`中通过`jq_account_enabled`和`qmt_account_enabled`选择账户，缺少策略键时默认只启用JQ。
+3. 在仓库源码中审查顶部的`VALIDATE_REMOTE_DURING_BACKTEST`、可选`STRATEGY_ID`和`QMT_INITIAL_CAPITAL`；回测自动使用`BACKTEST`。省略ID只运行JQ且不远程预检；显式ID未匹配配置键时仍默认只启用JQ。模拟交易仅按显式ID的同名配置开关选择账户。
 4. 使用[`scripts/export_joinquant.py`](../../scripts/export_joinquant.py)执行Python 3.8语法、明显凭据扫描、
    profile形状和私有profile只读门禁，并生成原样文件与确定性manifest；完整步骤见
    [`聚宽校验与导出`](../../docs/live-ledger/06-joinquant-export.md)。单文件bundle不是标准路径。

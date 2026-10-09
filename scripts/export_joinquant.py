@@ -456,6 +456,8 @@ def _strategy_identity(text: str, source_name: str) -> Dict[str, object]:
             values[name] = ast.literal_eval(node.value)
         except (TypeError, ValueError, SyntaxError):
             values[name] = None
+    if "STRATEGY_ID" not in values:
+        return {"strategy_id": None}
     identity: Dict[str, object] = {}
     for field, key in (("STRATEGY_ID", "strategy_id"),):
         value = values.get(field)
@@ -496,6 +498,14 @@ def validate_private_profile(
     assignments = _profile_assignments(tree, "private profile")
     _validate_profile_shape(assignments, "private profile", True)
     strategy_id = identity["strategy_id"]
+    if strategy_id is None:
+        return {
+            "profile": None,
+            "profile_schema_version": assignments["PROFILE_SCHEMA_VERSION"],
+            "strategy_id": None,
+            "jq_account_enabled": True,
+            "qmt_account_enabled": False,
+        }
     settings = assignments["STRATEGIES"].get(strategy_id, {})
     profile_name = settings.get("profile", assignments["DEFAULT_PROFILE"])
     jq_enabled = settings.get("jq_account_enabled", True)
