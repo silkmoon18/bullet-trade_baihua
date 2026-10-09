@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$EnvFile,
     [Parameter(Mandatory = $true)][string]$LedgerDatabase,
     [Parameter(Mandatory = $true)][string]$BackupDir,
+    [ValidateRange(1, 3650)][int]$BackupRetainDays = 7,
     [string]$TaskPrefix = 'BulletTradeBaihua'
 )
 
@@ -31,7 +32,7 @@ Register-ScheduledTask -TaskName "$TaskPrefix-Server" -Action $serverAction `
     -Principal $principal -Description 'BulletTrade QMT StrategyLedger server' -Force | Out-Null
 
 $backupAction = New-ScheduledTaskAction -Execute $python -Argument (
-    "`"$backupScript`" backup --database `"$LedgerDatabase`" --output-dir `"$BackupDir`""
+    "`"$backupScript`" backup --database `"$LedgerDatabase`" --output-dir `"$BackupDir`" --retain-days $BackupRetainDays"
 )
 $backupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
     -MultipleInstances IgnoreNew

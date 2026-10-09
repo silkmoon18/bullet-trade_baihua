@@ -78,9 +78,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows\register_strategy_tas
   -BackupDir E:\dev\Github\bullet-trade_baihua\.data\backups
 ```
 
-注册两个当前用户、有限权限任务：登录时启动server（失败最多重启3次），每日18:00在线备份SQLite。QMT通常依赖登录桌面会话，因此不注册无人登录的SYSTEM服务。
+注册两个当前用户、有限权限任务：登录时启动server（失败最多重启3次），每日18:00在线备份SQLite。备份任务默认传入`--retain-days 7`，可用`-BackupRetainDays`调整。QMT通常依赖登录桌面会话，因此不注册无人登录的SYSTEM服务。
 
 ## 5. 备份与恢复
+
+自动备份使用`strategy-ledger-auto-YYYYMMDD-HHMMSS-ffffff.db`，仅在新备份完整生成并通过SQLite检查后，清理早于保留日历区间的自动备份。保留7天指当天及前6天；不递归清理子目录，不删除手工备份、关键操作前快照、当前账本或WAL/SHM。失败备份会清理本次临时文件，不先删除旧备份腾空间。已有任务需单独更新备份参数；不要为了更新备份规则重新注册交易服务。
 
 手工备份：
 
@@ -89,6 +91,8 @@ python scripts\strategy_ledger_backup.py backup `
   --database E:\dev\Github\bullet-trade_baihua\.data\strategy-ledger.db `
   --output-dir E:\dev\Github\bullet-trade_baihua\.data\backups
 ```
+
+手工调用不传`--retain-days`时保持原文件名，并且不触发自动清理。维护前的手工快照不会被每日保留规则删除。
 
 恢复前停止BulletTrade server，把当前数据库及`-wal/-shm`文件整体移到单独故障目录，然后恢复到不存在的目标；工具拒绝覆盖已有数据库：
 
