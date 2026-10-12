@@ -43,6 +43,14 @@ from collections import namedtuple
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
+
+def _wall_timestamp(value: Any) -> str:
+    """Format Unix milliseconds in China time; never use JQ's logical clock."""
+    if value is None:
+        return "未发生"
+    seconds, milliseconds = divmod(int(value), 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds + 8 * 3600)) + ".{:03d}+08:00".format(milliseconds)
+
 __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
@@ -1709,6 +1717,7 @@ class JoinQuantRuntime:
         self._pending_rebalance_logs = []  # type: list
         self._rebalance_timing = None  # type: Optional[Dict[str, Any]]
         self._pending_decision_ms = None  # type: Optional[float]
+        self._pending_decision_wall_times = {}  # type: Dict[str, Any]
         self._rebalance_started = 0.0
 
     def prepare_rebalance_candidates(self, context: Any, securities: Any) -> None:
@@ -2073,6 +2082,7 @@ class JoinQuantRuntime:
 
         self._store_prepared_rebalance(None)
         started = time.perf_counter()
+        decision_started_at_ms = int(time.time() * 1000)
         captured = []
         self._captured_logs = captured
         prepared = False
@@ -2104,6 +2114,8 @@ class JoinQuantRuntime:
             )
             snapshot["decision_logs"] = list(captured)
             snapshot["decision_elapsed_ms"] = (time.perf_counter() - started) * 1000
+            snapshot["decision_started_at_ms"] = decision_started_at_ms
+            snapshot["decision_ready_at_ms"] = int(time.time() * 1000)
             self._store_prepared_rebalance(snapshot)
             prepared = True
         except Exception as exc:
@@ -2146,6 +2158,9 @@ class JoinQuantRuntime:
             return None
         self._store_prepared_rebalance(None)
         self._pending_decision_ms = snapshot.get("decision_elapsed_ms")
+        self._pending_decision_wall_times = {
+            key: snapshot.get(key) for key in ("decision_started_at_ms", "decision_ready_at_ms")
+        }
         self._pending_rebalance_logs = list(snapshot.get("decision_logs", ()))
         self._pending_rebalance_logs.append((
             "info", "执行冻结目标 | 选股时间={} 下单时间={}".format(
@@ -2754,7 +2769,12 @@ class JoinQuantRuntime:
             "decision_ms": self._pending_decision_ms,
             "first_jq_order_ms": None, "orders_ms": None, "notification_ms": None,
             "qmt_submit_ms": None, "qmt_accepted_ms": None,
+            "execution_started_at_ms": int(time.time() * 1000),
+            "qmt_requested_at_ms": None, "qmt_accepted_at_ms": None,
+            "first_jq_order_at_ms": None,
         }
+        self._rebalance_timing.update(self._pending_decision_wall_times)
+        self._pending_decision_wall_times = {}
         self._pending_decision_ms = None
         try:
             return self._execute_rebalance(
@@ -2787,9 +2807,20 @@ class JoinQuantRuntime:
                 display(timing["logs_ms"]),
                 timing["rpc_connections"], timing["rpc_reused"],
             )),))
+            self._flush_logs((("info", (
+                "调仓实际时间 | strategy_id={} key={} | 决策开始={} 决策完成={} "
+                "执行开始={} QMT请求={} QMT接受={} 首个JQ调用={}"
+            ).format(
+                self.state.get("strategy_id") or "JQ", idempotency_key,
+                *[_wall_timestamp(timing.get(key)) for key in (
+                    "decision_started_at_ms", "decision_ready_at_ms", "execution_started_at_ms",
+                    "qmt_requested_at_ms", "qmt_accepted_at_ms", "first_jq_order_at_ms",
+                )],
+            )),))
 
     def _note_first_jq_order(self) -> None:
         if self._rebalance_timing["first_jq_order_ms"] is None:
+            self._rebalance_timing["first_jq_order_at_ms"] = int(time.time() * 1000)
             self._rebalance_timing["first_jq_order_ms"] = (
                 time.perf_counter() - self._rebalance_started
             ) * 1000
@@ -2883,6 +2914,7 @@ class JoinQuantRuntime:
                             qmt_marks.setdefault(security, float(position.price))
                     qmt_security_names = _security_names(qmt_weights)
                     if qmt_weights:
+                        self._rebalance_timing["qmt_requested_at_ms"] = int(time.time() * 1000)
                         self._rebalance_timing["qmt_submit_ms"] = (
                             time.perf_counter() - self._rebalance_started
                         ) * 1000
@@ -2895,6 +2927,7 @@ class JoinQuantRuntime:
                             qmt_security_names,
                         )
                         qmt_submitted = True
+                        self._rebalance_timing["qmt_accepted_at_ms"] = int(time.time() * 1000)
                         self._rebalance_timing["qmt_accepted_ms"] = (
                             time.perf_counter() - self._rebalance_started
                         ) * 1000

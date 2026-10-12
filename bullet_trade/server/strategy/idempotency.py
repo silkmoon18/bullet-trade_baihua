@@ -258,6 +258,20 @@ class SQLiteOperationRepository:
         finally:
             connection.close()
 
+    def has_pending_dispatch(self, strategy_account_id: str) -> bool:
+        """Read-only queue check; claim_next remains the atomic dispatch gate."""
+        connection = connect_database(self.database_path)
+        try:
+            return connection.execute(
+                "SELECT 1 FROM outbox o JOIN strategy_operations op "
+                "ON op.operation_id = o.operation_id "
+                "WHERE o.strategy_account_id = ? AND o.state = 'PENDING' "
+                "AND op.state = 'PENDING' AND o.available_at <= ? LIMIT 1",
+                (strategy_account_id, _now_text()),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
     def claim_next(
         self, strategy_account_id: Optional[str] = None,
         *, sellable_limits: Optional[Mapping[str, int]] = None,

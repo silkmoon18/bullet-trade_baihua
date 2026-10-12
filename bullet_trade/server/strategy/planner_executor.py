@@ -479,6 +479,9 @@ class SQLiteTargetExecutionService:
             True,
         )
 
+    def has_pending_dispatch(self, strategy_account_id: str) -> bool:
+        return self._operations.has_pending_dispatch(strategy_account_id)
+
     async def dispatch_next(
         self,
         submitter: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]],

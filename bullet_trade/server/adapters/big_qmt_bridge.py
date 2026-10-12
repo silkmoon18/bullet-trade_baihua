@@ -9,6 +9,8 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass, field
+from datetime import datetime
 
 from bullet_trade.data.api import get_security_tplus_override
 from bullet_trade.utils.env_loader import get_env
@@ -20,9 +22,24 @@ from .big_qmt import (
     _fill_trade_sides_from_orders, _filter_orders, _filter_trades,
     _normalize_order, _normalize_trade,
     _normalize_snapshot_tick, load_big_qmt_gateway_config,
+    _matches_confirmed_big_qmt_submission,
 )
 
 log = logging.getLogger(__name__)
+CALLBACK_CONFIRM_GRACE_SECONDS = 0.5
+
+
+@dataclass
+class _SubmissionCallbacks:
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    orders: dict = field(default_factory=dict)
+    wait_until: float = 0.0
+    source: str = "query"
+    disconnected: bool = False
+
+
+def _is_operation_tag(tag):
+    return re.fullmatch(r"bt:[0-9a-f]{6}:[0-9a-f]{12}", tag) is not None
 
 
 class BridgeClient(BigQmtGatewayClient):
@@ -145,6 +162,8 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         self._listeners = []
         self._history = SQLiteBrokerHistoryStore(config.strategy_database_path) if config.strategy_database_path else None
         self._account = router.list_accounts()[0]
+        self._observed_order_ids = set()
+        self._submission_callbacks = {}
         client.bridge.listeners.append(self._event)
 
     async def start(self):
@@ -177,6 +196,24 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
             if self._history:
                 # A persistence failure is surfaced, never silently treated as stored.
                 getattr(self._history, "record_" + event)(key, payload)
+            if event == "order":
+                order_id = str(payload.get("order_id") or "").strip()
+                if order_id:
+                    self._observed_order_ids.add(order_id)
+                for tag, pending in tuple(self._submission_callbacks.items()):
+                    if pending.disconnected:
+                        continue
+                    if tag in (payload.get("qmt_user_order_id"), payload.get("order_remark"), payload.get("remark")):
+                        pending.orders[order_id] = dict(payload)
+                        pending.changed.set()
+        elif event == "disconnected":
+            # A callback from a replacement connection cannot acknowledge an
+            # in-flight write on the old one. Use the normal query recovery.
+            for pending in self._submission_callbacks.values():
+                pending.orders.clear()
+                pending.disconnected = True
+                pending.wait_until = 0
+                pending.changed.set()
         for callback in tuple(self._listeners):
             try:
                 callback(key, event, payload)
@@ -189,6 +226,7 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
             self._history.record_orders(account.config.key or "default", current)
             if (filters or {}).get("include_history"):
                 current = list(merge_broker_rows(current, self._history.list_orders(account.config.key or "default"), "order_id"))
+        self._observed_order_ids.update(str(row["order_id"]) for row in current if row.get("order_id"))
         return _filter_orders(current, filters or {})
 
     async def list_trades(self, account, filters=None):
@@ -207,7 +245,7 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         # Fork client_tag already fits QMT's 23-byte field. Preserve it verbatim,
         # so callbacks still identify the operation after both processes restart.
         tag = str(request.get("order_remark") or request.get("remark") or "")
-        if re.fullmatch(r"bt:[0-9a-f]{6}:[0-9a-f]{12}", tag):
+        if _is_operation_tag(tag):
             request["qmt_user_order_id"] = tag
         style = dict(request.get("style") or {})
         if style.get("type") == "market" and not (style.get("market_type") or request.get("market_type")):
@@ -217,7 +255,70 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         # This only waits for acknowledgement, not fills. Chasing stays server-side.
         if float(request.get("wait_timeout") or 0) <= 0:
             request["wait_timeout"] = 3.0
-        return await super().place_order(account, request)
+        if not _is_operation_tag(tag):
+            return await super().place_order(account, request)
+        if tag in self._submission_callbacks:
+            raise BigQmtGatewayError("Submission already in progress for this client tag", broker_called=False)
+        pending = _SubmissionCallbacks()
+        self._submission_callbacks[tag] = pending  # Before passorder: early callbacks count.
+        started = time.monotonic()
+        requested_wall = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        try:
+            result = await super().place_order(account, request)
+            log.info(
+                "QMT委托确认 | 标的=%s 方向=%s | 确认来源=%s 提交至确认=%.0fms | 请求时间=%s 确认时间=%s | 原生时点=%s",
+                request.get("security"), request.get("side"),
+                "unknown" if result.get("submit_unknown") else pending.source,
+                (time.monotonic() - started) * 1000,
+                requested_wall, datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                result.get("_bt_submit_timing", {}),
+            )
+            return result
+        finally:
+            self._submission_callbacks.pop(tag, None)
+
+    async def _snapshot_order_ids(self, account, request):
+        if _is_operation_tag(str(request.get("qmt_user_order_id") or "")):
+            # Durable operation tags are unique per attempt. Startup/submit
+            # reconciliation already observed this physical account's orders.
+            # Keep its old IDs; don't make a second native /orders round-trip.
+            return set(self._observed_order_ids)
+        return await super()._snapshot_order_ids(account, request)
+
+    async def _confirm_place_order_submission(self, account, request, order, wait_timeout,
+                                             known_order_ids=None, submitted_at=None):
+        pending = self._submission_callbacks.get(str(request.get("qmt_user_order_id") or ""))
+        if pending is not None:
+            pending.wait_until = time.monotonic() + min(CALLBACK_CONFIRM_GRACE_SECONDS, wait_timeout)
+        result = await super()._confirm_place_order_submission(
+            account, request, order, wait_timeout, known_order_ids, submitted_at
+        )
+        if "_bt_submit_timing" in order:
+            result["_bt_submit_timing"] = order["_bt_submit_timing"]
+        return result
+
+    async def _find_submitted_order(self, account, request, order, known_order_ids=None, submitted_at=None):
+        tag = str(request.get("qmt_user_order_id") or "")
+        pending = self._submission_callbacks.get(tag)
+        if pending is not None and not pending.disconnected:
+            while True:
+                matches = [row for row in pending.orders.values() if _matches_confirmed_big_qmt_submission(
+                    row, request, tag, known_order_ids or set(), submitted_at
+                )]
+                if len(matches) == 1:
+                    pending.source = "callback"
+                    return matches[0]
+                remaining = pending.wait_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                pending.changed.clear()
+                try:
+                    await asyncio.wait_for(pending.changed.wait(), remaining)
+                except asyncio.TimeoutError:
+                    break
+        # Missing, incomplete or conflicting callbacks are not proof. Query
+        # using the same identity checks; never send the native order again.
+        return await super()._find_submitted_order(account, request, order, known_order_ids, submitted_at)
 
 
 def build_bridge_bundle(config, router):

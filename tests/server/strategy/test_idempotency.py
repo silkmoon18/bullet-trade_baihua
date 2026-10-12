@@ -68,6 +68,19 @@ def test_same_key_and_payload_replays_one_operation_and_outbox(operation_reposit
     assert _counts(operation_repository) == (1, 1)
 
 
+def test_pending_dispatch_check_is_scoped_and_never_claims(operation_repository):
+    repository = operation_repository
+    assert repository.has_pending_dispatch("good-etf") is False
+    _create(repository)
+    assert repository.has_pending_dispatch("good-etf") is True
+    assert repository.has_pending_dispatch("other-strategy") is False
+    claim = repository.claim_next("good-etf")
+    assert repository.has_pending_dispatch("good-etf") is False
+    repository.begin_submission(claim.outbox_id)
+    repository.finish_submission(claim.outbox_id, {"order_id": "broker-1"})
+    assert repository.has_pending_dispatch("good-etf") is False
+
+
 def test_sellable_filter_keeps_blocked_order_pending_and_claims_other_security(operation_repository):
     repository = operation_repository
     first = repository.create_operation("good-etf", "broker.submit", "sell-a", {

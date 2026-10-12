@@ -24,7 +24,7 @@ import socket
 import time
 from collections import OrderedDict
 
-BUILD_ID = "20260915_bridge_v2"
+BUILD_ID = "20261012_bridge_v3"
 MAX_FRAME = 2 * 1024 * 1024
 _runtime = None
 
@@ -272,11 +272,14 @@ class BridgeRuntime:
             if not tag or len(tag.encode("ascii")) > 23:
                 raise ValueError("Missing or invalid QMT order tag")
             fn = _api("passorder")
+            called_at = int(time.time() * 1000)
             boundary[0] = True
             fn(23 if side == "BUY" else 24, 1101, self.account, code, pr_type, float(price), amount,
                "bt_bridge", 2, tag, self.c)
             # passorder return values are NOT stable broker order IDs.
-            return dict(order_id="", status="submit_unknown", submit_unknown=True, qmt_user_order_id=tag)
+            return dict(order_id="", status="submit_unknown", submit_unknown=True, qmt_user_order_id=tag,
+                        _bt_submit_timing=dict(qmt_passorder_at_ms=called_at,
+                                              qmt_passorder_returned_at_ms=int(time.time() * 1000)))
         if action == "/cancel_order":
             if not ENABLE_CANCEL:
                 raise RuntimeError("CANCEL_ORDER_DISABLED")
@@ -309,7 +312,10 @@ class BridgeRuntime:
                 # Only writes need deduplication. Never evict an uncertain write.
                 self.seen[key] = dict(response, code="SUBMIT_UNKNOWN")
                 reserved = True
+            received_at = int(time.time() * 1000)
             response.update(ok=True, value=self.dispatch(message["action"], message.get("payload") or {}, boundary))
+            if message.get("action") == "/place_order":
+                response["value"]["_bt_submit_timing"]["qmt_received_at_ms"] = received_at
         except Exception as exc:
             response.update(error=str(exc), code="QMT_ACTION_FAILED", broker_called=boundary[0])
         if reserved:

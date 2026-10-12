@@ -30,6 +30,7 @@ from bullet_trade.server.strategy.schema import connect_database
 from bullet_trade.server.feishu_notifier import TargetBuyPlanNotification
 from bullet_trade.server.strategy.domain import IntentState, SHANGHAI_TZ
 from bullet_trade.server.strategy.reconciliation import BrokerAccountSnapshot
+from bullet_trade.server.strategy.planner_executor import DispatchResult
 
 
 SECURITY = "510050.XSHG"
@@ -120,6 +121,9 @@ async def test_first_dispatch_reuses_recent_submit_reconciliation(api, monkeypat
         "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
     })
     assert broker.order_calls == 1
+    # One submit snapshot and one post-submit fill refresh, not an extra
+    # dispatch snapshot just to find that the local outbox is empty.
+    assert len(observed_reads) == 2
 
 
 @pytest.mark.asyncio
@@ -348,10 +352,10 @@ async def test_dispatch_checks_time_before_each_order(api, monkeypatch):
     async def dispatch(submitter, strategy_id, *, sellable_limits):
         calls.append(strategy_id)
         session_open[0] = False
-        return "first-dispatch"
+        return DispatchResult("first-dispatch", "broker-1", False)
 
     monkeypatch.setattr(service.planner, "dispatch_next", dispatch)
-    assert await service._dispatch_pending(None, "good_etf") == ("first-dispatch",)
+    assert await service._dispatch_pending(None, "good_etf") == (DispatchResult("first-dispatch", "broker-1", False),)
     assert calls == ["good_etf"]
 
 

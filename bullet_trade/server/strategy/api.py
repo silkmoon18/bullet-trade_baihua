@@ -375,6 +375,7 @@ class SQLiteStrategyAPI:
         if self._closed:
             raise RuntimeError("StrategyLedger is shutting down")
         target_received_at = time.monotonic()
+        target_received_wall = datetime.now(SHANGHAI_TZ).isoformat(timespec="milliseconds")
         strategy_id = self._strategy_id(payload)
         self._bind_runtime(strategy_id, account_context, account_key)
         key = str(payload.get("idempotency_key") or "").strip()
@@ -496,8 +497,11 @@ class SQLiteStrategyAPI:
             self._schedule_open_resume(strategy_id)
             logger.info("QMT盘前目标已接受 | strategy_id=%s | 限价单尝试券商预委托；市价卖单等待09:30，继续先卖后买", strategy_id)
         logger.info(
-            "QMT目标已接受 | strategy_id=%s | 接收至接受=%.0fms | 首笔委托异步发出",
-            strategy_id, (time.monotonic() - target_received_at) * 1000,
+            "QMT目标已接受 | strategy_id=%s key=%s | 接收至接受=%.0fms | 接收时间=%s 接受时间=%s | 首笔委托异步发出",
+            strategy_id, key, (time.monotonic() - target_received_at) * 1000,
+            # Wall times correlate with JQ/bridge logs; duration uses only
+            # this process's monotonic clock, never cross-machine subtraction.
+            target_received_wall, datetime.now(SHANGHAI_TZ).isoformat(timespec="milliseconds"),
         )
         # Include reservations created by planning, but do not wait for a new
         # broker observation. This is an acceptance snapshot, not a fill report.
@@ -1576,6 +1580,11 @@ class SQLiteStrategyAPI:
                         (time.monotonic() - target_received_at) * 1000,
                     )
                 dispatched.append(dispatch)
+                if dispatch.unknown or not self.planner.has_pending_dispatch(strategy_account_id):
+                    # Don't pay for another native snapshot just to discover
+                    # an empty local queue. The worker still refreshes fills
+                    # after submission; callbacks/recovery also reconcile.
+                    break
         return tuple(dispatched)
 
     def _broker_revisions(self) -> Tuple[int, int]:

@@ -14,6 +14,7 @@ from bullet_trade.server.adapters.big_qmt import (
     _normalize_order, build_big_qmt_bundle,
 )
 from bullet_trade.server.adapters.big_qmt_bridge import BridgeBrokerAdapter
+import bullet_trade.server.adapters.big_qmt_bridge as bridge_adapter_module
 from bullet_trade.server.config import AccountConfig, ServerConfig
 
 
@@ -250,3 +251,158 @@ async def test_disabled_native_gate_is_explicit_not_unknown(monkeypatch, tmp_pat
             await e.broker.place_order(e.account, dict(security="510300.XSHG", amount=100, side="BUY",
                 style={"type": "limit", "price": "1.002"}))
         assert error.value.broker_called is False and not e.writes
+        assert not e.broker._submission_callbacks
+
+
+def trace_commands(e, monkeypatch):
+    paths = []
+    original = e.runtime.dispatch
+    def dispatch(action, payload, boundary):
+        if action in {"/place_order", "/orders"}:
+            paths.append(action)
+        return original(action, payload, boundary)
+    monkeypatch.setattr(e.runtime, "dispatch", dispatch)
+    return paths
+
+
+def buy_request(**kwargs):
+    return dict(security="510300.XSHG", amount=100, side="BUY",
+                style={"type": "limit", "price": "1.002"},
+                order_remark="bt:abcdef:123456789abc", **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay", [0, .03])
+async def test_stable_native_callback_confirms_without_order_queries(monkeypatch, tmp_path, delay):
+    async with connected(monkeypatch, tmp_path) as e:
+        paths = trace_commands(e, monkeypatch)
+        original = e.script.order_callback
+        def callback(context, row):
+            # Same-ID repeats update one observation, not two candidates.
+            asyncio.get_running_loop().call_later(delay, original, context, row)
+            asyncio.get_running_loop().call_later(delay, original, context, row)
+        monkeypatch.setattr(e.script, "order_callback", callback)
+        result = await e.broker.place_order(e.account, buy_request())
+        assert result["order_id"] == "native-order-1"
+        assert paths == ["/place_order"] and len(e.writes) == 1
+        assert result["_bt_submit_timing"]["qmt_passorder_at_ms"] > 0
+        assert not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["missing", "tag", "security", "side", "amount", "id", "time", "conflict"])
+async def test_unusable_callback_falls_back_to_query_never_resubmits(monkeypatch, tmp_path, bad):
+    monkeypatch.setattr(bridge_adapter_module, "CALLBACK_CONFIRM_GRACE_SECONDS", .02)
+    async with connected(monkeypatch, tmp_path) as e:
+        paths = trace_commands(e, monkeypatch)
+        original = e.script.order_callback
+        def callback(context, row):
+            if bad == "missing":
+                return
+            fields = {
+                "tag": {"m_strRemark": "bt:000000:000000000000"},
+                "security": {"m_strInstrumentID": "159919"},
+                "side": {"m_nOpType": 24}, "amount": {"m_nVolumeTotalOriginal": 200},
+                "id": {"m_strOrderSysID": "0"},
+                "time": {"m_strInsertDate": "20200101"},
+                "conflict": {"m_strUserOrderId": "different-tag"},
+            }
+            original(context, dict(row, **fields[bad]))
+        monkeypatch.setattr(e.script, "order_callback", callback)
+        result = await e.broker.place_order(e.account, buy_request())
+        assert result["order_id"] == "native-order-1"
+        assert paths == ["/place_order", "/orders"] and len(e.writes) == 1
+        assert not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+async def test_observed_old_id_is_not_acknowledgement_of_new_operation(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge_adapter_module, "CALLBACK_CONFIRM_GRACE_SECONDS", .01)
+    async with connected(monkeypatch, tmp_path) as e:
+        e.broker._observed_order_ids.add("native-order-1")
+        result = await e.broker.place_order(e.account, buy_request(wait_timeout=.02))
+        assert result["submit_unknown"] is True
+        assert len(e.writes) == 1 and not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+async def test_legacy_non_operation_tag_keeps_query_confirmation(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        paths = trace_commands(e, monkeypatch)
+        request = buy_request()
+        request["order_remark"] = "legacy-order"
+        result = await e.broker.place_order(e.account, request)
+        assert result["order_id"] == "native-order-1"
+        assert paths == ["/orders", "/place_order", "/orders"]
+        assert len(e.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_old_bridge_reply_without_native_timestamps_is_compatible(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        original = e.runtime.send
+        def send(message):
+            if message.get("type") == "response" and isinstance(message.get("value"), dict):
+                message["value"].pop("_bt_submit_timing", None)
+            original(message)
+        monkeypatch.setattr(e.runtime, "send", send)
+        result = await e.broker.place_order(e.account, buy_request())
+        assert result["order_id"] == "native-order-1"
+        assert "_bt_submit_timing" not in result and len(e.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_conflicting_stable_callback_ids_remain_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge_adapter_module, "CALLBACK_CONFIRM_GRACE_SECONDS", .01)
+    async with connected(monkeypatch, tmp_path) as e:
+        original = e.script.passorder
+        def place(*args):
+            original(*args)
+            other = dict(e.orders[-1], m_strOrderSysID="other-order")
+            e.orders.append(other)
+            e.script.order_callback(None, other)
+        monkeypatch.setattr(e.script, "passorder", place)
+        result = await e.broker.place_order(e.account, buy_request(wait_timeout=.03))
+        assert result["submit_unknown"] is True and len(e.writes) == 1
+        assert not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+async def test_disconnect_does_not_use_replacement_callback_or_resend(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        monkeypatch.setattr(e.script, "order_callback", lambda *args: None)
+        task = asyncio.create_task(e.broker.place_order(e.account, buy_request(wait_timeout=.1)))
+        for _ in range(100):
+            if e.writes:
+                break
+            await asyncio.sleep(.005)
+        assert len(e.writes) == 1
+        pending = e.broker._submission_callbacks["bt:abcdef:123456789abc"]
+        e.broker.client.bridge._disconnect()
+        e.broker._event("order", e.script._order(e.orders[0]))
+        assert pending.disconnected and not pending.orders
+        try:
+            result = await task
+        except BigQmtGatewayError:
+            pass
+        else:
+            assert result["submit_unknown"] is True
+        assert len(e.writes) == 1 and not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_tag_is_not_sent_twice_and_waiter_is_cleaned(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        monkeypatch.setattr(e.script, "order_callback", lambda *args: None)
+        task = asyncio.create_task(e.broker.place_order(e.account, buy_request()))
+        for _ in range(100):
+            if e.writes:
+                break
+            await asyncio.sleep(.005)
+        with pytest.raises(BigQmtGatewayError) as error:
+            await e.broker.place_order(e.account, buy_request())
+        assert error.value.broker_called is False and len(e.writes) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not e.broker._submission_callbacks

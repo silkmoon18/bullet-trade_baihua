@@ -91,6 +91,41 @@ def test_frozen_logs_survive_restart_and_are_emitted_once_after_submission(helpe
     assert len(jq.calls) == 1
 
 
+def test_wall_timeline_is_real_time_not_jq_clock_and_survives_freeze(helper, monkeypatch):
+    jq = JQ()
+    runtime = jq.runtime(helper)
+    runtime.qmt_account_enabled = True
+    runtime._qmt_callback_allowed = lambda *args: True
+    runtime.advance_targets = lambda context: True
+    runtime._retry_qmt_readiness = lambda *args: None
+    elapsed = [1791768610.123]
+    monkeypatch.setattr(helper.time, "time", lambda: elapsed[0])
+    def decide(context):
+        elapsed[0] += .4
+        return {"BUY": .5}, {"BUY": 10.0}
+    runtime.prepare_rebalance(jq.context, decide)
+    jq.g = pickle.loads(pickle.dumps(jq.g))
+    runtime = jq.runtime(helper)
+    runtime.qmt_account_enabled = True
+    runtime._qmt_callback_allowed = lambda *args: True
+    runtime.advance_targets = lambda context: True
+    def submit(*args):
+        elapsed[0] += 1.2
+        return {"snapshot": {"total_value": 10000, "positions": {}}}
+    runtime.submit_targets = submit
+    runtime.send_target_buy_plan = lambda *args, **kwargs: None
+    runtime.execute_prepared_rebalance(jq.context)
+    timing = jq.g.bt_last_rebalance_timing
+    assert timing["decision_started_at_ms"] == 1791768610123
+    assert timing["decision_ready_at_ms"] >= timing["decision_started_at_ms"] + 399
+    assert timing["qmt_requested_at_ms"] >= timing["decision_ready_at_ms"]
+    assert timing["first_jq_order_at_ms"] == timing["qmt_accepted_at_ms"]
+    assert timing["qmt_accepted_at_ms"] >= timing["qmt_requested_at_ms"] + 1199
+    assert helper._wall_timestamp(timing["decision_started_at_ms"]) == "2026-10-12T09:30:10.123+08:00"
+    assert any("调仓实际时间" in message for message in jq.messages)
+    assert jq.calls == [("BUY", 5000)]
+
+
 def test_reporting_failure_does_not_repeat_or_fail_native_orders(helper):
     jq = JQ()
     runtime = jq.runtime(helper)
