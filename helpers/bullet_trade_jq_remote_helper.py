@@ -39,6 +39,8 @@ import struct
 import threading
 import time
 import uuid
+import functools
+from contextlib import contextmanager
 from collections import namedtuple
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -50,6 +52,124 @@ def _wall_timestamp(value: Any) -> str:
         return "未发生"
     seconds, milliseconds = divmod(int(value), 1000)
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds + 8 * 3600)) + ".{:03d}+08:00".format(milliseconds)
+
+
+_execution_timing = threading.local()
+
+
+class _ExecutionTrace:
+    def __init__(self, phase: str, trace_id: str) -> None:
+        self.phase, self.trace_id = phase, trace_id
+        self.started, self.started_at = time.perf_counter(), _wall_timestamp(time.time() * 1000)
+        self.stages = {}  # type: Dict[str, Any]
+        self.remote = []
+        self.rpc_before = dict(_rpc_stats)
+
+    def record(self, name: str, started: float, outcome: str = "ok") -> None:
+        elapsed = max(0.0, (time.perf_counter() - started) * 1000)
+        row = self.stages.setdefault(name, {"calls": 0, "ms": 0.0, "max_ms": 0.0, "errors": 0})
+        row["calls"] += 1
+        row["ms"] += elapsed
+        row["max_ms"] = max(row["max_ms"], elapsed)
+        row["errors"] += outcome != "ok"
+        row.setdefault('first_finished_at', _wall_timestamp(time.time()*1000))
+        row['last_finished_at'] = _wall_timestamp(time.time()*1000)
+
+    def message(self) -> str:
+        return "执行链路耗时 | " + json.dumps({
+            "trace_id": self.trace_id, "phase": self.phase, "started_at": self.started_at,
+            "finished_at": _wall_timestamp(time.time() * 1000),
+            "elapsed_ms": round((time.perf_counter()-self.started)*1000, 3),
+            "stages": self.stages, "remote": self.remote,
+            "rpc_connections": _rpc_stats['connections']-self.rpc_before['connections'],
+            "rpc_reused": _rpc_stats['reused']-self.rpc_before['reused'],
+        }, ensure_ascii=False)
+
+
+@contextmanager
+def _execution_span(name: str):
+    trace, started = getattr(_execution_timing, "current", None), time.perf_counter()
+    outcome = "ok"
+    try:
+        yield
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        if trace is not None:
+            try:
+                trace.record(name, started, outcome)
+            except Exception:
+                pass
+
+
+def _timed_runtime(phase: str):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped(self, context, *args, **kwargs):
+            if self.state.get('mode') == 'BACKTEST':
+                return fn(self, context, *args, **kwargs)
+            previous = getattr(_execution_timing, "current", None)
+            if previous is not None:
+                with _execution_span(phase):
+                    return fn(self, context, *args, **kwargs)
+            clock = _strategy_clock_parts(getattr(context, "current_dt", None))
+            key = "open-{:04d}{:02d}{:02d}".format(*clock[:3]) if clock else phase
+            trace = _ExecutionTrace(phase, "{}:{}".format(self.state.get("strategy_id") or "JQ", key))
+            _execution_timing.current = trace
+            replaced = {}
+            namespace = self._namespace or {}
+            # Observe existing calls only: do not issue extra data/order requests.
+            for name in ("get_current_data", "history", "get_extras", "get_price",
+                         "get_all_securities", "get_security_info", "get_orders", "get_open_orders",
+                         "get_trades", "order_target", "order_target_value", "cancel_order"):
+                original = namespace.get(name)
+                if callable(original):
+                    def instrument(api=original, stage="jq.api." + name):
+                        @functools.wraps(api)
+                        def call(*a, **kw):
+                            with _execution_span(stage):
+                                return api(*a, **kw)
+                        return call
+                    replacement = instrument()
+                    replaced[name] = (original, replacement)
+                    namespace[name] = replacement
+            finance = namespace.get('finance')
+            if finance is not None and callable(getattr(finance, 'run_query', None)):
+                class TimedFinance:
+                    def __getattr__(self, name):
+                        target = getattr(finance, name)
+                        if name != 'run_query':
+                            return target
+                        def call(*a, **kw):
+                            with _execution_span('jq.api.finance.run_query'):
+                                return target(*a, **kw)
+                        return call
+                proxy = TimedFinance()
+                replaced['finance'] = (finance, proxy)
+                namespace['finance'] = proxy
+            try:
+                with _execution_span(phase):
+                    return fn(self, context, *args, **kwargs)
+            finally:
+                for name, (original, replacement) in replaced.items():
+                    if namespace.get(name) is replacement:
+                        namespace[name] = original
+                _execution_timing.current = previous
+                try:
+                    timing_log = ('info', trace.message())
+                    saved = namespace.get('g')
+                    snapshot = getattr(saved, 'bt_open_decision', None) if saved is not None else self._prepared_rebalance
+                    if phase == 'jq.freeze_decision' and kwargs.get('qmt_execute_time') is None and snapshot:
+                        # Ordinary opening decisions already defer diagnostics
+                        # until native submit; timing must not undo that fast path.
+                        snapshot.setdefault('decision_logs', []).append(timing_log)
+                    else:
+                        self._flush_logs((timing_log,))
+                except Exception:
+                    pass
+        return wrapped
+    return decorate
 
 __all__ = [
     "STRATEGY_RUNTIME_API_VERSION",
@@ -97,10 +217,11 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 25
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v25"
+STRATEGY_RUNTIME_API_VERSION = 26
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v26"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
+_JQ_FIXED_SLIPPAGE = 0.002  # Native total spread; each side bears half.
 HONG_KONG_ETF_KEYWORDS = (
     "港股",
     "恒生",
@@ -701,17 +822,23 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def _send_message(sock: socket.socket, message: Dict[str, Any]) -> None:
-    body = json.dumps(
-        message, ensure_ascii=False, default=_json_default
-    ).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(body)) + body)
+    with _execution_span('rpc.json_encode'):
+        body = json.dumps(
+            message, ensure_ascii=False, default=_json_default
+        ).encode("utf-8")
+    with _execution_span('rpc.socket_sendall'):
+        sock.sendall(struct.pack(">I", len(body)) + body)
 
 
 def _read_message(sock: socket.socket) -> Dict[str, Any]:
-    size = struct.unpack(">I", _recv_exact(sock, 4))[0]
+    with _execution_span('rpc.socket_receive_wait_including_server'):
+        size = struct.unpack(">I", _recv_exact(sock, 4))[0]
     if size > 32 * 1024 * 1024:
         raise RuntimeError("服务器响应过大")
-    result = json.loads(_recv_exact(sock, size).decode("utf-8"))
+    with _execution_span('rpc.socket_receive_wait_including_server'):
+        body = _recv_exact(sock, size)
+    with _execution_span('rpc.json_decode'):
+        result = json.loads(body.decode("utf-8"))
     if not isinstance(result, dict):
         raise RuntimeError("服务器响应格式无效")
     return result
@@ -744,10 +871,11 @@ def _get_rpc_connection(profile: Dict[str, Any]) -> Any:
             _rpc_stats["reused"] += 1
             return sock
         _close_rpc_connection()
-    sock = socket.create_connection(
-        (profile["host"], profile["port"]),
-        timeout=min(float(profile["rpc_timeout"]), 10.0),
-    )
+    with _execution_span('rpc.dns_tcp_connect'):
+        sock = socket.create_connection(
+            (profile["host"], profile["port"]),
+            timeout=min(float(profile["rpc_timeout"]), 10.0),
+        )
     try:
         set_option = getattr(sock, "setsockopt", None)
         if callable(set_option):
@@ -755,8 +883,9 @@ def _get_rpc_connection(profile: Dict[str, Any]) -> Any:
             set_option(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         tls_cert = profile.get("tls_cert")
         if tls_cert:
-            context = ssl.create_default_context(cafile=tls_cert)
-            sock = context.wrap_socket(sock, server_hostname=profile["host"])
+            with _execution_span('rpc.tls_handshake'):
+                context = ssl.create_default_context(cafile=tls_cert)
+                sock = context.wrap_socket(sock, server_hostname=profile["host"])
         sock.settimeout(float(profile["rpc_timeout"]))
         _send_message(sock, {
             "type": "handshake", "token": profile["token"], "protocol": 1,
@@ -777,8 +906,18 @@ def _get_rpc_connection(profile: Dict[str, Any]) -> Any:
 
 def _strategy_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # A persistent connection has one response reader. Serialize complete RPCs.
+    started = time.perf_counter()
     with _rpc_lock:
-        return _strategy_request_locked(action, payload)
+        trace = getattr(_execution_timing, "current", None)
+        if trace is not None:
+            trace.record("rpc.lock_wait", started)
+        with _execution_span("rpc." + action):
+            result = _strategy_request_locked(action, payload)
+        if trace is not None and isinstance(result, dict) and len(trace.remote) < 32:
+            observed = result.get("_bt_server_timing")
+            if isinstance(observed, dict):
+                trace.remote.append(dict(action=action, **observed))
+        return result
 
 
 def _ping_rpc_connection(sock: Any) -> None:
@@ -806,7 +945,8 @@ def _strategy_request_locked(action: str, payload: Dict[str, Any]) -> Dict[str, 
         phase = "连接/应用握手"
         request_may_have_been_sent = False
         try:
-            sock = _get_rpc_connection(profile)
+            with _execution_span("rpc.connection_tls_auth_or_reuse"):
+                sock = _get_rpc_connection(profile)
             sock.settimeout(timeout)
             if not safe_retry and (
                 time.monotonic() - _rpc_connection["last_used"] >= _RPC_IDLE_PROBE_SECONDS
@@ -814,28 +954,34 @@ def _strategy_request_locked(action: str, payload: Dict[str, Any]) -> Dict[str, 
                 # A ping has no order side effects. A dead idle socket can be
                 # replaced before any business bytes are sent, never after.
                 phase = "连接保活"
-                _ping_rpc_connection(sock)
+                with _execution_span("rpc.idle_ping"):
+                    _ping_rpc_connection(sock)
 
             request_id = uuid.uuid4().hex
             request_payload = dict(payload)
             request_payload["strategy_id"] = _active_state["strategy_id"]
+            trace = getattr(_execution_timing, "current", None)
+            if trace is not None:
+                request_payload["trace_id"] = trace.trace_id
             if profile.get("account_key"):
                 request_payload["account_key"] = profile["account_key"]
 
             phase = "发送请求"
             # sendall 失败时也可能已经发送了部分数据；有副作用的请求必须按未知结果处理。
             request_may_have_been_sent = True
-            _send_message(
-                sock,
-                {
-                    "type": "request",
-                    "id": request_id,
-                    "action": action,
-                    "payload": request_payload,
-                },
-            )
+            with _execution_span("rpc.serialize_send"):
+                _send_message(
+                    sock,
+                    {
+                        "type": "request",
+                        "id": request_id,
+                        "action": action,
+                        "payload": request_payload,
+                    },
+                )
             phase = "接收响应"
-            response = _read_message(sock)
+            with _execution_span("rpc.wait_receive_decode_including_server"):
+                response = _read_message(sock)
             if response.get("type") == "error":
                 raise _ServerResponseError(
                     "{}: {}".format(
@@ -910,6 +1056,7 @@ def submit_targets(
     execution: Optional[ExecutionRequest] = None,
     security_names: Optional[Dict[str, str]] = None,
     reuse_existing: bool = False,
+    execute_at: Any = None,
 ) -> Dict[str, Any]:
     if _active_state is None or not _active_state.get("qmt_account_enabled"):
         raise RuntimeError("只有启用QMT账户后才可以提交真实组合目标")
@@ -924,6 +1071,8 @@ def submit_targets(
         payload["security_names"] = security_names
     if reuse_existing:
         payload["reuse_existing"] = True
+    if execute_at is not None:
+        payload["execute_at"] = execute_at
     return _strategy_request("strategy.submit_targets", payload)
 
 
@@ -1026,6 +1175,7 @@ def _restore_runtime_targets() -> None:
         "marks": {},
         "security_names": _security_names(intent.get("weights", {})),
         "execution": execution,
+        "execute_at": intent.get("execute_at"),
     }
 
 
@@ -1059,6 +1209,7 @@ def submit_runtime_targets(
     idempotency_key: str,
     execution: ExecutionRequest,
     security_names: Optional[Dict[str, str]] = None,
+    execute_at: Any = None,
 ) -> Dict[str, Any]:
     """Submit one typed daily target and retain only restart state."""
 
@@ -1071,6 +1222,7 @@ def submit_runtime_targets(
         execution=execution,
         security_names=security_names,
         reuse_existing=True,
+        **({"execute_at": execute_at} if execute_at is not None else {}),
     )
     weights = dict(result.get("effective_weights", weights))
     effective_execution = result.get("effective_execution")
@@ -1083,6 +1235,7 @@ def submit_runtime_targets(
         "marks": dict(marks),
         "security_names": dict(security_names or {}),
         "execution": execution,
+        "execute_at": result["intent"].get("execute_at", execute_at),
     }
     portfolio = PortfolioView(result["snapshot"])
     _record_runtime_portfolio(portfolio)
@@ -1108,6 +1261,8 @@ def advance_runtime_targets(context: Any) -> bool:
         _runtime_target_state["idempotency_key"],
         _runtime_target_state["execution"],
         _runtime_target_state.get("security_names"),
+        **({"execute_at": _runtime_target_state["execute_at"]}
+           if _runtime_target_state.get("execute_at") is not None else {}),
     )
     if result["intent"]["state"] in _TERMINAL_INTENT_STATES:
         _runtime_target_state = None
@@ -1744,6 +1899,7 @@ class JoinQuantRuntime:
         _security_name_cache.update(prepared.get("security_names", {}))
         return tuple(prepared["securities"])
 
+    @_timed_runtime('jq.rpc_prewarm')
     def _prewarm_rpc(self, context: Any) -> None:
         if not self.qmt_account_enabled or not self._qmt_callback_allowed(context, "连接预热"):
             return
@@ -1782,6 +1938,7 @@ class JoinQuantRuntime:
         self._set_qmt_ready(True)
         self._log("info", "QMT账户重新对账通过，恢复QMT执行")
 
+    @_timed_runtime('jq.prewarm_qmt')
     def prewarm_qmt(self, context: Any) -> None:
         """Prepare QMT account and quote feed before the opening decision."""
 
@@ -1798,6 +1955,9 @@ class JoinQuantRuntime:
                 "strategy.prepare_session",
                 payload,
             )
+            self.state['server_features'] = dict(ensured.get('server_features') or {})
+            if self.state['server_features'].get('scheduled_targets_v1') is not True:
+                self._log('warn', '服务器未确认支持定时目标；09:26预发策略不可用，请更新服务器；不影响普通即时目标')
             reconciliation = ensured.get("reconciliation", {})
             if reconciliation.get("state") != "READY":
                 raise RuntimeError(
@@ -1809,8 +1969,9 @@ class JoinQuantRuntime:
             self._set_qmt_ready(True)
             self._log(
                 "info",
-                "QMT盘前准备完成 | 对账=READY 行情链路={}；执行时以新快照提交目标".format(
-                    "就绪" if ensured.get("quote_ready") else "未验证"
+                "QMT盘前准备完成 | 对账=READY 行情链路={} 定时目标={}；执行时以新快照提交目标".format(
+                    "就绪" if ensured.get("quote_ready") else "未验证",
+                    '支持' if self.state['server_features'].get('scheduled_targets_v1') is True else '未确认',
                 ),
             )
         except Exception as exc:
@@ -1860,6 +2021,11 @@ class JoinQuantRuntime:
             raise RuntimeError("聚宽{}不可用".format(name))
         return api
 
+    @_timed_runtime('jq.prepare_candidates')
+    def run_decision(self, context: Any, callback: Callable[[Any], Any]) -> Any:
+        """Observe a strategy callback without moving its decision rules."""
+        return callback(context)
+
     def configure_platform(self, benchmark: str = "000300.XSHG") -> None:
         """Apply the shared JoinQuant runtime settings used by ETF strategies."""
 
@@ -1880,7 +2046,7 @@ class JoinQuantRuntime:
             min_commission=5,
         )
         self._platform_api("set_order_cost")(order_cost, type="fund")
-        slippage = self._platform_api("FixedSlippage")(0.002)
+        slippage = self._platform_api("FixedSlippage")(_JQ_FIXED_SLIPPAGE)
         self._platform_api("set_slippage")(slippage)
 
     def schedule_daily(
@@ -2017,7 +2183,8 @@ class JoinQuantRuntime:
             )
             + "风控: {} | 14:55 尾盘快照".format("/".join(risk_check_times))
             + " | 选股={} 下单={}".format(
-                open_decision_time, open_order_time or open_decision_time
+                opening_decision_time if opening_decision is not None else open_decision_time,
+                open_order_time or open_decision_time
             ),
         )
         if replace_existing:
@@ -2071,15 +2238,21 @@ class JoinQuantRuntime:
             # A serializable decision snapshot, not an order continuation plan.
             setattr(global_state, "bt_open_decision", decision)
 
+    @_timed_runtime('jq.freeze_decision')
     def prepare_rebalance(
         self,
         context: Any,
         decide: Callable[
             [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
         ],
+        *, qmt_execute_time: Optional[str] = None,
     ) -> None:
         """Freeze one account-neutral decision and the JQ sizing capital."""
 
+        if qmt_execute_time is not None:
+            self._validate_open_time(qmt_execute_time)
+            if context.current_dt.strftime("%H:%M") >= qmt_execute_time:
+                raise ValueError("定时目标必须在执行时间前锁定")
         self._store_prepared_rebalance(None)
         started = time.perf_counter()
         decision_started_at_ms = int(time.time() * 1000)
@@ -2104,6 +2277,7 @@ class JoinQuantRuntime:
                     float(context.portfolio.total_value)
                     if self.jq_account_enabled else None
                 ),
+                "qmt_server_managed": qmt_execute_time is not None,
             }
             self._log(
                 "info",
@@ -2118,13 +2292,40 @@ class JoinQuantRuntime:
             snapshot["decision_ready_at_ms"] = int(time.time() * 1000)
             self._store_prepared_rebalance(snapshot)
             prepared = True
+            if qmt_execute_time is not None and self.qmt_account_enabled:
+                # Freeze the JQ decision first: a remote failure must not erase
+                # it or cause an unannounced 09:30 fallback submission.
+                qmt_plan = {}
+                try:
+                    if self._qmt_callback_allowed(context, "定时目标"):
+                        self._retry_qmt_readiness(context)
+                        hour, minute = map(int, qmt_execute_time.split(":"))
+                        execute_at = context.current_dt.replace(
+                            hour=hour, minute=minute, second=0, microsecond=0,
+                        ).isoformat()
+                        qmt_plan = {
+                            "weights": dict(weights), "marks": dict(marks),
+                            "key": "open-{:04d}{:02d}{:02d}".format(*clock[:3]),
+                            "buy_not_before": qmt_execute_time,
+                            "qmt_execute_at": execute_at,
+                        }
+                        self._submit_qmt_server_rotation(context, qmt_plan)
+                except Exception as exc:
+                    if qmt_plan.get("qmt") == "BUY_SENT":
+                        self._log("warn", "QMT定时目标已接受，但日志/通知失败；不会重复提交：{}".format(exc))
+                    else:
+                        self._log("error", "QMT定时目标未确认接受，09:30不会补发；JQ冻结计划保留：{}".format(exc))
+                finally:
+                    snapshot["qmt_scheduled"] = qmt_plan.get("qmt") == "BUY_SENT"
         except Exception as exc:
             self._store_prepared_rebalance(None)
             self._log("error", "选股目标冻结失败，跳过下单：{}".format(exc))
         finally:
             self._captured_logs = None
-            if not prepared:
+            if not prepared or qmt_execute_time is not None:
                 self._flush_logs(captured)
+                if prepared:
+                    snapshot["decision_logs"] = []
 
     def _flush_logs(self, entries: Any) -> None:
         for level, message in entries:
@@ -2134,10 +2335,23 @@ class JoinQuantRuntime:
                 # Reporting failure cannot change a completed submission.
                 pass
 
+    @_timed_runtime('jq.execute_frozen_plan')
     def execute_prepared_rebalance(
-        self, context: Any
+        self, context: Any, *, jq_wait_for_sells: bool = False,
+        backtest_buy_price_increase: float = 0.0,
+        qmt_server_rotation: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Submit the same-day snapshot once, without reranking or retries."""
+        """Submit a frozen decision, optionally confirming JQ sells first."""
+
+        if qmt_server_rotation and not jq_wait_for_sells:
+            raise ValueError("服务器轮换必须同时声明卖出后买入")
+        if jq_wait_for_sells and not qmt_server_rotation and (
+            not self.jq_account_enabled or self.qmt_account_enabled
+        ):
+            raise ValueError("等待跌停价卖单成交实验仅支持JQ账户")
+        increase = self._validate_backtest_buy_price_increase(backtest_buy_price_increase)
+        if increase and not jq_wait_for_sells:
+            raise ValueError("回测买入涨价仅支持独立JQ卖出确认实验")
 
         global_state = (self._namespace or {}).get("g")
         snapshot = (
@@ -2157,6 +2371,19 @@ class JoinQuantRuntime:
             self._log("warn", "尚未到选股时间，跳过下单")
             return None
         self._store_prepared_rebalance(None)
+        if jq_wait_for_sells:
+            try:
+                self.prepare_sell_then_buy(
+                    context, snapshot["weights"], snapshot["marks"],
+                    "open-{:04d}{:02d}{:02d}".format(*clock[:3]),
+                    liquidate_all=False, jq_planning_total=snapshot["jq_planning_total"],
+                    backtest_buy_price_increase=increase,
+                    qmt_server_rotation=qmt_server_rotation,
+                    qmt_server_managed=snapshot.get("qmt_server_managed", False),
+                )
+            finally:
+                self._flush_logs(snapshot.get("decision_logs", ()))
+            return None
         self._pending_decision_ms = snapshot.get("decision_elapsed_ms")
         self._pending_decision_wall_times = {
             key: snapshot.get(key) for key in ("decision_started_at_ms", "decision_ready_at_ms")
@@ -2410,6 +2637,7 @@ class JoinQuantRuntime:
         idempotency_key: str,
         execution: ExecutionRequest,
         security_names: Optional[Dict[str, str]] = None,
+        *, execute_at: Any = None,
     ) -> Dict[str, Any]:
         return submit_runtime_targets(
             context,
@@ -2418,6 +2646,7 @@ class JoinQuantRuntime:
             idempotency_key,
             execution,
             security_names,
+            **({"execute_at": execute_at} if execute_at is not None else {}),
         )
 
     @staticmethod
@@ -2549,11 +2778,19 @@ class JoinQuantRuntime:
         marks: Dict[str, Any],
         idempotency_key: str,
         buy_not_before: str = "09:30",
+        *,
+        liquidate_all: bool = True,
+        jq_planning_total: Optional[float] = None,
+        backtest_buy_price_increase: float = 0.0,
+        qmt_server_rotation: bool = False,
+        qmt_server_managed: bool = False,
     ) -> None:
         """Opt-in liquidation plan. Persist only plain data in JQ's saved g.
 
-        All old strategy holdings, including selected securities, are sold.
-        QMT still owns its order lifecycle; JQ buys are one native batch only.
+        By default, liquidate all holdings; legacy QMT execution is unchanged.
+        liquidate_all=False retains selected JQ holdings and confirms each
+        required native sell before one market buy batch. qmt_server_rotation
+        opts into a separate server-owned whole-portfolio intent for QMT.
         """
 
         buy_not_before = time.strftime("%H:%M", time.strptime(buy_not_before, "%H:%M"))
@@ -2563,19 +2800,32 @@ class JoinQuantRuntime:
         target_marks = {code: float(marks[code]) for code in target_weights}
         if any(not math.isfinite(value) or value <= 0 for value in target_marks.values()):
             raise ValueError("目标参考价必须是有限正数")
+        if qmt_server_rotation and liquidate_all:
+            raise ValueError("服务器轮换保留计划内持仓，不支持全清仓流程")
+        if not liquidate_all and not qmt_server_rotation and (
+            not self.jq_account_enabled or self.qmt_account_enabled
+        ):
+            raise ValueError("保留目标持仓的分阶段实验仅支持JQ账户")
+        increase = self._validate_backtest_buy_price_increase(backtest_buy_price_increase)
+        if increase and (liquidate_all or (self.qmt_account_enabled and not qmt_server_rotation)):
+            raise ValueError("回测买入涨价仅支持独立JQ卖出确认实验")
         saved = self._saved_plan_namespace()
         day = context.current_dt.strftime("%Y-%m-%d")
         plan = getattr(saved, "bt_sell_then_buy", None)
         if plan and plan["day"] == day and plan["key"] == idempotency_key:
-            if (plan["weights"], plan["marks"], plan["buy_not_before"]) != (
-                target_weights, target_marks, buy_not_before
+            if (plan["weights"], plan["marks"], plan["buy_not_before"],
+                plan.get("liquidate_all", True), plan.get("jq_planning_total"),
+                plan.get("backtest_buy_price_increase", 0.0),
+                plan.get("qmt_server_rotation", False), plan.get("qmt_server_managed", False)) != (
+                target_weights, target_marks, buy_not_before, liquidate_all, jq_planning_total,
+                increase, qmt_server_rotation, qmt_server_managed,
             ):
                 raise RuntimeError("同一清仓买入计划的决策发生变化")
             self.advance_sell_then_buy(context)
             return
         if plan and plan["day"] == day:
             raise RuntimeError("当日已有清仓买入计划，不能重复建立")
-        qmt_allowed = self.qmt_account_enabled and self._qmt_callback_allowed(
+        qmt_allowed = not qmt_server_managed and self.qmt_account_enabled and self._qmt_callback_allowed(
             context, "清仓计划"
         )
         plan = {
@@ -2584,15 +2834,33 @@ class JoinQuantRuntime:
             "buy_not_before": buy_not_before,
             "jq": "START" if self.jq_account_enabled else "DONE",
             # A replay-created plan must never become a live QMT order later.
-            "qmt": "CANCEL_OLD" if qmt_allowed else "DONE",
+            "qmt": ("SERVER_SUBMITTING" if qmt_server_rotation else "CANCEL_OLD")
+                   if qmt_allowed else "DONE",
         }
+        if not liquidate_all:
+            planning_total = ((float(context.portfolio.total_value)
+                               if jq_planning_total is None else float(jq_planning_total))
+                              if self.jq_account_enabled else 0.0)
+            if not math.isfinite(planning_total) or planning_total < 0:
+                raise ValueError("冻结资金基数必须是有限非负数")
+            plan.update({
+                "liquidate_all": False, "jq_planning_total": jq_planning_total,
+                "jq_buying_total": planning_total,
+                "jq_sell_targets": (self._jq_lower_limit_sell_targets(
+                    context.portfolio, target_weights, planning_total)
+                    if self.jq_account_enabled else {}),
+                "jq_sell_orders": {},
+                "backtest_buy_price_increase": increase,
+                "qmt_server_rotation": qmt_server_rotation,
+                "qmt_server_managed": qmt_server_managed,
+            })
         saved.bt_sell_then_buy = plan
         for code, weight in target_weights.items():
             self._log("info", "策略目标比例 | {} 比例={:.2%}".format(
                 _security_label(code), weight
             ))
-        self._log("info", "清仓后买入计划已锁定 | 最早买入={} | 两账户独立确认清仓".format(
-            buy_not_before
+        self._log("info", "卖出后买入计划已锁定 | 最早买入={} | {}".format(
+            buy_not_before, "两账户独立确认清仓" if liquidate_all else "保留目标持仓，逐笔确认卖出成交"
         ))
         self.advance_sell_then_buy(context)
 
@@ -2615,44 +2883,164 @@ class JoinQuantRuntime:
             return
         if plan["jq"] == "START":
             self.cancel_orders()
-            limits = self._liquidation_limits(context.portfolio.positions)
+            positions = context.portfolio.positions
+            targets = plan.get("jq_sell_targets")
+            to_sell = positions if targets is None else {code: positions[code] for code in targets}
+            limits = self._liquidation_limits(to_sell) if to_sell else {}
             # An uncertain native submission must not be blindly repeated.
             plan["jq"] = "FAILED"
             for code, price in limits.items():
-                order = self.order_target(code, 0, limit_price=price)
-                self._log("info", "JQ清仓限价已提交 | {} 跌停价={:.3f}".format(
-                    _security_label(code), price
-                ))
+                quantity = 0 if targets is None else targets[code]
+                required = int(positions[code].total_amount) - quantity
+                order = self.order_target(code, quantity, limit_price=price)
                 if order is None:
-                    raise RuntimeError("JQ未接受清仓委托：{}".format(_security_label(code)))
+                    raise RuntimeError("JQ未接受卖出委托：{}，本轮不买入".format(_security_label(code)))
+                if targets is not None:
+                    order_id = getattr(order, "order_id", None)
+                    if order_id is None:
+                        raise RuntimeError("JQ卖单缺少委托ID，无法确认成交，本轮不买入")
+                    plan["jq_sell_orders"][code] = {
+                        "order_id": str(order_id), "quantity": required,
+                    }
+                self._log("info", "JQ跌停价卖单已提交 | {} 目标份额={} 限价={:.3f}".format(
+                    _security_label(code), quantity, price))
             plan["jq"] = "SELLING"
         if context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
             return
-        if any(pos.total_amount > 0 for pos in context.portfolio.positions.values()):
-            self._log("info", "JQ等待清仓成交，尚未全部卖出，不提交买单")
-            return
-        if self._platform_api("get_open_orders")():
-            self._log("info", "JQ等待清仓委托终结，不提交买单")
-            return
+        if "jq_sell_targets" in plan:
+            if not self._jq_required_sells_filled(context, plan):
+                return
+        else:
+            if any(pos.total_amount > 0 for pos in context.portfolio.positions.values()):
+                self._log("info", "JQ等待清仓成交，尚未全部卖出，不提交买单")
+                return
+            if self._platform_api("get_open_orders")():
+                self._log("info", "JQ等待清仓委托终结，不提交买单")
+                return
         if not plan["weights"]:
             plan["jq"] = "DONE"
             return
         portfolio = context.portfolio
+        planning_total = float(plan.get("jq_buying_total", portfolio.total_value))
+        buy_weights = plan["weights"]
+        if "jq_sell_targets" in plan:
+            buy_weights = {
+                code: weight for code, weight in buy_weights.items()
+                if code not in plan["jq_sell_targets"] and code not in plan.get("jq_risk_exits", ())
+                and planning_total * weight > self._position_value(portfolio.positions.get(code), plan["marks"][code])
+            }
         if not self.qmt_account_enabled:
             self.send_target_buy_plan(
-                self._target_buy_plan_items(portfolio, plan["weights"], plan["marks"]),
+                self._target_buy_plan_items(portfolio, buy_weights, plan["marks"],
+                                            planning_total if "jq_sell_targets" in plan else None),
                 occurred_at=context.current_dt,
             )
-        planning_total = float(portfolio.total_value)
         plan["jq"] = "BUY_SENT"
         # Do not add minute buy retries or QMT's premium to native JQ orders.
-        for code, weight in plan["weights"].items():
+        for code, weight in buy_weights.items():
             target_value = planning_total * weight
-            order = self.order_target_value(code, target_value)
+            order = self._order_with_backtest_buy_increase(
+                context, code, target_value, plan.get("backtest_buy_price_increase", 0.0),
+            )
+            if "jq_sell_targets" in plan and order is None:
+                self._log("warn", "JQ买入接口未返回委托 | {} | 不补买".format(_security_label(code)))
+                continue
             self._log("info", "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
                 _security_label(code), target_value, getattr(order, "order_id", None)
             ))
-        self._log("info", "JQ清仓已确认，原生市价买入已提交一次")
+        self._log("info", "JQ必要卖单全部成交，原生市价买入接口已调用一次，以逐笔结果为准"
+                  if "jq_sell_targets" in plan else "JQ清仓已确认，原生市价买入已提交一次")
+
+    @staticmethod
+    def _validate_backtest_buy_price_increase(value: Any) -> float:
+        if isinstance(value, bool):
+            raise ValueError("回测买入涨价比例必须是有限非负数")
+        increase = float(value)
+        if not math.isfinite(increase) or increase < 0:
+            raise ValueError("回测买入涨价比例必须是有限非负数")
+        return increase
+
+    def _order_with_backtest_buy_increase(
+        self, context: Any, security: str, target_value: float, increase: float,
+    ) -> Any:
+        """Stress only synchronous native backtest market buys, not limit prices.
+
+        The normal model is p + spread/2. Add (p + spread/2) * increase
+        to its one-sided slippage and restore the baseline after each call.
+        Native sizing, cash clipping, price limits and commissions still apply.
+        """
+        if not increase or self.mode != RuntimeMode.BACKTEST:
+            return self.order_target_value(security, target_value)
+        quote = self._platform_api("get_current_data")()[security]
+        # JQ's 09:30 market matching uses the opening price. Later minute
+        # callbacks use the current last completed price, not the frozen open.
+        price = float(quote.day_open if context.current_dt.strftime("%H:%M") == "09:30"
+                      else quote.last_price)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("回测买入撮合参考价无效：{}".format(security))
+        position = context.portfolio.positions.get(security)
+        if target_value <= int(getattr(position, "total_amount", 0)) * price:
+            return self.order_target_value(security, target_value)
+        original_price = price + _JQ_FIXED_SLIPPAGE / 2
+        spread = _JQ_FIXED_SLIPPAGE + 2 * original_price * increase
+        set_slippage = self._platform_api("set_slippage")
+        fixed_slippage = self._platform_api("FixedSlippage")
+        try:
+            set_slippage(fixed_slippage(spread))
+            self._log("info", "回测买入涨价 | {} 原模型价={:.6f} 额外上涨={:.3%} "
+                      "模型成交价={:.6f} | 实际成交以聚宽撮合为准".format(
+                          _security_label(security), original_price, increase,
+                          original_price * (1 + increase)))
+            return self.order_target_value(security, target_value)
+        finally:
+            set_slippage(fixed_slippage(_JQ_FIXED_SLIPPAGE))
+
+    def _jq_required_sells_filled(self, context: Any, plan: Dict[str, Any]) -> bool:
+        """Require this plan's fills, not just a possibly manual position change."""
+        if not plan["jq_sell_orders"]:
+            return True
+        orders = {str(key): order for key, order in self._platform_api("get_orders")().items()}
+        open_ids = {str(key) for key in self._platform_api("get_open_orders")()}
+        for code, required in plan["jq_sell_orders"].items():
+            order_id = required["order_id"]
+            order = orders.get(order_id)
+            filled = int(getattr(order, "filled", 0)) if order is not None else 0
+            if filled < required["quantity"]:
+                status = getattr(order, "status", "")
+                status_name = str(getattr(status, "name", status)).lower().rsplit(".", 1)[-1]
+                if status_name in ("canceled", "cancelled", "partly_canceled", "rejected", "filled", "held"):
+                    plan["jq"] = "FAILED"
+                    self._log("warn", "JQ卖单未全部成交即终结 | {} 成交={}/{} 状态={} | 本轮不买入".format(
+                        _security_label(code), filled, required["quantity"], status_name))
+                else:
+                    self._log("info", "JQ等待卖单全部成交 | {} 成交={}/{}，不提交买单".format(
+                        _security_label(code), filled, required["quantity"]))
+                return False
+            position = context.portfolio.positions.get(code)
+            if (order_id in open_ids or int(getattr(position, "total_amount", 0))
+                    > plan["jq_sell_targets"][code]):
+                self._log("info", "JQ等待卖单终结及持仓更新，不提交买单")
+                return False
+        return True
+
+    def _jq_lower_limit_sell_targets(
+        self, portfolio: Any, weights: Dict[str, Any], planning_total: float,
+    ) -> Dict[str, int]:
+        targets = {}
+        for code, position in list(portfolio.positions.items()):
+            if position.total_amount <= 0:
+                continue
+            if code not in weights or float(weights[code]) == 0:
+                targets[code] = 0
+                continue
+            price = float(position.price)
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("减仓参考价无效：{}".format(code))
+            delta = int((planning_total * float(weights[code])
+                         - self._position_value(position, price)) / price / 100) * 100
+            if delta < 0:
+                targets[code] = max(0, int(position.total_amount) + delta)
+        return targets
 
     def _advance_qmt_sell_then_buy(self, context: Any, plan: Dict[str, Any]) -> None:
         if plan["qmt"] in ("DONE", "BUY_SENT"):
@@ -2660,6 +3048,9 @@ class JoinQuantRuntime:
         if not self._qmt_callback_allowed(context, "清仓后买入"):
             return
         self._retry_qmt_readiness(context)
+        if plan.get("qmt_server_rotation"):
+            self._submit_qmt_server_rotation(context, plan)
+            return
         if plan["qmt"] == "CANCEL_OLD":
             if not self.cancel_targets():
                 return  # An old target must stop before a new liquidation.
@@ -2724,12 +3115,70 @@ class JoinQuantRuntime:
             occurred_at=context.current_dt,
         )
 
+    def _submit_qmt_server_rotation(self, context: Any, plan: Dict[str, Any]) -> None:
+        """Submit one whole-portfolio intent; QMT fills/recovery stay server-owned."""
+        execute_at = plan.get("qmt_execute_at")
+        if execute_at is not None:
+            features = self.state.get('server_features')
+            if features is None:
+                # Normal 09:20 preparation supplies this without an opening RTT.
+                prepared = _strategy_request('strategy.prepare_session', {'initial_capital': self._qmt_initial_capital})
+                features = self.state['server_features'] = dict(prepared.get('server_features') or {})
+            if features.get('scheduled_targets_v1') is not True:
+                raise RuntimeError('服务器不支持定时目标 scheduled_targets_v1；请部署配套服务器；不改为即时下单或09:30补交')
+        if execute_at is None and context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
+            return
+        if execute_at is None and not self.advance_targets(context):
+            return
+        portfolio = get_portfolio(as_of=context.current_dt)
+        weights, marks = dict(plan["weights"]), dict(plan["marks"])
+        positions = {code: position for code, position in portfolio.positions.items()
+                     if position.total_amount > 0}
+        if not weights:
+            weights = {code: 0.0 for code in positions}
+        if not weights:
+            plan["qmt"] = "DONE"
+            return
+        for code, position in positions.items():
+            marks.setdefault(code, float(position.price))
+        # JQ positions cannot enumerate QMT's independently owned securities.
+        limits = {code: int(round(price * 1_000_000)) for code, price in
+                  self._liquidation_limits(positions).items()}
+        if "qmt_rotation_execution" not in plan:
+            plan["qmt_rotation_execution"] = _execution_to_wire(ExecutionRequest(
+                style=LimitExecution(2_000), sell_style=LimitExecution(0, limits),
+                follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
+                repricing=RepricingPolicy.KEEP_ORIGINAL,
+            ))
+            plan["qmt_rotation_weights"] = weights
+            plan["qmt_rotation_marks"] = marks
+        result = self.submit_targets(
+            context, plan["qmt_rotation_weights"], plan["qmt_rotation_marks"],
+            plan["key"], _execution_from_wire(plan["qmt_rotation_execution"]),
+            _security_names(plan["qmt_rotation_weights"]),
+            **({"execute_at": execute_at} if execute_at is not None else {}),
+        )
+        plan["qmt"] = "BUY_SENT"  # Accepted intent, not a claim of completed buys.
+        self._log_qmt_planned_orders(result)
+        self._log("info", "QMT轮换目标已提交 | 保留计划内持仓，跌停价卖出计划外/超额部分；"
+                  "服务器确认卖出后固定参考价上浮0.2%买入 | intent_id={}".format(
+                      result.get("intent", {}).get("intent_id")))
+        if execute_at is not None:
+            self._log("info", "QMT定时计划已接受 | 执行时间={} | 开始前不发单；届时服务器独立执行，不依赖JQ回调".format(execute_at))
+        snapshot = result.get("snapshot")
+        accepted = PortfolioView(snapshot) if isinstance(snapshot, dict) else portfolio
+        self.send_target_buy_plan(
+            self._target_buy_plan_items(accepted, plan["weights"], plan["marks"]),
+            occurred_at=context.current_dt,
+        )
+
     def _saved_plan_namespace(self) -> Any:
         saved = self._namespace.get("g") if self._namespace is not None else None
         if saved is None:
             raise RuntimeError("聚宽g不可用，无法保存清仓后买入计划")
         return saved
 
+    @_timed_runtime('jq.confirm_sells_or_buy_once')
     def advance_sell_then_buy(self, context: Any) -> None:
         """Resume only today's explicit plan; never reselect or repeat JQ buys."""
 
@@ -2739,10 +3188,13 @@ class JoinQuantRuntime:
         # Sell orders remain native/server-owned outside this callback window.
         if not ("09:26" <= context.current_dt.strftime("%H:%M") < "15:00"):
             return
-        for account, advance in (
+        advances = (
             ("JQ", self._advance_jq_sell_then_buy),
             ("QMT", self._advance_qmt_sell_then_buy),
-        ):
+        )
+        if plan.get("qmt_server_rotation"):
+            advances = tuple(reversed(advances))  # V2 sends QMT intent before native JQ calls.
+        for account, advance in advances:
             try:
                 advance(context, plan)
             except Exception as exc:
@@ -3175,6 +3627,14 @@ class JoinQuantRuntime:
                     "take_profit": take_profit,
                     "orders": [],
                 }
+                plan = getattr((self._namespace or {}).get("g"), "bt_sell_then_buy", None)
+                if (isinstance(plan, dict) and "jq_sell_targets" in plan
+                        and plan.get("jq") == "SELLING"
+                        and plan["day"] == context.current_dt.strftime("%Y-%m-%d")):
+                    for security in stop_loss + take_profit:
+                        exits = plan.setdefault("jq_risk_exits", [])
+                        if security not in exits:
+                            exits.append(security)
                 for security in stop_loss + take_profit:
                     order_obj = self.order_target(security, 0)
                     account_result["orders"].append(

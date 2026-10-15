@@ -59,6 +59,8 @@ ARTIFACTS: Sequence[ArtifactSpec] = (
 _ARTIFACT_ROLES = frozenset(spec.role for spec in ARTIFACTS)
 STRATEGY_SOURCES = {
     "good_etf": "strategies/joinquant/good_etf.py",
+    "good_etf_v2": "strategies/joinquant/good_etf_v2.py",
+    "good_etf_0926_limitup": "strategies/joinquant/good_etf_0926_limitup.py",
     "etf_reversal": "strategies/joinquant/etf_reversal.py",
 }
 

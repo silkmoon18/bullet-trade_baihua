@@ -238,6 +238,7 @@ class PortfolioIntent:
     state: IntentState = IntentState.CREATED
     trading_day: Optional[date] = None
     execution_request: ExecutionRequest = ExecutionRequest()
+    execute_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         _require_int(self.expected_ledger_version, "expected_ledger_version")
@@ -250,6 +251,11 @@ class PortfolioIntent:
             raise TypeError("trading_day must be date")
         if type(self.execution_request) is not ExecutionRequest:
             raise TypeError("execution_request must be ExecutionRequest")
+        if self.execute_at is not None:
+            if not isinstance(self.execute_at, datetime) or self.execute_at.utcoffset() is None:
+                raise ValueError("execute_at must be a timezone-aware datetime")
+            if self.trading_day != self.execute_at.astimezone(SHANGHAI_TZ).date():
+                raise ValueError("execute_at must belong to the intent trading day")
 
 
 @dataclass(frozen=True)

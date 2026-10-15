@@ -15,6 +15,7 @@ from typing import Any, Dict
 from uuid import uuid4
 
 from .adapters.big_qmt import BigQmtGatewayError
+from .timing import current_trace
 
 log = logging.getLogger(__name__)
 MAX_FRAME = 2 * 1024 * 1024
@@ -24,6 +25,7 @@ MAX_FRAME = 2 * 1024 * 1024
 class PendingCommand:
     future: asyncio.Future
     write: bool
+    timing: object = None
 
 
 class QmtBridge:
@@ -136,6 +138,7 @@ class QmtBridge:
                 elif kind == "response":
                     pending = self.pending.get(str(message.get("id")))
                     if pending and not pending.future.done():
+                        pending.timing = message.get('timing')
                         if message.get("ok") is True:
                             pending.future.set_result(message.get("value"))
                         else:
@@ -157,6 +160,7 @@ class QmtBridge:
             self.tasks.discard(task)
 
     async def request(self, action, payload, timeout=10.0):
+        started = time.perf_counter()
         write = action in {"/place_order", "/cancel_order"}
         if not self.connected or (write and not self.ready):
             raise BigQmtGatewayError("QMT bridge not ready", code="QMT_NOT_READY", broker_called=False)
@@ -184,4 +188,11 @@ class QmtBridge:
             self._disconnect()
             raise BigQmtGatewayError("QMT transport failed", code="SUBMIT_UNKNOWN" if write else "BRIDGE_OFFLINE") from exc
         finally:
-            self.pending.pop(command_id, None)
+            pending = self.pending.pop(command_id, None)
+            trace = current_trace()
+            if trace is not None:
+                try:
+                    trace.record('bridge.' + action, started, command_id=command_id,
+                                 qmt_timing=pending.timing if pending is not None else None)
+                except Exception:
+                    pass

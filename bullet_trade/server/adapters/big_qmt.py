@@ -1374,7 +1374,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         ]
         return _filter_orders(orders, filters or {})
 
-    async def list_trades(
+    async def _query_trades(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:
         payload = _gateway_order_filters(filters or {})
@@ -1385,6 +1385,12 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             for item in _extract_list(data, "trades")
             if isinstance(item, dict)
         ]
+        return trades
+
+    async def list_trades(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
+        trades = await self._query_trades(account, filters)
         if any(not str(trade.get("side") or "").strip() for trade in trades):
             try:
                 orders = await self.list_orders(account)

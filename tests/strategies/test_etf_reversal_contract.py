@@ -240,7 +240,7 @@ def test_initialize_delegates_schedule_and_backtest_needs_no_remote_profile(monk
     monkeypatch.setattr(helper, 'install_joinquant_runtime', install)
     strategy.initialize(context())
     assert installed[0]['validate_remote_during_backtest'] is False
-    assert installed[0]['expected_api_version'] == 25
+    assert installed[0]['expected_api_version'] == 26
     assert installed[0]['strategy_id'] == 'etf_reversal_daily'
     args, kwargs = scheduled[0]
     assert args[3] == ()

@@ -219,6 +219,7 @@ class JoinQuantRuntime:
     qmt_account_enabled: bool
 
     def configure_platform(self, benchmark: str = ...) -> None: ...
+    def run_decision(self, context: Context, callback: Callable[[Any], Any]) -> Any: ...
     def schedule_daily(
         self,
         before_market_open: Callable[[Any], Any],
@@ -242,9 +243,12 @@ class JoinQuantRuntime:
         decide: Callable[
             [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
         ],
+        *, qmt_execute_time: Optional[str] = ...,
     ) -> None: ...
     def execute_prepared_rebalance(
-        self, context: Context
+        self, context: Context, *, jq_wait_for_sells: bool = ...,
+        backtest_buy_price_increase: float = ...,
+        qmt_server_rotation: bool = ...,
     ) -> Optional[Dict[str, Any]]: ...
     def log_process_initialize(self) -> None: ...
     def log_strategy_event(self, message: str) -> None: ...
@@ -263,6 +267,7 @@ class JoinQuantRuntime:
         idempotency_key: str,
         execution: ExecutionRequest,
         security_names: Optional[Dict[str, str]] = ...,
+        *, execute_at: Any = ...,
     ) -> Dict[str, Any]: ...
     @staticmethod
     def security_name(security: str, known_name: Any = ...) -> str: ...
@@ -313,6 +318,12 @@ class JoinQuantRuntime:
         marks: Dict[str, Any],
         idempotency_key: str,
         buy_not_before: str = ...,
+        *,
+        liquidate_all: bool = ...,
+        jq_planning_total: Optional[float] = ...,
+        backtest_buy_price_increase: float = ...,
+        qmt_server_rotation: bool = ...,
+        qmt_server_managed: bool = ...,
     ) -> None: ...
     def advance_sell_then_buy(self, context: Context) -> None: ...
     def execute_risk_management(
@@ -355,6 +366,7 @@ def submit_targets(
     execution: Optional[ExecutionRequest] = ...,
     security_names: Optional[Dict[str, str]] = ...,
     reuse_existing: bool = ...,
+    execute_at: Any = ...,
 ) -> Dict[str, Any]: ...
 def notify_target_buy_plan(
     items: Any,
@@ -382,6 +394,7 @@ def submit_runtime_targets(
     idempotency_key: str,
     execution: ExecutionRequest,
     security_names: Optional[Dict[str, str]] = ...,
+    execute_at: Any = ...,
 ) -> Dict[str, Any]: ...
 def advance_runtime_targets(context: Context) -> bool: ...
 def cancel_runtime_targets() -> bool: ...

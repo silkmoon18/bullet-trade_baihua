@@ -94,6 +94,51 @@ def test_reversal_export_selects_its_identity_and_preserves_validated_sources(tm
     assert exporter.export_joinquant(ROOT, second, strategy="etf_reversal") == manifest
 
 
+def test_v2_export_preserves_new_strategy_and_private_profile_identity(tmp_path):
+    exporter = _load_export_module()
+    destination = tmp_path / "v2"
+    manifest = exporter.export_joinquant(ROOT, destination, strategy="good_etf_v2")
+    assert exporter._repository_snapshot(ROOT, "good_etf_v2")[2] == {'strategy_id': 'good_etf_v2'}
+    assert set(path.name for path in destination.iterdir()) == {
+        'good_etf_v2.py', 'bullet_trade_jq_remote_helper.py',
+        'jq_runtime_config.example.py', 'manifest.json',
+    }
+    for spec in exporter._artifacts_for_strategy('good_etf_v2'):
+        assert (destination / spec.output).read_bytes() == (ROOT / spec.source).read_bytes()
+    assert manifest['production_ready'] is False
+
+
+def test_0926_limitup_export_is_anonymous_and_preserves_source_bytes(tmp_path):
+    exporter = _load_export_module()
+    destination = tmp_path / "limitup"
+    name = "good_etf_0926_limitup"
+    manifest = exporter.export_joinquant(ROOT, destination, strategy=name)
+    files, _, identity = exporter._repository_snapshot(ROOT, name)
+    assert identity == {"strategy_id": None}
+    assert manifest["files"] == files
+    for spec in exporter._artifacts_for_strategy(name):
+        assert (destination / spec.output).read_bytes() == (ROOT / spec.source).read_bytes()
+    code = """
+import importlib.util, sys, types
+sys.path.insert(0, {path!r})
+jq = types.ModuleType('jqdata')
+jq.__all__ = []
+sys.modules['jqdata'] = jq
+spec = importlib.util.spec_from_file_location('limitup_upload', {source!r})
+strategy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(strategy)
+assert not hasattr(strategy, 'STRATEGY_ID')
+assert strategy.OPEN_DECISION_TIME == '09:26'
+assert strategy.OPEN_ORDER_TIME == '09:30'
+assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 26
+assert strategy.VALIDATE_REMOTE_DURING_BACKTEST is False
+print('LIMITUP_IMPORT_OK')
+""".format(path=str(destination), source=str(destination / (name + ".py")))
+    result = _run_cleanroom(code)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "LIMITUP_IMPORT_OK"
+
+
 def test_reversal_export_cli_validation_and_unknown_strategy_fail_closed(tmp_path):
     exporter = _load_export_module()
     result = subprocess.run(
@@ -133,7 +178,7 @@ spec = importlib.util.spec_from_file_location('reversal_upload', root / 'etf_rev
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 assert strategy.STRATEGY_ID == 'etf_reversal_daily'
-assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 25
+assert strategy.bt.STRATEGY_RUNTIME_API_VERSION == 26
 assert strategy.VALIDATE_REMOTE_DURING_BACKTEST is False
 assert strategy.OPEN_DECISION_TIME == strategy.OPEN_ORDER_TIME == '09:35'
 strategy._validate_parameters()
@@ -602,7 +647,7 @@ assert spec is not None and spec.loader is not None
 strategy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(strategy)
 helper = sys.modules['bullet_trade_jq_remote_helper']
-assert helper.STRATEGY_RUNTIME_API_VERSION == 25
+assert helper.STRATEGY_RUNTIME_API_VERSION == 26
 profile = runpy.run_path(str(root / 'jq_runtime_config.example.py'))
 assert profile['PROFILE_SCHEMA_VERSION'] == 3
 assert profile['DEFAULT_PROFILE'] == 'qmt-main'
@@ -681,7 +726,7 @@ except RuntimeError as exc:
     assert 'API' in str(exc)
 else:
     raise AssertionError('accepted mismatched helper API')
-assert called == [25]
+assert called == [26]
 print('VERSION_MISMATCH_FAIL_CLOSED_OK')
 """.format(path=str(strategy_path))
 

@@ -289,7 +289,10 @@ async def test_preopen_has_one_server_owned_open_wakeup_without_holding_lock(api
     monkeypatch.setattr(strategy_api_module, "datetime", Clock)
     monkeypatch.setattr(service, "_is_limit_preopen_session", lambda now: True)
     monkeypatch.setattr(service.planner, "active_intents",
-                        lambda strategy_id: (SimpleNamespace(intent_id="pending"),))
+                        lambda strategy_id: (SimpleNamespace(
+                            intent_id="pending", execute_at=None,
+                            execution_request=ExecutionRequest(style=LimitExecution(preopen=True)),
+                        ),))
     entered, release = asyncio.Event(), asyncio.Event()
     delays, resumed = [], []
 
@@ -355,6 +358,7 @@ async def test_dispatch_checks_time_before_each_order(api, monkeypatch):
         return DispatchResult("first-dispatch", "broker-1", False)
 
     monkeypatch.setattr(service.planner, "dispatch_next", dispatch)
+    monkeypatch.setattr(service.planner, "has_pending_dispatch", lambda _: True)
     assert await service._dispatch_pending(None, "good_etf") == (DispatchResult("first-dispatch", "broker-1", False),)
     assert calls == ["good_etf"]
 
@@ -784,6 +788,216 @@ async def test_resume_dispatches_existing_pending_outbox_without_new_order(api, 
         )
     finally:
         connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", [None, "event", "state", "stale"])
+async def test_resume_reuses_only_unchanged_recent_reconciliation(api, monkeypatch, invalidate):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    now = datetime.now(SHANGHAI_TZ)
+    marks = {SECURITY: MarketMark(SECURITY, price_to_units("10"), now, "test")}
+    snapshot = service.valuation.create_snapshot("good_etf", marks, now, timedelta(minutes=5))
+    planned = service.planner.submit_target_weights(
+        "good_etf", "resume-snapshot-" + str(invalidate),
+        {SECURITY: "0.5"}, snapshot, marks, now,
+    )
+    reads = []
+    collect = strategy_api_module.collect_async_broker_snapshot
+    place = broker.place_order
+    advance = service.planner.advance_intent
+
+    async def counted_collect(*args, **kwargs):
+        reads.append(True)
+        result = await collect(*args, **kwargs)
+        if invalidate == "event" and len(reads) == 1:
+            service._record_broker_change(event=True)
+        return result
+
+    def checked_advance(*args, **kwargs):
+        result = advance(*args, **kwargs)
+        if invalidate == "state":
+            service._record_broker_change()
+        return result
+
+    async def checked_place(*args, **kwargs):
+        assert len(reads) == (1 if invalidate is None else 2)
+        return await place(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", counted_collect)
+    monkeypatch.setattr(service.planner, "advance_intent", checked_advance)
+    monkeypatch.setattr(broker, "place_order", checked_place)
+    if invalidate == "stale":
+        monkeypatch.setattr(strategy_api_module, "FIRST_DISPATCH_SNAPSHOT_MAX_AGE_SECONDS", -1)
+    await service._resume_intent_locked(planned.intent.intent_id)
+    assert broker.order_calls == 1
+    assert len(reads) == (1 if invalidate is None else 2)
+
+
+@pytest.mark.asyncio
+async def test_empty_dispatch_queue_does_not_query_broker(api, monkeypatch):
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+
+    async def unexpected_collect(*args, **kwargs):
+        pytest.fail("an empty local dispatch queue needs no broker snapshot")
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", unexpected_collect)
+    assert await service._dispatch_pending(None, "good_etf") == ()
+
+
+@pytest.mark.asyncio
+async def test_broker_callback_burst_coalesces_refresh_not_event_revisions(api, monkeypatch):
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    handled = []
+    before = service._broker_revisions()[0]
+
+    async def handle(key, event):
+        handled.append((key, event))
+
+    monkeypatch.setattr(service, "_handle_broker_event", handle)
+    for _ in range(10):
+        service._on_broker_event("default", "order")
+        service._on_broker_event("default", "trade")
+    await asyncio.sleep(0)
+    await drain_execution(service)
+    assert handled == [("default", "trade")]
+    assert service._broker_revisions()[0] == before + 20
+    assert service._broker_refreshes == {}
+
+
+@pytest.mark.asyncio
+async def test_callbacks_during_refresh_are_not_lost_or_run_in_parallel(api, monkeypatch):
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    entered, release = asyncio.Event(), asyncio.Event()
+    handled = []
+
+    async def handle(key, event):
+        handled.append(event)
+        if len(handled) == 1:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(service, "_handle_broker_event", handle)
+    service._on_broker_event("default", "order")
+    await asyncio.wait_for(entered.wait(), 1)
+    for _ in range(10):
+        service._on_broker_event("default", "trade")
+    await asyncio.sleep(0)
+    assert handled == ["order"] and len(service._broker_refreshes) == 1
+    release.set()
+    await drain_execution(service)
+    assert handled == ["order", "trade"]
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_still_processes_callback_received_during_read(api, monkeypatch):
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    entered, release = asyncio.Event(), asyncio.Event()
+    handled = []
+    errors = []
+    monkeypatch.setattr(strategy_api_module.logger, "exception", lambda message, *args: errors.append(message))
+
+    async def handle(key, event):
+        handled.append(event)
+        if len(handled) == 1:
+            entered.set()
+            await release.wait()
+            raise OSError("temporary query failure")
+
+    monkeypatch.setattr(service, "_handle_broker_event", handle)
+    service._on_broker_event("default", "order")
+    await asyncio.wait_for(entered.wait(), 1)
+    service._on_broker_event("default", "trade")
+    await asyncio.sleep(0)
+    release.set()
+    while service._background_tasks:
+        await asyncio.gather(*tuple(service._background_tasks), return_exceptions=True)
+    assert handled == ["order", "trade"]
+    assert errors == ["StrategyLedger callback task failed"]
+    assert service._broker_refreshes == {}
+
+
+@pytest.mark.asyncio
+async def test_coalesced_disconnect_and_reconnect_preserve_ready_gate(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    service._on_broker_event("default", "order")
+    service._on_broker_event("default", "disconnected")
+    await asyncio.sleep(0)
+    await drain_execution(service)
+    assert not service.startup_ready and broker.order_calls == 0
+    service._on_broker_event("default", "connected")
+    await asyncio.sleep(0)
+    await drain_execution(service)
+    assert service.startup_ready and broker.order_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_burst_books_fill_once_without_another_order(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "coalesced-fill",
+        "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
+    })
+    db = connect_database(service.database_path)
+    try:
+        qty, price = db.execute("SELECT requested_qty, limit_price_units FROM strategy_orders").fetchone()
+    finally:
+        db.close()
+    broker.positions = [{"security": SECURITY, "amount": qty, "closeable_amount": 0}]
+    broker.orders[0]["status"] = "filled"
+    broker.trades = [{
+        "trade_id": "burst-fill", "trade_id_source": "broker", "order_id": "broker-1",
+        "security": SECURITY, "side": "BUY", "amount": qty, "price": price / 1_000_000,
+        "commission_fee": 5, "commission_known": True, "tax": 0, "tax_known": True,
+        "time": datetime.now(SHANGHAI_TZ).isoformat(),
+    }]
+    reads = []
+    collect = strategy_api_module.collect_async_broker_snapshot
+
+    async def counted_collect(*args, **kwargs):
+        reads.append(True)
+        return await collect(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", counted_collect)
+    for _ in range(10):
+        service._on_broker_event("default", "order")
+        service._on_broker_event("default", "trade")
+    await asyncio.sleep(0)
+    await drain_execution(service)
+    assert len(reads) == 1 and broker.order_calls == 1
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+        assert db.execute("SELECT total_qty FROM positions").fetchone()[0] == qty
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_restart_coalesced_broker_worker(api, monkeypatch):
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    entered = asyncio.Event()
+
+    async def handle(key, event):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_handle_broker_event", handle)
+    service._on_broker_event("default", "order")
+    await asyncio.wait_for(entered.wait(), 1)
+    service._on_broker_event("default", "trade")
+    await asyncio.sleep(0)
+    await service.close()
+    service._on_broker_event("default", "connected")
+    await asyncio.sleep(0)
+    assert not service._background_tasks and service._broker_refreshes == {}
 
 
 @pytest.mark.asyncio
@@ -1822,6 +2036,52 @@ async def _seed_sellable_position(api, monkeypatch, available):
     monkeypatch.setattr(broker, "place_order", place_order)
     notifications.clear()
     return calls
+
+
+@pytest.mark.asyncio
+async def test_coalesced_partial_then_full_sell_still_unlocks_one_buy(api, monkeypatch):
+    service, broker, account, _ = api
+    calls = await _seed_sellable_position(api, monkeypatch, 500)
+    new_security = "510300.XSHG"
+    await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "callback-rotation",
+        "weights": {new_security: 0.5}, "marks": {new_security: 10},
+        "execution": execution_request_to_wire(ExecutionRequest(
+            style=LimitExecution(2000), sell_style=MarketExecution(15_000),
+        )),
+    })
+    assert [p["side"] for p in calls] == ["SELL"]
+    sell = broker.orders[-1]
+    reads = []
+    collect = strategy_api_module.collect_async_broker_snapshot
+
+    async def counted_collect(*args, **kwargs):
+        reads.append(True)
+        return await collect(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_api_module, "collect_async_broker_snapshot", counted_collect)
+    for quantity, state in ((100, "partly_filled"), (400, "filled")):
+        sell.update(status=state, filled=100 if quantity == 100 else 500)
+        broker.cash += quantity * 10 - quantity / 100
+        broker.positions = ([{"security": SECURITY, "amount": 400, "closeable_amount": 0}]
+                            if quantity == 100 else [])
+        broker.trades.append({
+            "trade_id": "sell-fill-" + str(quantity), "trade_id_source": "broker",
+            "order_id": sell["order_id"], "security": SECURITY, "side": "SELL",
+            "amount": quantity, "price": 10,
+            "commission_fee": quantity / 100, "commission_known": True,
+            "tax": 0, "tax_known": True, "time": datetime.now(SHANGHAI_TZ).isoformat(),
+        })
+        for _ in range(10):
+            service._on_broker_event("default", "order")
+            service._on_broker_event("default", "trade")
+        await asyncio.sleep(0)
+        await drain_execution(service)
+        assert [p["side"] for p in calls] == (["SELL"] if quantity == 100 else ["SELL", "BUY"])
+    assert calls[1]["security"] == new_security
+    assert calls[1]["style"] == {"type": "limit", "price": "10.02"}
+    assert len(reads) == 2  # One observation per burst, no second pre-buy query.
+    assert broker.order_calls == 3  # Seed buy, liquidation sell, one target buy.
 
 
 @pytest.mark.asyncio

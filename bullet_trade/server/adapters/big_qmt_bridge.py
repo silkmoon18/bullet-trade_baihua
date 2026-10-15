@@ -193,6 +193,14 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         key = self._account.config.key or "default"
         if isinstance(payload, dict) and event in {"order", "trade"}:
             payload = (_normalize_order if event == "order" else _normalize_trade)(payload)
+            try:
+                log.info('QMT原生回报时点 | event=%s security=%s tag=%s status=%s | QMT接收=%s 服务器接收=%s 券商时间=%s',
+                         event, payload.get('security'), payload.get('qmt_user_order_id') or payload.get('remark'),
+                         payload.get('status'), payload.get('_bt_event_received_at_ms'),
+                         datetime.now().astimezone().isoformat(timespec='milliseconds'),
+                         payload.get('order_time') or payload.get('time'))
+            except Exception:
+                pass
             if self._history:
                 # A persistence failure is surfaced, never silently treated as stored.
                 getattr(self._history, "record_" + event)(key, payload)
@@ -231,6 +239,16 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
 
     async def list_trades(self, account, filters=None):
         current = await super().list_trades(account, {})
+        return self._merge_trade_history(account, current, filters)
+
+    async def _list_snapshot_trades(self, account, orders_read):
+        # Both reads are already queued in the same bridge pump. Missing
+        # directions use that exact observation, not a second /orders RPC.
+        current = await self._query_trades(account, {})
+        current = _fill_trade_sides_from_orders(current, await orders_read)
+        return self._merge_trade_history(account, current, {"include_history": True})
+
+    def _merge_trade_history(self, account, current, filters):
         if self._history:
             self._history.record_trades(account.config.key or "default", current)
             if (filters or {}).get("include_history"):

@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 # ===== 部署契约 =====
 STRATEGY_ID = 'good_etf_remote_1000_20261008'  # 可省略；使用QMT时须与私有配置的key一致
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 25
+_EXPECTED_RUNTIME_API_VERSION = 26
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====

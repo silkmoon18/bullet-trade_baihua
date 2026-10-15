@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from ..timing import measured
 import hashlib
 import json
 import sqlite3
@@ -169,6 +170,7 @@ def collect_broker_snapshot(
     )
 
 
+@measured('broker.snapshot_reads')
 async def collect_async_broker_snapshot(
     broker: AsyncBrokerSnapshotReader,
     account_context: object,
@@ -180,13 +182,20 @@ async def collect_async_broker_snapshot(
         # The local Big QMT bridge processes these independent read requests
         # on one QMT thread. Queue them in one pump instead of waiting a timer
         # interval after every reply. Other adapters keep the old ordering.
+        orders_read = broker.list_orders(
+            account_context, {"from_broker": True, "include_history": True}
+        )
+        snapshot_trades = getattr(broker, "_list_snapshot_trades", None)
+        if callable(snapshot_trades):
+            orders_read = asyncio.ensure_future(orders_read)
+            trades_read = snapshot_trades(account_context, orders_read)
+        else:
+            trades_read = broker.list_trades(account_context, {"include_history": True})
         account, positions, orders, trades = await asyncio.gather(
             broker.get_account_info(account_context),
             broker.get_positions(account_context),
-            broker.list_orders(
-                account_context, {"from_broker": True, "include_history": True}
-            ),
-            broker.list_trades(account_context, {"include_history": True}),
+            orders_read,
+            trades_read,
         )
     else:
         account = await broker.get_account_info(account_context)

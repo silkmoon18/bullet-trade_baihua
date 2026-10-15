@@ -47,6 +47,10 @@ def test_write_once_preserves_server_price_and_type(script, price_type):
     assert messages[0]["value"]["submit_unknown"] is True
     timing = messages[0]["value"]["_bt_submit_timing"]
     assert timing["qmt_received_at_ms"] <= timing["qmt_passorder_at_ms"] <= timing["qmt_passorder_returned_at_ms"]
+    observed = messages[0]['timing']
+    assert observed['qmt_api_calls']['passorder']['calls'] == 1
+    assert observed['qmt_api_calls']['passorder']['ms'] >= 0
+    assert observed['qmt_command_ms'] >= observed['qmt_api_calls']['passorder']['ms']
 
 
 @pytest.mark.parametrize("action", ["/place_order", "/cancel_order"])

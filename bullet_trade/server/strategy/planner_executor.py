@@ -189,6 +189,8 @@ def _intent(row: sqlite3.Row) -> PortfolioIntent:
             else datetime.fromisoformat(row["created_at"]).date()
         ),
         execution_request=execution_request,
+        execute_at=(datetime.fromisoformat(payload["execute_at"])
+                    if payload.get("execute_at") else None),
     )
 
 
@@ -212,6 +214,7 @@ class SQLiteTargetExecutionService:
         execution_request: Optional[ExecutionRequest] = None,
         quotes: Optional[Mapping[str, MarketQuote]] = None,
         security_names: Optional[Mapping[str, str]] = None,
+        execute_at: Optional[datetime] = None,
     ) -> IntentAdvanceResult:
         request = execution_request or ExecutionRequest(
             style=LimitExecution(self.config.limit_price_offset_ppm)
@@ -219,6 +222,11 @@ class SQLiteTargetExecutionService:
         if type(request) is not ExecutionRequest:
             raise TypeError("execution_request must be ExecutionRequest")
         current = now or datetime.now(SHANGHAI_TZ)
+        if execute_at is not None and (
+            execute_at.utcoffset() is None
+            or execute_at.astimezone(SHANGHAI_TZ).date() != current.date()
+        ):
+            raise TargetPlanningError("execute_at must be on the current trading day")
         self._expire_old_intents(account_id, current)
         normalized = {security: _weight_units(value) for security, value in weights.items()}
         if not normalized or any(not security for security in normalized):
@@ -235,6 +243,8 @@ class SQLiteTargetExecutionService:
                 raise TargetPlanningError(
                     "idempotency key has different execution request"
                 )
+            if existing.execute_at != execute_at:
+                raise TargetPlanningError("idempotency key has different execute_at")
             return self.advance_intent(
                 existing.intent_id, snapshot, marks, current, quotes=quotes
             )
@@ -261,6 +271,7 @@ class SQLiteTargetExecutionService:
             request,
             current,
             security_names or {},
+            execute_at,
         )
         return self.advance_intent(
             intent.intent_id, snapshot, marks, current, quotes=quotes
@@ -299,6 +310,11 @@ class SQLiteTargetExecutionService:
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.CANCELED), (), False
             )
+        if intent.execute_at is not None and current < intent.execute_at:
+            # Persist the quantities/reference prices, not broker orders or
+            # reservations. Quotes, callbacks and repeated RPCs cannot start
+            # this intent early; the server-owned timer advances it at the open.
+            return IntentAdvanceResult(intent, (), True)
         if any(row["side"] == OrderSide.SELL.value for row in intent_working):
             return IntentAdvanceResult(intent, (), True)
         positions = {item.security: item for item in snapshot.positions}
@@ -640,6 +656,7 @@ class SQLiteTargetExecutionService:
         request,
         now,
         security_names,
+        execute_at=None,
     ):
         if not key:
             raise TargetPlanningError("idempotency key cannot be empty")
@@ -658,6 +675,8 @@ class SQLiteTargetExecutionService:
                 if name
             },
         }
+        if execute_at is not None:
+            payload["execute_at"] = execute_at.isoformat()
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         connection = connect_database(self.database_path)
         try:

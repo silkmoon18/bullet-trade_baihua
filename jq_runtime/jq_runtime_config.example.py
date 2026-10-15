@@ -25,6 +25,12 @@ DEFAULT_PROFILE = "qmt-main"
 # - 省略或找不到策略key时默认为JQ=True、QMT=False。
 # - 回测始终由run_type自动识别，只运行聚宽账户；无需额外配置。
 STRATEGIES = {
+    "good_etf_v2": {
+        "profile": "qmt-main",
+        "jq_account_enabled": True,
+        "qmt_account_enabled": False,  # 实盘切换核验/白名单配置后改为True
+        "jq_log_enabled": True,
+    },
     "good_etf_remote_1000_20261008": {
         "profile": "qmt-main",
         "jq_account_enabled": True,

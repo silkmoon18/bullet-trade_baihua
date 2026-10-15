@@ -16,6 +16,7 @@ from bullet_trade.server.adapters.big_qmt import (
 from bullet_trade.server.adapters.big_qmt_bridge import BridgeBrokerAdapter
 import bullet_trade.server.adapters.big_qmt_bridge as bridge_adapter_module
 from bullet_trade.server.config import AccountConfig, ServerConfig
+from bullet_trade.server.strategy.reconciliation import collect_async_broker_snapshot
 
 
 def make_bundle(monkeypatch, tmp_path):
@@ -157,6 +158,83 @@ async def test_live_bridge_fills_missing_trade_sides_from_orders_and_history(mon
         e.trades.clear()
         history = await e.broker.list_trades(e.account, {"include_history": True})
         assert [row["side"] for row in history] == ["BUY", "SELL"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_snapshot_shares_order_query_for_missing_trade_side(monkeypatch, tmp_path):
+    async with connected(monkeypatch, tmp_path) as e:
+        day, now = time.strftime("%Y%m%d"), time.strftime("%H:%M:%S")
+        e.orders.append(dict(
+            m_strOrderSysID="snapshot-order", m_strInstrumentID="159118", m_strExchangeID="SZ",
+            m_nOpType=24, m_nVolumeTotalOriginal=100, m_nVolumeTraded=100,
+            m_nOrderStatus=56, m_strInsertDate=day, m_strInsertTime=now,
+        ))
+        e.trades.append(dict(
+            m_strOrderSysID="snapshot-order", m_strTradeID="snapshot-trade",
+            m_strInstrumentID="159118", m_strExchangeID="SZ", m_nVolume=100,
+            m_dTradePrice=1.002, m_dTradeAmount=100.2, m_strTradeDate=day, m_strTradeTime=now,
+        ))
+        paths = []
+        post = e.broker.client.post
+
+        async def counted_post(path, *args, **kwargs):
+            paths.append(path)
+            return await post(path, *args, **kwargs)
+
+        monkeypatch.setattr(e.broker.client, "post", counted_post)
+        snapshot = await collect_async_broker_snapshot(e.broker, e.account)
+        assert sorted(paths) == ["/account", "/orders", "/positions", "/trades"]
+        assert snapshot.trades[0]["side"] == "SELL" and not e.writes
+        assert e.broker._history.list_trades("default")[0]["side"] == "SELL"
+        # Across a native query reset the same durable order evidence remains.
+        e.orders.clear()
+        e.trades.clear()
+        paths.clear()
+        restored = await collect_async_broker_snapshot(e.broker, e.account)
+        assert restored.trades[0]["side"] == "SELL"
+        assert sorted(paths) == ["/account", "/orders", "/positions", "/trades"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["security", "day", "id"])
+async def test_snapshot_trade_side_keeps_identity_boundaries(monkeypatch, tmp_path, mismatch):
+    bundle, account = make_bundle(monkeypatch, tmp_path)
+    broker = bundle.broker_adapter
+    order = dict(order_id="same", security="159118.XSHE", side="BUY",
+                 order_time="2026-10-13 09:30:00")
+    trade = dict(order_id="same", trade_id="fill", security="159118.XSHE", side="",
+                 time="2026-10-13 09:30:01", amount=100, price=1.002)
+    trade.update({"security": "159119.XSHE"} if mismatch == "security" else
+                 {"time": "2026-10-14 09:30:00"} if mismatch == "day" else {"order_id": "other"})
+
+    async def read_trades(*args):
+        return [trade]
+
+    async def read_orders():
+        return [order]
+
+    monkeypatch.setattr(broker, "_query_trades", read_trades)
+    result = await broker._list_snapshot_trades(account, asyncio.create_task(read_orders()))
+    assert result[0]["side"] == ""
+
+
+@pytest.mark.asyncio
+async def test_snapshot_order_read_failure_is_not_hidden_or_retried(monkeypatch, tmp_path):
+    bundle, account = make_bundle(monkeypatch, tmp_path)
+    broker = bundle.broker_adapter
+    calls = []
+
+    async def post(path, *args, **kwargs):
+        calls.append(path)
+        if path == "/orders":
+            raise BigQmtGatewayError("order query unavailable")
+        return {"available_cash": 10000} if path == "/account" else []
+
+    monkeypatch.setattr(broker.client, "post", post)
+    with pytest.raises(BigQmtGatewayError, match="order query unavailable"):
+        await collect_async_broker_snapshot(broker, account)
+    await asyncio.sleep(0)
+    assert calls.count("/orders") == 1 and "/place_order" not in calls
 
 
 @pytest.mark.asyncio

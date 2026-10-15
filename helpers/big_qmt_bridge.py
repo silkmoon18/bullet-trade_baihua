@@ -24,7 +24,7 @@ import socket
 import time
 from collections import OrderedDict
 
-BUILD_ID = "20261012_bridge_v3"
+BUILD_ID = "20261015_bridge_v4"
 MAX_FRAME = 2 * 1024 * 1024
 _runtime = None
 
@@ -141,9 +141,25 @@ class BridgeRuntime:
         self.details = {}
         self.details_day = ""
         self.pumping = False
+        self.command_timing = None
+
+    def call(self, name, fn, *args, **kwargs):
+        started = time.perf_counter()
+        outcome = "ok"
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            if self.command_timing is not None:
+                row = self.command_timing.setdefault(name, dict(calls=0, ms=0., errors=0))
+                row['calls'] += 1
+                row['ms'] += (time.perf_counter()-started)*1000
+                row['errors'] += outcome != "ok"
 
     def rows(self, kind):
-        result = _api("get_trade_detail_data")(self.account, ACCOUNT_TYPE, kind)
+        result = self.call('get_trade_detail_data.' + kind, _api("get_trade_detail_data"), self.account, ACCOUNT_TYPE, kind)
         if result is None:
             raise RuntimeError("QMT query returned no result: " + kind)
         return list(result)
@@ -176,6 +192,8 @@ class BridgeRuntime:
 
     def event(self, name, payload):
         if self.welcomed:
+            if name in ('order', 'trade') and isinstance(payload, dict):
+                payload = dict(payload, _bt_event_received_at_ms=int(time.time()*1000))
             self.send(dict(type="event", event=name, payload=payload))
 
     def detail(self, code):
@@ -183,7 +201,7 @@ class BridgeRuntime:
         if day != self.details_day:
             self.details, self.details_day = {}, day
         if code not in self.details:
-            self.details[code] = self.c.get_instrument_detail(code) or {}
+            self.details[code] = self.call('get_instrument_detail', self.c.get_instrument_detail, code) or {}
         return self.details[code]
 
     def quotes(self, payload):
@@ -209,9 +227,9 @@ class BridgeRuntime:
         if len(desired) > MAX_SUBSCRIPTIONS:
             raise ValueError("Too many QMT quote subscriptions")
         for code in set(self.subscriptions) - desired:
-            self.c.unsubscribe_quote(self.subscriptions.pop(code))
+            self.call('unsubscribe_quote', self.c.unsubscribe_quote, self.subscriptions.pop(code))
         for code in desired - set(self.subscriptions):
-            sub = self.c.subscribe_quote(code, period="tick", dividend_type="none", result_type="dict", callback=self.on_quote)
+            sub = self.call('subscribe_quote', self.c.subscribe_quote, code, period="tick", dividend_type="none", result_type="dict", callback=self.on_quote)
             if not isinstance(sub, int) or sub <= 0:
                 raise RuntimeError("QMT quote subscription failed: " + code)
             self.subscriptions[code] = sub
@@ -239,7 +257,7 @@ class BridgeRuntime:
             return self.subscriptions_to(payload["symbols"])
         code = _qmt(payload.get("security", ""))
         if action in ("/data/snapshot", "/data/current_tick", "/data/live_current"):
-            ticks = self.c.get_full_tick([code])
+            ticks = self.call('get_full_tick', self.c.get_full_tick, [code])
             if not ticks or not ticks.get(code):
                 raise RuntimeError("QMT quote missing: " + code)
             return self.quotes(ticks)[_jq(code)][-1]
@@ -248,9 +266,9 @@ class BridgeRuntime:
             detail.update(code=_jq(code), display_name=detail.get("InstrumentName", ""))
             return detail
         if action == "/data/tplus":
-            return 0 if code in self.c.get_stock_list_in_sector("T+0\u57fa\u91d1") else 1
+            return 0 if code in self.call('get_stock_list_in_sector', self.c.get_stock_list_in_sector, "T+0\u57fa\u91d1") else 1
         if action == "/data/trade_days":
-            return dict(values=self.c.get_trading_dates(code or "000001.SH", payload.get("start", ""),
+            return dict(values=self.call('get_trading_dates', self.c.get_trading_dates, code or "000001.SH", payload.get("start", ""),
                         payload.get("end", ""), payload.get("count", -1), "1d"))
         if action == "/place_order":
             if not ENABLE_TRADING:
@@ -274,7 +292,7 @@ class BridgeRuntime:
             fn = _api("passorder")
             called_at = int(time.time() * 1000)
             boundary[0] = True
-            fn(23 if side == "BUY" else 24, 1101, self.account, code, pr_type, float(price), amount,
+            self.call('passorder', fn, 23 if side == "BUY" else 24, 1101, self.account, code, pr_type, float(price), amount,
                "bt_bridge", 2, tag, self.c)
             # passorder return values are NOT stable broker order IDs.
             return dict(order_id="", status="submit_unknown", submit_unknown=True, qmt_user_order_id=tag,
@@ -288,7 +306,7 @@ class BridgeRuntime:
                 raise ValueError("Missing order_id")
             fn = _api("cancel")
             boundary[0] = True
-            fn(order_id, self.account, ACCOUNT_TYPE, self.c)
+            self.call('cancel', fn, order_id, self.account, ACCOUNT_TYPE, self.c)
             return dict(order_id=order_id, status="submit_unknown", submit_unknown=True)
         raise ValueError("Unsupported bridge action: " + action)
 
@@ -301,6 +319,8 @@ class BridgeRuntime:
             return
         boundary = [False]
         response = dict(type="response", id=key, ok=False)
+        started, received_at = time.perf_counter(), int(time.time()*1000)
+        self.command_timing = {}
         write = message.get("action") in ("/place_order", "/cancel_order")
         reserved = False
         try:
@@ -318,6 +338,11 @@ class BridgeRuntime:
                 response["value"]["_bt_submit_timing"]["qmt_received_at_ms"] = received_at
         except Exception as exc:
             response.update(error=str(exc), code="QMT_ACTION_FAILED", broker_called=boundary[0])
+        response['timing'] = dict(qmt_received_at_ms=received_at,
+                                  qmt_finished_at_ms=int(time.time()*1000),
+                                  qmt_command_ms=(time.perf_counter()-started)*1000,
+                                  qmt_api_calls=self.command_timing)
+        self.command_timing = None
         if reserved:
             self.seen[key] = response
         self.send(response)

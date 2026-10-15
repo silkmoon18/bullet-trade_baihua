@@ -58,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 25,
+            "api_version": 26,
             "strategy_id": "good_etf_remote_1000_20261008",
             "mode": mode.value,
         }
@@ -396,7 +396,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": strategy.STRATEGY_ID,
         "qmt_initial_capital": 1000,
-        "expected_api_version": 25,
+        "expected_api_version": 26,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }
