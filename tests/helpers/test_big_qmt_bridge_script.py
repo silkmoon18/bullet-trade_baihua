@@ -144,10 +144,122 @@ def test_init_timer_and_historical_bars_do_not_order(script):
                               run_time=lambda *args: calls.append(args))
     script.init(context)
     script.handlebar(context)
-    assert calls == [("on_timer", "500nMilliSecond", "20200101000000")]
+    assert calls == [("on_timer", "100nMilliSecond", "20200101000000")]
     assert script._runtime.sock is None
     script.stop(context)
     script.init(context)  # Stop/start releases local resources.
+
+
+@pytest.mark.parametrize('account,token,typ,fields', [
+    ('', 'secret-not-for-logs', 'STOCK', ['ACCOUNT_ID:']),
+    ('test-account', '', 'STOCK', ['BRIDGE_TOKEN:']),
+    ('test-account', 'secret-not-for-logs', 'CREDIT', ['ACCOUNT_TYPE:']),
+    ('', '', 'CREDIT', ['ACCOUNT_ID:', 'BRIDGE_TOKEN:', 'ACCOUNT_TYPE:']),
+])
+def test_init_reports_exact_missing_configuration_without_binding_or_secret(script, account, token, typ, fields):
+    script.ACCOUNT_ID, script.BRIDGE_TOKEN, script.ACCOUNT_TYPE = account, token, typ
+    context = SimpleNamespace(set_account=lambda _: pytest.fail('Invalid config must not bind account'))
+    with pytest.raises(RuntimeError) as caught:
+        script.init(context)
+    assert all(field in str(caught.value) for field in fields)
+    assert 'secret-not-for-logs' not in str(caught.value)
+    assert script._runtime is None
+
+
+def test_context_account_id_is_accepted_without_guessing_or_enabling_trade(script):
+    script.BRIDGE_TOKEN = 'private-test-token'
+    bound = []
+    context = SimpleNamespace(account_id='test-selected-account', set_account=bound.append,
+                              run_time=lambda *args: None)
+    script.init(context)
+    assert bound == ['test-selected-account']
+    assert script.ENABLE_TRADING is False and script.ENABLE_CANCEL is False
+    assert script._runtime.sock is None
+    script.stop(context)
+
+
+class SendingSocket:
+    def __init__(self, result=None):
+        self.result, self.frames, self.closed = result, [], False
+
+    def send(self, data):
+        if isinstance(self.result, Exception):
+            raise self.result
+        size = len(data) if self.result is None else self.result
+        self.frames.append(data[:size])
+        return size
+
+    def close(self):
+        self.closed = True
+
+
+def test_callback_is_flushed_without_waiting_for_another_timer(script):
+    import json
+    bridge = script.BridgeRuntime(SimpleNamespace(), 'test-account')
+    bridge.sock = SendingSocket()
+    bridge.connected = bridge.welcomed = True
+    bridge.event('order', {'security': '510300.XSHG', 'status': 'open'})
+    assert len(bridge.sock.frames) == 1 and bridge.outgoing == b''
+    assert json.loads(bridge.sock.frames[0])['event'] == 'order'
+
+
+def test_partial_or_blocked_send_keeps_bytes_without_blocking_or_duplication(script):
+    bridge = script.BridgeRuntime(SimpleNamespace(), 'test-account')
+    sock = bridge.sock = SendingSocket(3)
+    bridge.connected = True
+    bridge.send({'type': 'response', 'ok': True})
+    remaining = bridge.outgoing
+    assert remaining and len(sock.frames) == 1
+    sock.result = BlockingIOError()
+    bridge.flush_outgoing()
+    assert bridge.outgoing == remaining and not sock.closed
+    sock.result = None
+    bridge.flush_outgoing()
+    assert bridge.outgoing == b''
+    import json
+    assert json.loads(b''.join(sock.frames)) == {'type': 'response', 'ok': True}
+
+
+def test_send_failure_after_passorder_preserves_dedup_and_never_replays_write(script):
+    calls = []
+    script.ENABLE_TRADING = True
+    script.passorder = lambda *args: calls.append(args)
+    bridge = script.BridgeRuntime(SimpleNamespace(), 'test-account')
+    sock = bridge.sock = SendingSocket(OSError('lost acknowledgement'))
+    bridge.connected = True
+    bridge.command(command())
+    assert len(calls) == 1 and sock.closed and bridge.sock is None
+    assert 'one' in bridge.seen and bridge.seen['one']['ok']
+    bridge.command(command())
+    assert len(calls) == 1
+
+
+def test_client_socket_uses_nonblocking_tcp_nodelay(script, monkeypatch):
+    options = []
+    sock = SimpleNamespace(setblocking=lambda value: options.append(('blocking', value)),
+        setsockopt=lambda *args: options.append(args), connect_ex=lambda addr: 10035,
+        close=lambda: None)
+    monkeypatch.setattr(script.socket, 'socket', lambda: sock)
+    monkeypatch.setattr(script.select, 'select', lambda *args: ([], [], []))
+    bridge = script.BridgeRuntime(SimpleNamespace(), 'test-account')
+    bridge.pump()
+    assert ('blocking', False) in options
+    assert (script.socket.IPPROTO_TCP, script.socket.TCP_NODELAY, 1) in options
+    bridge.close()
+
+
+def test_timing_reports_actual_pump_gap_without_extra_qmt_calls(script, monkeypatch):
+    bridge, messages = runtime(script)
+    reads, clock = [], [1.]
+    script.get_trade_detail_data = lambda *args: reads.append(args) or []
+    bridge._pump = lambda: bridge.command(command('read', '/orders'))
+    monkeypatch.setattr(script.time, 'monotonic', lambda: clock[0])
+    bridge.pump()
+    assert messages[-1]['timing']['qmt_pump_gap_ms'] is None
+    clock[0] = 3.05
+    bridge.pump()
+    assert messages[-1]['timing']['qmt_pump_gap_ms'] == pytest.approx(2050.)
+    assert len(reads) == 2
 
 
 def test_portable_single_file_has_no_strategy_or_external_runtime():

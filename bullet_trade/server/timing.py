@@ -5,13 +5,19 @@ import contextvars
 import functools
 import inspect
 import json
-import logging
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 _current = contextvars.ContextVar('bt_execution_timing', default=None)
-log = logging.getLogger(__name__)
+
+
+def print_timing(message, *args):
+    """Diagnostics only: bypass application/file log handlers; never affect trading."""
+    try:
+        print('{} {}'.format(Trace.wall(), message % args if args else message))
+    except Exception:
+        pass
 
 
 class Trace:
@@ -43,7 +49,7 @@ class Trace:
         if self.tags.get('had_active_intent') is False:
             return  # Don't log every idle account/position heartbeat.
         try:
-            log.info('执行链路耗时 | %s', json.dumps(self.summary(), ensure_ascii=False, allow_nan=False))
+            print_timing('执行链路耗时 | %s', json.dumps(self.summary(), ensure_ascii=False, allow_nan=False))
         except Exception:
             pass
 

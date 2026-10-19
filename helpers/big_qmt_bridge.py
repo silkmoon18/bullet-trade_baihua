@@ -12,7 +12,7 @@ BRIDGE_PORT = 9001                  # BT listens on 127.0.0.1, never public.
 BRIDGE_TOKEN = ""                   # Same as BIG_QMT_GATEWAY_PASSWORD.
 ENABLE_TRADING = False              # passorder gate; does not enable server strategies.
 ENABLE_CANCEL = False               # Independent cancel gate.
-TIMER_MS = 500                      # Network pump, NOT an order retry interval.
+TIMER_MS = 100                      # Network pump, NOT an order retry interval.
 MAX_SUBSCRIPTIONS = 100             # Subscribe only targets and owned positions.
 
 import builtins
@@ -24,7 +24,7 @@ import socket
 import time
 from collections import OrderedDict
 
-BUILD_ID = "20261015_bridge_v4"
+BUILD_ID = "20261019_bridge_v6"
 MAX_FRAME = 2 * 1024 * 1024
 _runtime = None
 
@@ -141,6 +141,7 @@ class BridgeRuntime:
         self.details = {}
         self.details_day = ""
         self.pumping = False
+        self.last_pump_at = self.pump_gap_ms = None
         self.command_timing = None
 
     def call(self, name, fn, *args, **kwargs):
@@ -189,6 +190,25 @@ class BridgeRuntime:
             self.disconnect()
             raise RuntimeError("QMT bridge output overflow; reconnect and reconcile")
         self.outgoing += frame
+        # Responses and callbacks needn't wait for the next timer. One
+        # nonblocking send only; partial writes stay buffered and never replay
+        # the native trading command.
+        try:
+            self.flush_outgoing()
+        except OSError as exc:
+            print("[bt_bridge] connection paused: " + str(exc))
+            self.disconnect()
+
+    def flush_outgoing(self):
+        if not self.connected or self.sock is None or not self.outgoing:
+            return
+        try:
+            size = self.sock.send(self.outgoing)
+            if size <= 0:
+                raise OSError("BT bridge send closed")
+            self.outgoing = self.outgoing[size:]
+        except BlockingIOError:
+            pass
 
     def event(self, name, payload):
         if self.welcomed:
@@ -341,6 +361,7 @@ class BridgeRuntime:
         response['timing'] = dict(qmt_received_at_ms=received_at,
                                   qmt_finished_at_ms=int(time.time()*1000),
                                   qmt_command_ms=(time.perf_counter()-started)*1000,
+                                  qmt_pump_gap_ms=self.pump_gap_ms,
                                   qmt_api_calls=self.command_timing)
         self.command_timing = None
         if reserved:
@@ -351,6 +372,9 @@ class BridgeRuntime:
         if self.closed or self.pumping:
             return
         self.pumping = True
+        now = time.monotonic()
+        self.pump_gap_ms = None if self.last_pump_at is None else (now-self.last_pump_at)*1000
+        self.last_pump_at = now
         try:
             self._pump()
         except (OSError, ValueError, RuntimeError) as exc:
@@ -366,6 +390,7 @@ class BridgeRuntime:
                 return
             self.sock = socket.socket()
             self.sock.setblocking(False)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             error = self.sock.connect_ex(("127.0.0.1", BRIDGE_PORT))
             if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, 10035, 10036):
                 raise OSError(error, "BT bridge unavailable")
@@ -406,11 +431,7 @@ class BridgeRuntime:
             self.send(dict(type="heartbeat", health=self.health()))
             self.last_heartbeat = now
         if self.outgoing and writable:
-            try:
-                size = self.sock.send(self.outgoing)
-                self.outgoing = self.outgoing[size:]
-            except BlockingIOError:
-                pass
+            self.flush_outgoing()
 
     def disconnect(self):
         if self.sock is not None:
@@ -438,9 +459,19 @@ def init(ContextInfo):
         raise RuntimeError("Bridge already running")
     if getattr(ContextInfo, "do_back_test", False):
         raise RuntimeError("Bridge requires strategy-trading mode, not backtest")
-    account_id = ACCOUNT_ID or globals().get("account") or getattr(ContextInfo, "accountID", "")
-    if not account_id or not BRIDGE_TOKEN or ACCOUNT_TYPE != "STOCK":
-        raise RuntimeError("Configure account, BRIDGE_TOKEN and STOCK account type")
+    account_id = (str(ACCOUNT_ID or "").strip() or str(globals().get("account") or "").strip()
+                  or str(getattr(ContextInfo, "accountID", "") or "").strip()
+                  or str(getattr(ContextInfo, "account_id", "") or "").strip())
+    # Never guess an account or silently enable a write gate.
+    missing = []
+    if not account_id:
+        missing.append("ACCOUNT_ID: select the account in strategy trading, or fill ACCOUNT_ID")
+    if not isinstance(BRIDGE_TOKEN, str) or not BRIDGE_TOKEN.strip():
+        missing.append("BRIDGE_TOKEN: fill the private bridge token (not the broker password)")
+    if ACCOUNT_TYPE != "STOCK":
+        missing.append('ACCOUNT_TYPE: must be "STOCK"')
+    if missing:
+        raise RuntimeError("Bridge configuration invalid; " + "; ".join(missing))
     ContextInfo.set_account(str(account_id))
     runtime = BridgeRuntime(ContextInfo, str(account_id))
     _runtime = runtime

@@ -13,7 +13,7 @@ from bullet_trade.server.adapters.big_qmt import (
     BigQmtBrokerAdapter, BigQmtGatewayError, _fill_trade_sides_from_orders,
     _normalize_order, build_big_qmt_bundle,
 )
-from bullet_trade.server.adapters.big_qmt_bridge import BridgeBrokerAdapter
+from bullet_trade.server.adapters.big_qmt_bridge import BridgeBrokerAdapter, BridgeDataAdapter
 import bullet_trade.server.adapters.big_qmt_bridge as bridge_adapter_module
 from bullet_trade.server.config import AccountConfig, ServerConfig
 from bullet_trade.server.strategy.reconciliation import collect_async_broker_snapshot
@@ -235,6 +235,24 @@ async def test_snapshot_order_read_failure_is_not_hidden_or_retried(monkeypatch,
         await collect_async_broker_snapshot(broker, account)
     await asyncio.sleep(0)
     assert calls.count("/orders") == 1 and "/place_order" not in calls
+
+
+@pytest.mark.asyncio
+async def test_timing_uses_stdout_without_file_logger_and_keeps_native_order(monkeypatch, tmp_path, capsys):
+    async with connected(monkeypatch, tmp_path) as e:
+        def forbidden(*args, **kwargs):
+            pytest.fail('Timing must bypass application/file log handlers')
+
+        monkeypatch.setattr(bridge_adapter_module.log, 'info', forbidden)
+        result = await e.broker.place_order(e.account, dict(
+            security='510300.XSHG', amount=100, side='BUY',
+            style={'type': 'limit', 'price': '1.002'},
+            order_remark='bt:abcdef:123456789abc', wait_timeout=0))
+        assert result['order_id'] == 'native-order-1' and not result.get('submit_unknown')
+        assert len(e.writes) == 1 and e.writes[0][4:7] == (11, 1.002, 100)
+        assert e.broker._history.list_orders('default')[0]['order_id'] == 'native-order-1'
+        output = capsys.readouterr().out
+        assert 'QMT原生回报时点 | ' in output and 'QMT委托确认 | ' in output
 
 
 @pytest.mark.asyncio
@@ -484,3 +502,141 @@ async def test_concurrent_same_tag_is_not_sent_twice_and_waiter_is_cleaned(monke
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not e.broker._submission_callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cycle', [0, 1])
+async def test_tplus_static_metadata_is_shared_and_reused_not_financial_data(monkeypatch, cycle):
+    calls, ready, release = [], asyncio.Event(), asyncio.Event()
+    async def post(path, payload):
+        calls.append((path, payload))
+        ready.set()
+        await release.wait()
+        return cycle
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    first = asyncio.create_task(data.get_tplus('TEST.XSHG'))
+    await ready.wait()
+    readers = [asyncio.create_task(data.get_tplus('TEST.XSHG')) for _ in range(9)]
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+    assert await first == cycle and await asyncio.gather(*readers) == [cycle]*9
+    assert [await data.get_tplus('TEST.XSHG') for _ in range(10)] == [cycle]*10
+    assert len(calls) == 1 and not data._tplus_inflight
+    assert calls[0][0] == '/data/tplus'  # Never caches cash/positions/orders/trades.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalidate', ['day', 'reconnect', 'disconnect'])
+async def test_tplus_cache_is_invalidated_by_session_or_china_date(monkeypatch, invalidate):
+    calls, day = [], ['2026-10-19']
+    async def post(path, payload):
+        calls.append(path)
+        return 0
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    monkeypatch.setattr(data, '_metadata_day', lambda: day[0])
+    assert await data.get_tplus('TEST') == 0
+    if invalidate == 'day':
+        day[0] = '2026-10-20'
+    else:
+        data._event('disconnected' if invalidate == 'disconnect' else 'connected', None)
+        if data._restore_task is not None:
+            await data._restore_task
+    assert await data.get_tplus('TEST') == 0
+    assert calls.count('/data/tplus') == 2
+
+
+@pytest.mark.asyncio
+async def test_tplus_failure_is_not_cached_and_explicit_override_is_checked_first(monkeypatch):
+    calls, override = [], [None]
+    async def post(*args):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError('temporary read failure')
+        return 1
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: override[0])
+    with pytest.raises(OSError):
+        await data.get_tplus('TEST')
+    assert await data.get_tplus('TEST') == 1
+    override[0] = 0
+    assert await data.get_tplus('TEST') == 0 and len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_tplus_cycle_is_not_cached(monkeypatch):
+    calls = []
+    async def post(*args):
+        calls.append(True)
+        return 2 if len(calls) == 1 else 1
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    assert await data.get_tplus('TEST') == 2  # Preserve the original result for caller validation.
+    assert not data._tplus_cache
+    assert await data.get_tplus('TEST') == 1 and len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_pending_metadata_read_and_clears_cache(monkeypatch):
+    entered, canceled, stopped = asyncio.Event(), asyncio.Event(), []
+    async def post(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+    async def stop_bridge():
+        stopped.append(True)
+    client = SimpleNamespace(bridge=SimpleNamespace(listeners=[], stop=stop_bridge), post=post)
+    data = BridgeDataAdapter(client)
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    data._tplus_cache['previous'] = 1
+    reader = asyncio.create_task(data.get_tplus('TEST'))
+    await entered.wait()
+    await data.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+    assert canceled.is_set() and not data._tplus_inflight and not data._tplus_cache
+    assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_stale_tplus_inflight_response_cannot_fill_new_connection_cache(monkeypatch):
+    calls, entered, release = [], asyncio.Event(), asyncio.Event()
+    async def post(*args):
+        calls.append(True)
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+            return 0
+        return 1
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    pending = asyncio.create_task(data.get_tplus('TEST'))
+    await entered.wait()
+    data._event('disconnected', None)
+    assert await data.get_tplus('TEST') == 1
+    release.set()
+    assert await pending == 0  # The old caller can observe its read, never seed the new cache.
+    assert await data.get_tplus('TEST') == 1 and len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_canceling_one_metadata_reader_does_not_cancel_other_readers(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def post(*args):
+        entered.set()
+        await release.wait()
+        return 0
+    data = BridgeDataAdapter(SimpleNamespace(bridge=SimpleNamespace(listeners=[]), post=post))
+    monkeypatch.setattr(bridge_adapter_module, 'get_security_tplus_override', lambda _: None)
+    first = asyncio.create_task(data.get_tplus('TEST'))
+    await entered.wait()
+    other = asyncio.create_task(data.get_tplus('TEST'))
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    assert await other == 0 and await data.get_tplus('TEST') == 0

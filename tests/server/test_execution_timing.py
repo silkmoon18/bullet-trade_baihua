@@ -11,7 +11,7 @@ from tests.server.strategy.test_strategy_api import api, drain_execution, SECURI
 @pytest.mark.asyncio
 async def test_trace_contains_stages_and_keeps_parallel_requests_isolated(monkeypatch):
     logs = []
-    monkeypatch.setattr(timing.log, 'info', lambda *a, **k: logs.append(a))
+    monkeypatch.setattr('builtins.print', lambda *a, **k: logs.append(a))
     @timing.traced('test.request')
     async def request(payload):
         with timing.span('local.work'):
@@ -28,7 +28,7 @@ async def test_trace_contains_stages_and_keeps_parallel_requests_isolated(monkey
 
 @pytest.mark.asyncio
 async def test_logger_failure_does_not_mask_success_or_business_exception(monkeypatch):
-    monkeypatch.setattr(timing.log, 'info', lambda *a, **k: (_ for _ in ()).throw(OSError('log full')))
+    monkeypatch.setattr('builtins.print', lambda *a, **k: (_ for _ in ()).throw(OSError('output unavailable')))
 
     @timing.traced('test.request')
     async def request(payload):
@@ -49,6 +49,31 @@ def test_trace_memory_is_bounded_and_counts_are_complete():
     assert len(trace.events) == 128
     assert trace.summary()['stages']['qmt.query']['calls'] == 1000
     json.dumps(trace.summary(), allow_nan=False)
+
+
+def test_timing_only_prints_without_file_or_application_log_handlers(monkeypatch, capsys):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Timing diagnostics must not write files or invoke log handlers')
+
+    monkeypatch.setattr('builtins.open', forbidden)
+    monkeypatch.setattr('logging.Logger._log', forbidden)
+    trace = timing.Trace('test.stdout', 'public-key')
+    trace.record('local.work', trace.started)
+    trace.flush()
+    timing.print_timing('QMT首笔快照 | strategy_id=%s | 快照年龄=%.0fms', 'test', 2.)
+    output = capsys.readouterr().out
+    assert '执行链路耗时 | ' in output and 'test.stdout' in output
+    assert 'QMT首笔快照 | strategy_id=test | 快照年龄=2ms' in output
+
+
+def test_idle_trace_does_not_print(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Idle account heartbeat must not flood timing output')
+
+    monkeypatch.setattr('builtins.print', forbidden)
+    trace = timing.Trace('test.idle')
+    trace.tags['had_active_intent'] = False
+    trace.flush()
 
 
 @pytest.mark.asyncio

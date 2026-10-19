@@ -46,6 +46,62 @@ def request(clock):
 
 
 @pytest.mark.asyncio
+async def test_future_target_wakes_do_not_repeat_broker_reads_but_open_requires_fresh_read(
+    api, timed_clock, monkeypatch,
+):
+    service, broker, account, _ = api
+    await service.ensure_account(account, 'default', {'strategy_id': 'good_etf'})
+    monkeypatch.setattr(service, '_schedule_open_resume', lambda _: None)
+    reads = []
+    collect = api_module.collect_async_broker_snapshot
+    async def counted_collect(*args, **kwargs):
+        reads.append(timed_clock[0])
+        return await collect(*args, **kwargs)
+    monkeypatch.setattr(api_module, 'collect_async_broker_snapshot', counted_collect)
+    accepted = await service.submit_targets(account, 'default', request(timed_clock))
+    await drain_execution(service)
+    assert len(reads) == 1 and broker.order_calls == 0
+    for minute in (26, 27, 28, 29):
+        timed_clock[0] = timed_clock[0].replace(minute=minute)
+        for _ in range(3):
+            await service._resume_intent(accepted['intent']['intent_id'])
+    assert len(reads) == 1  # Twelve quiet wakes, no extra native query/reconciliation.
+    timed_clock[0] = timed_clock[0].replace(minute=30)
+    place = broker.place_order
+    async def checked_place(*args, **kwargs):
+        assert len(reads) == 2 and reads[-1].minute == 30
+        return await place(*args, **kwargs)
+    monkeypatch.setattr(broker, 'place_order', checked_place)
+    await service._resume_intent(accepted['intent']['intent_id'])
+    assert broker.order_calls == 1 and len(reads) == 2
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_future_target_still_refreshes_genuine_broker_events(api, timed_clock, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, 'default', {'strategy_id': 'good_etf'})
+    monkeypatch.setattr(service, '_schedule_open_resume', lambda _: None)
+    accepted = await service.submit_targets(account, 'default', request(timed_clock))
+    await drain_execution(service)
+    refreshes, refresh = [], service._refresh
+    async def tracked_refresh(*args, **kwargs):
+        refreshes.append(True)
+        return await refresh(*args, **kwargs)
+    monkeypatch.setattr(service, '_refresh', tracked_refresh)
+    await service._handle_broker_event('default', 'trade')
+    assert refreshes == [True] and broker.order_calls == 0
+    assert service.get_intent({'strategy_id': 'good_etf'})['intent_id'] == accepted['intent']['intent_id']
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute('SELECT COUNT(*) FROM strategy_orders').fetchone()[0] == 0
+        assert db.execute('SELECT reserved_cash_units FROM strategy_accounts').fetchone()[0] == 0
+    finally:
+        db.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('minute', [30, 35])
 @pytest.mark.parametrize('preopen', [False, True])
 async def test_scheduled_target_no_orders_or_reservations_until_server_timer(

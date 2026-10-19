@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..timing import traced, measured, span, current_trace, record_elapsed
+from ..timing import traced, measured, span, current_trace, record_elapsed, print_timing
 
 import asyncio
 import json
@@ -1474,7 +1474,13 @@ class SQLiteStrategyAPI:
                 intents = self.planner.active_intents(strategy_id)
                 if trace is not None and intents:
                     trace.tags['had_active_intent'] = True
-                if not intents:
+                now = datetime.now(SHANGHAI_TZ)
+                if not intents or all(
+                    intent.execute_at is not None and now < intent.execute_at
+                    for intent in intents
+                ):
+                    # Future targets wait quietly, but genuine broker events
+                    # must still book fills and reconcile the physical account.
                     await self._refresh(
                         binding[0], binding[1], strategy_id, {}
                     )
@@ -1516,10 +1522,12 @@ class SQLiteStrategyAPI:
                               schedule_lateness_ms=(now-intent.execute_at).total_seconds()*1000)
         if intent.execute_at is not None and now < intent.execute_at:
             self._schedule_open_resume(intent.account_id)
-        if (intent.execute_at is not None and now < intent.execute_at) or (
-            not self._can_dispatch_now() and not self._can_submit_preopen_limit(
+            # Acceptance already reconciled. No orders/reservations exist for
+            # this future intent. Real callbacks reconcile in their own path;
+            # ordinary timer/tick wakes need no repeated full broker query.
+            return
+        if not self._can_dispatch_now() and not self._can_submit_preopen_limit(
                 intent.execution_request
-            )
         ):
             # Late/reconnect callbacks still book fills; they must not plan or
             # dispatch the unfinished daytime target using an old closing tick.
@@ -1675,7 +1683,7 @@ class SQLiteStrategyAPI:
                     if reconciliation.state.value != "READY":
                         break
                 if prepared_snapshot is not None:
-                    logger.info(
+                    print_timing(
                         "QMT首笔快照 | strategy_id=%s | 复用=%s | 快照年龄=%.0fms",
                         strategy_account_id, reuse_prepared, age * 1000,
                     )
@@ -1696,7 +1704,7 @@ class SQLiteStrategyAPI:
                     break
                 self._record_broker_change()
                 if not dispatched and target_received_at is not None:
-                    logger.info(
+                    print_timing(
                         "QMT首笔提交处理完成 | strategy_id=%s | 接收至处理完成=%.0fms",
                         strategy_account_id,
                         (time.monotonic() - target_received_at) * 1000,

@@ -10,11 +10,12 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from bullet_trade.data.api import get_security_tplus_override
 from bullet_trade.utils.env_loader import get_env
 from ..big_qmt_bridge import QmtBridge
+from ..timing import print_timing, record_elapsed
 from ..strategy.broker_history import SQLiteBrokerHistoryStore, merge_broker_rows
 from .base import AdapterBundle, BROKER_CALL_MARKER_KEY
 from .big_qmt import (
@@ -84,12 +85,21 @@ class BridgeDataAdapter(BigQmtDataAdapter):
         self._applied = None
         self._subscription_lock = asyncio.Lock()
         self._restore_task = None
+        self._metadata_epoch = 0
+        self._tplus_cache_day = None
+        self._tplus_cache = {}
+        self._tplus_inflight = {}
         client.bridge.listeners.append(self._event)
 
     async def start(self):
         await self.client.bridge.start()
 
     async def stop(self):
+        pending = tuple(self._tplus_inflight.values())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._tplus_cache.clear()
         if self._restore_task:
             self._restore_task.cancel()
             await asyncio.gather(self._restore_task, return_exceptions=True)
@@ -108,11 +118,21 @@ class BridgeDataAdapter(BigQmtDataAdapter):
                 except Exception:
                     log.exception("Big QMT tick listener failed")
         elif event == "connected":
+            self._invalidate_metadata()
             self._applied = None
             if self._restore_task is None or self._restore_task.done():
                 self._restore_task = asyncio.create_task(self._restore_subscriptions())
         elif event == "disconnected":
+            self._invalidate_metadata()
             self._applied = None
+
+    def _invalidate_metadata(self):
+        self._metadata_epoch += 1
+        self._tplus_cache.clear()
+
+    @staticmethod
+    def _metadata_day():
+        return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
     async def _restore_subscriptions(self):
         try:
@@ -147,7 +167,31 @@ class BridgeDataAdapter(BigQmtDataAdapter):
         override = get_security_tplus_override(security)
         if override is not None:
             return int(override)
-        return int(await self.client.post("/data/tplus", {"security": security}))
+        started = time.perf_counter()
+        day = self._metadata_day()
+        if day != self._tplus_cache_day:
+            self._tplus_cache.clear()
+            self._tplus_cache_day = day
+        key = (day, self._metadata_epoch, security)
+        if key in self._tplus_cache:
+            record_elapsed('metadata.tplus_cache_hit', started)
+            return self._tplus_cache[key]
+        task = self._tplus_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(self._read_tplus(key, security))
+            self._tplus_inflight[key] = task
+            # A canceled reader must not cancel a shared read or leak its error.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return await asyncio.shield(task)
+
+    async def _read_tplus(self, key, security):
+        try:
+            cycle = int(await self.client.post("/data/tplus", {"security": security}))
+            if (cycle in (0, 1) and key[:2] == (self._metadata_day(), self._metadata_epoch)):
+                self._tplus_cache[key] = cycle
+            return cycle
+        finally:
+            self._tplus_inflight.pop(key, None)
 
     async def get_history(self, payload):
         raise BigQmtGatewayError("Bridge is for live execution; keep historical strategy data in JQ",
@@ -194,7 +238,7 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         if isinstance(payload, dict) and event in {"order", "trade"}:
             payload = (_normalize_order if event == "order" else _normalize_trade)(payload)
             try:
-                log.info('QMT原生回报时点 | event=%s security=%s tag=%s status=%s | QMT接收=%s 服务器接收=%s 券商时间=%s',
+                print_timing('QMT原生回报时点 | event=%s security=%s tag=%s status=%s | QMT接收=%s 服务器接收=%s 券商时间=%s',
                          event, payload.get('security'), payload.get('qmt_user_order_id') or payload.get('remark'),
                          payload.get('status'), payload.get('_bt_event_received_at_ms'),
                          datetime.now().astimezone().isoformat(timespec='milliseconds'),
@@ -283,7 +327,7 @@ class BridgeBrokerAdapter(BigQmtBrokerAdapter):
         requested_wall = datetime.now().astimezone().isoformat(timespec="milliseconds")
         try:
             result = await super().place_order(account, request)
-            log.info(
+            print_timing(
                 "QMT委托确认 | 标的=%s 方向=%s | 确认来源=%s 提交至确认=%.0fms | 请求时间=%s 确认时间=%s | 原生时点=%s",
                 request.get("security"), request.get("side"),
                 "unknown" if result.get("submit_unknown") else pending.source,
