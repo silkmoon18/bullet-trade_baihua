@@ -1017,27 +1017,210 @@ def test_business_and_timing_logs_are_memory_only_during_trading(mod, tmp_path, 
     assert len(host._log_buffer.rows) == 2 and not list(tmp_path.iterdir())
 
 
-def test_native_archive_only_after_close_with_bounded_buffer_and_retry(mod, tmp_path, monkeypatch):
+@pytest.fixture
+def native_archive_workers(mod, monkeypatch):
+    workers = []
+
+    class Worker:
+        def __init__(self, target, args, daemon):
+            assert daemon is True
+            self.target, self.args = target, args
+
+        def start(self):
+            workers.append(self)
+
+        def run(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(mod.threading, 'Thread', Worker)
+    return workers
+
+
+@pytest.mark.parametrize('hour', [0, 6, 9, 10, 12, 14, 16, 20])
+def test_native_archive_each_scheduled_point_once_in_worker(mod, tmp_path, native_archive_workers, hour):
+    cfg = mod.Settings()
+    assert cfg.LOG_ARCHIVE_TIMES == ('00:00', '06:00', '09:00', '10:00', '12:00', '14:00', '16:00', '20:00')
+    buffer = mod.NativeLogBuffer(4096)
+    due = NOW.replace(hour=hour, minute=0, second=0)
+    before = due - dt.timedelta(seconds=30)
+    path = str(tmp_path/'ledger.json')
+    buffer.append('NAV original report', before)
+    assert not buffer.request_flush(path, before, cfg.LOG_ARCHIVE_TIMES)
+    assert buffer.request_flush(path, due + dt.timedelta(seconds=7), cfg.LOG_ARCHIVE_TIMES)
+    assert not buffer.request_flush(path, due + dt.timedelta(seconds=8), cfg.LOG_ARCHIVE_TIMES)
+    assert not list(tmp_path.iterdir())  # The QMT callback starts a worker, never writes a log.
+    assert len(native_archive_workers) == 1
+    native_archive_workers.pop().run()
+    saved = tmp_path/('ledger.json.' + before.strftime('%Y%m%d') + '.log')
+    assert saved.read_text(encoding='utf8') == 'NAV original report\n'
+    buffer.append('later report', due + dt.timedelta(seconds=20))
+    assert not buffer.request_flush(path, due + dt.timedelta(seconds=30), cfg.LOG_ARCHIVE_TIMES)
+    assert not buffer.request_flush(path, due + dt.timedelta(minutes=15), cfg.LOG_ARCHIVE_TIMES)
+    assert len(buffer.rows) == 1 and not native_archive_workers
+
+
+@pytest.mark.parametrize('hour', [0, 6, 9, 10, 12, 14, 16, 20])
+def test_native_archive_start_in_scheduled_minute(mod, tmp_path, native_archive_workers, hour):
+    now = NOW.replace(hour=hour, minute=0, second=40)
+    buffer = mod.NativeLogBuffer(4096)
+    buffer.append('startup report', now)
+    assert buffer.request_flush(str(tmp_path/'ledger.json'), now, mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert not buffer.rows
+
+
+def test_native_archive_midinterval_restart_waits_but_delayed_callback_catches_up(mod, tmp_path, native_archive_workers):
+    buffer = mod.NativeLogBuffer(4096)
+    path = str(tmp_path/'ledger.json')
+    buffer.append('opening report', NOW)
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    assert not buffer.request_flush(path, NOW.replace(minute=59), mod.LOG_ARCHIVE_TIMES)
+    # An already running process delayed over several points saves one batch, not one per missed point.
+    assert buffer.request_flush(path, NOW.replace(hour=12, minute=4), mod.LOG_ARCHIVE_TIMES)
+    assert len(native_archive_workers) == 1
+    native_archive_workers.pop().run()
+    assert buffer.archive_slot == '20260911:12:00'
+    assert not buffer.request_flush(path, NOW.replace(hour=12, minute=5), mod.LOG_ARCHIVE_TIMES)
+
+
+def test_native_archive_empty_point_does_not_flush_opening_logs_later(mod, tmp_path, native_archive_workers):
+    buffer = mod.NativeLogBuffer(4096)
+    path = str(tmp_path/'ledger.json')
+    assert not buffer.request_flush(path, NOW.replace(hour=8, minute=59), mod.LOG_ARCHIVE_TIMES)
+    assert not buffer.request_flush(path, NOW.replace(minute=0), mod.LOG_ARCHIVE_TIMES)
+    buffer.append('09:30 selection NAV', NOW)
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    assert buffer.request_flush(path, NOW.replace(hour=10, minute=0), mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert (tmp_path/'ledger.json.20260911.log').read_text(encoding='utf8') == '09:30 selection NAV\n'
+
+
+def test_native_archive_bounded_buffer_retry_and_new_logs_preserved(mod, tmp_path, monkeypatch, native_archive_workers):
     buffer = mod.NativeLogBuffer(1024)
     for index in range(30):
         buffer.append('x'*100 + str(index), NOW)
     assert buffer.chars <= 1024 and buffer.dropped > 0
-    assert not buffer.request_flush(str(tmp_path/'ledger.json'), NOW, '15:10')
-    # Worker rechecks the real local clock even if a scheduled launch is stale.
-    buffer.writing = True
-    buffer._write(str(tmp_path/'ledger.json'), NOW.replace(hour=16))
-    assert not list(tmp_path.iterdir()) and buffer.rows and not buffer.writing
-    monkeypatch.setattr(mod, 'china_now', lambda: NOW.replace(hour=16))
+    path, due = str(tmp_path/'ledger.json'), NOW.replace(hour=10, minute=0)
+    mono = [100.]
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: mono[0])
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    assert buffer.request_flush(path, due, mod.LOG_ARCHIVE_TIMES)
     with monkeypatch.context() as patch:
         patch.setattr(mod, 'open', lambda *a, **k: (_ for _ in ()).throw(OSError('disk unavailable')), raising=False)
-        buffer.writing = True
-        buffer._write(str(tmp_path/'ledger.json'), NOW.replace(hour=16))
+        native_archive_workers.pop().run()
     assert buffer.rows and not buffer.writing and buffer.chars <= 1024
-    buffer.writing = True
-    buffer._write(str(tmp_path/'ledger.json'), NOW.replace(hour=16))
+    mono[0] += 59
+    assert not buffer.request_flush(path, due + dt.timedelta(seconds=59), mod.LOG_ARCHIVE_TIMES)
+    mono[0] += 1
+    assert buffer.request_flush(path, due + dt.timedelta(minutes=1), mod.LOG_ARCHIVE_TIMES)
+    # Appended while the worker is writing: do not erase, and do not launch a duplicate worker.
+    original_open = open
+
+    def append_during_write(*args, **kwargs):
+        buffer.append('concurrent report', due)
+        return original_open(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mod, 'open', append_during_write, raising=False)
+        native_archive_workers.pop().run()
     saved = (tmp_path/'ledger.json.20260911.log').read_text(encoding='utf8')
     assert 'log_archive_gap' in saved and 'x'*100 in saved
-    assert not buffer.rows and not buffer.writing
+    assert [line for _, line in buffer.rows] == ['concurrent report'] and not buffer.writing
+    assert buffer.archive_slot == '20260911:10:00'
+    assert not buffer.request_flush(path, due + dt.timedelta(minutes=2), mod.LOG_ARCHIVE_TIMES)
+
+
+def test_native_archive_next_day_and_original_log_dates(mod, tmp_path, monkeypatch, native_archive_workers):
+    buffer = mod.NativeLogBuffer(4096)
+    path = str(tmp_path/'ledger.json')
+    before = NOW.replace(hour=23, minute=59)
+    midnight = (before + dt.timedelta(days=1)).replace(hour=0, minute=0)
+    buffer.append('previous day NAV', before)
+    assert not buffer.request_flush(path, before, mod.LOG_ARCHIVE_TIMES)
+    buffer.append('new day report', midnight)
+    assert buffer.request_flush(path, midnight, mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert (tmp_path/'ledger.json.20260911.log').read_text(encoding='utf8') == 'previous day NAV\n'
+    assert (tmp_path/'ledger.json.20260912.log').read_text(encoding='utf8') == 'new day report\n'
+    assert buffer.archive_slot == '20260912:00:00'
+    mono = mod.time.monotonic() + 3600
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: mono)
+    buffer.append('morning NAV', midnight.replace(hour=6))
+    assert buffer.request_flush(path, midnight.replace(hour=6), mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert buffer.archive_slot == '20260912:06:00'
+
+
+def test_native_archive_thread_start_failure_keeps_pending_logs(mod, tmp_path, monkeypatch, native_archive_workers):
+    buffer = mod.NativeLogBuffer(4096)
+    path, due = str(tmp_path/'ledger.json'), NOW.replace(hour=10, minute=0)
+    mono = [100.]
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: mono[0])
+    buffer.append('NAV original report', NOW)
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    original_thread = mod.threading.Thread
+
+    def failed_thread(*args, **kwargs):
+        raise RuntimeError('cannot start worker')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mod.threading, 'Thread', failed_thread)
+        assert not buffer.request_flush(path, due, mod.LOG_ARCHIVE_TIMES)
+    assert buffer.rows and not buffer.writing and not native_archive_workers
+    assert mod.threading.Thread is original_thread
+    mono[0] += 60
+    assert buffer.request_flush(path, due + dt.timedelta(minutes=1), mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert not buffer.rows and buffer.archive_slot == '20260911:10:00'
+
+
+def test_native_archive_gap_only_failure_is_retryable(mod, tmp_path, monkeypatch, native_archive_workers):
+    buffer = mod.NativeLogBuffer(1024)
+    path, due = str(tmp_path/'ledger.json'), NOW.replace(hour=10, minute=0)
+    mono = [100.]
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: mono[0])
+    buffer.append('x'*2048, NOW)
+    assert not buffer.rows and buffer.dropped == 1
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    assert buffer.request_flush(path, due, mod.LOG_ARCHIVE_TIMES)
+    with monkeypatch.context() as patch:
+        patch.setattr(mod, 'open', lambda *a, **k: (_ for _ in ()).throw(OSError('disk unavailable')), raising=False)
+        native_archive_workers.pop().run()
+    assert not buffer.rows and buffer.dropped == 1 and buffer.archive_slot == '20260911:09:00'
+    mono[0] += 60
+    assert buffer.request_flush(path, due + dt.timedelta(minutes=1), mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert (tmp_path/'ledger.json.20260911.log').read_text(encoding='utf8') == '[log_archive_gap] dropped_records=1\n'
+    assert buffer.dropped == 0 and buffer.archive_slot == '20260911:10:00'
+
+
+def test_native_archive_inflight_write_does_not_consume_later_empty_point(mod, tmp_path, monkeypatch, native_archive_workers):
+    buffer = mod.NativeLogBuffer(4096)
+    path, due = str(tmp_path/'ledger.json'), NOW.replace(hour=10, minute=0)
+    mono = [100.]
+    monkeypatch.setattr(mod.time, 'monotonic', lambda: mono[0])
+    buffer.append('original report', NOW)
+    assert not buffer.request_flush(path, NOW, mod.LOG_ARCHIVE_TIMES)
+    assert buffer.request_flush(path, due, mod.LOG_ARCHIVE_TIMES)
+    original_open = open
+
+    def later_callback_during_write(*args, **kwargs):
+        # Worker already drained the batch. Do not advance a later slot while it is still writing.
+        assert not buffer.rows
+        assert not buffer.request_flush(path, due.replace(hour=12), mod.LOG_ARCHIVE_TIMES)
+        assert buffer.archive_slot == '20260911:09:00'
+        buffer.append('new report', due.replace(hour=12))
+        return original_open(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mod, 'open', later_callback_during_write, raising=False)
+        native_archive_workers.pop().run()
+    mono[0] += 7200
+    assert buffer.archive_slot == '20260911:10:00'
+    assert buffer.request_flush(path, due.replace(hour=12), mod.LOG_ARCHIVE_TIMES)
+    native_archive_workers.pop().run()
+    assert (tmp_path/'ledger.json.20260911.log').read_text(encoding='utf8') == 'original report\nnew report\n'
+    assert not buffer.rows and buffer.archive_slot == '20260911:12:00'
 
 
 def test_idle_afterhours_keeps_queries_but_does_not_flood_timing(mod, tmp_path, capsys):

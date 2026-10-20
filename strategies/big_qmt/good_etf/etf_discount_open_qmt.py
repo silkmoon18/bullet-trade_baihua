@@ -65,10 +65,11 @@ QUERY_SECONDS = 5         # 委托/成交查询补漏间隔，单位秒；不是行情 tick 频率
 RETRY_SECONDS = 3         # 确认剩余已撤且成交入账后，续单最小间隔（秒）
 CASH_RESERVE = 5.0        # 每笔活动买单预留金额（元）；不记作手续费
 
-# ==================== 配置结束：以下通常无需修改 ====================
-
+# ---- 诊断日志：北京时间定点后台归档，不改变交易账本即时持久化 ----
 LOG_BUFFER_MAX_CHARS = 8 * 1024 * 1024  # 内存日志上限；超限报告丢弃数量
-LOG_ARCHIVE_TIME = "15:10"  # 收盘后保存日志，不改变交易账本即时持久化
+LOG_ARCHIVE_TIMES = ("00:00", "06:00", "09:00", "10:00", "12:00", "14:00", "16:00", "20:00")
+
+# ==================== 配置结束：以下通常无需修改 ====================
 
 import hashlib
 import json
@@ -95,11 +96,12 @@ _native_previous_output_ms = None
 
 
 class NativeLogBuffer:
-    """Diagnostics only. Never call QMT, touch a ledger or write during trading."""
+    """Diagnostics only. Scheduled file workers never call QMT or touch a ledger."""
     def __init__(self, max_chars):
         self.rows, self.chars, self.dropped = deque(), 0, 0
         self.max_chars = max(1024, int(max_chars))
         self.guard, self.writing, self.last_attempt = threading.Lock(), False, float('-inf')
+        self.archive_slot = None
 
     def append(self, line, now):
         with self.guard:
@@ -112,26 +114,37 @@ class NativeLogBuffer:
                 self.chars -= len(self.rows.popleft()[1])
                 self.dropped += 1
 
-    def request_flush(self, prefix, now, archive_time):
-        if '08:50' <= now.strftime('%H:%M') < max('15:10', archive_time):
+    def request_flush(self, prefix, now, archive_times):
+        times = sorted(set(archive_times))
+        if not times:
             return False
+        clock = now.strftime('%H:%M')
+        elapsed = [point for point in times if point <= clock]
+        day = now if elapsed else now - dt.timedelta(days=1)
+        slot = day.strftime('%Y%m%d') + ':' + (elapsed[-1] if elapsed else times[-1])
         with self.guard:
-            if self.writing or not self.rows or time.monotonic()-self.last_attempt < 60:
+            if self.archive_slot is None:
+                # A mid-interval restart waits for the next point, not an opening flush.
+                self.archive_slot = '' if clock in times else slot
+            if slot <= self.archive_slot:
+                return False
+            if self.writing:
+                return False
+            if not self.rows and not self.dropped:
+                self.archive_slot = slot
+                return False
+            if time.monotonic()-self.last_attempt < 60:
                 return False
             self.writing, self.last_attempt = True, time.monotonic()
         try:
-            threading.Thread(target=self._write, args=(prefix, now), daemon=True).start()
+            threading.Thread(target=self._write, args=(prefix, now, slot), daemon=True).start()
         except Exception:
             with self.guard:
                 self.writing = False
             return False
         return True
 
-    def _write(self, prefix, now):
-        if '08:50' <= china_now().strftime('%H:%M') < '15:10':
-            with self.guard:
-                self.writing = False
-            return
+    def _write(self, prefix, now, slot):
         with self.guard:
             batch, missing = list(self.rows), self.dropped
             self.rows.clear()
@@ -161,6 +174,8 @@ class NativeLogBuffer:
                 self.chars += sum(len(line) for _, line in failed)
                 if now.strftime('%Y%m%d') not in saved:
                     self.dropped += missing
+                if len(saved) == len(grouped):
+                    self.archive_slot = slot
                 while self.chars > self.max_chars or len(self.rows) > 20000:
                     self.chars -= len(self.rows.popleft()[1])
                     self.dropped += 1
@@ -190,7 +205,8 @@ def maybe_archive_native_logs(runtime):
         else:
             prefix = os.path.join(runtime.settings.STATE_DIR,
                                  'paper' if runtime.paper is not None else 'selection')
-        buffer.request_flush(prefix, china_now(), getattr(runtime.settings, 'LOG_ARCHIVE_TIME', '15:10'))
+        buffer.request_flush(prefix, china_now(), getattr(runtime.settings, 'LOG_ARCHIVE_TIMES',
+                             ('00:00', '06:00', '09:00', '10:00', '12:00', '14:00', '16:00', '20:00')))
     except Exception:
         pass
 
