@@ -54,10 +54,11 @@ def test_only_declared_price_time_and_order_decisions_change(monkeypatch):
         ]
     strategy = load_strategy(monkeypatch)
     original_strategy = _load_strategy(monkeypatch)
-    for name in ("MAX_HOLD_NUM", "MIN_MONEY", "MAX_MONEY", "DEPLOY_RATIO",
+    for name in ("MIN_MONEY", "MAX_MONEY", "DEPLOY_RATIO",
                  "STOP_LOSS_RATIO", "TAKE_PROFIT_RATIO", "SKIP_SUSPENDED_LIMITUP",
                  "RISK_CHECK_TIMES"):
         assert getattr(strategy, name) == getattr(original_strategy, name)
+    assert strategy.MAX_HOLD_NUM == 3  # Independent backtest selection count is unchanged.
     assert not hasattr(strategy, "STRATEGY_ID")
     assert strategy.VALIDATE_REMOTE_DURING_BACKTEST is False
     direct_calls = {
@@ -104,15 +105,18 @@ def test_schedule_freezes_at_0926_sells_at_0930_and_confirms_on_each_bar(monkeyp
     strategy._runtime = runtime
     strategy._declare_schedule()
     assert scheduled == [
-        (strategy.before_market_open, "09:20"),
-        (strategy.market_open, "09:26"),
-        (strategy.execute_opening_plan, "09:30"),
-        (helper.advance_joinquant_sell_then_buy, "every_bar"),
-        (strategy.handle_risk_management, "10:30"),
-        (strategy.handle_risk_management, "13:30"),
-        (strategy.handle_risk_management, "14:50"),
-        (strategy.after_market_check, "14:55"),
+        (helper._scheduled_prepare, "09:20"),
+        (helper._scheduled_decision, "09:26"),
+        (helper._scheduled_orders, "09:30"),
+        (helper._scheduled_minute_confirm, "every_bar"),
+        (helper._scheduled_risk, "10:30"),
+        (helper._scheduled_risk, "13:30"),
+        (helper._scheduled_risk, "14:50"),
+        (helper._scheduled_snapshot, "14:55"),
     ]
+    for slot, callback in (('prepare', strategy.before_market_open), ('decision', strategy.market_open),
+                           ('orders', strategy.execute_opening_plan), ('risk', strategy.handle_risk_management)):
+        assert runtime._scheduled_entries[slot]['callback'] is callback
     assert not hasattr(runtime, "on_bar")
 
 

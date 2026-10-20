@@ -240,3 +240,31 @@ JQ helper原本就不为耗时日志自行写文件，仍使用聚宽平台日�
 验证结果：服务器策略/账本/BigQMT适配/桥接/计时及私有导出483项、JQ与独立QMT策略隔离485项通过；补实际收发间隔打点后，桥接/缓存/传输及导出74项再次通过。包括短写、暂不可写、断线后不重发原生写命令、缓存跨日/重连失效、取消共享读取、提前目标不反复查询、真实事件仍入账，以及开盘必须取新快照。测试不代表已验证真实网络或柜台耗时。
 
 手动更新清单：部署服务器修改后，需要将`helpers/big_qmt_bridge.py` v6完整替换QMT中的`BT_BRIDGE_REAL`，保留原顶部私有账户、令牌、端口和已授权开关，再重启桥接模型。聚宽`good_etf_v2.py`、研究根目录`bullet_trade_jq_remote_helper.py`、私有`jq_runtime_config.py`以及独立原生`GOOD_ETF`本次均不用更新；其他既有未提交修改不属于本轮延迟优化。
+
+## 两条路线命名与耗时日志审查（2026-10-21）
+
+当前源码改名：`strategies/joinquant/etf_discount_auction_jq.py`为“ETF竞价折价轮动_jq”（原`good_etf_v2.py`）；`strategies/big_qmt/good_etf/etf_discount_open_qmt.py`为“ETF开盘折价轮动_qmt”（原本目录`good_etf.py`）。改名只修改路径、说明、导出及测试引用，不修改运行语句。内部策略ID分别仍为`good_etf_v2`和`good_etf_big_qmt`，初始QMT策略资金分别5000和1000元；JQ初始资金由平台独立设置，不能从QMT配置推定。沿用已有实例、配置、白名单与账本，不为展示改名新建账本或并发模型。新旧JQ导出选择名均读取唯一新源码，旧选择名仅为兼容入口。
+
+日志审查结论是“已有主要接口打点，但尚不足以保证下一交易日完整复盘”，不能再把打点覆盖等同于留存已验证：
+
+- JQ helper可分解候选、冻结计划、RPC、原生交易接口和本地阶段，平台保存其输出。但计时从helper方法开始，不是平台最外层回调入口；缺少计划时间/实际入口/入口前调度的配对字段，不能凭逻辑时间前缀把平台延迟解释为本地运算。
+- 服务器已有锁等待、快照、对账、目标、持久化和下单阶段，以及有界事件记录；`server/timing.py`只print，`start_strategy_server.ps1`未配置stdout留存。因此09:30服务器自主执行的详细trace不保证进入`server.log`，也没有JQ调用方接收该轮trace。已有业务日志、操作响应和bridge时间能拼接边界，不能补造丢失的内部耗时。
+- bridge返回命令接收/执行、原生API及收发间隔耗时；委托操作响应保存实际passorder时点。原生QMT输出含定时触发、行情、计算、下单、回报及账本持久化，完整输出需核实QMT客户端`userdata/log/XtClient_FormulaOutput_YYYYMMDD.log`，不能只看账本旁的业务日志。
+- 本地同进程用单调时钟；跨进程用带日期时区的墙钟关联，券商秒级时间和查询发现时间不冒充毫秒撮合时间。QMT原生接口内部的缓存、网络及柜台等待仍无法独立拆分。
+
+性能上没有为耗时统计增加行情/账户查询或交易请求，逐次打点在内存聚合，关键trace只print，不新增逐次文件写入/飞书。计时、JSON和print仍有非零开销，stdout阻塞也可能拖慢交易，不能承诺“完全不影响性能”，更不能用离线测试冒充QMT实测。此次改名不新增打点或改变日志I/O；服务器后台trace的低开销可靠留存、JQ最外层入口配对及实测输出开销仍是待完善项，需在声称完整耗时验收前解决。
+
+
+## 语义命名和非交易期归档修复（2026-10-21）
+
+上一节日志审查中的两项缺口已在本地代码补齐，尚待提交部署和下一交易日实际验收：
+
+1. 当前源码为`strategies/joinquant/etf_discount_auction_jq.py`（ETF竞价折价轮动_jq）和`strategies/big_qmt/good_etf/etf_discount_open_qmt.py`（ETF开盘折价轮动_qmt）；分别表示竞价后09:26参考价决策、开盘后09:30 lastPrice决策。仅声明展示名，内部`good_etf_v2` / `good_etf_big_qmt`、5000 / 1000元初始资金和原账本不变，旧文件不留重复副本。
+2. JQ helper在可序列化的顶层调度入口记录`callback.planned_at / entered_at / entry_delay_ms / logical_time`，同时记录上次回调完成、helper加载和进程标识。入口不增加任何数据查询或交易；只保存回调名称与日程到g以支持重启，不保存闭包。历史回测不改入口。入口延后仍不能证明平台内部原因。
+3. 服务器CLI日志文件handler替换为有界内存handler，耗时print也进入同一诊断缓存。北京时间08:50—15:10不写日志文件，15:10后/次日08:50前由文件线程保存UTF-8日文件：配置日志名若为`server.log`，业务为`server-YYYYMMDD.log`，完整后台trace为`execution-timing-YYYYMMDD.log`。网页业务日志优先读取内存，满额时无需读文件。此行为只作用于server CLI，不修改回测或其他CLI的日志系统。
+4. 原生QMT业务与耗时文本日志同样仅print/内存缓冲，盘后文件线程写原账本旁的日期日志，线程不调用QMT、不操作账本。文件保存失败保留待重试，缓冲区有字符数和条数上限，溢出明确记录`log_archive_gap`。服务器上限1600万字符/20000条，原生默认800万字符/20000条；按字符计，并非精确字节数。
+5. 各阶段保留起止偏移、累计/最大耗时、调用/异常次数和进程标识；服务器增加父子span关联及关闭后的trace隔离。只保留128条详细事件，溢出会标记`events_dropped`，阶段累计不截断。恢复/预挂卖单目标还记录09:30最早买入门槛及本次观察偏移。嵌套阶段不能相加为总耗时，回报观察时点也不能冒充撮合时点。
+
+用户要求盘中不实时写日志，意味着**盘中崩溃或重启可能丢失未归档诊断**；停止会在控制台提示pending，不能同时声称崩溃不丢日志。print可能被QMT/JQ客户端自动保存，本项目不能禁止宿主写入；print、内存/JSON统计仍有非零开销，新trace会保留输出开销供下一轮核对。交易账本、幂等和委托/成交恢复数据必须继续即时落盘，不受诊断归档规则影响。
+
+手动更新清单：JQ完整策略`etf_discount_auction_jq.py`、研究根目录`helpers/bullet_trade_jq_remote_helper.py`、原生QMT完整单文件`etf_discount_open_qmt.py`；服务器需发布`server/deferred_logs.py`及配套CLI/app/timing修改和上一轮预挂修复。保留ID/账户/资金/账本；本轮不需要改私有config或bridge，也没有启动模型、下单、提交或部署。

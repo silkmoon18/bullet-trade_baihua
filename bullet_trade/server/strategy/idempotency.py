@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Optional, Union, cast
+from typing import Mapping, Optional, Tuple, Union, cast
 from uuid import uuid4
 
 from .domain import SHANGHAI_TZ
@@ -276,6 +276,7 @@ class SQLiteOperationRepository:
         self, strategy_account_id: Optional[str] = None,
         *, sellable_limits: Optional[Mapping[str, int]] = None,
         limit_orders_only: bool = False,
+        allowed_sides: Optional[Tuple[str, ...]] = None,
     ) -> Optional[OutboxClaim]:
         """Atomically claim the oldest dispatchable outbox row.
 
@@ -304,6 +305,8 @@ class SQLiteOperationRepository:
             for candidate in candidates:
                 payload = json.loads(candidate["payload_json"]).get("payload", {})
                 if limit_orders_only and payload.get("style", {}).get("type") != "limit":
+                    continue
+                if allowed_sides is not None and payload.get("side") not in allowed_sides:
                     continue
                 if sellable_limits is not None:
                     if (

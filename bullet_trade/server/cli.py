@@ -14,6 +14,7 @@ from .adapters import qmt  # noqa: F401
 from .adapters.base import AccountRouter
 from .app import ServerApplication
 from .config import build_server_config
+from .deferred_logs import ServerLogCapture
 
 
 def _install_signal_handlers(app: ServerApplication) -> None:
@@ -39,19 +40,15 @@ async def _async_main(args) -> int:
     except Exception:
         pass
     config = build_server_config(args)
-    if config.log_file:
-        try:
-            log.configure_file_logging(file_path=config.log_file)
-        except Exception:
-            log.warning("无法将日志写入 %s，继续使用默认输出", config.log_file)
-    router = AccountRouter(config.accounts)
-    builder = get_adapter(config.server_type)
-    bundle = builder(config, router)
-    app = ServerApplication(config=config, router=router, adapters=bundle)
-    _install_signal_handlers(app)
-    if config.generated_token:
-        log.warning("未配置 QMT_SERVER_TOKEN，已临时生成随机 token: %s", config.token)
-    await app.start()
+    async with ServerLogCapture(log, config.log_file):
+        router = AccountRouter(config.accounts)
+        builder = get_adapter(config.server_type)
+        bundle = builder(config, router)
+        app = ServerApplication(config=config, router=router, adapters=bundle)
+        _install_signal_handlers(app)
+        if config.generated_token:
+            log.warning("未配置 QMT_SERVER_TOKEN，已临时生成随机 token: %s", config.token)
+        await app.start()
     return 0
 
 

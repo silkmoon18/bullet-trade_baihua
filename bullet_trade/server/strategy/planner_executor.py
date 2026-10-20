@@ -43,6 +43,7 @@ from .execution import (
     RepricingPolicy,
     execution_request_from_wire,
     execution_request_to_wire,
+    preopen_limit_sides,
 )
 from .idempotency import SQLiteOperationRepository
 from .repository import RepositoryError, SQLiteStrategyRepository
@@ -337,6 +338,10 @@ class SQLiteTargetExecutionService:
             if not uncovered_delta:
                 return IntentAdvanceResult(intent, (), True)
         self._require_ready(intent.account_id, snapshot, current)
+        preopen_sides = preopen_limit_sides(intent.execution_request)
+        preopen_clock = current.astimezone(SHANGHAI_TZ)
+        preopen_window = (bool(preopen_sides) and preopen_clock.weekday() < 5
+                          and (9, 26) <= (preopen_clock.hour, preopen_clock.minute) < (9, 30))
 
         sells = []
         buys = []
@@ -362,6 +367,9 @@ class SQLiteTargetExecutionService:
             side = OrderSide.SELL if delta < 0 else OrderSide.BUY
             if delta < 0:
                 sell_pending = True
+            if preopen_window and side.value not in preopen_sides:
+                waiting_for_trigger = True  # No buy order or cash reservation before 09:30.
+                continue
             if any(
                 row["security"] == security and row["side"] == side.value
                 for row in intent_working
@@ -505,10 +513,12 @@ class SQLiteTargetExecutionService:
         *,
         sellable_limits: Optional[Mapping[str, int]] = None,
         limit_orders_only: bool = False,
+        allowed_sides: Optional[Tuple[str, ...]] = None,
     ) -> Optional[DispatchResult]:
         claim = self._operations.claim_next(
             strategy_account_id, sellable_limits=sellable_limits,
             limit_orders_only=limit_orders_only,
+            allowed_sides=allowed_sides,
         )
         if claim is None:
             return None

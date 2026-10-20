@@ -119,6 +119,22 @@ def test_preopen_limit_filter_never_claims_market_sell(operation_repository):
     assert repository.claim_next("good-etf").operation_id == market.operation.operation_id
 
 
+def test_atomic_side_filter_cannot_dispatch_unapproved_buy(operation_repository):
+    repository = operation_repository
+    buy = repository.create_operation('good-etf', 'broker.place_order', 'buy', {
+        'side': 'BUY', 'security': '510300.XSHG', 'amount': 100,
+        'style': {'type': 'limit', 'price': '1.002'},
+    })
+    sell = repository.create_operation('good-etf', 'broker.place_order', 'sell', {
+        'side': 'SELL', 'security': '510050.XSHG', 'amount': 100,
+        'style': {'type': 'limit', 'price': '0.9'},
+    })
+    assert repository.claim_next('good-etf', limit_orders_only=True, allowed_sides=('SELL',)).operation_id == sell.operation.operation_id
+    assert repository.claim_next('good-etf', limit_orders_only=True, allowed_sides=('SELL',)) is None
+    assert repository.claim_next('good-etf', allowed_sides=()) is None
+    assert repository.claim_next('good-etf').operation_id == buy.operation.operation_id
+
+
 def test_same_key_with_different_payload_conflicts(operation_repository):
     _create(operation_repository, amount=100)
     with pytest.raises(IdempotencyConflictError, match="different payload"):

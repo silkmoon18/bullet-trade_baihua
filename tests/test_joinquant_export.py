@@ -94,16 +94,17 @@ def test_reversal_export_selects_its_identity_and_preserves_validated_sources(tm
     assert exporter.export_joinquant(ROOT, second, strategy="etf_reversal") == manifest
 
 
-def test_v2_export_preserves_new_strategy_and_private_profile_identity(tmp_path):
+@pytest.mark.parametrize('selector', ['etf_discount_auction_jq', 'good_etf_jq_bridge', 'good_etf_v2'])
+def test_v2_export_preserves_new_strategy_and_private_profile_identity(tmp_path, selector):
     exporter = _load_export_module()
     destination = tmp_path / "v2"
-    manifest = exporter.export_joinquant(ROOT, destination, strategy="good_etf_v2")
-    assert exporter._repository_snapshot(ROOT, "good_etf_v2")[2] == {'strategy_id': 'good_etf_v2'}
+    manifest = exporter.export_joinquant(ROOT, destination, strategy=selector)
+    assert exporter._repository_snapshot(ROOT, selector)[2] == {'strategy_id': 'good_etf_v2'}
     assert set(path.name for path in destination.iterdir()) == {
-        'good_etf_v2.py', 'bullet_trade_jq_remote_helper.py',
+        'etf_discount_auction_jq.py', 'bullet_trade_jq_remote_helper.py',
         'jq_runtime_config.example.py', 'manifest.json',
     }
-    for spec in exporter._artifacts_for_strategy('good_etf_v2'):
+    for spec in exporter._artifacts_for_strategy(selector):
         assert (destination / spec.output).read_bytes() == (ROOT / spec.source).read_bytes()
     assert manifest['production_ready'] is False
 

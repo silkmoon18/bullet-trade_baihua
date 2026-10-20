@@ -47,12 +47,13 @@ def test_open_variant_is_standalone_and_preserves_other_decisions(monkeypatch):
     strategy = _load_open_strategy(monkeypatch)
     assert strategy.STRATEGY_ID == "good_etf_open_0925"
     for name in (
-        "MAX_HOLD_NUM", "MIN_MONEY", "MAX_MONEY", "STOP_LOSS_RATIO",
+        "MIN_MONEY", "MAX_MONEY", "STOP_LOSS_RATIO",
         "TAKE_PROFIT_RATIO", "DEPLOY_RATIO", "SKIP_SUSPENDED_LIMITUP",
         "RISK_CHECK_TIMES",
     ):
         original_strategy = _load_strategy(monkeypatch)
         assert getattr(strategy, name) == getattr(original_strategy, name)
+    assert strategy.MAX_HOLD_NUM == 3  # The independent variant does not inherit v1's new two-name default.
     assert strategy.QMT_INITIAL_CAPITAL == 10000  # The independent variant's budget did not change.
 
 

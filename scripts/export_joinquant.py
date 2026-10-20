@@ -59,7 +59,10 @@ ARTIFACTS: Sequence[ArtifactSpec] = (
 _ARTIFACT_ROLES = frozenset(spec.role for spec in ARTIFACTS)
 STRATEGY_SOURCES = {
     "good_etf": "strategies/joinquant/good_etf.py",
-    "good_etf_v2": "strategies/joinquant/good_etf_v2.py",
+    "etf_discount_auction_jq": "strategies/joinquant/etf_discount_auction_jq.py",
+    "good_etf_jq_bridge": "strategies/joinquant/etf_discount_auction_jq.py",
+    # Keep the old export selector for existing automation; account ID is unchanged.
+    "good_etf_v2": "strategies/joinquant/etf_discount_auction_jq.py",
     "good_etf_0926_limitup": "strategies/joinquant/good_etf_0926_limitup.py",
     "etf_reversal": "strategies/joinquant/etf_reversal.py",
 }
@@ -71,7 +74,8 @@ def _artifacts_for_strategy(strategy: str) -> Sequence[ArtifactSpec]:
     return (
         ArtifactSpec(
             role="strategy", source=STRATEGY_SOURCES[strategy],
-            output=strategy + ".py", upload_name=strategy + ".py",
+            output=Path(STRATEGY_SOURCES[strategy]).name,
+            upload_name=Path(STRATEGY_SOURCES[strategy]).name,
         ),
     ) + tuple(ARTIFACTS[1:])
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Union
+from typing import Dict, Mapping, Optional, Tuple, Union
 
 
 EXECUTION_WIRE_SCHEMA_VERSION = 2
@@ -158,6 +158,13 @@ class ExecutionRequest:
             ),
         ):
             raise TypeError("sell_style must be a supported execution style or None")
+
+
+def preopen_limit_sides(request: ExecutionRequest) -> Tuple[str, ...]:
+    """Explicit permissions per side; selling early must never enable early buys."""
+    return tuple(side for side, style in (
+        ("BUY", request.style), ("SELL", request.sell_style or request.style)
+    ) if isinstance(style, LimitExecution) and style.preopen)
 
 
 @dataclass(frozen=True)

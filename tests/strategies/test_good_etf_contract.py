@@ -352,6 +352,15 @@ def test_risk_check_times_are_top_level_configuration(monkeypatch):
     assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
 
 
+def test_v1_two_name_defaults_match_current_helper_without_changing_schedule(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    assert strategy.MAX_HOLD_NUM == 2
+    assert strategy._EXPECTED_RUNTIME_API_VERSION == real_helper.STRATEGY_RUNTIME_API_VERSION == 26
+    assert strategy.OPEN_DECISION_TIME == strategy.OPEN_ORDER_TIME == '09:30'
+    assert strategy.DEPLOY_RATIO == .95
+    assert STRATEGY_PATH.read_bytes().startswith(b'# -*- coding: utf-8 -*-')
+
+
 @pytest.mark.parametrize("filename", ["good_etf.py", "good_etf_open_0925.py", "etf_reversal.py"])
 def test_strategy_diagnostics_and_account_execution_remain_in_helper(filename):
     source = (STRATEGY_PATH.parent / filename).read_text(encoding="utf-8")
@@ -464,13 +473,13 @@ def test_hk_short_name_fix_preserves_remaining_filters_ranking_and_weights(
     assert runtime.prepared_candidates == [tuple(codes[1:4])]
     weights, marks = strategy.market_open(context)
     assert runtime.rebalances == []
-    premiums = [abs(price / 2.0 - 1) * 100 for price in prices.values()]
-    assert list(weights) == codes[1:4]
+    premiums = [abs(price / 2.0 - 1) * 100 for price in (1.0, 1.5)]
+    assert list(weights) == codes[1:3]
     assert weights == {
         code: value / sum(premiums) * 0.95
-        for code, value in zip(codes[1:4], premiums)
+        for code, value in zip(codes[1:3], premiums)
     }
-    assert marks == prices
+    assert marks == {code: prices[code] for code in codes[1:3]}
 
 
 def test_lifecycle_installs_runtime_before_platform_calls():
@@ -591,7 +600,7 @@ def test_old_saved_schedule_is_migrated_to_execution_entry_without_changing_deci
 
     # The restored legacy entry returns a valid decision but never reaches execution.
     old_weights, old_marks = schedules[0][1](context)
-    assert len(old_weights) == 3
+    assert len(old_weights) == 2
     assert executions == []
     for _ in range(2):
         strategy.process_initialize(context)
@@ -602,7 +611,8 @@ def test_old_saved_schedule_is_migrated_to_execution_entry_without_changing_deci
         assert executions == []
     assert len(cleared) == 2
     opening = [callback for at, callback in schedules if at == "09:30"]
-    assert opening == [real_helper._decide_joinquant_open_rebalance]
+    assert opening == [real_helper._scheduled_decision]
+    assert runtime._scheduled_entries['decision']['callback'] is real_helper._decide_joinquant_open_rebalance
     assert [at for at, _ in schedules] == ["09:20", "09:30", "10:30", "13:30", "14:50", "14:55"]
     opening[0](context)
     assert len(executions) == 1
@@ -690,16 +700,14 @@ def test_market_open_preserves_discount_ranking_filters_and_weights(
     )
 
     assert runtime.rebalances == []
-    assert list(weights) == codes[:3]
+    assert list(weights) == codes[:2]
     assert weights == pytest.approx({
-        "510001.XSHG": 50.0 / 85.0 * 0.95,
-        "510002.XSHG": 25.0 / 85.0 * 0.95,
-        "510003.XSHG": 10.0 / 85.0 * 0.95,
+        "510001.XSHG": 50.0 / 75.0 * 0.95,
+        "510002.XSHG": 25.0 / 75.0 * 0.95,
     })
     assert marks == {
         "510001.XSHG": 1.0,
         "510002.XSHG": 1.5,
-        "510003.XSHG": 1.8,
     }
 
 
@@ -765,16 +773,16 @@ def test_scheduled_delay_freezes_selection_weights_marks_and_jq_amounts(
         context.current_dt += pd.Timedelta(minutes=delay_minutes)
         schedules[order_time](context)
 
-    premiums = [abs(price / 2.0 - 1) * 100 for price in [1.0, 1.5, 1.8]]
+    premiums = [abs(price / 2.0 - 1) * 100 for price in [1.0, 1.5]]
     expected_weights = {
         code: value / sum(premiums) * 0.95
-        for code, value in zip(codes[:3], premiums)
+        for code, value in zip(codes[:2], premiums)
     }
-    assert observed == [(expected_weights, dict(zip(codes[:3], [1.0, 1.5, 1.8])), "open-20260908")]
+    assert observed == [(expected_weights, dict(zip(codes[:2], [1.0, 1.5])), "open-20260908")]
     assert orders == [(code, 10000.0 * weight) for code, weight in expected_weights.items()]
     assert quote_times == [pd.Timestamp("2026-09-08 09:30:00")]
     assert runtime.execute_prepared_rebalance(context) is None
-    assert len(orders) == 3
+    assert len(orders) == 2
 
 
 def test_initialize_passes_custom_decision_and_order_times(monkeypatch):

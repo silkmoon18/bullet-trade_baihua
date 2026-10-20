@@ -7,11 +7,13 @@
 \u5df2\u6709\u805a\u5bbd/\u670d\u52a1\u5668\u7248\u672c\u4e0d\u53d7\u5f71\u54cd\uff1b\u4ea4\u6613\u4e0e\u56de\u6d4b\u63a5\u53e3\u80fd\u529b\u4ecd\u987b\u5b9e\u9645\u9a8c\u8bc1\u3002
 """
 
+# ETF¿ªÅÌÕÛ¼ÛÂÖ¶¯_qmt£»ÄÚ²¿IDºÍÏÖÓÐÕË±¾²»±ä¡£
 # ==================== ÓÃ»§ÅäÖÃ£ºÖ»ÐèÐÞ¸Ä´ËÇøÓò ====================
 
 # ---- ÕË»§¡¢½»Ò×¿ª¹ØºÍ²ßÂÔ¹éÊô×Ê½ð ----
 ACCOUNT_ID = ""  # Use the account selected in QMT, or fill locally; never commit it.
 STRATEGY_ID = "good_etf_big_qmt" # Í¬Ò»ÕË»§Ö»ÔËÐÐÒ»¸ö±¾²ßÂÔÊµÀý£¬²»Óë¾É remote Í¬Ê±½»Ò×
+STRATEGY_NAME = "ETF\u5f00\u76d8\u6298\u4ef7\u8f6e\u52a8_qmt"  # Õ¹Ê¾Ãû£¬²»²ÎÓëÕË±¾Â·¾¶»ò¶©µ¥¹éÊô
 ENABLE_TRADING = True      # Êµ¼ÊÏòQMTµ±Ç°°ó¶¨ÕË»§ÏÂµ¥£»ÐèÏÈÍ£Ö¹Í¬ÕË»§¿ÉÄÜ²¢·¢ÏÂµ¥µÄ¾É²ßÂÔ
 INITIAL_CAPITAL = 1000.0   # ½ö½»Ò×Ä£Ê½Ê¹ÓÃ£»Ö»Ñ¡¹É²»¶ÁÈ¡×Ê½ð¡£ÒÑÓÐÕË±¾²»ÄÜ¸ÄÊý×ÖÀ´ÖØÖÃ
 PAPER_TRADING = False      # Ö½ÃæÄ£Ê½¹Ø±Õ£»½öÔÚENABLE_TRADING=FalseÊ±²ÅÉúÐ§
@@ -22,12 +24,18 @@ STATE_DIR = r"C:\qmt_good_etf_big_qmt_data"  # ¿Í»§¶ËÉÏµÄË½ÓÐÕË±¾Ä¿Â¼£»²»µÃÓë¾ÉÔ
 ETF_SECTOR = "\u6caa\u6df1ETF"      # ¿Í»§¶ËÈ«ÊÐ³¡ ETF °å¿éÃû£¬ÇëºË¶Ô³ÉÔ±·¶Î§
 NAV_FILE = ""              # ÊµÊ±¿ÉÑ¡¶µµ×£ºÏÈ¶ÁQMT PCF£¬È±Ê§Ê±ÔÙ¶ÁÇ°Ò»½»Ò×ÈÕ¾»ÖµJSON
 ALLOW_UNDATED_LIVE_NAV = True  # ÊµÅÌ½ÓÊÜÈÕÆÚÈ±Ê§µÄÓÐÐ§QMT nav²¢¾¯¸æ£»ÈÔÐèÃ¿ÌìÔÚQMT¸üÐÂPCF¡£False=ÑÏ¸ñÈÕÆÚÐ£Ñé
+AUTO_DOWNLOAD_DAILY = True   # ½öÅÌÇ°·ÖÅú²¹È±Ê§ÈÕÏß£»ÀúÊ·»Ø²âºÍ¿ªÅÌÖ´ÐÐ²»ÏÂÔØ
+PREPARE_RETRY_SECONDS = 30  # ÁÙÊ±Êý¾Ý´íÎóµÄ×¼±¸ÖØÊÔ¼ä¸ô£»½Ó¿Ú²»¼æÈÝµ±Ìì²»·´¸´ÖØÊÔ
+DAILY_DOWNLOAD_START = "09:10"
+DAILY_DOWNLOAD_CUTOFF = "09:25"  # µ½µãÁ¢¼´Í£Ö¹°²ÅÅÐÂÏÂÔØ£¬²»ÑÓºó09:30¾ö²ß
+DAILY_DOWNLOAD_BATCH = 10    # Ã¿´Îtimer×î¶à²¹ÕâÐ©±êµÄ£¬µ¥±êµÄµ±ÌìÖ»Ìá½»Ò»´ÎÏÂÔØ
+DAILY_DOWNLOAD_BUDGET_MS = 200  # Åú´ÎÈíÔ¤Ëã£»²»ÄÜÖÐ¶ÏQMTÕýÔÚÖ´ÐÐµÄµ¥´ÎÔ­Éúµ÷ÓÃ
 BACKTEST_DATA_FILE = ""    # »Ø²â¿ÉÑ¡¶µµ×£ºÁô¿ÕÏÈ³¢ÊÔQMT£»È±ÉÙÀúÊ·ETF³Ø/Ç°ÈÕ¾»Öµ/ÕÇÍ£¼ÛÊ±ÔÙÌîJSON
 TRACKED_INDEX_NAMES = {}    # ¿ÉÑ¡£º{"510300.SH": "»¦Éî300"}£¬²¹³ä¸ú×ÙÖ¸ÊýÃû³Æ
 FEISHU_WEBHOOK = ""        # ¿ÉÑ¡·ÉÊé»úÆ÷ÈË webhook£»¿ÕÖµ¹Ø±ÕÍ¨Öª£¬²»Òª¹«¿ªÆ¾¾Ý
 
 # ---- Ñ¡¹ÉÓë·ç¿Ø£º±£ÁôÔ­ GoodETF ²ÎÊý¼°ÑÏ¸ñ±È½Ï±ß½ç ----
-MAX_HOLD_NUM = 3           # ÕÛ¼Û×îÉîµÄÇ° N Ö»
+MAX_HOLD_NUM = 2           # ÕÛ¼Û×îÉîµÄÇ° N Ö»
 MIN_MONEY = 5e6            # Ç°Ò»½»Ò×ÈÕ³É½»¶îÑÏ¸ñ´óÓÚ 500 ÍòÔª
 MAX_MONEY = 2e7            # Ç°Ò»½»Ò×ÈÕ³É½»¶îÑÏ¸ñÐ¡ÓÚ 2000 ÍòÔª
 STOP_LOSS_RATIO = 0.95     # ÏÖ¼ÛÑÏ¸ñµÍÓÚ²ßÂÔ³Ö²Ö³É±¾µÄ 95% Ê±Ö¹Ëð
@@ -40,6 +48,9 @@ HK_CODES = {"520590.SH", "520890.SH", "513320.SH", "159322.SZ"}  # ¸Û¹ÉÊôÐÔÃ÷È·µ
 # ---- ¾ö²ßÊ±¼ä£ºÖÐ¹úÊ±Çø£¬¸ñÊ½ HH:MM ----
 PREPARE_TIME = "09:20"      # ÅÌÇ°×¼±¸£»È±Ê§Ê±ÔÚ¿ªÅÌ¾ö²ßÏÖ³¡²¹ÅÜ
 OPEN_TIME = "09:30"         # Ã¿ÈÕÑ¡¹Éµ÷²Ö£¬²»ÔÚ´í¹ý¸Ã·ÖÖÓºó²¹×ö¿ªÅÌ¾ö²ß
+OPEN_QUOTE_WAIT_SECONDS = 10.0  # ´Ó OPEN_TIME µÄ00ÃëÆð×î¶àµÈ¶à¾Ã£¬Ðë´óÓÚ0Ð¡ÓÚ60£»³¬Ê±²»µ÷²Ö
+OPEN_QUOTE_LOG_SECONDS = 2.0    # µÈ´ýÐÅÏ¢»ã×Ü¼ä¸ô£¬²»Öð¸öË¢È±Ê§±êµÄ£»Ö»print
+QUOTE_FUTURE_TOLERANCE_SECONDS = 2.0  # ÔÊÐíÐÐÇéÊ±¼äÁìÏÈ±¾»úµÄÃëÊý£¬³¬³öÊÓÎªÊ±ÖÓÒì³£
 RISK_CHECK_TIMES = ("10:30", "13:30", "14:50")
 SNAPSHOT_TIME = "14:55"     # ×éºÏ/¾»Öµ/·ÑÓÃ¿ìÕÕ
 
@@ -56,6 +67,9 @@ CASH_RESERVE = 5.0        # Ã¿±Ê»î¶¯Âòµ¥Ô¤Áô½ð¶î£¨Ôª£©£»²»¼Ç×÷ÊÖÐø·Ñ
 
 # ==================== ÅäÖÃ½áÊø£ºÒÔÏÂÍ¨³£ÎÞÐèÐÞ¸Ä ====================
 
+LOG_BUFFER_MAX_CHARS = 8 * 1024 * 1024  # ÄÚ´æÈÕÖ¾ÉÏÏÞ£»³¬ÏÞ±¨¸æ¶ªÆúÊýÁ¿
+LOG_ARCHIVE_TIME = "15:10"  # ÊÕÅÌºó±£´æÈÕÖ¾£¬²»¸Ä±ä½»Ò×ÕË±¾¼´Ê±³Ö¾Ã»¯
+
 import hashlib
 import json
 import math
@@ -70,10 +84,156 @@ import pandas as pd
 import threading
 import urllib.request
 import functools
+import sys
 from contextlib import contextmanager
+from collections import Counter, deque
 
 
 _native_timing = threading.local()
+_native_process_instance = uuid.uuid4().hex[:12]
+_native_previous_output_ms = None
+
+
+class NativeLogBuffer:
+    """Diagnostics only. Never call QMT, touch a ledger or write during trading."""
+    def __init__(self, max_chars):
+        self.rows, self.chars, self.dropped = deque(), 0, 0
+        self.max_chars = max(1024, int(max_chars))
+        self.guard, self.writing, self.last_attempt = threading.Lock(), False, float('-inf')
+
+    def append(self, line, now):
+        with self.guard:
+            if len(line) > self.max_chars:
+                self.dropped += 1
+                return
+            self.rows.append((now.strftime('%Y%m%d'), line))
+            self.chars += len(line)
+            while self.chars > self.max_chars or len(self.rows) > 20000:
+                self.chars -= len(self.rows.popleft()[1])
+                self.dropped += 1
+
+    def request_flush(self, prefix, now, archive_time):
+        if '08:50' <= now.strftime('%H:%M') < max('15:10', archive_time):
+            return False
+        with self.guard:
+            if self.writing or not self.rows or time.monotonic()-self.last_attempt < 60:
+                return False
+            self.writing, self.last_attempt = True, time.monotonic()
+        try:
+            threading.Thread(target=self._write, args=(prefix, now), daemon=True).start()
+        except Exception:
+            with self.guard:
+                self.writing = False
+            return False
+        return True
+
+    def _write(self, prefix, now):
+        if '08:50' <= china_now().strftime('%H:%M') < '15:10':
+            with self.guard:
+                self.writing = False
+            return
+        with self.guard:
+            batch, missing = list(self.rows), self.dropped
+            self.rows.clear()
+            self.chars, self.dropped = 0, 0
+        grouped, saved = {}, set()
+        for day, line in batch:
+            grouped.setdefault(day, []).append(line)
+        if missing:
+            grouped.setdefault(now.strftime('%Y%m%d'), []).append(
+                '[log_archive_gap] dropped_records=' + str(missing))
+        try:
+            for day, lines in grouped.items():
+                try:
+                    path = prefix + '.' + day + '.log'
+                    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+                    with open(path, 'a', encoding='utf-8', errors='backslashreplace') as stream:
+                        stream.write('\n'.join(lines) + '\n')
+                    saved.add(day)
+                except OSError:
+                    try:
+                        print('[log_archive] save failed; pending memory retained')
+                    except Exception:
+                        pass
+            with self.guard:
+                failed = [(day, line) for day, line in batch if day not in saved]
+                self.rows.extendleft(reversed(failed))
+                self.chars += sum(len(line) for _, line in failed)
+                if now.strftime('%Y%m%d') not in saved:
+                    self.dropped += missing
+                while self.chars > self.max_chars or len(self.rows) > 20000:
+                    self.chars -= len(self.rows.popleft()[1])
+                    self.dropped += 1
+        finally:
+            with self.guard:
+                self.writing = False
+
+
+def buffer_native_line(runtime, line, now):
+    try:
+        buffer = getattr(runtime, '_log_buffer', None)
+        if buffer is None:
+            buffer = runtime._log_buffer = NativeLogBuffer(
+                getattr(runtime.settings, 'LOG_BUFFER_MAX_CHARS', 8*1024*1024))
+        buffer.append(line, now)
+    except Exception:
+        pass
+
+
+def maybe_archive_native_logs(runtime):
+    try:
+        buffer = getattr(runtime, '_log_buffer', None)
+        if buffer is None:
+            return
+        if hasattr(runtime, 'executor'):
+            prefix = runtime.executor.path
+        else:
+            prefix = os.path.join(runtime.settings.STATE_DIR,
+                                 'paper' if runtime.paper is not None else 'selection')
+        buffer.request_flush(prefix, china_now(), getattr(runtime.settings, 'LOG_ARCHIVE_TIME', '15:10'))
+    except Exception:
+        pass
+
+
+def archive_after_callback(fn):
+    @functools.wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            maybe_archive_native_logs(self)
+            if fn.__name__ == 'close':
+                buffer = getattr(self, '_log_buffer', None)
+                if buffer is not None and buffer.rows and not buffer.writing:
+                    try:
+                        print('[log_archive_pending] records={} | intraday restart may lose unsaved diagnostics'.format(len(buffer.rows)))
+                    except Exception:
+                        pass
+    return wrapped
+
+
+@contextmanager
+def native_guard(lock):
+    with native_span('local.runtime_guard_wait'):
+        lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def print_timing_only(text, line):
+    """Return True for optional timing output, with no file/notification writes."""
+    if not text.startswith(("\u6267\u884c\u94fe\u8def\u8017\u65f6 | ",
+                            "\u6267\u884c\u56de\u62a5\u8017\u65f6 | ",
+                            "\u5b9e\u5355\u8017\u65f6 | ",
+                            "\u7eb8\u9762\u8017\u65f6 | ", "[opening_quotes]", "[quote_status]")):
+        return False
+    try:
+        print(line)
+    except Exception:
+        pass  # Diagnostic output must not change an order or fill result.
+    return True
 
 
 class TimingTrace:
@@ -81,6 +241,8 @@ class TimingTrace:
         self.phase, self.trace_id = phase, trace_id
         self.started, self.started_at = time.perf_counter(), china_now().isoformat(timespec="milliseconds")
         self.stages = {}
+        self.events = []
+        self.events_dropped = 0
 
     def record(self, stage, started, outcome="ok"):
         elapsed = max(0., (time.perf_counter()-started)*1000)
@@ -89,12 +251,20 @@ class TimingTrace:
                    max_ms=max(row['max_ms'], elapsed), errors=row['errors']+(outcome != 'ok'))
         row.setdefault('first_finished_at', china_now().isoformat(timespec='milliseconds'))
         row['last_finished_at'] = china_now().isoformat(timespec='milliseconds')
+        if len(self.events) < 128:
+            self.events.append(dict(stage=stage, ms=elapsed, outcome=outcome,
+                                    start_offset_ms=(started-self.started)*1000,
+                                    finish_offset_ms=(time.perf_counter()-self.started)*1000))
+        else:
+            self.events_dropped += 1
 
     def message(self):
         return "\u6267\u884c\u94fe\u8def\u8017\u65f6 | " + json.dumps(dict(
             trace_id=self.trace_id, phase=self.phase, started_at=self.started_at,
             finished_at=china_now().isoformat(timespec="milliseconds"),
-            elapsed_ms=(time.perf_counter()-self.started)*1000, stages=self.stages), ensure_ascii=False)
+            elapsed_ms=(time.perf_counter()-self.started)*1000, stages=self.stages,
+            events=self.events, events_dropped=self.events_dropped, process_instance=_native_process_instance,
+            previous_timing_output_ms=_native_previous_output_ms), ensure_ascii=False)
 
 
 @contextmanager
@@ -128,6 +298,7 @@ def native_traced(phase):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapped(self, *args, **kwargs):
+            global _native_previous_output_ms
             if phase == 'native.timer':
                 now = kwargs.get('now') or (args[0] if args else None) or china_now()
                 today, clock = now.strftime('%Y%m%d'), now.strftime('%H:%M')
@@ -153,7 +324,9 @@ def native_traced(phase):
                 # durable state write remains visible while executing work.
                 if any(key.startswith(('qmt.api.', 'local.ledger_save')) for key in trace.stages):
                     try:
+                        output_started = time.perf_counter()
                         self.log(trace.message())
+                        _native_previous_output_ms = (time.perf_counter()-output_started)*1000
                     except Exception:
                         pass
         return wrapped
@@ -285,9 +458,127 @@ def positive(number):
 
 
 def date_text(raw):
-    if isinstance(raw, (int, float)) and raw > 1e11:
-        return dt.datetime.fromtimestamp(raw / 1000).strftime("%Y%m%d")
-    return str(raw).replace("-", "")[:8]
+    text = str(raw).strip()
+    # QMT/Pandas indexes can be numpy.int64 or numeric strings, not builtin int.
+    digits = text.split('.', 1)[0]
+    if digits.isdigit() and len(digits) in (10, 13):
+        try:
+            stamp = float(text) / (1000 if len(digits) == 13 else 1)
+            return dt.datetime.fromtimestamp(stamp, dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
+        except (OverflowError, OSError, ValueError):
+            pass
+    return text.replace("-", "")[:8]
+
+
+def quote_datetime(raw):
+    """Normalize QMT timestamps in Beijing, including numpy scalars and numeric strings."""
+    zone = dt.timezone(dt.timedelta(hours=8))
+    if isinstance(raw, dt.datetime):
+        if raw != raw:  # pandas NaT is datetime-like but is not a valid source timestamp.
+            return None
+        return raw.replace(tzinfo=zone) if raw.tzinfo is None else raw.astimezone(zone)
+    text = str(raw).strip()
+    digits = text.split('.', 1)[0]
+    try:
+        if digits.isdigit() and len(digits) in (10, 13):
+            number = float(text)
+            if not math.isfinite(number):
+                return None
+            return dt.datetime.fromtimestamp(number / (1000 if len(digits) == 13 else 1), zone)
+        if digits.isdigit() and len(digits) in (14, 17):
+            if len(digits) == 14 and '.' in text:
+                return dt.datetime.strptime(text, '%Y%m%d%H%M%S.%f').replace(tzinfo=zone)
+            parsed = dt.datetime.strptime(digits[:14], '%Y%m%d%H%M%S')
+            if len(digits) == 17:
+                parsed = parsed.replace(microsecond=int(digits[14:]) * 1000)
+            return parsed.replace(tzinfo=zone)
+        for fmt in ('%Y%m%d %H:%M:%S.%f', '%Y%m%d %H:%M:%S',
+                    '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return dt.datetime.strptime(text, fmt).replace(tzinfo=zone)
+            except ValueError:
+                pass
+    except (ValueError, TypeError, OverflowError, OSError):
+        pass
+    return None
+
+
+class QuoteIssue(NamedTuple):
+    security: str
+    reason: str
+    raw_time: str
+    time_type: str
+    parsed_time: str
+    raw_price: str
+
+
+class QuoteBatch(NamedTuple):
+    rows: dict
+    issues: tuple
+    paused: int
+
+
+class OpeningQuotesTimeout(RuntimeError):
+    pass
+
+
+class DailyDataUnavailable(RuntimeError):
+    pass
+
+
+def frame_from_rows(rows, columns):
+    """QMT pandas 0.22.0 has no from_dict(columns=...). Keep explicit order."""
+    if not rows:
+        return pd.DataFrame(columns=list(columns))
+    frame = pd.DataFrame.from_dict(rows, orient="index")
+    frame.columns = list(columns)
+    return frame
+
+
+def check_pandas_environment():
+    """Synthetic only: fail before account binding, ledger allocation or timers."""
+    try:
+        daily = frame_from_rows({'B': [3., 1., 9.], 'A': [2., 1., 8.], 'MISSING': [4., 1., 8.]},
+                                ['high_price', 'low_price', 'money'])
+        nav = frame_from_rows({'A': 2., 'B': 3.}, ['unit_net_value'])
+        frame = daily[(daily['money'] > 7.) & (daily['money'] < 10.)].join(nav, how='inner')
+        frame['last_price'] = [1.8 if code == 'A' else 2.85 for code in frame.index]
+        frame['premium'] = (frame['last_price'] / frame['unit_net_value'] - 1) * 100
+        ranked = frame[frame['premium'] < 0].sort_values(['premium'], ascending=True).head(2)
+        discounts = ranked['premium'].abs().tolist()
+        weights = [number / sum(discounts) * .95 for number in discounts]
+        if (ranked.index.tolist() != ['A', 'B']
+                or list(frame.columns) != ['high_price', 'low_price', 'money', 'unit_net_value', 'last_price', 'premium']
+                or abs(weights[0] - .95 * 2 / 3) > 1e-10
+                or abs(weights[1] - .95 / 3) > 1e-10
+                or frame_from_rows({}, ['unit_net_value']).columns.tolist() != ['unit_net_value']):
+            raise ValueError('DataFrame schema, join, sort or weight check differs')
+    except Exception as exc:
+        raise RuntimeError('[native_environment] dataframe_check=FAIL; {}: {}; no runtime started'.format(
+            type(exc).__name__, exc)) from exc
+    print('[native_environment] build=20261019_pandas_v1 python={} pandas={} dataframe_check=PASS; '
+          'synthetic only, not market data or order verification'.format(
+              sys.version.split()[0], getattr(pd, '__version__', 'unknown')))
+
+
+class PreparationGuard:
+    """Throttle preparation only; never pause report booking, exits or live orders."""
+    def __init__(self, settings):
+        self.settings, self.day, self.next_at, self.fatal = settings, '', 0., False
+
+    def ready(self, today):
+        if self.day != today:
+            self.day, self.next_at, self.fatal = today, 0., False
+        return not self.fatal and time.monotonic() >= self.next_at
+
+    def failed(self, error):
+        self.fatal = isinstance(error, (TypeError, AttributeError, ImportError, NotImplementedError))
+        if self.fatal:
+            return '\u5f53\u65e5\u51c6\u5907\u5df2\u505c\u6b62\uff0c\u8bf7\u4fee\u590d\u517c\u5bb9\u6027\u540e\u91cd\u542f\uff1b\u4e0d\u8865\u53d1\u9519\u8fc7\u7684\u8ba1\u5212'
+        delay = max(5., self.settings.PREPARE_RETRY_SECONDS)
+        self.next_at = time.monotonic() + delay
+        return '{:.0f}\u79d2\u540e\u91cd\u67e5\u51c6\u5907\uff0c\u4ec5\u5728\u539f\u5b9a\u51c6\u5907/\u9009\u80a1\u65f6\u6bb5\u5185\u91cd\u8bd5'.format(delay)
 
 
 def china_now():
@@ -318,6 +609,80 @@ class QmtData:
         self.allow_undated_nav, self.unverified_nav = allow_undated_nav, set()
         self.nav_details, self.nav_read_at = {}, "\u672a\u8bfb\u53d6"
         self.universe_count, self.daily_count = 0, 0
+        self.daily_warmup, self.daily_missing_key = None, None
+        self.quote_watch_key, self.quote_watch_id = None, None
+        self.opening_key, self.opening_log_at, self.opening_status = None, None, ''
+        self.opening_attempts = 0
+
+    def warm_quotes(self, codes, now):
+        key = (now.strftime('%Y%m%d'), tuple(sorted(set(codes))))
+        if key == self.quote_watch_key or not key[1]:
+            return
+        self.close_quote_watch()
+        self.quote_watch_key = key
+        subscribe = getattr(self.c, 'subscribe_whole_quote', None)
+        if not callable(subscribe):
+            self.log('[opening_quotes] subscription unavailable; use batch snapshot reads on timers')
+            return
+        try:
+            sub = self.call('subscribe_whole_quote', subscribe, list(key[1]))
+            if not isinstance(sub, int) or isinstance(sub, bool) or sub <= 0:
+                raise RuntimeError('invalid quote subscription id')
+            self.quote_watch_id = sub
+            self.log('[opening_quotes] prewarmed candidates={}'.format(len(key[1])))
+        except Exception as exc:
+            self.log('[opening_quotes] subscription failed: {}; use checked snapshots'.format(type(exc).__name__))
+
+    def close_quote_watch(self):
+        sub, self.quote_watch_id, self.quote_watch_key = self.quote_watch_id, None, None
+        unsubscribe = getattr(self.c, 'unsubscribe_quote', None)
+        if sub is not None and callable(unsubscribe):
+            try:
+                unsubscribe(sub)  # Only this model's subscription; never broker cancel.
+            except Exception:
+                pass
+
+    @staticmethod
+    def quote_summary(batch, count):
+        return 'candidates={} ready={} paused={} pending={} reasons={} samples={}'.format(
+            count, len(batch.rows) - batch.paused, batch.paused, len(batch.issues),
+            dict(Counter(item.reason for item in batch.issues)),
+            [item._asdict() for item in batch.issues[:5]])
+
+    def opening_quotes(self, codes, now, open_at):
+        scheduled = now.replace(hour=int(open_at[:2]), minute=int(open_at[3:]), second=0, microsecond=0)
+        wait = float(self.settings.OPEN_QUOTE_WAIT_SECONDS)
+        if not math.isfinite(wait) or not 0 < wait < 60:
+            raise ValueError('OPEN_QUOTE_WAIT_SECONDS must be between 0 and 60')
+        key = (now.strftime('%Y%m%d'), open_at)
+        if self.opening_key != key:
+            self.opening_key, self.opening_log_at, self.opening_attempts = key, None, 0
+            self.opening_status = '[opening_quotes] no snapshot read in execution window'
+        deadline = scheduled + dt.timedelta(seconds=wait)
+        if now > deadline:
+            raise OpeningQuotesTimeout(self.opening_status + '; deadline=' + deadline.isoformat())
+        self.opening_attempts += 1
+        started = time.perf_counter()
+        try:
+            batch = self.quote_batch(codes, now, allow_suspended=True)
+        except Exception as exc:
+            batch = QuoteBatch({}, tuple(QuoteIssue(code, 'query_failed', '', '', '',
+                               type(exc).__name__) for code in codes), 0)
+        self.opening_status = '[opening_quotes] attempt={} delay_ms={:.1f} {}'.format(
+            self.opening_attempts, (now - scheduled).total_seconds() * 1000,
+            self.quote_summary(batch, len(codes)))
+        observed_now = now + dt.timedelta(seconds=max(0., time.perf_counter() - started))
+        if observed_now > deadline:
+            raise OpeningQuotesTimeout(self.opening_status + '; deadline=' + deadline.isoformat())
+        if not batch.issues:
+            return batch.rows
+        if now >= deadline:
+            raise OpeningQuotesTimeout(self.opening_status + '; deadline=' + deadline.isoformat())
+        mono = time.monotonic()
+        if self.opening_log_at is None or mono - self.opening_log_at >= self.settings.OPEN_QUOTE_LOG_SECONDS:
+            self.log(self.opening_status)
+            self.opening_log_at = mono
+        return None  # Retry on the existing 1-second timer, never sleep or partially plan.
 
     def api(self, name):
         fn = self.namespace.get(name) or getattr(builtins, name, None)
@@ -374,26 +739,103 @@ class QmtData:
         self.universe_count = len(rows)
         return rows
 
+    def read_daily(self, codes, previous):
+        return self.call('get_market_data_ex', self.c.get_market_data_ex,
+            ["high", "low", "amount"], codes, period="1d", end_time=previous + "235959",
+            count=1, dividend_type="none", fill_data=False, subscribe=False)
+
+    @staticmethod
+    def daily_rows(data, codes, previous):
+        rows, missing, samples = {}, [], []
+        for code in codes:
+            frame = (data or {}).get(code)
+            reason = 'no_result' if frame is None else 'empty'
+            raw_date = None
+            if frame is not None and not frame.empty:
+                raw_date = frame.index[-1]
+                observed = date_text(raw_date)
+                reason = 'wrong_day:' + observed
+                if observed == previous:
+                    try:
+                        bar = frame.iloc[-1]
+                        fields = [float(bar[name]) for name in ('high', 'low', 'amount')]
+                        rows[code] = fields  # Preserve existing NaN/inner-join and liquidity semantics.
+                        continue
+                    except (KeyError, TypeError, ValueError):
+                        reason = 'missing_or_invalid_fields'
+            if code not in rows:
+                missing.append(code)
+                if len(samples) < 5:
+                    samples.append((code, reason, str(raw_date)[:40], type(raw_date).__name__))
+        return rows, missing, samples
+
+    def warm_daily_cache(self, previous, now):
+        """Bounded pre-open cache repair; never calls account/order APIs or changes factors."""
+        clock = now.strftime('%H:%M')
+        if (not self.settings.AUTO_DOWNLOAD_DAILY
+                or not self.settings.DAILY_DOWNLOAD_START <= clock < self.settings.DAILY_DOWNLOAD_CUTOFF
+                or clock >= self.settings.OPEN_TIME):
+            return False
+        download = self.namespace.get('download_history_data') or getattr(builtins, 'download_history_data', None)
+        if not callable(download):
+            return False  # Missing terminal API is diagnosed by daily(), never invented.
+        if self.daily_warmup is None or self.daily_warmup['previous'] != previous:
+            codes = list(self.call('get_stock_list_in_sector', self.c.get_stock_list_in_sector, self.settings.ETF_SECTOR) or [])
+            if not codes:
+                return False
+            _, missing, _ = self.daily_rows(self.read_daily(codes, previous), codes, previous)
+            self.daily_warmup = dict(previous=previous, queue=missing, at=0, next_check=0., done=not missing, failures=0)
+            if missing:
+                self.log('[daily_cache] previous={} missing={}; pre-open downloads only'.format(previous, len(missing)))
+        state = self.daily_warmup
+        if state['done']:
+            return False
+        started = time.perf_counter()
+        batch = max(1, min(100, int(self.settings.DAILY_DOWNLOAD_BATCH)))
+        for _ in range(batch):
+            if state['at'] >= len(state['queue']):
+                break
+            # Check the real wall clock again: a slow native call may cross the cutoff.
+            actual_clock = china_now().strftime('%H:%M')
+            if actual_clock >= min(self.settings.DAILY_DOWNLOAD_CUTOFF, self.settings.OPEN_TIME):
+                return False
+            code = state['queue'][state['at']]
+            state['at'] += 1  # Unknown download outcomes are not repeatedly re-issued.
+            try:
+                self.call('download_history_data', download, code, '1d', previous, previous)
+            except Exception:
+                state['failures'] += 1
+            if (time.perf_counter() - started) * 1000 >= max(1., self.settings.DAILY_DOWNLOAD_BUDGET_MS):
+                break
+        if state['at'] < len(state['queue']):
+            return True
+        if time.monotonic() >= state['next_check']:
+            state['next_check'] = time.monotonic() + 5
+            rows, missing, _ = self.daily_rows(self.read_daily(state['queue'], previous), state['queue'], previous)
+            if not missing or (rows and clock >= self.settings.PREPARE_TIME):
+                state['done'] = True
+                if not missing:
+                    self.log('[daily_cache] previous={} verified; downloads={}'.format(previous, state['at']))
+                else:
+                    self.log('[daily_cache] previous={} valid={}/{} missing={} download_errors={}; '
+                             'continue preparation; missing symbols retain original exclusion policy'.format(
+                                 previous, len(rows), len(state['queue']), len(missing), state['failures']))
+                return False
+        return True
+
     def daily(self, codes, previous):
         self.daily_count = len(codes)
         if not codes:
             return pd.DataFrame(columns=["high_price", "low_price", "money"])
-        data = self.call('get_market_data_ex', self.c.get_market_data_ex,
-            ["high", "low", "amount"], codes, period="1d", end_time=previous + "235959",
-            count=1, dividend_type="none", fill_data=False, subscribe=False)
-        rows, missing = {}, []
-        for code in codes:
-            frame = data.get(code)
-            if frame is None or frame.empty or date_text(frame.index[-1]) != previous:
-                missing.append(code)
-                continue  # ¶ÔÓ¦Ô­²ßÂÔ inner join / NaN Á÷¶¯ÐÔ¹ýÂËµÄÈ±Ê§Êý¾ÝÐÐÎª
-            bar = frame.iloc[-1]
-            rows[code] = [float(bar["high"]), float(bar["low"]), float(bar["amount"])]
-        if missing:
-            self.log("\u524d\u65e5\u65e5\u7ebf\u7f3a\u5931/\u8fc7\u671f {} \u53ea: {}\uff1b\u8bf7\u8865\u5145\u65e5\u7ebf\u6570\u636e".format(len(missing), missing[:10]))
+        rows, missing, samples = self.daily_rows(self.read_daily(codes, previous), codes, previous)
+        diagnostic = (previous, len(missing), tuple(samples))
+        if missing and diagnostic != self.daily_missing_key:
+            self.daily_missing_key = diagnostic
+            self.log('[daily_cache] previous={} valid={}/{} missing_samples={}; download QMT ETF daily data, not PCF'.format(
+                previous, len(rows), len(codes), samples))
         if not rows:
-            raise RuntimeError("\u5168\u4f53\u524d\u65e5\u65e5\u7ebf\u7f3a\u5931\uff0c\u8bf7\u5148\u8865\u5145 QMT \u65e5\u7ebf\u6570\u636e")
-        return pd.DataFrame.from_dict(rows, orient="index", columns=["high_price", "low_price", "money"])
+            raise DailyDataUnavailable("\u5168\u4f53\u524d\u65e5\u65e5\u7ebf\u7f3a\u5931\uff0c\u8bf7\u5148\u8865\u5145 QMT \u65e5\u7ebf\u6570\u636e")
+        return frame_from_rows(rows, ["high_price", "low_price", "money"])
 
     def pcf_nav(self, codes, previous, today):
         """\u6309\u8c03\u7528\u65b9\u7b56\u7565\u63a5\u53d7\u7f3a\u5931\u65e5\u671f\uff1b\u660e\u786e\u9519\u8bef\u65e5\u671f\u59cb\u7ec8\u62d2\u7edd\uff0c\u4e0d\u4f2a\u9020\u66f4\u65b0\u8bc1\u660e\u3002"""
@@ -448,45 +890,58 @@ class QmtData:
             self.log("\u524d\u65e5\u5355\u4f4d\u51c0\u503c\u7f3a\u5931/\u65e5\u671f\u4e0d\u660e {} \u53ea: {}\uff1b\u672a\u4f7f\u7528 IOPV".format(len(missing), missing[:10]))
         if not rows:
             raise RuntimeError("\u65e0\u53ef\u7528\u7684\u524d\u65e5\u5355\u4f4d\u51c0\u503c\uff0c\u8df3\u8fc7\u4ea4\u6613\uff1b\u8bf7\u68c0\u67e5QMT PCF\uff0cNAV_FILE\u4ec5\u4e3a\u53ef\u9009\u515c\u5e95")
-        return pd.DataFrame.from_dict(rows, orient="index", columns=["unit_net_value"])
+        return frame_from_rows(rows, ["unit_net_value"])
 
-    def quotes(self, codes, now, strict=True):
+    def quote_batch(self, codes, now, allow_suspended=False):
         if not codes:
-            return {}
+            return QuoteBatch({}, (), 0)
         ticks = self.call('get_full_tick', self.c.get_full_tick, list(codes))
-        rows = {}
+        rows, issues, paused_count = {}, [], 0
+        zone = dt.timezone(dt.timedelta(hours=8))
+        local_now = now.replace(tzinfo=zone) if now.tzinfo is None else now.astimezone(zone)
+        market_open = local_now.replace(hour=9, minute=30, second=0, microsecond=0)
         for code in codes:
             tick = ticks.get(code, {})
             price = positive(tick.get("lastPrice"))
             stamp = tick.get("time") or tick.get("stime") or tick.get("timetag")
+            parsed = quote_datetime(stamp)
             detail = self.detail(code)
             paused = tick.get("openInt") in (1, 16, 17, 20) or detail.get("IsTrading") is False
-            if paused and price is not None:
+            if paused and allow_suspended and SKIP_SUSPENDED_LIMITUP:
                 # Í£ÅÆÃ»ÓÐÐÂ tick ÊôÕý³£Çé¿ö£¬ÈÔ·µ»ØÍ£ÅÆ±ê¼Ç½»ÓÉ¾ö²ß¹ýÂË¡£
-                rows[code] = dict(last_price=price, paused=True,
+                paused_count += 1
+                rows[code] = dict(last_price=price or 0., paused=True,
                                   high_limit=positive(detail.get("UpStopPrice")) or float("inf"))
                 continue
-            if price is None or date_text(stamp) != now.strftime("%Y%m%d"):
-                if strict:
-                    raise RuntimeError("\u6700\u65b0\u884c\u60c5\u65e0\u6548/\u4e0d\u662f\u4eca\u5929: " + code)
-                self.log("\u6682\u4e0d\u53c2\u4e0e\u672c\u8f6e\u9009\u80a1 | {} | \u6700\u65b0\u884c\u60c5\u65e0\u6548/\u4e0d\u662f\u4eca\u5929".format(self.label(code)))
-                continue
-            if isinstance(stamp, (int, float)):
-                quote_clock = dt.datetime.fromtimestamp(stamp / 1000).strftime("%H%M%S")
-            else:
-                digits = "".join(char for char in str(stamp) if char.isdigit())
-                quote_clock = digits[8:14]
-            if now.strftime("%H%M%S") >= "093000" and quote_clock < "093000":
-                if strict:
-                    raise RuntimeError("\u7b49\u5f85\u5f00\u76d8\u540e\u7684 lastPrice: " + code)
-                self.log("\u6682\u4e0d\u53c2\u4e0e\u672c\u8f6e\u9009\u80a1 | {} | \u5c1a\u65e0\u5f00\u76d8\u540elastPrice".format(self.label(code)))
+            reason = ('invalid_price' if price is None else
+                      'invalid_time' if parsed is None else
+                      'wrong_day' if parsed.date() != local_now.date() else
+                      'future_time' if parsed > local_now + dt.timedelta(seconds=self.settings.QUOTE_FUTURE_TOLERANCE_SECONDS) else
+                      'before_open' if local_now >= market_open and parsed < market_open else '')
+            if reason:
+                issues.append(QuoteIssue(code, reason, repr(stamp)[:100], type(stamp).__name__,
+                                        parsed.isoformat() if parsed is not None else '',
+                                        repr(tick.get('lastPrice'))[:100]))
                 continue
             self.last_quote_time = str(stamp)
             rows[code] = dict(last_price=price, paused=paused,
                               high_limit=positive(detail.get("UpStopPrice")) or float("inf"))
-        if not rows:
+        return QuoteBatch(rows, tuple(issues), paused_count)
+
+    def quotes(self, codes, now, strict=True):
+        if not codes:
+            return {}
+        batch = self.quote_batch(codes, now)
+        if batch.issues:
+            if strict:
+                first = batch.issues[0]
+                message = ("\u7b49\u5f85\u5f00\u76d8\u540e\u7684 lastPrice: " if first.reason == 'before_open'
+                           else "\u6700\u65b0\u884c\u60c5\u65e0\u6548/\u4e0d\u662f\u4eca\u5929: ")
+                raise RuntimeError(message + first.security)
+            self.log('[quote_status] ' + self.quote_summary(batch, len(codes)))
+        if not batch.rows:
             raise RuntimeError("\u5168\u4f53\u5019\u9009ETF\u65e0\u6709\u6548\u6700\u65b0\u884c\u60c5\uff0c\u4fdd\u7559\u6301\u4ed3\uff0c\u7b49\u5f85\u672c\u5206\u949f\u91cd\u67e5")
-        return rows
+        return batch.rows
 
 
 # Ñ¸Í¶ÄÚÖÃ Python Ã¶¾Ù£º53 ²¿³·¡¢54 ÒÑ³·¡¢55 ²¿³É¡¢56 ÒÑ³É¡¢57 ·Ïµ¥¡£
@@ -1023,27 +1478,29 @@ class SelectionRuntime:
         self.day, self.jobs, self.frame, self.last_decision = "", set(), None, None
         self.is_trading_day, self.calendar_checked_at, self.retry_at = False, 0, 0
         self.last_error = None
+        self.preparation = PreparationGuard(settings)
         self.paper = PaperAccount(self.data, settings) if settings.PAPER_TRADING else None
         self.last_timing = None
 
-    @native_measured('local.log_stdout_and_file')
+    @native_measured('local.log_stdout_and_memory')
     def log(self, text):
         now = china_now()
         mode = "\u7eb8\u9762\u6a21\u62df" if self.paper is not None else "\u4ec5\u9009\u80a1"
         line = "{} [{}][{}] {}".format(now.isoformat(sep=" ", timespec="milliseconds"), self.settings.STRATEGY_ID, mode, text)
-        print(line)
+        buffer_native_line(self, line, now)
+        if print_timing_only(text, line):
+            return
         try:
-            os.makedirs(self.settings.STATE_DIR, exist_ok=True)
-            path = os.path.join(self.settings.STATE_DIR, ("paper_" if self.paper is not None else "selection_")
-                                + now.strftime("%Y%m%d") + ".log")
-            with open(path, "a", encoding="utf-8") as stream:
-                stream.write(line + "\n")
-        except OSError:
-            print("\u4ec5\u9009\u80a1\u672c\u5730\u65e5\u5fd7\u5199\u5165\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5STATE_DIR\uff1bQMT\u65e5\u5fd7\u4ecd\u6709\u8f93\u51fa")
+            print(line)
+        except Exception:
+            pass
 
     def start(self, prepare_time, open_time, risk_times, snapshot_time):
         self.times = prepare_time, open_time, tuple(risk_times), snapshot_time
+        self.log("[strategy_name] " + self.settings.STRATEGY_NAME)
         self.c.run_time("on_timer", "1nSecond", china_now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.log('[opening_quotes] build=20261020_quotes_v1 wait_seconds={} require_all_tradable=True'.format(
+            self.settings.OPEN_QUOTE_WAIT_SECONDS))
         self.log("\u542f\u52a8 | \u4e0d\u7ed1\u5b9a\u8d26\u6237\u3001\u4e0d\u67e5\u8be2\u8d44\u91d1/\u6301\u4ed3\u3001\u4e0d\u5efa\u4ea4\u6613\u8d26\u672c\u3001\u4e0d\u4e0b\u5355\u3001\u4e0d\u64a4\u5355\u3001\u4e0d\u53d1\u9001\u98de\u4e66\uff1b\u5df2\u6709\u670d\u52a1\u4e0d\u53d7\u5f71\u54cd")
         self.log("\u8c03\u5ea6 | {}\u51c6\u5907 | {}\u9009\u80a1 | {}\u9009\u80a1\u6458\u8981\uff1b\u9519\u8fc7\u9009\u80a1\u5206\u949f\u4e0d\u8865\u505a".format(prepare_time, open_time, snapshot_time))
         self.log("\u6570\u636e | \u5f53\u524dQMT ETF\u6c60\u3001\u524d\u65e5\u65e5\u7ebf\u3001PCF\u51c0\u503c\uff1b\u65e5\u671f\u4e3a0/\u7f3a\u5931\u4ec5\u7528\u4e8e\u4eba\u5de5\u5bf9\u7167\uff0c\u5e76\u6807\u8bb0\u672a\u6838\u9a8c")
@@ -1052,12 +1509,14 @@ class SelectionRuntime:
                      "\u6309lastPrice\u5047\u8bbe\u7acb\u5373\u6210\u4ea4\uff0c\u4e0d\u6a21\u62df\u6392\u961f/\u6df1\u5ea6/\u90e8\u5206\u6210\u4ea4/\u8d39\u7528/T+1/\u98ce\u63a7\uff1b"
                      "\u6ca1\u6709QMT\u63a5\u53e3\u63d0\u4ea4\u3001\u59d4\u6258\u6216\u6210\u4ea4\u56de\u62a5\uff0c\u8017\u65f6\u4e0d\u4ee3\u8868\u5b9e\u76d8\u6210\u4ea4\u5ef6\u8fdf\uff1b\u91cd\u542f\u865a\u62df\u8d44\u91d1\u548c\u6301\u4ed3\u91cd\u7f6e".format(self.paper.cash))
 
+    @archive_after_callback
     def tick(self, now=None):
         now = now or china_now()
         callback_started = time.perf_counter()
-        with self.guard:
+        with native_guard(self.guard):
             if self.closed or time.monotonic() < self.retry_at:
                 return
+            preparing = False
             try:
                 today, clock = now.strftime("%Y%m%d"), now.strftime("%H:%M")
                 if today != self.day or (not self.is_trading_day and "09:00" <= clock <= "15:00"
@@ -1070,11 +1529,28 @@ class SelectionRuntime:
                 if not self.is_trading_day:
                     return
                 prepare_at, open_at, _, snapshot_at = self.times
-                key = today + ":" + clock
-                if key in self.jobs or clock not in (prepare_at, open_at, snapshot_at):
+                prepare_key = today + ':' + prepare_at
+                prepare_due = prepare_at <= clock < open_at and prepare_key not in self.jobs
+                warming_due = (self.settings.AUTO_DOWNLOAD_DAILY
+                    and self.settings.DAILY_DOWNLOAD_START <= clock < self.settings.DAILY_DOWNLOAD_CUTOFF)
+                if (prepare_due or clock == open_at or warming_due) and not self.preparation.ready(today):
                     return
-                if clock in (prepare_at, open_at) and self.frame is None:
+                preparing = True
+                warming = self.data.warm_daily_cache(self.previous, now)
+                preparing = False
+                if prepare_due and warming:
+                    return  # Continue bounded downloads on later timers, not repeated full preparation.
+                key = today + ":" + clock
+                if prepare_due:
+                    key = prepare_key
+                if key in self.jobs or (not prepare_due and clock not in (open_at, snapshot_at)):
+                    return
+                if (prepare_due or clock == open_at) and self.frame is None:
+                    preparing = True
                     self.frame = self.prepare_fn(self.data, self.previous, today)
+                    preparing = False
+                    if self.frame is not None and not self.frame.empty:
+                        self.data.warm_quotes(self.frame.index.tolist(), now)
                     self.log("\u76d8\u524d\u7b5b\u9009 | \u524d\u65e5\u65e5\u7ebf={} | \u5f53\u524dETF\u6c60={} | \u6e2f\u80a1\u8fc7\u6ee4\u540e={} | \u6d41\u52a8\u6027\u53ca\u51c0\u503c\u7b5b\u9009\u540e={} | \u6210\u4ea4\u989d\u8303\u56f4=({:.0f},{:.0f})".format(
                         self.previous, self.data.universe_count, self.data.daily_count,
                         0 if self.frame is None else len(self.frame), MIN_MONEY, MAX_MONEY))
@@ -1083,7 +1559,10 @@ class SelectionRuntime:
                         self.log("\u9009\u80a1\u8df3\u8fc7 | \u9884\u5904\u7406\u65e0\u5019\u9009\uff1b\u6ca1\u6709\u4efb\u4f55\u4ea4\u6613\u64cd\u4f5c")
                     else:
                         quote_started, started = china_now(), time.perf_counter()
-                        quotes = self.data.quotes(self.frame.index.tolist(), now, strict=False)
+                        quote_now = now + dt.timedelta(seconds=max(0., time.perf_counter() - callback_started))
+                        quotes = self.data.opening_quotes(self.frame.index.tolist(), quote_now, open_at)
+                        if quotes is None:
+                            return  # Preserve the full frame; retry only the quote gate next timer.
                         quote_done = time.perf_counter()
                         self.last_decision = self.select_fn(self.frame, quotes)
                         decision_done = china_now()
@@ -1100,6 +1579,7 @@ class SelectionRuntime:
                         # decision diagnostics; logging isn't part of the hot path.
                         paper_events = (self.paper.rebalance(self.last_decision, quotes, now, self.last_timing)
                                         if self.paper is not None else [])
+                        self.log(self.data.opening_status)
                         self.log("\u9009\u80a1\u7ed3\u679c | \u56de\u8c03\u5f00\u59cb\u65f6\u95f4={} | \u884c\u60c5\u8bfb\u53d6\u5f00\u59cb={} | \u8ba1\u7b97\u5b8c\u6210={} | \u884c\u60c5\u53ca\u9009\u80a1\u8017\u65f6={:.1f}ms | \u9009\u4e2d={} | \u76ee\u6807\u6743\u91cd={}".format(
                             now.strftime("%Y-%m-%d %H:%M:%S"), quote_started.strftime("%H:%M:%S.%f")[:-3],
                             decision_done.strftime("%H:%M:%S.%f")[:-3], (selected_at - started) * 1000,
@@ -1135,8 +1615,13 @@ class SelectionRuntime:
                             self.paper.cash, {self.data.label(code): pos["qty"] for code, pos in self.paper.positions.items() if pos["qty"]}))
                 self.jobs.add(key)
                 self.last_error = None
+            except OpeningQuotesTimeout as exc:
+                self.jobs.add(today + ':' + open_at)
+                self.log('\u5f00\u76d8\u884c\u60c5\u7b49\u5f85\u8d85\u65f6\uff0c\u4fdd\u7559\u539f\u6301\u4ed3\uff0c\u672c\u8f6e\u4e0d\u8c03\u4ed3 | ' + str(exc))
             except Exception as exc:
-                message = "\u9009\u80a1\u9a8c\u8bc1\u5931\u8d25 | \u539f\u56e0={}\uff1b\u672c\u5206\u949f\u7a0d\u540e\u91cd\u67e5\uff0c\u672a\u8fdb\u884c\u4ea4\u6613".format(exc)
+                action = (self.preparation.failed(exc) if preparing else
+                          'retry after query interval; no order was submitted by selection-only mode')
+                message = "\u9009\u80a1\u9a8c\u8bc1\u5931\u8d25 | \u539f\u56e0={} | {}".format(exc, action)
                 if message != self.last_error:
                     self.log(message)
                     self.last_error = message
@@ -1151,9 +1636,11 @@ class SelectionRuntime:
     def on_error(self, args, error):
         pass
 
+    @archive_after_callback
     def close(self):
-        with self.guard:
+        with native_guard(self.guard):
             self.closed = True  # Ã»ÓÐÕË±¾Ëø»ò¹ñÌ¨Î¯ÍÐÐèÒª´¦Àí¡£
+            self.data.close_quote_watch()
 
 
 class Runtime:
@@ -1172,20 +1659,22 @@ class Runtime:
         self.guard = threading.RLock()
         self.closed = False
         self.notices, self.last_sync, self.day, self.frame = {}, 0, "", None
+        self.preparation = PreparationGuard(settings)
         self.calendar_checked_at = 0
         self.executor = Executor(self.data, settings, self.account, self.emit)
         self.last_timing = None
 
+    @native_measured('local.log_stdout_and_memory')
     def log(self, text):
         now = china_now()
         line = "{} [{}] {}".format(now.isoformat(sep=" ", timespec="milliseconds"), self.settings.STRATEGY_ID, text)
-        print(line)
+        buffer_native_line(self, line, now)
+        if print_timing_only(text, line):
+            return
         try:
-            path = self.executor.path + "." + now.strftime("%Y%m%d") + ".log"
-            with open(path, "a", encoding="utf-8") as stream:
-                stream.write(line + "\n")
-        except OSError:
-            print("\u672c\u5730\u65e5\u5fd7\u5199\u5165\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5STATE_DIR\uff1b\u67dc\u53f0\u56de\u62a5\u548c\u5df2\u843d\u76d8\u8d26\u672c\u4e0d\u53d7\u5f71\u54cd")
+            print(line)
+        except Exception:
+            pass
 
     def handlebar(self):
         pass  # ÊµÊ±³õÊ¼»¯±éÀúÀúÊ· bar£¬²»ÄÜÔÚÕâÀï´¥·¢ quickTrade=2
@@ -1221,27 +1710,32 @@ class Runtime:
 
     def start(self, prepare_time, open_time, risk_times, snapshot_time):
         self.times = prepare_time, open_time, tuple(risk_times), snapshot_time
+        self.log("[strategy_name] " + self.settings.STRATEGY_NAME)
         self.c.set_account(self.account)
         self.c.run_time("on_timer", "1nSecond", china_now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.log('[opening_quotes] build=20261020_quotes_v1 wait_seconds={} require_all_tradable=True'.format(
+            self.settings.OPEN_QUOTE_WAIT_SECONDS))
         self.log("\u72ec\u7acb\u5927QMT\u7248 | \u4ea4\u6613={} | \u8d26\u672c={} | \u4e0d\u4f9d\u8d56\u805a\u5bbd/\u670d\u52a1\u5668/bridge\uff1b\u540c\u8d26\u6237\u52ff\u4e0e\u65e7remote\u540c\u65f6\u4ea4\u6613".format(
             self.settings.ENABLE_TRADING, self.executor.path))
         self.log("\u6570\u636e\u6765\u6e90: QMT\u4f18\u5148\uff1bPCF\u7f3a\u5931\u65f6\u53ef\u7528\u524d\u65e5NAV_FILE\u515c\u5e95\uff1b\u4e0d\u7528IOPV\u6216\u4eca\u65e5\u6570\u636e\u66ff\u4ee3\u5386\u53f2\u51c0\u503c")
         self.log("\u51c0\u503c\u89c4\u5219 | \u63a5\u53d7\u7f3a\u5931\u65e5\u671f={} | \u660e\u786e\u9519\u8bef\u65e5\u671f\u4ecd\u6392\u9664\uff1b\u7f3a\u5931\u65e5\u671f\u4e0d\u8bc1\u660ePCF\u5df2\u66f4\u65b0\uff0c"
                  "\u8bf7\u6bcf\u65e5\u5728QMT\u6570\u636e\u7ba1\u7406\u66f4\u65b0ETF\u7533\u8d4e\u6e05\u5355".format(self.settings.ALLOW_UNDATED_LIVE_NAV))
 
+    @archive_after_callback
     def close(self):
-        # stop Ê±½»Ò×Á¬½ÓÒÑ¶Ï¿ª£¬Ö»ÊÍ·Å±¾µØ×ÊÔ´£¬²»²éÑ¯¡¢ÏÂµ¥»ò³·µ¥¡£
-        with self.guard:
+        # stop Ê±½öÊÍ·Å×ÔÓÐÐÐÇé¶©ÔÄºÍ±¾µØ×ÊÔ´£¬²»²éÑ¯ÕË»§¡¢ÏÂµ¥»ò³·µ¥¡£
+        with native_guard(self.guard):
             if self.closed:
                 return
             self.closed = True
+            self.data.close_quote_watch()
             self.executor.close()
             self.log("\u7b56\u7565\u5df2\u505c\u6b62 | \u8d26\u672c\u9501\u5df2\u91ca\u653e | \u8d26\u672c\u4fdd\u7559\uff1b\u672a\u64a4\u9500\u67dc\u53f0\u59d4\u6258")
 
     @native_traced('native.report_callback')
     def on_report(self, kind, row):
         received_at, received_mono = china_now(), time.perf_counter()
-        with self.guard:
+        with native_guard(self.guard):
             if self.closed:
                 return
             try:
@@ -1253,7 +1747,7 @@ class Runtime:
     def on_error(self, args, error):
         # ¹Ù·½ orderArgs.strategyName µÄ¸ñÊ½Îª ²ßÂÔÃû_&&&_Í¶×Ê±¸×¢¡£
         tag = str(value(args, "strategyName", "")).rsplit("_&&&_", 1)[-1]
-        with self.guard:
+        with native_guard(self.guard):
             if self.closed:
                 return
             order = self.executor.state["orders"].get(tag)
@@ -1264,13 +1758,15 @@ class Runtime:
             elif str(value(args, "strategyName", "")).startswith(self.settings.STRATEGY_ID):
                 self.emit("\u4e0b\u5355\u5f02\u5e38", body="\u539f\u56e0: " + str(error) + "\n\u5904\u7406: \u672a\u80fd\u5173\u8054\u6295\u8d44\u5907\u6ce8\uff0c\u8bf7\u68c0\u67e5\u67dc\u53f0\u59d4\u6258")
 
+    @archive_after_callback
     @native_traced('native.timer')
     def tick(self, now=None):
         now = now or china_now()
         callback_started = time.perf_counter()
-        with self.guard:
+        with native_guard(self.guard):
             if self.closed:
                 return
+            preparing = False
             try:
                 opening_timing, sync_ms = None, 0.0
                 today, clock = now.strftime("%Y%m%d"), now.strftime("%H:%M")
@@ -1289,17 +1785,43 @@ class Runtime:
                 if not self.is_trading_day:
                     return
                 prepare_at, open_at, risk_times, snapshot_at = self.times
+                prepare_key = today + ':' + prepare_at
+                prepare_due = prepare_at <= clock < open_at and prepare_key not in self.executor.state['jobs']
+                warming_due = (self.settings.AUTO_DOWNLOAD_DAILY
+                    and self.settings.DAILY_DOWNLOAD_START <= clock < self.settings.DAILY_DOWNLOAD_CUTOFF)
+                if (prepare_due or clock == open_at or warming_due) and not self.preparation.ready(today):
+                    self.executor.advance(now)
+                    return
+                preparing = True
+                warming = self.data.warm_daily_cache(self.previous, now)
+                preparing = False
                 key = today + ":" + clock
                 if key not in self.executor.state["jobs"]:
-                    if clock == prepare_at:
-                        self.frame = self.prepare_fn(self.data, self.previous, today)
-                        self.log("\u76d8\u524d\u5019\u9009: {}".format(0 if self.frame is None else len(self.frame)))
+                    if prepare_due:
+                        if warming:
+                            key = None
+                        else:
+                            preparing = True
+                            self.frame = self.prepare_fn(self.data, self.previous, today)
+                            preparing = False
+                            if self.frame is not None and not self.frame.empty:
+                                self.data.warm_quotes(self.frame.index.tolist(), now)
+                            key = prepare_key
+                            self.log("\u76d8\u524d\u5019\u9009: {}".format(0 if self.frame is None else len(self.frame)))
                     elif clock == open_at:
                         if self.frame is None:
+                            preparing = True
                             self.frame = self.prepare_fn(self.data, self.previous, today)
+                            preparing = False
+                            if self.frame is not None and not self.frame.empty:
+                                self.data.warm_quotes(self.frame.index.tolist(), now)
                         if self.frame is not None and not self.frame.empty:
                             quote_started = time.perf_counter()
-                            quotes = self.data.quotes(self.frame.index.tolist(), now, strict=False)
+                            quote_now = now + dt.timedelta(seconds=max(0., time.perf_counter() - callback_started))
+                            quotes = self.data.opening_quotes(self.frame.index.tolist(), quote_now, open_at)
+                            if quotes is None:
+                                self.executor.advance(now)  # Existing targets/reports are not blocked.
+                                return
                             quote_done = time.perf_counter()
                             decision = self.select_fn(self.frame, quotes)
                             decision_done = time.perf_counter()
@@ -1335,6 +1857,7 @@ class Runtime:
                         self.executor.save()
                 self.executor.advance(now)
                 if opening_timing is not None:
+                    self.log(self.data.opening_status)  # Diagnostics after the first possible submit.
                     scheduled = now.replace(hour=int(open_at[:2]), minute=int(open_at[3:]), second=0, microsecond=0)
                     self.log("\u5b9e\u5355\u8017\u65f6 | \u8ba1\u5212\u65f6\u95f4={} \u56de\u8c03\u65f6\u95f4={} \u5b9a\u65f6\u89e6\u53d1\u5ef6\u540e={:.1f}ms \u5b9a\u65f6\u67e5\u8be2={:.1f}ms "
                              "\u884c\u60c5={:.1f}ms \u9009\u80a1={:.1f}ms \u76ee\u6807\u51c6\u5907\uff08\u542b\u67e5\u8be2/\u4f30\u503c/\u843d\u76d8\uff09={:.1f}ms "
@@ -1351,8 +1874,18 @@ class Runtime:
                                      self.data.label(code), detail["nav"], detail["preTradingDay"], detail["tradingDay"],
                                      self.previous if detail["date_verified"] else "\u672a\u6838\u9a8c\uff0c\u6309QMT\u8fd4\u56de\u503c\u4f7f\u7528",
                                      self.data.nav_read_at))
+            except OpeningQuotesTimeout as exc:
+                job = today + ':' + open_at
+                if job not in self.executor.state['jobs']:
+                    self.executor.state['jobs'].append(job)
+                    self.executor.save()  # Restart must not retry a timed-out opening decision.
+                self.emit('\u5f00\u76d8\u884c\u60c5\u7b49\u5f85\u8d85\u65f6', body='\u4fdd\u7559\u539f\u6301\u4ed3\uff0c\u672c\u8f6e\u4e0d\u8c03\u4ed3\n' + str(exc))
+                self.executor.advance(now)
             except Exception as exc:
-                self.emit("\u8fd0\u884c\u963b\u65ad", body="\u539f\u56e0: " + str(exc) + "\n\u5904\u7406: \u4fdd\u7559\u8d26\u672c\u4e0e\u59d4\u6258\uff0c\u4e0b\u4e00\u6b21\u8c03\u5ea6\u91cd\u65b0\u68c0\u67e5")
+                action = (self.preparation.failed(exc) if preparing else
+                          '\u4e0b\u4e00\u6b21\u8c03\u5ea6\u91cd\u65b0\u68c0\u67e5')
+                self.emit("\u8fd0\u884c\u963b\u65ad", body="\u539f\u56e0: " + str(exc)
+                          + "\n\u5904\u7406: \u4fdd\u7559\u8d26\u672c\u4e0e\u59d4\u6258; " + action)
 
 
 def positive_capital(amount):
@@ -1438,7 +1971,7 @@ class BacktestData(QmtData):
             self.log("\u5386\u53f2\u524d\u65e5\u51c0\u503c\u7f3a\u5931 {} \u53ea: {}\uff1b\u6309\u539f\u903b\u8f91\u6392\u9664\uff0c\u4e0d\u4f7f\u7528 PCF/IOPV".format(len(missing), missing[:10]))
         if not rows:
             raise RuntimeError("QMT\u672a\u8fd4\u56de\u53ef\u9a8c\u8bc1\u7684\u5386\u53f2\u524d\u65e5\u5355\u4f4d\u51c0\u503c: {}\uff1b\u8bf7\u770bQMT\u51c0\u503c\u63a5\u53e3\u65e5\u5fd7\uff0c\u82e5\u8fd4\u56de\u6700\u65b0PCF\u6216\u6743\u9650\u4e0d\u8db3\uff0c\u53ef\u586b\u5199BACKTEST_DATA_FILE\uff1b\u4e0d\u7528IOPV\u66ff\u4ee3".format(previous))
-        return pd.DataFrame.from_dict(rows, orient="index", columns=["unit_net_value"])
+        return frame_from_rows(rows, ["unit_net_value"])
 
     def high_limits(self, codes, now):
         missing = [code for code in codes if code not in self.limits]
@@ -1658,6 +2191,7 @@ class BacktestRuntime:
 
 
 def create_runtime(context, namespace, settings, prepare_fn, select_fn, risk_fn):
+    check_pandas_environment()
     if getattr(context, "do_back_test", False):
         runtime_type = BacktestRuntime
     else:

@@ -18,7 +18,7 @@ from tests.strategies.test_good_etf_0926_limitup import (
 from tests.test_jq_rebalance import JQ
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / 'strategies/joinquant/good_etf_v2.py'
+SOURCE = ROOT / 'strategies/joinquant/etf_discount_auction_jq.py'
 
 
 def load_strategy(monkeypatch):
@@ -28,6 +28,9 @@ def load_strategy(monkeypatch):
 
 
 def test_v2_changes_identity_and_budget_not_selection_formula(monkeypatch):
+    assert SOURCE.name == 'etf_discount_auction_jq.py'
+    assert not (SOURCE.parent / 'good_etf_jq_bridge.py').exists()
+    assert not (SOURCE.parent / 'good_etf_v2.py').exists()
     old = ast.parse((SOURCE.parent / 'good_etf_0926_limitup.py').read_text(encoding='utf8'))
     new = ast.parse(SOURCE.read_text(encoding='utf8'), feature_version=(3, 8))
     functions = lambda tree: {node.name: node for node in tree.body
@@ -40,6 +43,8 @@ def test_v2_changes_identity_and_budget_not_selection_formula(monkeypatch):
         assert ast.dump(functions(old)[name]) == ast.dump(functions(new)[name])
     strategy = load_strategy(monkeypatch)
     assert strategy.STRATEGY_ID == 'good_etf_v2'
+    assert strategy.STRATEGY_NAME == 'ETF竞价折价轮动_jq'
+    assert strategy.MAX_HOLD_NUM == 2
     assert strategy.QMT_INITIAL_CAPITAL == 5000
     assert strategy.BUY_PRICE_INCREASE == .002
     assert strategy.OPEN_DECISION_TIME == '09:26'
@@ -63,7 +68,7 @@ def test_strategy_only_declares_execution_policy(monkeypatch):
     prepared = []
     strategy._runtime.prepare_rebalance = lambda context, decide, **kwargs: prepared.append(kwargs)
     strategy.market_open(NS())
-    assert prepared == [{'qmt_execute_time': '09:30'}]
+    assert prepared == [{'qmt_execute_time': '09:30', 'qmt_preopen_sells': True}]
 
 
 @pytest.mark.parametrize('run_type', ['simple_backtest', 'full_backtest'])
@@ -94,7 +99,7 @@ def setup_rotation(monkeypatch, jq_enabled=True):
     runtime.qmt_account_enabled = True
     runtime.state.update(mode=runtime.mode.value, jq_account_enabled=jq_enabled,
                          qmt_account_enabled=True, strategy_id='good_etf_v2')
-    runtime.state['server_features'] = {'scheduled_targets_v1': True}
+    runtime.state['server_features'] = {'scheduled_targets_v1': True, 'preopen_sell_rotation_v1': True}
     runtime._qmt_callback_allowed = lambda *args: True
     runtime.advance_targets = lambda context: True
     qmt = NS(total_value=5000, positions={
@@ -228,6 +233,65 @@ def test_schedule_notification_failure_does_not_misreport_accepted_target(monkey
     assert len(submitted) == 1 and jq.g.bt_open_decision['qmt_scheduled']
 
 
+@pytest.mark.parametrize('jq_enabled', [False, True])
+def test_v2_preopen_sells_start_at_0926_and_jq_0930_cannot_drive_qmt(monkeypatch, jq_enabled):
+    helper, jq, runtime, _, _, submitted = setup_rotation(monkeypatch, jq_enabled)
+    times, original = [], runtime.submit_targets
+
+    def submit(*args, **kwargs):
+        times.append((args[0].current_dt, kwargs))
+        return original(*args)
+
+    runtime.submit_targets = submit
+    jq.context.current_dt = jq.context.current_dt.replace(minute=26)
+    runtime.prepare_rebalance(jq.context, lambda context: ({'BUY': .5}, jq.prices),
+                              qmt_execute_time='09:30', qmt_preopen_sells=True)
+    assert len(submitted) == 1 and not jq.calls
+    assert times == [(jq.context.current_dt, {})]  # Immediate target, not a future execute_at.
+    execution = submitted[0][3]
+    assert execution.style == helper.LimitExecution(2000) and not execution.style.preopen
+    assert execution.sell_style == helper.LimitExecution(0, {'QMT_OLD': 7200000, 'QMT_TRIM': 9000000}, preopen=True)
+    assert execution.follow_up is helper.FollowUpPolicy.UNTIL_FILLED_TODAY
+    assert execution.repricing is helper.RepricingPolicy.KEEP_ORIGINAL
+    jq.g = pickle.loads(pickle.dumps(jq.g))
+    runtime._namespace['g'] = jq.g
+    runtime.submit_targets = lambda *a, **k: pytest.fail('No second QMT target')
+    monkeypatch.setattr(helper, 'get_portfolio', lambda **kwargs: pytest.fail('No QMT query from JQ opening callback'))
+    runtime.advance_targets = lambda *a: pytest.fail('No JQ-driven QMT order progression')
+    jq.context.current_dt = jq.context.current_dt.replace(minute=30)
+    runtime.execute_prepared_rebalance(jq.context, jq_wait_for_sells=True, qmt_server_rotation=True)
+    assert len(submitted) == 1
+    assert ('BUY' in jq.positions) is jq_enabled
+
+
+def test_old_server_cannot_silently_accept_preopen_rotation(monkeypatch):
+    _, jq, runtime, _, _, submitted = setup_rotation(monkeypatch)
+    runtime.state['server_features'] = {'scheduled_targets_v1': True}
+    jq.context.current_dt = jq.context.current_dt.replace(minute=26)
+    runtime.prepare_rebalance(jq.context, lambda context: ({'BUY': .5}, jq.prices),
+                              qmt_execute_time='09:30', qmt_preopen_sells=True)
+    assert not submitted and not jq.calls
+    assert jq.g.bt_open_decision is not None and not jq.g.bt_open_decision['qmt_scheduled']
+
+
+def test_missing_runtime_feature_rejected_before_private_config_or_account(monkeypatch):
+    helper = importlib.reload(helper_module)
+    monkeypatch.setattr(helper, '_load_runtime_configuration', lambda *a: pytest.fail('No config read'))
+    with pytest.raises(RuntimeError, match='helper缺少策略要求的功能'):
+        helper.install_joinquant_runtime({}, context=NS(run_params=NS(type='sim_trade')),
+                                         qmt_initial_capital=5000, required_features=('unknown',))
+
+
+@pytest.mark.parametrize('time,flag,kind', [('09:35', True, ValueError), (None, True, ValueError),
+                                          ('09:30', 1, TypeError)])
+def test_preopen_rotation_cannot_accidentally_change_buy_start(monkeypatch, time, flag, kind):
+    _, jq, runtime, _, _, submitted = setup_rotation(monkeypatch)
+    with pytest.raises(kind):
+        runtime.prepare_rebalance(jq.context, lambda context: ({'BUY': .5}, jq.prices),
+                                  qmt_execute_time=time, qmt_preopen_sells=flag)
+    assert not submitted and not jq.calls
+
+
 @pytest.mark.parametrize('enabled', [False, True])
 def test_scheduled_prepare_does_not_submit_qmt_for_jq_or_historical_replay(monkeypatch, enabled):
     _, jq, runtime, _, _, submitted = setup_rotation(monkeypatch)
@@ -325,11 +389,12 @@ def test_next_day_cannot_submit_yesterdays_pending_rotation(monkeypatch):
 
 def test_nonempty_v2_selection_preserves_exact_auction_ranking_and_weights(monkeypatch):
     strategy = load_strategy(monkeypatch)
-    strategy.g.fund_list = pd.DataFrame({'unit_net_value': [2.0, 2.0, 2.0]},
-                                      index=['SECOND', 'FIRST', 'EXPENSIVE'])
+    strategy.g.fund_list = pd.DataFrame({'unit_net_value': [2.0] * 4},
+                                      index=['SECOND', 'THIRD', 'FIRST', 'EXPENSIVE'])
     strategy.get_current_data = lambda: {
         'FIRST': NS(day_open=1.0, high_limit=2.2, paused=False, last_price=3),
         'SECOND': NS(day_open=1.5, high_limit=2.2, paused=False, last_price=.1),
+        'THIRD': NS(day_open=1.8, high_limit=2.2, paused=False, last_price=.01),
         'EXPENSIVE': NS(day_open=2.1, high_limit=2.2, paused=False, last_price=.01),
     }
     weights, marks = strategy.select_opening_etfs(NS())
@@ -365,7 +430,8 @@ def test_new_5000_account_does_not_take_old_strategy_positions(tmp_path):
 
 
 @pytest.mark.parametrize('scheduled', [False, True])
-def test_server_lower_limit_sells_must_fill_before_fixed_premium_buys(tmp_path, scheduled):
+@pytest.mark.parametrize('preopen', [False, True])
+def test_server_lower_limit_sells_must_fill_before_fixed_premium_buys(tmp_path, scheduled, preopen):
     from tests.server.strategy.test_planner_executor import _setup, _add_position, ACCOUNT, PHYSICAL, A, B
     from bullet_trade.server.strategy import (
         money_to_units, price_to_units, BrokerAccountSnapshot, BrokerPositionSnapshot,
@@ -393,7 +459,7 @@ def test_server_lower_limit_sells_must_fill_before_fixed_premium_buys(tmp_path, 
     result = planner.submit_target_weights(
         ACCOUNT, 'v2-server-rotation', {B: .95}, snapshot, marks, now,
         execution_request=ExecutionRequest(style=LimitExecution(2000),
-                                          sell_style=LimitExecution(0, {A: price_to_units('1.8')})),
+                                          sell_style=LimitExecution(0, {A: price_to_units('1.8')}, preopen=preopen)),
         execute_at=now.replace(minute=30) if scheduled else None,
     )
     if scheduled:
@@ -423,6 +489,12 @@ def test_server_lower_limit_sells_must_fill_before_fixed_premium_buys(tmp_path, 
     assert not planner.advance_intent(result.intent.intent_id, partial, marks, now).orders
     fill(500, 'complete')
     flat = valuation.create_snapshot(ACCOUNT, marks, now, timedelta(minutes=1))
+    if preopen and not scheduled:
+        assert not planner.advance_intent(result.intent.intent_id, flat, marks, now).orders
+        assert repository.get_strategy_account(ACCOUNT).reserved_cash_units == 0
+        now = now.replace(minute=30)
+        marks = {code: type(mark)(code, mark.price_units, now, 'test') for code, mark in marks.items()}
+        flat = valuation.create_snapshot(ACCOUNT, marks, now, timedelta(minutes=10))
     buy = planner.advance_intent(result.intent.intent_id, flat, marks, now)
     assert len(buy.orders) == 1
     assert buy.orders[0].side is OrderSide.BUY and buy.orders[0].security == B

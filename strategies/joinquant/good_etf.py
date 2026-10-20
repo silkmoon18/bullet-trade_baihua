@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 克隆自聚宽文章：https://www.joinquant.com/post/1399
 # 标题：【量化课堂】多因子策略入门
 # 作者：JoinQuant量化课堂
@@ -31,11 +32,11 @@ if TYPE_CHECKING:
 # ===== 部署契约 =====
 STRATEGY_ID = 'good_etf_remote_1000_20261008'  # 可省略；使用QMT时须与私有配置的key一致
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 26
+_EXPECTED_RUNTIME_API_VERSION = 26  # 与研究根目录helper API26配套，不跳过版本校验
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
-MAX_HOLD_NUM = 3           # 最大持仓只数：选折价最深的前 N 只
+MAX_HOLD_NUM = 2           # 最大持仓只数：选折价最深的前 N 只
 MIN_MONEY = 5e6            # 流动性下限：前一日成交额 > 500 万
 MAX_MONEY = 2e7            # 流动性上限：前一日成交额 < 2000 万
 STOP_LOSS_RATIO = 0.95     # 止损线：现价跌破成本价 95%

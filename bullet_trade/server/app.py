@@ -53,6 +53,7 @@ from .config import ServerConfig
 from .dashboard import DashboardHTTPServer, DashboardReadModel, tail_log_file
 from .session import ClientSession
 from .tick import TickSubscriptionManager
+from .timing import archive_sink
 
 
 _STRATEGY_STARTUP_RETRY_SECONDS = 5.0
@@ -248,7 +249,11 @@ class ServerApplication:
         self,
         notification: Union[TradeNotification, TargetBuyPlanNotification],
     ) -> Dict[str, bool]:
-        """Always write the event locally, then fan out to optional Feishu."""
+        """Accept the local diagnostic event, then fan out to optional Feishu.
+
+        Server CLI logging buffers the text in memory until after close;
+        financial order/fill records remain immediately durable in SQLite.
+        """
 
         log.info(format_strategy_event_log(notification))
         feishu_queued = False
@@ -411,8 +416,20 @@ class ServerApplication:
             "snapshot": snapshot,
             "snapshot_error": snapshot_error,
             "activity": activity,
-            "logs": tail_log_file(self.config.log_file, log_limit),
+            "logs": self._recent_server_logs(log_limit),
         }
+
+    def _recent_server_logs(self, limit):
+        sink = archive_sink()
+        if sink is None:
+            return tail_log_file(self.config.log_file, limit)
+        if limit <= 0:
+            return []
+        pending = sink.tail(limit)
+        if len(pending) >= limit:
+            return pending
+        stored = tail_log_file(str(sink.path_for('business', datetime.now(SHANGHAI_TZ).strftime('%Y%m%d'))), limit)
+        return (stored + pending)[-limit:]
 
     async def _dashboard_live_snapshot(
         self, strategy_id: str

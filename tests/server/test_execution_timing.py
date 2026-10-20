@@ -48,7 +48,27 @@ def test_trace_memory_is_bounded_and_counts_are_complete():
         trace.record('qmt.query', trace.started)
     assert len(trace.events) == 128
     assert trace.summary()['stages']['qmt.query']['calls'] == 1000
+    assert trace.summary()['events_dropped'] == 872
     json.dumps(trace.summary(), allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_parent_span_links_and_closed_inherited_context_is_not_reused():
+    @timing.traced('nested.child')
+    async def child(payload):
+        return {'ok': True}
+    @timing.traced('nested.parent')
+    async def parent(payload):
+        return {'child': await child({})}
+    result = await parent({})
+    assert result['child']['_bt_server_timing']['parent_span_id'] == result['_bt_server_timing']['span_id']
+    trace = timing.Trace('completed')
+    token = timing._current.set(trace)
+    try:
+        trace.flush()
+        assert timing.current_trace() is None
+    finally:
+        timing._current.reset(token)
 
 
 def test_timing_only_prints_without_file_or_application_log_handlers(monkeypatch, capsys):

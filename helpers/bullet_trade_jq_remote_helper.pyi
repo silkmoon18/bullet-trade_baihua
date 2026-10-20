@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, FrozenSet, Literal, Optional, Tuple, Typ
 from joinquant_typing import Context
 
 STRATEGY_RUNTIME_API_VERSION: int
+JOINQUANT_RUNTIME_FEATURES: Tuple[str, ...]
 STRATEGY_RUNTIME_HELPER_MARKER: str
 PROFILE_SCHEMA_VERSION: int
 HONG_KONG_ETF_KEYWORDS: Tuple[str, ...]
@@ -244,6 +245,7 @@ class JoinQuantRuntime:
             [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
         ],
         *, qmt_execute_time: Optional[str] = ...,
+        qmt_preopen_sells: bool = ...,
     ) -> None: ...
     def execute_prepared_rebalance(
         self, context: Context, *, jq_wait_for_sells: bool = ...,
@@ -350,6 +352,7 @@ def install_joinquant_runtime(
     profile_module: str = ...,
     validate_remote_during_backtest: bool = ...,
     expected_api_version: int = ...,
+    required_features: Tuple[str, ...] = ...,
 ) -> JoinQuantRuntime: ...
 
 

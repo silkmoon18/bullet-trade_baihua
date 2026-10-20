@@ -9,7 +9,8 @@
 # 克隆自聚宽文章基础上的自定义修改版
 # 核心修改：消除风控函数中的未来函数风险，保证回测/实盘一致性
 # 统一仓库来源：bt_quant@e6462dd（导入时已移除连接凭据）
-# GoodETF v2：09:26按开盘价锁定选股并预发QMT目标；服务器09:30自主执行。
+# ETF竞价折价轮动_jq：09:26锁定选股并让QMT预挂必要跌停卖单；09:30起卖完后自主买入。
+# 原文件good_etf_v2.py；仅改文件/展示名称，内部good_etf_v2身份和现有账本不变。
 # JQ由helper逐笔确认必要卖单，买单仅提交一次；QMT由服务器推进组合目标。
 # 新账本good_etf_v2，QMT初始资金5000；不继承、卖出或改写旧策略的归属持仓。
 
@@ -33,12 +34,13 @@ if TYPE_CHECKING:
 
 # ===== 部署契约 =====
 STRATEGY_ID = 'good_etf_v2'  # 必须与私有config及服务器白名单同名
+STRATEGY_NAME = 'ETF竞价折价轮动_jq'  # 展示名；不作为config匹配或账本ID
 VALIDATE_REMOTE_DURING_BACKTEST = False  # 回测只使用JQ，不创建QMT账本
 _EXPECTED_RUNTIME_API_VERSION = 26
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
-MAX_HOLD_NUM = 3           # 最大持仓只数：选折价最深的前 N 只
+MAX_HOLD_NUM = 2           # 最大持仓只数：选折价最深的前 N 只
 MIN_MONEY = 5e6            # 流动性下限：前一日成交额 > 500 万
 MAX_MONEY = 2e7            # 流动性上限：前一日成交额 < 2000 万
 STOP_LOSS_RATIO = 0.95     # 止损线：现价跌破成本价 95%
@@ -47,8 +49,8 @@ DEPLOY_RATIO = 0.95        # 组合部署比例：预留5%现金覆盖整手、�
 BUY_PRICE_INCREASE = 0.002 # 仅回测：原模型买入成交价额外上涨比例，0.001=0.1%；0保持原行为
 QMT_INITIAL_CAPITAL = 5000 # 新QMT策略虚拟账户初始资金，不修改聚宽账户资金
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
-OPEN_DECISION_TIME = '09:26'  # 冻结决策并通知QMT服务器；尚不发单，使用分钟回测
-OPEN_ORDER_TIME = '09:30'     # QMT服务器独立启动；JQ回调执行自身先卖后买
+OPEN_DECISION_TIME = '09:26'  # 冻结决策并通知QMT立即预挂必要跌停卖单；使用分钟回测
+OPEN_ORDER_TIME = '09:30'     # QMT最早买入时间；JQ回调仍执行自身先卖后买
 RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
 
 _runtime: Any = None
@@ -64,6 +66,7 @@ def _install_runtime(context: 'Context') -> None:
         qmt_initial_capital=QMT_INITIAL_CAPITAL,
         profile_module=_EXPECTED_RUNTIME_PROFILE_MODULE,
         expected_api_version=_EXPECTED_RUNTIME_API_VERSION,
+        required_features=('preopen_sell_rotation_v1',),
         validate_remote_during_backtest=VALIDATE_REMOTE_DURING_BACKTEST,
     )
 
@@ -206,7 +209,8 @@ def _prepare_candidates(context: 'Context') -> None:
 
 def market_open(context: 'Context') -> None:
     """09:26只冻结决策并委托helper；不读取账户或推进订单。"""
-    _runtime.prepare_rebalance(context, select_opening_etfs, qmt_execute_time=OPEN_ORDER_TIME)
+    _runtime.prepare_rebalance(context, select_opening_etfs,
+                               qmt_execute_time=OPEN_ORDER_TIME, qmt_preopen_sells=True)
 
 
 def execute_opening_plan(context: 'Context') -> None:

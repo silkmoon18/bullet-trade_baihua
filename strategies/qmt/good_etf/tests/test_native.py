@@ -554,6 +554,8 @@ def test_direct_parity_with_existing_joinquant_strategy(mod, monkeypatch):
     old_test = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(old_test)
     old = old_test._load_strategy(monkeypatch)
+    # Compare formulas with the same explicit count; defaults are independently configured.
+    monkeypatch.setattr(old, "MAX_HOLD_NUM", mod.MAX_HOLD_NUM)
     old._runtime = old_test._Runtime(old_test.real_helper.RuntimeMode.JQ)
     codes = ["520590.XSHG", "510001.XSHG", "510002.XSHG", "510003.XSHG", "510004.XSHG", "510005.XSHG"]
     names = ["恒科", "港口ETF", "红利ETF", "科技ETF", "低流动性ETF", "高边界"]

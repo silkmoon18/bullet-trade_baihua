@@ -278,12 +278,14 @@ def test_qmt_schedule_prewarms_without_changing_decision_callbacks(helper):
         callbacks[0], callbacks[1], callbacks[2], ("10:30",), callbacks[3]
     )
 
-    assert calls[0][0] is callbacks[0]
-    assert calls[1][0] is helper.prewarm_joinquant_qmt
+    assert calls[0][0] is helper._scheduled_prepare
+    assert runtime._scheduled_entries['prepare']['callback'] is callbacks[0]
+    assert calls[1][0] is helper._scheduled_qmt_warm
     assert calls[1][1] == ("09:20",)
-    assert calls[2][0] is helper._prewarm_joinquant_rpc
+    assert calls[2][0] is helper._scheduled_rpc_warm
     assert calls[2][1] == ("09:29",)
-    assert calls[3][0] is callbacks[1]
+    assert calls[3][0] is helper._scheduled_orders
+    assert runtime._scheduled_entries['orders']['callback'] is callbacks[1]
     assert [call[2].get("time") for call in calls[4:]] == ["10:30", "14:55"]
 
 
@@ -309,7 +311,7 @@ def test_schedule_replacement_is_idempotent_and_preserves_decision_state(helper,
         )
         assert schedules == previous or previous is None
         previous = list(schedules)
-        assert [fn for at, fn in schedules if at == "09:30"] == [helper._decide_joinquant_open_rebalance]
+        assert [fn for at, fn in schedules if at == "09:30"] == [helper._scheduled_decision]
         assert all(getattr(saved, key) is value for key, value in original_state.items())
     assert len(cleared) == 3
     assert executions == []
@@ -361,8 +363,11 @@ def test_optional_0928_decision_runs_between_preparation_and_execution(helper):
     )
 
     assert [call[0] for call in calls[:3]] == [
-        callbacks[0], callbacks[4], callbacks[1],
+        helper._scheduled_prepare, helper._scheduled_decision, helper._scheduled_orders,
     ]
+    assert runtime._scheduled_entries['prepare']['callback'] is callbacks[0]
+    assert runtime._scheduled_entries['decision']['callback'] is callbacks[4]
+    assert runtime._scheduled_entries['orders']['callback'] is callbacks[1]
     assert [call[1] for call in calls[:3]] == [
         ("09:20",), ("09:28",), ("09:30",),
     ]
@@ -381,7 +386,8 @@ def test_0926_schedule_moves_single_decision_and_order_callback(helper):
         market_open_time="09:26",
     )
     assert [call[1] for call in calls[:2]] == [("09:20",), ("09:26",)]
-    assert sum(call[0] is callbacks[1] for call in calls) == 1
+    assert sum(call[0] is helper._scheduled_orders for call in calls) == 1
+    assert runtime._scheduled_entries['orders']['callback'] is callbacks[1]
     assert "09:26 下单" in logs[0]
 
 

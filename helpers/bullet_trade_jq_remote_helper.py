@@ -42,6 +42,7 @@ import uuid
 import functools
 from contextlib import contextmanager
 from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -55,6 +56,9 @@ def _wall_timestamp(value: Any) -> str:
 
 
 _execution_timing = threading.local()
+_helper_loaded_at = _wall_timestamp(time.time() * 1000)
+_timing_process_instance = uuid.uuid4().hex[:12]
+JOINQUANT_RUNTIME_FEATURES = ("preopen_sell_rotation_v1",)
 
 
 class _ExecutionTrace:
@@ -63,6 +67,12 @@ class _ExecutionTrace:
         self.started, self.started_at = time.perf_counter(), _wall_timestamp(time.time() * 1000)
         self.stages = {}  # type: Dict[str, Any]
         self.remote = []
+        self.events = []
+        self.events_dropped = 0
+        self.callback = dict(getattr(_execution_timing, 'callback_entry', None) or {})
+        if self.callback:
+            self.started = self.callback.pop('_entry_mono', self.started)
+            self.started_at = self.callback['entered_at']
         self.rpc_before = dict(_rpc_stats)
 
     def record(self, name: str, started: float, outcome: str = "ok") -> None:
@@ -74,6 +84,13 @@ class _ExecutionTrace:
         row["errors"] += outcome != "ok"
         row.setdefault('first_finished_at', _wall_timestamp(time.time()*1000))
         row['last_finished_at'] = _wall_timestamp(time.time()*1000)
+        if len(self.events) < 128:
+            self.events.append({'stage': name, 'ms': round(elapsed, 3),
+                                'start_offset_ms': round((started-self.started)*1000, 3),
+                                'finish_offset_ms': round((time.perf_counter()-self.started)*1000, 3),
+                                'outcome': outcome})
+        else:
+            self.events_dropped += 1
 
     def message(self) -> str:
         return "执行链路耗时 | " + json.dumps({
@@ -81,6 +98,9 @@ class _ExecutionTrace:
             "finished_at": _wall_timestamp(time.time() * 1000),
             "elapsed_ms": round((time.perf_counter()-self.started)*1000, 3),
             "stages": self.stages, "remote": self.remote,
+            "events": self.events, "events_dropped": self.events_dropped, "callback": self.callback,
+            "process_instance": _timing_process_instance, "helper_loaded_at": _helper_loaded_at,
+            "previous_timing_output_ms": getattr(_execution_timing, 'previous_output_ms', None),
             "rpc_connections": _rpc_stats['connections']-self.rpc_before['connections'],
             "rpc_reused": _rpc_stats['reused']-self.rpc_before['reused'],
         }, ensure_ascii=False)
@@ -157,6 +177,7 @@ def _timed_runtime(phase: str):
                         namespace[name] = original
                 _execution_timing.current = previous
                 try:
+                    output_started = time.perf_counter()
                     timing_log = ('info', trace.message())
                     saved = namespace.get('g')
                     snapshot = getattr(saved, 'bt_open_decision', None) if saved is not None else self._prepared_rebalance
@@ -166,12 +187,14 @@ def _timed_runtime(phase: str):
                         snapshot.setdefault('decision_logs', []).append(timing_log)
                     else:
                         self._flush_logs((timing_log,))
+                    _execution_timing.previous_output_ms = (time.perf_counter()-output_started)*1000
                 except Exception:
                     pass
         return wrapped
     return decorate
 
 __all__ = [
+    "JOINQUANT_RUNTIME_FEATURES",
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
     "PROFILE_SCHEMA_VERSION",
@@ -1874,6 +1897,61 @@ class JoinQuantRuntime:
         self._pending_decision_ms = None  # type: Optional[float]
         self._pending_decision_wall_times = {}  # type: Dict[str, Any]
         self._rebalance_started = 0.0
+        self._scheduled_entries = {}  # type: Dict[str, Any]
+        self._previous_callback = None  # type: Optional[Dict[str, Any]]
+
+    def _invoke_scheduled(self, context: Any, slot: str, entered_ms: float, entered_mono: float) -> Any:
+        entry = self._scheduled_entries.get(slot)
+        if entry is None:
+            saved = getattr((self._namespace or {}).get('g'), 'bt_scheduled_entries', {})
+            row = saved.get(slot, {}) if isinstance(saved, dict) else {}
+            name = row.get('callback_name')
+            callback = (self._namespace or {}).get(name) or globals().get(name)
+            if callable(callback):
+                entry = {'callback': callback, 'times': row.get('times', [])}
+                self._scheduled_entries[slot] = entry
+        if entry is None:
+            self._log('warn', '调度入口配置缺失 | {}；请重启以恢复日程'.format(slot))
+            return None
+        clock = _strategy_clock_parts(getattr(context, 'current_dt', None))
+        planned = None
+        if clock is not None:
+            logical_minute = '{:02d}:{:02d}'.format(clock[3], clock[4])
+            times = entry.get('times') or ()
+            planned = logical_minute if 'every_bar' in times else (
+                logical_minute if logical_minute in times else (times[0] if times else None))
+        planned_at, delay = None, None
+        if clock is not None and planned is not None and len(planned) == 5 and planned[2] == ':':
+            try:
+                hour, minute = (int(part) for part in planned.split(':'))
+                stamp = datetime(*clock[:3], hour, minute, tzinfo=timezone(timedelta(hours=8)))
+                planned_at = stamp.isoformat(timespec='milliseconds')
+                if _wall_timestamp(entered_ms)[:10] == planned_at[:10]:
+                    delay = round(entered_ms - stamp.timestamp()*1000, 3)
+            except (TypeError, ValueError):
+                pass
+        metadata = {
+            'slot': slot, 'name': getattr(entry['callback'], '__name__', slot),
+            'strategy_name': (self._namespace or {}).get('STRATEGY_NAME', self.state.get('strategy_id')),
+            'scheduled_time': planned, 'planned_at': planned_at,
+            'logical_time': str(getattr(context, 'current_dt', None)),
+            'entered_at': _wall_timestamp(entered_ms), 'entry_delay_ms': delay,
+            'previous_callback': self._previous_callback, '_entry_mono': entered_mono,
+        }
+        previous = getattr(_execution_timing, 'callback_entry', None)
+        _execution_timing.callback_entry = metadata
+        try:
+            return self._run_scheduled(context, slot)
+        finally:
+            _execution_timing.callback_entry = previous
+            self._previous_callback = {
+                'slot': slot, 'finished_at': _wall_timestamp(time.time()*1000),
+                'elapsed_ms': round((time.perf_counter()-entered_mono)*1000, 3),
+            }
+
+    @_timed_runtime('jq.scheduler_callback')
+    def _run_scheduled(self, context: Any, slot: str) -> Any:
+        return self._scheduled_entries[slot]['callback'](context)
 
     def prepare_rebalance_candidates(self, context: Any, securities: Any) -> None:
         """Cache only candidate codes/names; no price, target or order is prepared."""
@@ -2104,8 +2182,17 @@ class JoinQuantRuntime:
             self._platform_api("unschedule_all")()
         registered = []
 
+        self._scheduled_entries = {}
+
         def run_daily(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-            platform_run_daily(callback, *args, **kwargs)
+            slot = kwargs.pop('_slot')
+            at = args[0] if args else kwargs['time']
+            registered_callback = callback
+            if self.mode != RuntimeMode.BACKTEST:
+                row = self._scheduled_entries.setdefault(slot, {'callback': callback, 'times': []})
+                row['times'].append(at)
+                registered_callback = _SCHEDULE_DISPATCHERS[slot]
+            platform_run_daily(registered_callback, *args, **kwargs)
             registered.append((
                 args[0] if args else kwargs["time"],
                 getattr(callback, "__name__", type(callback).__name__),
@@ -2114,23 +2201,26 @@ class JoinQuantRuntime:
         run_daily(
             before_market_open,
             "09:20",
+            _slot='prepare',
             reference_security=reference_security,
         )
         if self.qmt_account_enabled:
             # Register after preprocessing so its candidate list is available.
-            run_daily(prewarm_joinquant_qmt, "09:20", reference_security=reference_security)
+            run_daily(prewarm_joinquant_qmt, "09:20", _slot='qmt_warm', reference_security=reference_security)
             for warmup_time in sorted(warmup_times):
-                run_daily(_prewarm_joinquant_rpc, warmup_time, reference_security=reference_security)
+                run_daily(_prewarm_joinquant_rpc, warmup_time, _slot='rpc_warm', reference_security=reference_security)
         if opening_decision is not None:
             run_daily(
                 opening_decision,
                 opening_decision_time,
+                _slot='decision',
                 reference_security=reference_security,
             )
         if open_order_time is None:
             run_daily(
                 market_open,
                 open_decision_time,
+                _slot='orders',
                 reference_security=reference_security,
             )
         else:
@@ -2146,12 +2236,14 @@ class JoinQuantRuntime:
             run_daily(
                 _decide_joinquant_open_rebalance,
                 open_decision_time,
+                _slot='decision',
                 reference_security=reference_security,
             )
             if open_order_time != open_decision_time:
                 run_daily(
                     _submit_joinquant_open_rebalance,
                     open_order_time,
+                    _slot='orders',
                     reference_security=reference_security,
                 )
         if sell_then_buy:
@@ -2159,17 +2251,20 @@ class JoinQuantRuntime:
             run_daily(
                 advance_joinquant_sell_then_buy,
                 time="every_bar",
+                _slot='minute_confirm',
                 reference_security=reference_security,
             )
         for risk_time in risk_check_times:
             run_daily(
                 risk_management,
                 time=risk_time,
+                _slot='risk',
                 reference_security=reference_security,
             )
         run_daily(
             after_market_check,
             time="14:55",
+            _slot='snapshot',
             reference_security=reference_security,
         )
         self._log(
@@ -2192,6 +2287,13 @@ class JoinQuantRuntime:
                 self._log(
                     "info", "调度入口 | 时间={} 回调={}".format(scheduled_time, callback_name)
                 )
+        global_state = (self._namespace or {}).get('g')
+        if global_state is not None and self.mode != RuntimeMode.BACKTEST:
+            setattr(global_state, 'bt_scheduled_entries', {
+                slot: {'callback_name': getattr(row['callback'], '__name__', ''),
+                       'times': list(row['times'])}
+                for slot, row in self._scheduled_entries.items()
+            })
 
     def _run_open_decision(self, context: Any) -> None:
         global_state = (self._namespace or {}).get("g")
@@ -2246,9 +2348,14 @@ class JoinQuantRuntime:
             [Any], Optional[Tuple[Dict[str, float], Dict[str, float]]]
         ],
         *, qmt_execute_time: Optional[str] = None,
+        qmt_preopen_sells: bool = False,
     ) -> None:
         """Freeze one account-neutral decision and the JQ sizing capital."""
 
+        if type(qmt_preopen_sells) is not bool:
+            raise TypeError("qmt_preopen_sells必须是bool")
+        if qmt_preopen_sells and qmt_execute_time != '09:30':
+            raise ValueError("盘前卖出轮换必须声明09:30起买入")
         if qmt_execute_time is not None:
             self._validate_open_time(qmt_execute_time)
             if context.current_dt.strftime("%H:%M") >= qmt_execute_time:
@@ -2308,6 +2415,7 @@ class JoinQuantRuntime:
                             "key": "open-{:04d}{:02d}{:02d}".format(*clock[:3]),
                             "buy_not_before": qmt_execute_time,
                             "qmt_execute_at": execute_at,
+                            "qmt_preopen_sells": qmt_preopen_sells,
                         }
                         self._submit_qmt_server_rotation(context, qmt_plan)
                 except Exception as exc:
@@ -2404,6 +2512,9 @@ class JoinQuantRuntime:
         )
 
     def log_process_initialize(self) -> None:
+        name = (self._namespace or {}).get('STRATEGY_NAME')
+        if name:
+            self._log('info', '策略名称={} | strategy_id={}'.format(name, self.state.get('strategy_id')))
         self._log(
             "info",
             "process_initialize 重建配置 {} | helper API={} marker={}".format(
@@ -3118,14 +3229,16 @@ class JoinQuantRuntime:
     def _submit_qmt_server_rotation(self, context: Any, plan: Dict[str, Any]) -> None:
         """Submit one whole-portfolio intent; QMT fills/recovery stay server-owned."""
         execute_at = plan.get("qmt_execute_at")
+        preopen_sells = plan.get("qmt_preopen_sells", False)
         if execute_at is not None:
             features = self.state.get('server_features')
             if features is None:
                 # Normal 09:20 preparation supplies this without an opening RTT.
                 prepared = _strategy_request('strategy.prepare_session', {'initial_capital': self._qmt_initial_capital})
                 features = self.state['server_features'] = dict(prepared.get('server_features') or {})
-            if features.get('scheduled_targets_v1') is not True:
-                raise RuntimeError('服务器不支持定时目标 scheduled_targets_v1；请部署配套服务器；不改为即时下单或09:30补交')
+            feature = 'preopen_sell_rotation_v1' if preopen_sells else 'scheduled_targets_v1'
+            if features.get(feature) is not True:
+                raise RuntimeError('服务器不支持{}；请部署配套服务器；不降级为其他下单方式或09:30补交'.format(feature))
         if execute_at is None and context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
             return
         if execute_at is None and not self.advance_targets(context):
@@ -3146,7 +3259,7 @@ class JoinQuantRuntime:
                   self._liquidation_limits(positions).items()}
         if "qmt_rotation_execution" not in plan:
             plan["qmt_rotation_execution"] = _execution_to_wire(ExecutionRequest(
-                style=LimitExecution(2_000), sell_style=LimitExecution(0, limits),
+                style=LimitExecution(2_000), sell_style=LimitExecution(0, limits, preopen=preopen_sells),
                 follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
                 repricing=RepricingPolicy.KEEP_ORIGINAL,
             ))
@@ -3156,14 +3269,16 @@ class JoinQuantRuntime:
             context, plan["qmt_rotation_weights"], plan["qmt_rotation_marks"],
             plan["key"], _execution_from_wire(plan["qmt_rotation_execution"]),
             _security_names(plan["qmt_rotation_weights"]),
-            **({"execute_at": execute_at} if execute_at is not None else {}),
+            **({"execute_at": execute_at} if execute_at is not None and not preopen_sells else {}),
         )
         plan["qmt"] = "BUY_SENT"  # Accepted intent, not a claim of completed buys.
         self._log_qmt_planned_orders(result)
         self._log("info", "QMT轮换目标已提交 | 保留计划内持仓，跌停价卖出计划外/超额部分；"
                   "服务器确认卖出后固定参考价上浮0.2%买入 | intent_id={}".format(
                       result.get("intent", {}).get("intent_id")))
-        if execute_at is not None:
+        if preopen_sells:
+            self._log("info", "QMT盘前卖出轮换已接受 | 必要跌停限价卖单立即尝试预委托；09:30起卖出成交入账后服务器自主买入；不依赖JQ回调")
+        elif execute_at is not None:
             self._log("info", "QMT定时计划已接受 | 执行时间={} | 开始前不发单；届时服务器独立执行，不依赖JQ回调".format(execute_at))
         snapshot = result.get("snapshot")
         accepted = PortfolioView(snapshot) if isinstance(snapshot, dict) else portfolio
@@ -3762,6 +3877,55 @@ class JoinQuantRuntime:
             return None
 
 
+def _dispatch_scheduled(context: Any, slot: str) -> Any:
+    entered_ms, entered_mono = time.time()*1000, time.perf_counter()
+    runtime = _active_joinquant_runtime
+    if runtime is not None:
+        return runtime._invoke_scheduled(context, slot, entered_ms, entered_mono)
+
+
+# Top-level stable functions are picklable by name in saved JQ schedules.
+# Never register a closure, lambda or a dynamically replaced strategy function.
+def _scheduled_prepare(context):
+    return _dispatch_scheduled(context, 'prepare')
+
+
+def _scheduled_decision(context):
+    return _dispatch_scheduled(context, 'decision')
+
+
+def _scheduled_orders(context):
+    return _dispatch_scheduled(context, 'orders')
+
+
+def _scheduled_risk(context):
+    return _dispatch_scheduled(context, 'risk')
+
+
+def _scheduled_snapshot(context):
+    return _dispatch_scheduled(context, 'snapshot')
+
+
+def _scheduled_qmt_warm(context):
+    return _dispatch_scheduled(context, 'qmt_warm')
+
+
+def _scheduled_rpc_warm(context):
+    return _dispatch_scheduled(context, 'rpc_warm')
+
+
+def _scheduled_minute_confirm(context):
+    return _dispatch_scheduled(context, 'minute_confirm')
+
+
+_SCHEDULE_DISPATCHERS = {
+    'prepare': _scheduled_prepare, 'decision': _scheduled_decision,
+    'orders': _scheduled_orders, 'risk': _scheduled_risk,
+    'snapshot': _scheduled_snapshot, 'qmt_warm': _scheduled_qmt_warm,
+    'rpc_warm': _scheduled_rpc_warm, 'minute_confirm': _scheduled_minute_confirm,
+}
+
+
 def advance_joinquant_sell_then_buy(context: Any) -> None:
     """Serializable scheduler entry for an explicitly opted-in staged plan."""
 
@@ -3811,10 +3975,18 @@ def install_joinquant_runtime(
     profile_module: str = "jq_runtime_config",
     validate_remote_during_backtest: bool = False,
     expected_api_version: int = STRATEGY_RUNTIME_API_VERSION,
+    required_features: Tuple[str, ...] = (),
 ) -> JoinQuantRuntime:
     """Install the facade; no ID means local JQ without a config lookup."""
 
     run_type = str(_run_type_from_context(context) or "").strip().lower()
+    if not isinstance(required_features, (tuple, list)) or any(
+        type(feature) is not str for feature in required_features
+    ):
+        raise TypeError("required_features必须是字符串列表或元组")
+    missing = sorted(set(required_features) - set(JOINQUANT_RUNTIME_FEATURES))
+    if missing:
+        raise RuntimeError("helper缺少策略要求的功能{}，请更新研究根目录单文件helper".format(missing))
     if type(namespace) is not dict:
         raise RuntimeError("策略namespace必须是普通dict（请传入globals()）")
     if type(validate_remote_during_backtest) is not bool:

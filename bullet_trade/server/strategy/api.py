@@ -44,6 +44,7 @@ from .execution import (
     RepricingPolicy,
     execution_request_from_wire,
     execution_request_to_wire,
+    preopen_limit_sides,
 )
 from .planner_executor import (
     PlannerConfig,
@@ -304,7 +305,8 @@ class SQLiteStrategyAPI:
             raise ValueError("candidate_securities must contain nonempty strings")
         candidates = set(code.strip() for code in raw_candidates)
         result = await self.ensure_account(account_context, account_key, payload)
-        result['server_features'] = {'scheduled_targets_v1': True, 'execution_timing_v1': True}
+        result['server_features'] = {'scheduled_targets_v1': True, 'execution_timing_v1': True,
+                                     'preopen_sell_rotation_v1': True}
         if result["reconciliation"]["state"] != "READY":
             return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
         strategy_id = self._strategy_id(payload)
@@ -532,7 +534,8 @@ class SQLiteStrategyAPI:
             ))
         if preopen_limit and not deferred:
             self._schedule_open_resume(strategy_id)
-            logger.info("QMT盘前目标已接受 | strategy_id=%s | 限价单尝试券商预委托；市价卖单等待09:30，继续先卖后买", strategy_id)
+            logger.info("QMT盘前目标已接受 | strategy_id=%s | 允许预委托方向=%s；未授权方向等待09:30；继续先卖后买",
+                        strategy_id, '/'.join(preopen_limit_sides(execution_request)))
         logger.info(
             "QMT目标已接受 | strategy_id=%s key=%s | 接收至接受=%.0fms | 接收时间=%s 接受时间=%s | %s",
             strategy_id, key, (time.monotonic() - target_received_at) * 1000,
@@ -1520,6 +1523,11 @@ class SQLiteStrategyAPI:
         if trace is not None and intent.execute_at is not None:
             trace.tags.update(scheduled_at=intent.execute_at.isoformat(), started_at=now.isoformat(),
                               schedule_lateness_ms=(now-intent.execute_at).total_seconds()*1000)
+        if trace is not None and preopen_limit_sides(intent.execution_request) == ('SELL',):
+            buy_gate = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            trace.tags.update(buy_not_before=buy_gate.isoformat(), observed_at=now.isoformat(),
+                              buy_gate_offset_ms=(now-buy_gate).total_seconds()*1000,
+                              preopen_sells=True)
         if intent.execute_at is not None and now < intent.execute_at:
             self._schedule_open_resume(intent.account_id)
             # Acceptance already reconciled. No orders/reservations exist for
@@ -1691,7 +1699,10 @@ class SQLiteStrategyAPI:
                 preopen_limit = not self._can_dispatch_now() and self._can_preopen_dispatch(strategy_account_id)
                 if not self._can_dispatch_now() and not preopen_limit:
                     break
-                dispatch_options = {"limit_orders_only": True} if preopen_limit else {}
+                dispatch_options = {
+                    "limit_orders_only": True,
+                    "allowed_sides": self._preopen_dispatch_sides(strategy_account_id),
+                } if preopen_limit else {}
                 with span('phase.outbox_and_broker_submit'):
                     dispatch = await self.planner.dispatch_next(
                         submitter, strategy_account_id,
@@ -1950,18 +1961,24 @@ class SQLiteStrategyAPI:
 
     def _can_submit_preopen_limit(self, request: ExecutionRequest) -> bool:
         return (
-            isinstance(request.style, LimitExecution)
-            and request.style.preopen
+            bool(preopen_limit_sides(request))
             and self._is_limit_preopen_session(datetime.now(SHANGHAI_TZ))
         )
 
     def _can_preopen_dispatch(self, strategy_id: str) -> bool:
-        return any(
-            self._can_submit_preopen_limit(intent.execution_request)
-            and (intent.execute_at is None or datetime.now(SHANGHAI_TZ) >= intent.execute_at)
-            and not self.planner.intent_cancel_requested(intent.intent_id)
-            for intent in self.planner.active_intents(strategy_id)
-        )
+        return bool(self._preopen_dispatch_sides(strategy_id))
+
+    def _preopen_dispatch_sides(self, strategy_id: str) -> Tuple[str, ...]:
+        now = datetime.now(SHANGHAI_TZ)
+        if not self._is_limit_preopen_session(now):
+            return ()
+        sides = set()
+        for intent in self.planner.active_intents(strategy_id):
+            if ((intent.execute_at is None or now >= intent.execute_at)
+                    and getattr(intent, 'trading_day', now.date()) in (None, now.date())
+                    and not self.planner.intent_cancel_requested(intent.intent_id)):
+                sides.update(preopen_limit_sides(intent.execution_request))
+        return tuple(sorted(sides))
 
     def _schedule_open_resume(self, strategy_id: str) -> None:
         """Wake for a durable timed target or legacy preorder at the open."""
