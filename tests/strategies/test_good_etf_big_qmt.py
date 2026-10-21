@@ -1238,6 +1238,51 @@ def test_idle_afterhours_keeps_queries_but_does_not_flood_timing(mod, tmp_path, 
         runtime.close()
 
 
+def test_pending_poll_trace_is_quiet_without_changing_queries_results_or_errors(mod, tmp_path, capsys):
+    class Host:
+        def __init__(self):
+            self.settings = types.SimpleNamespace(STRATEGY_ID='test')
+            self.executor = types.SimpleNamespace(path=str(tmp_path/'ledger.json'), state={
+                'orders': {'test': dict(status=50, booked=0, filled=0, qty=100)},
+                'targets': {}, 'positions': {}})
+            self.times = ('09:20', '09:30', ('10:30',), '14:55')
+            self.day, self.calls = '20260911', 0
+        log = mod.Runtime.log
+
+        @mod.native_traced('native.timer')
+        def poll(self, now, action=False, fail=False):
+            with mod.native_span('qmt.api.get_trade_detail_data.order'):
+                self.calls += 1
+                if fail:
+                    raise ValueError('preserve failure')
+            if action:
+                with mod.native_span('qmt.api.passorder'):
+                    pass
+            return 'unchanged result'
+
+    host = Host()
+    for _ in range(1000):
+        assert host.poll(NOW) == 'unchanged result'
+    assert host.calls == 1000 and '执行链路耗时' not in capsys.readouterr().out
+    assert host.poll(NOW, action=True) == 'unchanged result'
+    assert 'qmt.api.passorder' in capsys.readouterr().out
+    with pytest.raises(ValueError, match='preserve failure'):
+        host.poll(NOW, fail=True)
+    assert '"errors":1' in capsys.readouterr().out
+    assert not list(tmp_path.glob('*.log'))
+
+
+def test_native_buffer_prefers_business_over_repeated_idle_summaries(mod):
+    buffer = mod.NativeLogBuffer(1024)
+    buffer.append('original order/fill', NOW)
+    buffer.append('执行链路耗时 | opening submit details', NOW)
+    for i in range(1000):
+        buffer.append('[idle_timing] '+str(i)+'x'*80, NOW)
+    stored = '\n'.join(line for _, line in buffer.rows)
+    assert 'original order/fill' in stored and 'opening submit details' in stored
+    assert buffer.chars <= 1024 and buffer.dropped > 0
+
+
 @pytest.mark.parametrize('index_kind', ['text', 'timestamp', 'numpy_ms', 'text_ms', 'numpy_seconds'])
 def test_daily_date_accepts_real_qmt_pandas_indexes_without_future_data(mod, index_kind):
     import numpy as np

@@ -67,6 +67,20 @@ def test_overflow_is_bounded_and_explicit_after_close(tmp_path):
     assert 'entry8' in saved and 'entry9' in saved and 'dropped_records=8' in saved
 
 
+def test_routine_flood_never_evicts_business_or_critical_timing(tmp_path):
+    store = DeferredLogStore(tmp_path/'server.log', max_records=3, max_chars=200, clock=lambda: NOW)
+    store.append('business', 'original order/fill')
+    store.append('critical_timing', 'opening submit timing')
+    for i in range(1000):
+        store.append('timing', 'unchanged poll '+str(i))
+    assert store.tail(10) == ['original order/fill']
+    assert any(row[2] == 'opening submit timing' for row in store.pending)
+    assert len(store.pending) == 3 and store.chars <= 200
+    assert store.flush_ready(NOW.replace(hour=16))
+    assert 'opening submit timing' in store.path_for('timing', '20261022').read_text(encoding='utf8')
+    assert store.path_for('business', '20261022').read_text(encoding='utf8') == 'original order/fill\n'
+
+
 def test_file_error_keeps_pending_without_affecting_next_order(tmp_path, monkeypatch):
     store = DeferredLogStore(tmp_path/'server.log', clock=lambda: NOW)
     store.append('timing', 'observed event')

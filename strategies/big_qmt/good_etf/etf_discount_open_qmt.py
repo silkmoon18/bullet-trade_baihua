@@ -103,6 +103,17 @@ class NativeLogBuffer:
         self.guard, self.writing, self.last_attempt = threading.Lock(), False, float('-inf')
         self.archive_slot = None
 
+    def _trim(self):
+        while self.chars > self.max_chars or len(self.rows) > 20000:
+            index = next((i for i, row in enumerate(self.rows) if '[idle_timing]' in row[1]), None)
+            if index is None:
+                index = next((i for i, row in enumerate(self.rows)
+                              if '\u6267\u884c\u94fe\u8def\u8017\u65f6 | ' in row[1]), 0)
+            row = self.rows[index]
+            del self.rows[index]
+            self.chars -= len(row[1])
+            self.dropped += 1
+
     def append(self, line, now):
         with self.guard:
             if len(line) > self.max_chars:
@@ -110,9 +121,7 @@ class NativeLogBuffer:
                 return
             self.rows.append((now.strftime('%Y%m%d'), line))
             self.chars += len(line)
-            while self.chars > self.max_chars or len(self.rows) > 20000:
-                self.chars -= len(self.rows.popleft()[1])
-                self.dropped += 1
+            self._trim()
 
     def request_flush(self, prefix, now, archive_times):
         times = sorted(set(archive_times))
@@ -176,9 +185,7 @@ class NativeLogBuffer:
                     self.dropped += missing
                 if len(saved) == len(grouped):
                     self.archive_slot = slot
-                while self.chars > self.max_chars or len(self.rows) > 20000:
-                    self.chars -= len(self.rows.popleft()[1])
-                    self.dropped += 1
+                self._trim()
         finally:
             with self.guard:
                 self.writing = False
@@ -259,6 +266,7 @@ class TimingTrace:
         self.stages = {}
         self.events = []
         self.events_dropped = 0
+        self.important = False
 
     def record(self, stage, started, outcome="ok"):
         elapsed = max(0., (time.perf_counter()-started)*1000)
@@ -278,9 +286,34 @@ class TimingTrace:
         return "\u6267\u884c\u94fe\u8def\u8017\u65f6 | " + json.dumps(dict(
             trace_id=self.trace_id, phase=self.phase, started_at=self.started_at,
             finished_at=china_now().isoformat(timespec="milliseconds"),
-            elapsed_ms=(time.perf_counter()-self.started)*1000, stages=self.stages,
+            elapsed_ms=round((time.perf_counter()-self.started)*1000, 3),
+            stages={name: {k: round(v, 3) if isinstance(v, float) else v
+                           for k, v in row.items()} for name, row in self.stages.items()},
             events=self.events, events_dropped=self.events_dropped, process_instance=_native_process_instance,
-            previous_timing_output_ms=_native_previous_output_ms), ensure_ascii=False)
+            previous_timing_output_ms=_native_previous_output_ms), ensure_ascii=False, separators=(',', ':'))
+
+
+def summarize_native_idle(runtime, trace):
+    elapsed = (time.perf_counter()-trace.started)*1000
+    important = trace.important or any(row.get('errors') for row in trace.stages.values()) or any(
+        name in ('qmt.api.passorder', 'qmt.api.cancel', 'local.select_rank_weights') for name in trace.stages)
+    now = time.monotonic()
+    row = getattr(runtime, '_quiet_timing', None)
+    if important:
+        return False
+    if row is None:
+        row = runtime._quiet_timing = dict(started=now, count=0, ms=0., max_ms=0., slow_at=float('-inf'))
+    if elapsed >= 2000 and now-row['slow_at'] >= 60:
+        row['slow_at'] = now
+        return False
+    row['count'] += 1
+    row['ms'] += elapsed
+    row['max_ms'] = max(row['max_ms'], elapsed)
+    if now-row['started'] >= 1800:
+        runtime.log('[idle_timing] callbacks={} avg_ms={:.3f} max_ms={:.3f}; no_business_event=true'.format(
+            row['count'], row['ms']/row['count'], row['max_ms']))
+        row.update(started=now, count=0, ms=0., max_ms=0.)
+    return True
 
 
 @contextmanager
@@ -338,10 +371,12 @@ def native_traced(phase):
                 _native_timing.current = None
                 # No per-second idle/tick flood. Every actual native API and
                 # durable state write remains visible while executing work.
-                if any(key.startswith(('qmt.api.', 'local.ledger_save')) for key in trace.stages):
+                if trace.important or any(row.get('errors') for row in trace.stages.values()) or any(
+                        key.startswith(('qmt.api.', 'local.ledger_save')) for key in trace.stages):
                     try:
                         output_started = time.perf_counter()
-                        self.log(trace.message())
+                        if not summarize_native_idle(self, trace):
+                            self.log(trace.message())
                         _native_previous_output_ms = (time.perf_counter()-output_started)*1000
                     except Exception:
                         pass
@@ -1684,6 +1719,9 @@ class Runtime:
     def log(self, text):
         now = china_now()
         line = "{} [{}] {}".format(now.isoformat(sep=" ", timespec="milliseconds"), self.settings.STRATEGY_ID, text)
+        trace = getattr(_native_timing, 'current', None)
+        if trace is not None and not text.startswith(('\u6267\u884c\u94fe\u8def\u8017\u65f6 | ', '[idle_timing]')):
+            trace.important = True
         buffer_native_line(self, line, now)
         if print_timing_only(text, line):
             return

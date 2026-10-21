@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..timing import traced, measured, span, current_trace, record_elapsed, print_timing
+from ..timing import traced, measured, span, current_trace, record_elapsed, print_timing, observe_progress
 
 import asyncio
 import json
@@ -1006,6 +1006,17 @@ class SQLiteStrategyAPI:
             broker_snapshot,
             settlement_cycles=settlement_cycles,
         )
+        # Use the snapshot already queried for execution, not extra log queries.
+        try:
+            observe_progress(strategy_id, (
+                result.state.value,
+                tuple(sorted((str(row.get('security') or ''), str(row.get('side') or ''),
+                              str(row.get('status') or ''), str(row.get('filled') or 0),
+                              str(row.get('amount') or 0)) for row in broker_snapshot.orders)),
+                tuple(str(item) for item in result.details.get('blockers', ())),
+            ))
+        except Exception:
+            pass  # Optional diagnostics cannot change reconciliation or booking.
         self._record_broker_change()
         self.startup_ready = result.state.value == "READY"
         limits = dict(result.details.get("broker_sellable_limits", {}))
@@ -1590,13 +1601,17 @@ class SQLiteStrategyAPI:
         self._record_reconciliation_rejections(
             intent_id, reconciliation, execution_quotes
         )
-        self.planner.advance_intent(
+        advance = self.planner.advance_intent(
             intent_id,
             snapshot,
             market_marks,
             now,
             quotes=execution_quotes,
         )
+        try:
+            observe_progress('intent:' + intent.account_id, advance.intent.state.value)
+        except Exception:
+            pass
 
         async def submitter(order_payload: Mapping[str, object]):
             return await cast(Any, self.broker).place_order(
@@ -1721,6 +1736,14 @@ class SQLiteStrategyAPI:
                         (time.monotonic() - target_received_at) * 1000,
                     )
                 dispatched.append(dispatch)
+                if dispatch.unknown:
+                    trace = current_trace()
+                    if trace is not None:
+                        trace.tags['execution_event'] = 'submit_unknown'
+                    logger.warning(
+                        "QMT提交结果待确认 | strategy_id=%s | 原因=%s | 只查询认领原委托，不盲目重发",
+                        strategy_account_id, dispatch.error or "券商未确认委托编号",
+                    )
                 if dispatch.unknown or not self.planner.has_pending_dispatch(strategy_account_id):
                     # Don't pay for another native snapshot just to discover
                     # an empty local queue. The worker still refreshes fills

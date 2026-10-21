@@ -100,3 +100,39 @@ def test_schedule_timing_never_masks_callback_failure_or_adds_backtest_dispatch(
     record = json.loads(logs[-1].split(' | ', 1)[1])
     assert record['stages']['jq.scheduler_callback']['errors'] == 1
     assert getattr(helper._execution_timing, 'current', None) is None
+
+
+def test_quiet_minutes_preserve_results_and_only_print_periodic_summary(helper, monkeypatch):
+    logs, called, clock = [], [], [0.]
+    monkeypatch.setattr(helper.time, 'monotonic', lambda: clock[0])
+    runtime = helper.JoinQuantRuntime(_state('JQ', 'sim_trade'), {'log': NS(info=logs.append)})
+    runtime._scheduled_entries['minute_confirm'] = dict(
+        callback=lambda c: called.append(c) or 'same result', times=['every_bar'])
+    context = NS(current_dt=datetime(2026, 10, 22, 9, 31))
+    for i in range(240):
+        clock[0] = i * 60
+        assert runtime._invoke_scheduled(context, 'minute_confirm', helper.time.time()*1000,
+                                         helper.time.perf_counter()) == 'same result'
+    assert len(called) == 240
+    assert not any(line.startswith('执行链路耗时 | ') for line in logs)
+    assert 1 <= len(logs) <= 8 and all('空检查耗时汇总' in line for line in logs)
+
+
+def test_minute_order_and_exception_are_never_suppressed(helper):
+    logs, calls = [], []
+    namespace = {'log': NS(info=logs.append), 'order_target': lambda *a: calls.append(a) or 'order'}
+    runtime = helper.JoinQuantRuntime(_state('JQ', 'sim_trade'), namespace)
+    context = NS(current_dt=datetime(2026, 10, 22, 9, 31))
+    runtime._scheduled_entries['minute_confirm'] = dict(
+        callback=lambda c: namespace['order_target']('test', 0), times=['every_bar'])
+    def invoke():
+        return runtime._invoke_scheduled(context, 'minute_confirm', helper.time.time()*1000,
+                                         helper.time.perf_counter())
+    assert invoke() == 'order' and len(calls) == 1
+    assert json.loads(logs[-1].split(' | ', 1)[1])['stages']['jq.api.order_target']['calls'] == 1
+    def failed(c):
+        raise ValueError('unchanged business exception')
+    runtime._scheduled_entries['minute_confirm']['callback'] = failed
+    with pytest.raises(ValueError, match='unchanged business exception'):
+        invoke()
+    assert json.loads(logs[-1].split(' | ', 1)[1])['stages']['jq.scheduler_callback']['errors'] == 1

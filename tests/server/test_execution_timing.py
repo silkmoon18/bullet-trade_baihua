@@ -96,6 +96,51 @@ def test_idle_trace_does_not_print(monkeypatch):
     trace.flush()
 
 
+def test_unchanged_background_is_aggregated_but_actions_errors_and_progress_keep_detail(monkeypatch):
+    clock, printed = [0.], []
+    monkeypatch.setattr(timing.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(timing, 'print_timing', lambda *a, **k: printed.append(a))
+    policy = timing.QuietTracePolicy()
+    def trace(state=0):
+        row = timing.Trace('server.resume_target', 'strategy:today')
+        row.progress['strategy'] = state
+        return row
+    assert policy.detail(trace())
+    for _ in range(1000):
+        assert not policy.detail(trace())
+    assert not printed
+    clock[0] = 1800
+    assert not policy.detail(trace())
+    assert len(printed) == 1 and '汇总' in printed[0][0]
+    assert policy.detail(trace(1))
+    failed = trace(1)
+    failed.failed = True
+    assert policy.detail(failed)
+    submitted = trace(1)
+    submitted.record('bridge./place_order', submitted.started)
+    assert policy.detail(submitted)
+    for i in range(300):
+        row = trace()
+        row.trace_id = str(i)
+        policy.detail(row)
+    assert len(policy.rows) == 256
+
+
+def test_progress_observation_propagates_to_open_parent_without_database_or_broker():
+    parent = timing.Trace('parent')
+    token = timing._current.set(parent)
+    try:
+        child = timing.Trace('child')
+        child_token = timing._current.set(child)
+        try:
+            timing.observe_progress('strategy', ('READY', 1))
+            assert child.progress == parent.progress == {'strategy': ('READY', 1)}
+        finally:
+            timing._current.reset(child_token)
+    finally:
+        timing._current.reset(token)
+
+
 @pytest.mark.asyncio
 async def test_prepare_advertises_scheduler_and_ack_reports_processing_time(api, monkeypatch):
     service, broker, account, _ = api

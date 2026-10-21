@@ -97,13 +97,15 @@ class _ExecutionTrace:
             "trace_id": self.trace_id, "phase": self.phase, "started_at": self.started_at,
             "finished_at": _wall_timestamp(time.time() * 1000),
             "elapsed_ms": round((time.perf_counter()-self.started)*1000, 3),
-            "stages": self.stages, "remote": self.remote,
+            "stages": {name: {k: round(v, 3) if isinstance(v, float) else v
+                              for k, v in row.items()} for name, row in self.stages.items()},
+            "remote": self.remote,
             "events": self.events, "events_dropped": self.events_dropped, "callback": self.callback,
             "process_instance": _timing_process_instance, "helper_loaded_at": _helper_loaded_at,
             "previous_timing_output_ms": getattr(_execution_timing, 'previous_output_ms', None),
             "rpc_connections": _rpc_stats['connections']-self.rpc_before['connections'],
             "rpc_reused": _rpc_stats['reused']-self.rpc_before['reused'],
-        }, ensure_ascii=False)
+        }, ensure_ascii=False, separators=(',', ':'))
 
 
 @contextmanager
@@ -178,15 +180,16 @@ def _timed_runtime(phase: str):
                 _execution_timing.current = previous
                 try:
                     output_started = time.perf_counter()
-                    timing_log = ('info', trace.message())
-                    saved = namespace.get('g')
-                    snapshot = getattr(saved, 'bt_open_decision', None) if saved is not None else self._prepared_rebalance
-                    if phase == 'jq.freeze_decision' and kwargs.get('qmt_execute_time') is None and snapshot:
-                        # Ordinary opening decisions already defer diagnostics
-                        # until native submit; timing must not undo that fast path.
-                        snapshot.setdefault('decision_logs', []).append(timing_log)
-                    else:
-                        self._flush_logs((timing_log,))
+                    if not self._summarize_quiet_timing(trace):
+                        timing_log = ('info', trace.message())
+                        saved = namespace.get('g')
+                        snapshot = getattr(saved, 'bt_open_decision', None) if saved is not None else self._prepared_rebalance
+                        if phase == 'jq.freeze_decision' and kwargs.get('qmt_execute_time') is None and snapshot:
+                            # Ordinary opening decisions already defer diagnostics
+                            # until native submit; timing must not undo that fast path.
+                            snapshot.setdefault('decision_logs', []).append(timing_log)
+                        else:
+                            self._flush_logs((timing_log,))
                     _execution_timing.previous_output_ms = (time.perf_counter()-output_started)*1000
                 except Exception:
                     pass
@@ -1899,6 +1902,30 @@ class JoinQuantRuntime:
         self._rebalance_started = 0.0
         self._scheduled_entries = {}  # type: Dict[str, Any]
         self._previous_callback = None  # type: Optional[Dict[str, Any]]
+        self._quiet_timing = None
+
+    def _summarize_quiet_timing(self, trace: Any) -> bool:
+        """Suppress only read-only minute traces, never orders/RPC/errors/results."""
+        minute = trace.callback.get('slot') == 'minute_confirm'
+        important = any(row.get('errors') or name.startswith((
+            'rpc.', 'jq.api.order_', 'jq.api.cancel_order'))
+            for name, row in trace.stages.items())
+        elapsed = (time.perf_counter() - trace.started) * 1000
+        quiet = minute and not important and elapsed < 1000
+        now = time.monotonic()
+        if quiet:
+            if self._quiet_timing is None:
+                self._quiet_timing = dict(started=now, count=0, ms=0., max_ms=0.)
+            row = self._quiet_timing
+            row['count'] += 1
+            row['ms'] += elapsed
+            row['max_ms'] = max(row['max_ms'], elapsed)
+        row = self._quiet_timing
+        if row and (now-row['started'] >= 1800 or trace.callback.get('slot') == 'snapshot'):
+            self._quiet_timing = None
+            self._flush_logs((('info', '空检查耗时汇总 | minute_confirm 次数={} 平均={:.3f}ms 最大={:.3f}ms | 无下单/RPC/异常'.format(
+                row['count'], row['ms']/row['count'], row['max_ms'])),))
+        return quiet
 
     def _invoke_scheduled(self, context: Any, slot: str, entered_ms: float, entered_mono: float) -> Any:
         entry = self._scheduled_entries.get(slot)
@@ -2283,10 +2310,7 @@ class JoinQuantRuntime:
             ),
         )
         if replace_existing:
-            for scheduled_time, callback_name in registered:
-                self._log(
-                    "info", "调度入口 | 时间={} 回调={}".format(scheduled_time, callback_name)
-                )
+            self._log("info", "调度已恢复 | 入口数={} | 日程见任务调度摘要".format(len(registered)))
         global_state = (self._namespace or {}).get('g')
         if global_state is not None and self.mode != RuntimeMode.BACKTEST:
             setattr(global_state, 'bt_scheduled_entries', {

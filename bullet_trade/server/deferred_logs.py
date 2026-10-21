@@ -32,6 +32,18 @@ class DeferredLogStore:
         self.dropped, self.saved_drop_count = 0, 0
         self.guard, self.writer_guard = threading.Lock(), threading.Lock()
 
+    def _trim(self):
+        # Rare overflow path: routine samples cannot evict business or critical
+        # order/fill traces. Keep the existing hard total memory bound.
+        while len(self.pending) > self.max_records or self.chars > self.max_chars:
+            index = next((i for i, row in enumerate(self.pending) if row[0] == 'timing'), None)
+            if index is None:
+                index = next((i for i, row in enumerate(self.pending) if row[0] == 'critical_timing'), 0)
+            row = self.pending[index]
+            del self.pending[index]
+            self.chars -= len(row[2])
+            self.dropped += 1
+
     def path_for(self, kind, day):
         base = self.business_path
         if kind == 'timing':
@@ -48,9 +60,7 @@ class DeferredLogStore:
                     return
                 self.pending.append((kind, (now or self.clock()).strftime('%Y%m%d'), text))
                 self.chars += len(text)
-                while len(self.pending) > self.max_records or self.chars > self.max_chars:
-                    self.chars -= len(self.pending.popleft()[2])
-                    self.dropped += 1
+                self._trim()
         except Exception:
             pass  # Diagnostics never affect an order/fill result.
 
@@ -71,7 +81,7 @@ class DeferredLogStore:
                 missing = self.dropped - self.saved_drop_count
             groups = {}
             for kind, day, line in batch:
-                groups.setdefault((kind, day), []).append(line)
+                groups.setdefault(('timing' if kind == 'critical_timing' else kind, day), []).append(line)
             if missing:
                 groups.setdefault(('timing', now.strftime('%Y%m%d')), []).append(
                     now.isoformat() + ' log_archive_gap | dropped_records=' + str(missing))
@@ -88,12 +98,11 @@ class DeferredLogStore:
                     # never used to count trades or advance financial state.
                     continue
             with self.guard:
-                failed = [row for row in batch if row[:2] not in successful]
+                failed = [row for row in batch if
+                          ('timing' if row[0] == 'critical_timing' else row[0], row[1]) not in successful]
                 self.pending.extendleft(reversed(failed))
                 self.chars += sum(len(row[2]) for row in failed)
-                while len(self.pending) > self.max_records or self.chars > self.max_chars:
-                    self.chars -= len(self.pending.popleft()[2])
-                    self.dropped += 1
+                self._trim()
                 if ('timing', now.strftime('%Y%m%d')) in successful:
                     self.saved_drop_count += missing
             return bool(successful)

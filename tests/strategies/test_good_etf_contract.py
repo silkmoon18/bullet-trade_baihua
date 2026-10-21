@@ -618,7 +618,8 @@ def test_old_saved_schedule_is_migrated_to_execution_entry_without_changing_deci
     assert len(executions) == 1
     assert executions[0][0][1:3] == (old_weights, old_marks)
     assert executions[0][1] == {"jq_planning_total": 10000.0}
-    assert "调度入口 | 时间=09:30 回调=_decide_joinquant_open_rebalance" in strategy.log.messages
+    assert "调度已恢复 | 入口数=6 | 日程见任务调度摘要" in strategy.log.messages
+    assert not any(line.startswith('调度入口 | ') for line in strategy.log.messages)
 
 
 def test_market_open_emits_one_account_neutral_weight_decision(monkeypatch):
