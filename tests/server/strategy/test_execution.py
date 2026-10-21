@@ -9,6 +9,7 @@ from bullet_trade.server.strategy import (
     MarketExecution,
     MarketableLimitExecution,
     RepricingPolicy,
+    OrderSequence,
     execution_request_from_wire,
     execution_request_to_wire,
 )
@@ -35,6 +36,9 @@ from bullet_trade.server.strategy import (
             sell_style=MarketExecution(15_000),
         ),
         ExecutionRequest(style=MarketableLimitExecution(10_000)),
+        ExecutionRequest(style=LimitExecution(2000, preopen=True),
+                         sell_style=LimitExecution(0, preopen=True),
+                         order_sequence=OrderSequence.INDEPENDENT),
     ],
 )
 def test_execution_request_wire_round_trip(execution_request):
@@ -79,6 +83,18 @@ def test_execution_request_rejects_plain_string_enums():
 
     with pytest.raises(TypeError, match="sell_style"):
         ExecutionRequest(sell_style="MARKET")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="order_sequence"):
+        ExecutionRequest(order_sequence="INDEPENDENT")
+
+
+def test_execution_order_extension_defaults_safe_and_rejects_unknown():
+    wire = execution_request_to_wire(ExecutionRequest())
+    assert 'order_sequence' not in wire
+    assert execution_request_from_wire(wire).order_sequence is OrderSequence.SELL_THEN_BUY
+    wire['order_sequence'] = 'PARALLEL_UNCHECKED'
+    with pytest.raises(ValueError, match='order_sequence'):
+        execution_request_from_wire(wire)
 
 
 @pytest.mark.parametrize("prices", [None, {"A": 0}, {"A": True}, {"A": 1.01}, {"": 1000}])

@@ -402,7 +402,7 @@ def test_transport_warmup_follows_split_decision_and_order_times(helper, decisio
     callback = lambda context: None
     runtime.schedule_daily(callback, callback, callback, (), callback,
                            open_decision_time=decision, open_order_time=order)
-    assert tuple(args[0] for fn, args in calls if fn is helper._prewarm_joinquant_rpc) == expected
+    assert tuple(args[0] for fn, args in calls if fn is helper._scheduled_rpc_warm) == expected
 
 
 def test_transport_warmup_covers_both_explicit_stages_without_enabling_stages_for_default(helper):
@@ -413,4 +413,4 @@ def test_transport_warmup_covers_both_explicit_stages_without_enabling_stages_fo
     callback = lambda context: None
     runtime.schedule_daily(callback, callback, callback, (), callback,
                            opening_decision=callback, opening_decision_time="09:26", sell_then_buy=True)
-    assert tuple(args[0] for fn, args in calls if fn is helper._prewarm_joinquant_rpc) == ("09:25", "09:29")
+    assert tuple(args[0] for fn, args in calls if fn is helper._scheduled_rpc_warm) == ("09:25", "09:29")

@@ -881,6 +881,9 @@ def test_expired_intent_stays_active_until_working_order_is_terminal(tmp_path):
         marks,
         as_of,
     )
+    # A genuinely submitted order still needs broker reconciliation; a
+    # proven-unsent local DAY order is now fenced and canceled on expiry.
+    planner._booking.mark_order_submitted(ACCOUNT, planned.orders[0].order_id, 'broker-expired')
 
     expired = planner.advance_intent(
         planned.intent.intent_id,

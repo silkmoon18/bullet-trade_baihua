@@ -306,7 +306,8 @@ class SQLiteStrategyAPI:
         candidates = set(code.strip() for code in raw_candidates)
         result = await self.ensure_account(account_context, account_key, payload)
         result['server_features'] = {'scheduled_targets_v1': True, 'execution_timing_v1': True,
-                                     'preopen_sell_rotation_v1': True}
+                                     'preopen_sell_rotation_v1': True,
+                                     'independent_preopen_rotation_v1': True}
         if result["reconciliation"]["state"] != "READY":
             return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
         strategy_id = self._strategy_id(payload)
@@ -534,8 +535,9 @@ class SQLiteStrategyAPI:
             ))
         if preopen_limit and not deferred:
             self._schedule_open_resume(strategy_id)
-            logger.info("QMT盘前目标已接受 | strategy_id=%s | 允许预委托方向=%s；未授权方向等待09:30；继续先卖后买",
-                        strategy_id, '/'.join(preopen_limit_sides(execution_request)))
+            logger.info("QMT盘前目标已接受 | strategy_id=%s | 允许预委托方向=%s；未授权方向等待09:30；顺序=%s",
+                        strategy_id, '/'.join(preopen_limit_sides(execution_request)),
+                        execution_request.order_sequence.value)
         logger.info(
             "QMT目标已接受 | strategy_id=%s key=%s | 接收至接受=%.0fms | 接收时间=%s 接受时间=%s | %s",
             strategy_id, key, (time.monotonic() - target_received_at) * 1000,
@@ -762,6 +764,8 @@ class SQLiteStrategyAPI:
         expire_before: Optional[date] = None,
     ) -> Dict[str, object]:
         requested = []
+        if expire_before is not None:
+            self.planner.expire_unsent_orders(intent.intent_id, expire_before)
         broker_order_ids = self.planner.cancelable_broker_order_ids(
             intent.intent_id
         )
@@ -1721,6 +1725,7 @@ class SQLiteStrategyAPI:
                 with span('phase.outbox_and_broker_submit'):
                     dispatch = await self.planner.dispatch_next(
                         submitter, strategy_account_id,
+                        trading_day=datetime.now(SHANGHAI_TZ).date(),
                         sellable_limits={
                             p.security: max(0, p.sellable_qty) for p in broker_snapshot.positions
                         },

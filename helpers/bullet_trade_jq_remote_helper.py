@@ -58,7 +58,7 @@ def _wall_timestamp(value: Any) -> str:
 _execution_timing = threading.local()
 _helper_loaded_at = _wall_timestamp(time.time() * 1000)
 _timing_process_instance = uuid.uuid4().hex[:12]
-JOINQUANT_RUNTIME_FEATURES = ("preopen_sell_rotation_v1",)
+JOINQUANT_RUNTIME_FEATURES = ("preopen_sell_rotation_v1", "independent_preopen_rotation_v1")
 
 
 class _ExecutionTrace:
@@ -208,6 +208,7 @@ __all__ = [
     "RuntimeMode",
     "FollowUpPolicy",
     "RepricingPolicy",
+    "OrderSequence",
     "ConditionalLimitPriceMode",
     "LimitExecution",
     "ConditionalLimitExecution",
@@ -215,6 +216,7 @@ __all__ = [
     "MarketableLimitExecution",
     "ExecutionRequest",
     "default_etf_rebalance_execution",
+    "default_etf_preopen_execution",
     "default_etf_stop_loss_execution",
     "default_etf_take_profit_execution",
     "PortfolioView",
@@ -488,6 +490,11 @@ class RepricingPolicy(str, Enum):
     RECOMPUTE = "RECOMPUTE"
 
 
+class OrderSequence(str, Enum):
+    SELL_THEN_BUY = "SELL_THEN_BUY"
+    INDEPENDENT = "INDEPENDENT"
+
+
 class ConditionalLimitPriceMode(str, Enum):
     BOUNDARY = "BOUNDARY"
     COUNTERPARTY = "COUNTERPARTY"
@@ -592,7 +599,7 @@ _DEFAULT_EXECUTION_STYLE = object()
 
 
 _ExecutionRequestTuple = namedtuple(
-    "ExecutionRequest", ("style", "follow_up", "repricing", "sell_style")
+    "ExecutionRequest", ("style", "follow_up", "repricing", "sell_style", "order_sequence")
 )
 
 
@@ -605,6 +612,7 @@ class ExecutionRequest(_ExecutionRequestTuple):
         follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY,
         repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL,
         sell_style: Any = None,
+        order_sequence: OrderSequence = OrderSequence.SELL_THEN_BUY,
     ) -> "ExecutionRequest":
         if style is _DEFAULT_EXECUTION_STYLE:
             style = LimitExecution(2_000)
@@ -622,6 +630,8 @@ class ExecutionRequest(_ExecutionRequestTuple):
             raise TypeError("follow_up必须是FollowUpPolicy")
         if type(repricing) is not RepricingPolicy:
             raise TypeError("repricing必须是RepricingPolicy")
+        if type(order_sequence) is not OrderSequence:
+            raise TypeError("order_sequence必须是OrderSequence")
         if sell_style is not None and not isinstance(
             sell_style,
             (
@@ -633,8 +643,17 @@ class ExecutionRequest(_ExecutionRequestTuple):
         ):
             raise TypeError("sell_style不是支持的执行类型或None")
         return _ExecutionRequestTuple.__new__(
-            cls, style, follow_up, repricing, sell_style
+            cls, style, follow_up, repricing, sell_style, order_sequence
         )
+
+
+def default_etf_preopen_execution() -> ExecutionRequest:
+    """Preorder both sides independently; buys use the opening reference +1%."""
+    return ExecutionRequest(
+        style=LimitExecution(10_000, preopen=True),
+        sell_style=LimitExecution(0, preopen=True),
+        order_sequence=OrderSequence.INDEPENDENT,
+    )
 
 
 def default_etf_rebalance_execution() -> ExecutionRequest:
@@ -687,7 +706,7 @@ def _style_to_wire(style: Any) -> Dict[str, Any]:
 def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
     if type(request) is not ExecutionRequest:
         raise TypeError("execution必须是ExecutionRequest")
-    return {
+    result = {
         "schema_version": EXECUTION_WIRE_SCHEMA_VERSION,
         "style": _style_to_wire(request.style),
         "sell_style": (
@@ -698,6 +717,9 @@ def _execution_to_wire(request: ExecutionRequest) -> Dict[str, Any]:
         "follow_up": request.follow_up.value,
         "repricing": request.repricing.value,
     }
+    if request.order_sequence is not OrderSequence.SELL_THEN_BUY:
+        result["order_sequence"] = request.order_sequence.value
+    return result
 
 
 def _style_from_wire(raw_style: Any) -> Any:
@@ -740,6 +762,7 @@ def _execution_from_wire(value: Dict[str, Any]) -> ExecutionRequest:
                 if raw_sell_style is not None
                 else None
             ),
+            order_sequence=OrderSequence(value.get("order_sequence", "SELL_THEN_BUY")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("服务器执行请求内容无效") from exc
@@ -2373,11 +2396,16 @@ class JoinQuantRuntime:
         ],
         *, qmt_execute_time: Optional[str] = None,
         qmt_preopen_sells: bool = False,
+        qmt_execution: Optional[ExecutionRequest] = None,
     ) -> None:
         """Freeze one account-neutral decision and the JQ sizing capital."""
 
         if type(qmt_preopen_sells) is not bool:
             raise TypeError("qmt_preopen_sells必须是bool")
+        if qmt_execution is not None and type(qmt_execution) is not ExecutionRequest:
+            raise TypeError("qmt_execution必须是ExecutionRequest")
+        if qmt_execution is not None and qmt_execute_time is None:
+            raise ValueError("自定义盘前执行必须声明服务器自主执行时间")
         if qmt_preopen_sells and qmt_execute_time != '09:30':
             raise ValueError("盘前卖出轮换必须声明09:30起买入")
         if qmt_execute_time is not None:
@@ -2441,6 +2469,8 @@ class JoinQuantRuntime:
                             "qmt_execute_at": execute_at,
                             "qmt_preopen_sells": qmt_preopen_sells,
                         }
+                        if qmt_execution is not None:
+                            qmt_plan["qmt_execution"] = _execution_to_wire(qmt_execution)
                         self._submit_qmt_server_rotation(context, qmt_plan)
                 except Exception as exc:
                     if qmt_plan.get("qmt") == "BUY_SENT":
@@ -3254,13 +3284,20 @@ class JoinQuantRuntime:
         """Submit one whole-portfolio intent; QMT fills/recovery stay server-owned."""
         execute_at = plan.get("qmt_execute_at")
         preopen_sells = plan.get("qmt_preopen_sells", False)
+        custom = (_execution_from_wire(plan["qmt_execution"])
+                  if plan.get("qmt_execution") is not None else None)
+        independent = custom is not None and custom.order_sequence is OrderSequence.INDEPENDENT
+        preopen_requested = preopen_sells or (custom is not None and any(
+            isinstance(style, LimitExecution) and style.preopen
+            for style in (custom.style, custom.sell_style)))
         if execute_at is not None:
             features = self.state.get('server_features')
             if features is None:
                 # Normal 09:20 preparation supplies this without an opening RTT.
                 prepared = _strategy_request('strategy.prepare_session', {'initial_capital': self._qmt_initial_capital})
                 features = self.state['server_features'] = dict(prepared.get('server_features') or {})
-            feature = 'preopen_sell_rotation_v1' if preopen_sells else 'scheduled_targets_v1'
+            feature = ('independent_preopen_rotation_v1' if independent else
+                       'preopen_sell_rotation_v1' if preopen_requested else 'scheduled_targets_v1')
             if features.get(feature) is not True:
                 raise RuntimeError('服务器不支持{}；请部署配套服务器；不降级为其他下单方式或09:30补交'.format(feature))
         if execute_at is None and context.current_dt.strftime("%H:%M") < plan["buy_not_before"]:
@@ -3282,25 +3319,36 @@ class JoinQuantRuntime:
         limits = {code: int(round(price * 1_000_000)) for code, price in
                   self._liquidation_limits(positions).items()}
         if "qmt_rotation_execution" not in plan:
+            execution = custom or ExecutionRequest(
+                style=LimitExecution(2_000), sell_style=LimitExecution(0, limits, preopen=preopen_sells))
+            sell_style = execution.sell_style
+            if isinstance(sell_style, LimitExecution) and not sell_style.limit_prices:
+                sell_style = LimitExecution(sell_style.price_band_ppm, limits, preopen=sell_style.preopen)
             plan["qmt_rotation_execution"] = _execution_to_wire(ExecutionRequest(
-                style=LimitExecution(2_000), sell_style=LimitExecution(0, limits, preopen=preopen_sells),
-                follow_up=FollowUpPolicy.UNTIL_FILLED_TODAY,
-                repricing=RepricingPolicy.KEEP_ORIGINAL,
-            ))
+                style=execution.style, sell_style=sell_style,
+                follow_up=execution.follow_up, repricing=execution.repricing,
+                order_sequence=execution.order_sequence))
             plan["qmt_rotation_weights"] = weights
             plan["qmt_rotation_marks"] = marks
         result = self.submit_targets(
             context, plan["qmt_rotation_weights"], plan["qmt_rotation_marks"],
             plan["key"], _execution_from_wire(plan["qmt_rotation_execution"]),
             _security_names(plan["qmt_rotation_weights"]),
-            **({"execute_at": execute_at} if execute_at is not None and not preopen_sells else {}),
+            **({"execute_at": execute_at} if execute_at is not None and not preopen_requested else {}),
         )
         plan["qmt"] = "BUY_SENT"  # Accepted intent, not a claim of completed buys.
         self._log_qmt_planned_orders(result)
         self._log("info", "QMT轮换目标已提交 | 保留计划内持仓，跌停价卖出计划外/超额部分；"
-                  "服务器确认卖出后固定参考价上浮0.2%买入 | intent_id={}".format(
+                  "{} | intent_id={}".format(
+                      ("买卖独立预委托，买入只用已有现金，固定参考价上浮{:g}%".format(
+                          custom.style.price_band_ppm / 10_000)
+                       if isinstance(custom.style, LimitExecution) else
+                       "买卖独立执行，买入只用已有现金，按接口配置报价") if independent else
+                      "服务器确认卖出后固定参考价上浮0.2%买入",
                       result.get("intent", {}).get("intent_id")))
-        if preopen_sells:
+        if independent and preopen_requested:
+            self._log("info", "QMT买卖预委托已接受 | 09:26起直接提交固定限价；不等待卖出回款或JQ09:30回调；成交与报送以券商回报为准")
+        elif preopen_sells:
             self._log("info", "QMT盘前卖出轮换已接受 | 必要跌停限价卖单立即尝试预委托；09:30起卖出成交入账后服务器自主买入；不依赖JQ回调")
         elif execute_at is not None:
             self._log("info", "QMT定时计划已接受 | 执行时间={} | 开始前不发单；届时服务器独立执行，不依赖JQ回调".format(execute_at))

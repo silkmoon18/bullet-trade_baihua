@@ -14,7 +14,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Tuple, Union, cast
@@ -277,6 +277,7 @@ class SQLiteOperationRepository:
         *, sellable_limits: Optional[Mapping[str, int]] = None,
         limit_orders_only: bool = False,
         allowed_sides: Optional[Tuple[str, ...]] = None,
+        trading_day: Optional[date] = None,
     ) -> Optional[OutboxClaim]:
         """Atomically claim the oldest dispatchable outbox row.
 
@@ -297,9 +298,16 @@ class SQLiteOperationRepository:
                   AND o.state = 'PENDING'
                   AND o.available_at <= ?
                   AND (? IS NULL OR o.strategy_account_id = ?)
+                  AND (? IS NULL OR EXISTS (
+                      SELECT 1 FROM strategy_orders so
+                      WHERE so.order_id = op.operation_id AND so.trading_day = ?
+                        AND so.state = 'PENDING_SUBMIT'
+                  ))
                 ORDER BY o.outbox_id
                 """,
-                (now_text, strategy_account_id, strategy_account_id),
+                (now_text, strategy_account_id, strategy_account_id,
+                 trading_day.isoformat() if trading_day else None,
+                 trading_day.isoformat() if trading_day else None),
             ).fetchall()
             row = None
             for candidate in candidates:
@@ -351,6 +359,43 @@ class SQLiteOperationRepository:
         except sqlite3.DatabaseError as exc:
             connection.rollback()
             raise RepositoryError("failed to claim outbox message") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def expire_unsent_intent_orders(self, intent_id: str, before: date) -> Tuple[str, ...]:
+        """Fence only proven-unsent DAY orders; never touch unknown submissions.
+
+        A repeated call returns fenced rows too, so a crash before reservation
+        release can finish that release safely on the next recovery.
+        """
+        connection = connect_database(self.database_path)
+        marker = _json_text({'error': 'DAY_ORDER_EXPIRED_BEFORE_SUBMIT'})
+        try:
+            connection.execute('BEGIN IMMEDIATE')
+            rows = connection.execute(
+                "SELECT so.order_id FROM strategy_orders so "
+                "JOIN strategy_operations op ON op.operation_id=so.order_id "
+                "JOIN outbox o ON o.operation_id=op.operation_id "
+                "WHERE so.intent_id=? AND so.trading_day<? "
+                "AND so.state='PENDING_SUBMIT' AND so.filled_qty=0 "
+                "AND coalesce(so.broker_order_id,'')='' "
+                "AND ((op.state='PENDING' AND o.state='PENDING') OR "
+                "(op.state='FAILED' AND o.state='FAILED' AND op.response_json=?))",
+                (intent_id, before.isoformat(), marker),
+            ).fetchall()
+            ids = tuple(str(row['order_id']) for row in rows)
+            for order_id in ids:
+                connection.execute(
+                    "UPDATE strategy_operations SET state='FAILED',response_json=?,updated_at=? "
+                    "WHERE operation_id=? AND state='PENDING'", (marker, _now_text(), order_id))
+                connection.execute(
+                    "UPDATE outbox SET state='FAILED',updated_at=? "
+                    "WHERE operation_id=? AND state='PENDING'", (_now_text(), order_id))
+            connection.commit()
+            return ids
         except BaseException:
             connection.rollback()
             raise

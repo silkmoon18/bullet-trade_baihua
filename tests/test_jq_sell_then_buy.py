@@ -284,7 +284,7 @@ def test_minute_confirmation_is_registered_only_when_opted_in(setup):
                            opening_decision=callbacks[4], opening_decision_time="09:26",
                            sell_then_buy=True)
     confirmations = [row for row in schedules if row[1].get("time") == "every_bar"]
-    assert confirmations == [(helper.advance_joinquant_sell_then_buy, {
+    assert confirmations == [(helper._scheduled_minute_confirm, {
         "time": "every_bar", "reference_security": "000300.XSHG",
     })]
 

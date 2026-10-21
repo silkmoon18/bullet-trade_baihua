@@ -41,6 +41,7 @@ from .execution import (
     MarketQuote,
     MarketableLimitExecution,
     RepricingPolicy,
+    OrderSequence,
     execution_request_from_wire,
     execution_request_to_wire,
     preopen_limit_sides,
@@ -292,6 +293,9 @@ class SQLiteTargetExecutionService:
         current = now or datetime.now(SHANGHAI_TZ)
         working = self._working_orders(intent.account_id)
         if intent.trading_day is not None and current.date() != intent.trading_day:
+            if intent.trading_day < current.date():
+                self.expire_unsent_orders(intent_id, current.date())
+                working = self._working_orders(intent.account_id)
             if any(row["intent_id"] == intent.intent_id for row in working):
                 return IntentAdvanceResult(intent, (), True)
             return IntentAdvanceResult(
@@ -316,7 +320,8 @@ class SQLiteTargetExecutionService:
             # reservations. Quotes, callbacks and repeated RPCs cannot start
             # this intent early; the server-owned timer advances it at the open.
             return IntentAdvanceResult(intent, (), True)
-        if any(row["side"] == OrderSide.SELL.value for row in intent_working):
+        sell_first = intent.execution_request.order_sequence is OrderSequence.SELL_THEN_BUY
+        if sell_first and any(row["side"] == OrderSide.SELL.value for row in intent_working):
             return IntentAdvanceResult(intent, (), True)
         positions = {item.security: item for item in snapshot.positions}
         if intent_working:
@@ -435,17 +440,24 @@ class SQLiteTargetExecutionService:
                         )
                     )
 
-        if sell_pending and intent_working:
+        if sell_first and sell_pending and intent_working:
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.EXECUTING), (), True,
                 waiting_for_trigger,
             )
-        if sell_pending and not sells:
+        if sell_first and sell_pending and not sells:
             return IntentAdvanceResult(
                 self._set_state(intent_id, IntentState.EXECUTING), (), True,
                 waiting_for_trigger,
             )
-        selected = sells or self._affordable_buys(snapshot, buys)
+        # Independent buys spend only cash already available in this snapshot;
+        # never assume that queued/working sells have generated proceeds.
+        if sell_first:
+            side = OrderSide.SELL if sells else OrderSide.BUY
+            selected = [(side, item) for item in (sells or self._affordable_buys(snapshot, buys))]
+        else:
+            selected = ([(OrderSide.SELL, item) for item in sells]
+                        + [(OrderSide.BUY, item) for item in self._affordable_buys(snapshot, buys)])
         if not selected:
             if waiting_for_trigger or intent_working:
                 self._record_execution_wait(intent, None)
@@ -477,7 +489,6 @@ class SQLiteTargetExecutionService:
             self._record_execution_wait(intent, None)
             return IntentAdvanceResult(self._set_state(intent_id, IntentState.COMPLETED), (), False)
         self._record_execution_wait(intent, None)
-        side = OrderSide.SELL if sells else OrderSide.BUY
         orders = tuple(
             self._enqueue(
                 intent,
@@ -489,7 +500,7 @@ class SQLiteTargetExecutionService:
                 execution_type,
                 snapshot.as_of,
             )
-            for (
+            for side, (
                 security,
                 quantity,
                 order_price,
@@ -514,11 +525,13 @@ class SQLiteTargetExecutionService:
         sellable_limits: Optional[Mapping[str, int]] = None,
         limit_orders_only: bool = False,
         allowed_sides: Optional[Tuple[str, ...]] = None,
+        trading_day: Optional[date] = None,
     ) -> Optional[DispatchResult]:
         claim = self._operations.claim_next(
             strategy_account_id, sellable_limits=sellable_limits,
             limit_orders_only=limit_orders_only,
             allowed_sides=allowed_sides,
+            trading_day=trading_day,
         )
         if claim is None:
             return None
@@ -986,6 +999,16 @@ class SQLiteTargetExecutionService:
             for intent in (_intent(cast(sqlite3.Row, row)) for row in rows)
             if intent.trading_day is not None and intent.trading_day < before
         )
+
+    def expire_unsent_orders(self, intent_id: str, before: date) -> Tuple[str, ...]:
+        """Release reservations only after proven-unsent operations are fenced."""
+        intent = self.get_intent(intent_id)
+        expired = self._operations.expire_unsent_intent_orders(intent_id, before)
+        for order_id in expired:
+            account = self._ledger.get_strategy_account(intent.account_id)
+            self._booking.finalize_order(
+                intent.account_id, order_id, OrderState.CANCELED, account.ledger_version)
+        return expired
 
     def finalize_expired_orders(
         self, intent_id: str, before: date

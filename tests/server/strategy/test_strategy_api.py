@@ -352,7 +352,7 @@ async def test_dispatch_checks_time_before_each_order(api, monkeypatch):
     monkeypatch.setattr(service, "_can_dispatch_now", lambda: session_open[0])
     calls = []
 
-    async def dispatch(submitter, strategy_id, *, sellable_limits):
+    async def dispatch(submitter, strategy_id, *, sellable_limits, trading_day):
         calls.append(strategy_id)
         session_open[0] = False
         return DispatchResult("first-dispatch", "broker-1", False)

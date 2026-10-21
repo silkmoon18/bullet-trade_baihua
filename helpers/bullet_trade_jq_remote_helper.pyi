@@ -47,6 +47,11 @@ class RepricingPolicy(str, Enum):
     RECOMPUTE: str
 
 
+class OrderSequence(str, Enum):
+    SELL_THEN_BUY: str
+    INDEPENDENT: str
+
+
 class ConditionalLimitPriceMode(str, Enum):
     BOUNDARY: str
     COUNTERPARTY: str
@@ -107,14 +112,17 @@ class ExecutionRequest:
         follow_up: FollowUpPolicy = ...,
         repricing: RepricingPolicy = ...,
         sell_style: Optional[_ExecutionStyle] = ...,
+        order_sequence: OrderSequence = ...,
     ) -> ExecutionRequest: ...
     style: _ExecutionStyle
     follow_up: FollowUpPolicy
     repricing: RepricingPolicy
     sell_style: Optional[_ExecutionStyle]
+    order_sequence: OrderSequence
 
 
 def default_etf_rebalance_execution() -> ExecutionRequest: ...
+def default_etf_preopen_execution() -> ExecutionRequest: ...
 def default_etf_stop_loss_execution() -> ExecutionRequest: ...
 def default_etf_take_profit_execution() -> ExecutionRequest: ...
 
@@ -246,6 +254,7 @@ class JoinQuantRuntime:
         ],
         *, qmt_execute_time: Optional[str] = ...,
         qmt_preopen_sells: bool = ...,
+        qmt_execution: Optional[ExecutionRequest] = ...,
     ) -> None: ...
     def execute_prepared_rebalance(
         self, context: Context, *, jq_wait_for_sells: bool = ...,

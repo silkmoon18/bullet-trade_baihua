@@ -37,6 +37,7 @@ from .execution import (
     MarketQuote,
     MarketableLimitExecution,
     RepricingPolicy,
+    OrderSequence,
     execution_request_from_wire,
     execution_request_to_wire,
 )
@@ -179,6 +180,7 @@ __all__ = [
     "ReconciliationState",
     "ReconciliationResult",
     "RepricingPolicy",
+    "OrderSequence",
     "RepositoryError",
     "SQLiteStrategyRepository",
     "SQLiteStrategyAPI",

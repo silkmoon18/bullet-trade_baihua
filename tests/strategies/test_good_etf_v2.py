@@ -45,6 +45,7 @@ def test_v2_changes_identity_and_budget_not_selection_formula(monkeypatch):
     assert strategy.STRATEGY_ID == 'good_etf_v2'
     assert strategy.STRATEGY_NAME == 'ETF竞价折价轮动_jq'
     assert strategy.MAX_HOLD_NUM == 2
+    assert strategy.DEPLOY_RATIO == .50
     assert strategy.QMT_INITIAL_CAPITAL == 5000
     assert strategy.BUY_PRICE_INCREASE == .002
     assert strategy.OPEN_DECISION_TIME == '09:26'
@@ -68,7 +69,11 @@ def test_strategy_only_declares_execution_policy(monkeypatch):
     prepared = []
     strategy._runtime.prepare_rebalance = lambda context, decide, **kwargs: prepared.append(kwargs)
     strategy.market_open(NS())
-    assert prepared == [{'qmt_execute_time': '09:30', 'qmt_preopen_sells': True}]
+    assert len(prepared) == 1 and prepared[0]['qmt_execute_time'] == '09:30'
+    execution = prepared[0]['qmt_execution']
+    assert execution == helper_module.default_etf_preopen_execution()
+    assert execution.order_sequence is helper_module.OrderSequence.INDEPENDENT
+    assert execution.style == helper_module.LimitExecution(10000, preopen=True)
 
 
 @pytest.mark.parametrize('run_type', ['simple_backtest', 'full_backtest'])
@@ -99,7 +104,8 @@ def setup_rotation(monkeypatch, jq_enabled=True):
     runtime.qmt_account_enabled = True
     runtime.state.update(mode=runtime.mode.value, jq_account_enabled=jq_enabled,
                          qmt_account_enabled=True, strategy_id='good_etf_v2')
-    runtime.state['server_features'] = {'scheduled_targets_v1': True, 'preopen_sell_rotation_v1': True}
+    runtime.state['server_features'] = {'scheduled_targets_v1': True, 'preopen_sell_rotation_v1': True,
+                                        'independent_preopen_rotation_v1': True}
     runtime._qmt_callback_allowed = lambda *args: True
     runtime.advance_targets = lambda context: True
     qmt = NS(total_value=5000, positions={
@@ -399,7 +405,7 @@ def test_nonempty_v2_selection_preserves_exact_auction_ranking_and_weights(monke
     }
     weights, marks = strategy.select_opening_etfs(NS())
     assert list(weights) == ['FIRST', 'SECOND']
-    assert weights == pytest.approx({'FIRST': .95 * 2/3, 'SECOND': .95/3})
+    assert weights == pytest.approx({'FIRST': .50 * 2/3, 'SECOND': .50/3})
     assert marks == {'FIRST': 1, 'SECOND': 1.5}
 
 

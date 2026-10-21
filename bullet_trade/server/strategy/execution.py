@@ -30,6 +30,11 @@ class RepricingPolicy(str, Enum):
     RECOMPUTE = "RECOMPUTE"
 
 
+class OrderSequence(str, Enum):
+    SELL_THEN_BUY = "SELL_THEN_BUY"
+    INDEPENDENT = "INDEPENDENT"
+
+
 class ConditionalLimitPriceMode(str, Enum):
     BOUNDARY = "BOUNDARY"
     COUNTERPARTY = "COUNTERPARTY"
@@ -132,6 +137,7 @@ class ExecutionRequest:
     follow_up: FollowUpPolicy = FollowUpPolicy.UNTIL_FILLED_TODAY
     repricing: RepricingPolicy = RepricingPolicy.KEEP_ORIGINAL
     sell_style: Optional[ExecutionStyle] = None
+    order_sequence: OrderSequence = OrderSequence.SELL_THEN_BUY
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -148,6 +154,8 @@ class ExecutionRequest:
             raise TypeError("follow_up must be FollowUpPolicy")
         if type(self.repricing) is not RepricingPolicy:
             raise TypeError("repricing must be RepricingPolicy")
+        if type(self.order_sequence) is not OrderSequence:
+            raise TypeError("order_sequence must be OrderSequence")
         if self.sell_style is not None and not isinstance(
             self.sell_style,
             (
@@ -227,7 +235,7 @@ def execution_request_to_wire(request: ExecutionRequest) -> Dict[str, object]:
 
     if type(request) is not ExecutionRequest:
         raise TypeError("request must be ExecutionRequest")
-    return {
+    result = {
         "schema_version": EXECUTION_WIRE_SCHEMA_VERSION,
         "style": _style_to_wire(request.style),
         "sell_style": (
@@ -238,6 +246,11 @@ def execution_request_to_wire(request: ExecutionRequest) -> Dict[str, object]:
         "follow_up": request.follow_up.value,
         "repricing": request.repricing.value,
     }
+    # Preserve the old wire shape for all existing policies. Old servers
+    # reject this extension rather than silently running it sell-first.
+    if request.order_sequence is not OrderSequence.SELL_THEN_BUY:
+        result["order_sequence"] = request.order_sequence.value
+    return result
 
 
 def _require_exact_fields(
@@ -325,7 +338,7 @@ def execution_request_from_wire(value: Mapping[str, object]) -> ExecutionRequest
         )
     elif schema_version == EXECUTION_WIRE_SCHEMA_VERSION:
         allowed_fields = frozenset(
-            {"schema_version", "style", "sell_style", "follow_up", "repricing"}
+            {"schema_version", "style", "sell_style", "follow_up", "repricing", "order_sequence"}
         )
     else:
         raise ValueError("unsupported execution request schema_version")
@@ -347,5 +360,8 @@ def execution_request_from_wire(value: Mapping[str, object]) -> ExecutionRequest
             _style_from_wire(raw_sell_style, "sell execution style")
             if raw_sell_style is not None
             else None
+        ),
+        order_sequence=_enum_value(
+            OrderSequence, value.get("order_sequence", "SELL_THEN_BUY"), "order_sequence"
         ),
     )
