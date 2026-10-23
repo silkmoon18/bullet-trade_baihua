@@ -46,7 +46,7 @@ def test_v2_changes_identity_and_budget_not_selection_formula(monkeypatch):
     assert strategy.STRATEGY_NAME == 'ETF竞价折价轮动_jq'
     assert strategy.MAX_HOLD_NUM == 2
     assert strategy.DEPLOY_RATIO == .50
-    assert strategy.QMT_INITIAL_CAPITAL == 5000
+    assert strategy.QMT_INITIAL_CAPITAL == 10000
     assert strategy.BUY_PRICE_INCREASE == .002
     assert strategy.OPEN_DECISION_TIME == '09:26'
     assert strategy.OPEN_ORDER_TIME == '09:30'
@@ -73,7 +73,7 @@ def test_strategy_only_declares_execution_policy(monkeypatch):
     execution = prepared[0]['qmt_execution']
     assert execution == helper_module.default_etf_preopen_execution()
     assert execution.order_sequence is helper_module.OrderSequence.INDEPENDENT
-    assert execution.style == helper_module.LimitExecution(10000, preopen=True)
+    assert execution.style == helper_module.LimitExecution(5000, preopen=True)
 
 
 @pytest.mark.parametrize('run_type', ['simple_backtest', 'full_backtest'])

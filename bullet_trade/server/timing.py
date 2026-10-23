@@ -56,6 +56,7 @@ class Trace:
         self.started, self.started_at = time.perf_counter(), self.wall()
         self.events, self.totals = [], {}
         self.events_dropped = 0
+        self.events_aggregated = 0
         parent = current_trace()
         self.span_id = '{}:{}'.format(_process_instance, next(_trace_ids))
         self.parent_span_id = parent.span_id if parent else None
@@ -73,7 +74,12 @@ class Trace:
         total = self.totals.setdefault(stage, {'calls': 0, 'ms': 0., 'max_ms': 0.})
         total.update(calls=total['calls'] + 1, ms=total['ms'] + elapsed,
                      max_ms=max(total['max_ms'], elapsed))
-        if len(self.events) < 128:
+        if (stage.startswith('metadata.') and stage.endswith('cache_hit')
+                and elapsed < 200 and fields.get('outcome') != 'error'):
+            # Cache-hit totals are useful; 84 tiny samples must not evict submit
+            # or callback milestones from this bounded event list.
+            self.events_aggregated += 1
+        elif len(self.events) < 128:
             self.events.append(dict(stage=stage, ms=round(elapsed, 3), at=self.wall(),
                                     start_offset_ms=round((started-self.started)*1000, 3),
                                     finish_offset_ms=round((time.perf_counter()-self.started)*1000, 3), **fields))
@@ -84,6 +90,7 @@ class Trace:
         return dict(trace_id=self.trace_id, phase=self.phase, started_at=self.started_at,
                     process_instance=_process_instance, previous_timing_output_ms=round(_previous_output_ms, 3),
                     span_id=self.span_id, parent_span_id=self.parent_span_id, events_dropped=self.events_dropped,
+                    events_aggregated=self.events_aggregated,
                     finished_at=self.wall(), elapsed_ms=round((time.perf_counter()-self.started)*1000, 3),
                     tags=self.tags, stages={key: {k: round(v, 3) if isinstance(v, float) else v for k, v in value.items()}
                             for key, value in self.totals.items()}, events=self.events)

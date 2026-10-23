@@ -70,10 +70,27 @@ logger = logging.getLogger(__name__)
 EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 VALUATION_MARK_MAX_IDLE_AGE = timedelta(days=10)
 FIRST_DISPATCH_SNAPSHOT_MAX_AGE_SECONDS = 2.0
+STRATEGY_RUNTIME_BUILD_ID = "20261023-diagnostics-v2"
 
 
 class ReconciliationNotReadyError(RuntimeError):
     """Expected execution pause; the reconciliation notification explains it."""
+
+
+class ValuationMarkUnavailable(ValueError):
+    """Broker facts were booked, but this quote cannot support execution."""
+
+    def __init__(self, security: str, as_of: datetime) -> None:
+        self.security = security
+        super().__init__("QMT mark is stale or in the future: {} as_of={}".format(
+            security, as_of.isoformat()))
+
+
+def _runtime_build_label(value: object) -> str:
+    if (isinstance(value, str) and 0 < len(value) <= 64
+            and all(char.isascii() and (char.isalnum() or char in "_.:-") for char in value)):
+        return value
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -181,6 +198,7 @@ class SQLiteStrategyAPI:
         self._rejected_tick_symbols = set()
         self._resume_locks = {}
         self._sellable_waits = {}
+        self._valuation_wait_logs = {}
         self._dispatch_lock = asyncio.Lock()
         self._broker_revision_lock = threading.Lock()
         self._broker_state_revision = 0
@@ -308,45 +326,39 @@ class SQLiteStrategyAPI:
         result['server_features'] = {'scheduled_targets_v1': True, 'execution_timing_v1': True,
                                      'preopen_sell_rotation_v1': True,
                                      'independent_preopen_rotation_v1': True}
+        result['server_runtime_build_id'] = STRATEGY_RUNTIME_BUILD_ID
+        result['quote_subscription_scope'] = 'holdings_only'
+        result['candidate_count'] = len(candidates)
         if result["reconciliation"]["state"] != "READY":
             return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
         strategy_id = self._strategy_id(payload)
         holdings = set(self._held_securities(strategy_id))
-        securities = tuple(sorted(holdings | candidates))
+        # Selection stays in JQ. Subscribing its entire candidate pool can
+        # exhaust the bridge quota before any execution target even exists.
+        # Accept legacy candidate payloads, but never subscribe those symbols.
+        securities = tuple(sorted(holdings))
         subscribe = getattr(self.data_provider, "replace_execution_quotes", None)
         tick_fn = getattr(self.data_provider, "get_current_tick", None)
         quote_ready = False
         subscribed_holdings = 0
         subscribed_candidates = 0
         try:
-            if securities and callable(subscribe):
-                # Providers may update their desired owner set before the
-                # upstream subscription succeeds. A rejected candidate batch
-                # must not leave that oversized set in subsequent order feeds.
+            if callable(subscribe) and (securities or strategy_id in self._preopen_quote_owners):
                 self._preopen_quote_owners.add(strategy_id)
-                prepared = ()
-                attempted = set()
-                for symbols in (securities, tuple(sorted(holdings))):
-                    if not symbols or symbols in attempted:
-                        continue
-                    attempted.add(symbols)
-                    try:
-                        await subscribe("preopen:" + strategy_id, symbols)
-                    except Exception as exc:
-                        logger.warning("QMT盘前订阅未完成 | strategy_id=%s | %s", strategy_id, exc)
-                    else:
-                        prepared = symbols
-                        break
-                if not prepared:
+                try:
+                    await subscribe("preopen:" + strategy_id, securities)
+                except Exception as exc:
+                    logger.warning("QMT持仓行情预订阅未完成 | strategy_id=%s | %s", strategy_id, exc)
+                    # Desired ownership can change before an upstream failure.
+                    # Keep the cleanup tracked if that second RPC also fails.
                     await subscribe("preopen:" + strategy_id, ())
                     self._preopen_quote_owners.discard(strategy_id)
                     return dict(result, quote_ready=False, subscribed_holdings=0, subscribed_candidates=0)
-                securities = prepared
-                subscribed_holdings = len(holdings.intersection(prepared))
-                subscribed_candidates = len(candidates.intersection(prepared))
+                if not securities:
+                    self._preopen_quote_owners.discard(strategy_id)
+                subscribed_holdings = len(securities)
             if callable(tick_fn):
-                # The target remains unknown. Probe a subscribed symbol
-                # or the reference index, without using its pre-open price to
+                # Probe a held symbol or the reference index, without using its pre-open price to
                 # trade or blocking the decision if the feed is unavailable.
                 tick = await tick_fn(securities[0] if securities else "000300.XSHG")
                 quote_as_of = self._tick_as_of(tick)
@@ -539,12 +551,19 @@ class SQLiteStrategyAPI:
                         strategy_id, '/'.join(preopen_limit_sides(execution_request)),
                         execution_request.order_sequence.value)
         logger.info(
-            "QMT目标已接受 | strategy_id=%s key=%s | 接收至接受=%.0fms | 接收时间=%s 接受时间=%s | %s",
+            "QMT目标已接受 | strategy_id=%s key=%s | 接收至接受=%.0fms | 接收时间=%s 接受时间=%s | %s"
+            " | server_build=%s helper_build=%s 买入类型=%s 买入偏移ppm=%s 买入保护ppm=%s 顺序=%s 买入预委托=%s",
             strategy_id, key, (time.monotonic() - target_received_at) * 1000,
             # Wall times correlate with JQ/bridge logs; duration uses only
             # this process's monotonic clock, never cross-machine subtraction.
             target_received_wall, datetime.now(SHANGHAI_TZ).isoformat(timespec="milliseconds"),
             "定时等待，不发委托" if deferred else "首笔委托异步发出",
+            STRATEGY_RUNTIME_BUILD_ID, _runtime_build_label(payload.get("runtime_build_id")),
+            execution_request.style.execution_type.value,
+            getattr(execution_request.style, "price_band_ppm", None),
+            getattr(execution_request.style, "protect_price_band_ppm", None),
+            execution_request.order_sequence.value,
+            'BUY' in preopen_limit_sides(execution_request),
         )
         # Include reservations created by planning, but do not wait for a new
         # broker observation. This is an acceptance snapshot, not a fill report.
@@ -565,6 +584,7 @@ class SQLiteStrategyAPI:
             "reconciliation": _json_value(reconciliation),
             "effective_weights": _json_value(weights),
             "effective_execution": execution_request_to_wire(execution_request),
+            "server_runtime_build_id": STRATEGY_RUNTIME_BUILD_ID,
         }
 
     def _queue_target_execution(self, intent_id, awaitable):
@@ -1222,11 +1242,7 @@ class SQLiteStrategyAPI:
             if not self._valuation_mark_is_fresh(
                 mark_as_of, datetime.now(SHANGHAI_TZ)
             ):
-                raise ValueError(
-                    "QMT mark is stale or in the future: {} as_of={}".format(
-                        security, mark_as_of.isoformat()
-                    )
-                )
+                raise ValuationMarkUnavailable(security, mark_as_of)
             marks[security] = MarketMark(
                 security, price_to_units(str(price)), mark_as_of, "qmt"
             )
@@ -1497,11 +1513,13 @@ class SQLiteStrategyAPI:
                     intent.execute_at is not None and now < intent.execute_at
                     for intent in intents
                 ):
-                    # Future targets wait quietly, but genuine broker events
-                    # must still book fills and reconcile the physical account.
-                    await self._refresh(
-                        binding[0], binding[1], strategy_id, {}
-                    )
+                    # No executable target consumes a valuation here. Book
+                    # broker facts independently: missing/stale lunch or late
+                    # quotes must not fail an otherwise valid report refresh.
+                    broker_snapshot = await collect_async_broker_snapshot(
+                        cast(Any, self.broker), binding[0])
+                    await self._synchronize(
+                        strategy_id, self._physical_id(binding[1]), broker_snapshot)
                 for intent in intents:
                     await self._resume_intent_locked(intent.intent_id)
                 await self._sync_quote_subscriptions(strategy_id)
@@ -1602,6 +1620,17 @@ class SQLiteStrategyAPI:
             # The changed blocker already has one detailed notification.
             # Do not treat a normal execution pause as a callback crash.
             return
+        except ValuationMarkUnavailable as exc:
+            # _refresh already synchronized facts before trying valuation.
+            # Keep the intent alive, but never advance/dispatch from old marks.
+            previous = self._valuation_wait_logs.get(intent.account_id)
+            observed = time.monotonic()
+            if previous is None or previous[0] != exc.security or observed - previous[1] >= 60:
+                self._valuation_wait_logs[intent.account_id] = (exc.security, observed)
+                logger.warning("QMT目标等待有效估值行情 | strategy_id=%s | %s | 回报已对账；本轮不规划或发单，等待后续行情/回报",
+                               intent.account_id, exc)
+            return
+        self._valuation_wait_logs.pop(intent.account_id, None)
         self._record_reconciliation_rejections(
             intent_id, reconciliation, execution_quotes
         )

@@ -52,6 +52,24 @@ def test_trace_memory_is_bounded_and_counts_are_complete():
     json.dumps(trace.summary(), allow_nan=False)
 
 
+def test_tiny_cache_hits_leave_event_capacity_for_actual_broker_calls(monkeypatch):
+    clock = [0.]
+    monkeypatch.setattr(timing.time, 'perf_counter', lambda: clock[0])
+    trace = timing.Trace('server.execute_target', 'strategy:today')
+    for _ in range(425):
+        start = clock[0]
+        clock[0] += .00001
+        trace.record('metadata.tplus_cache_hit', start)
+    trace.record('bridge./place_order', clock[0], qmt_timing={'qmt_command_ms': .2})
+    summary = trace.summary()
+    assert summary['stages']['metadata.tplus_cache_hit']['calls'] == 425
+    assert summary['events_aggregated'] == 425 and summary['events_dropped'] == 0
+    assert len(summary['events']) == 1
+    assert summary['events'][0]['qmt_timing']['qmt_command_ms'] == .2
+    trace.record('metadata.tplus_cache_hit', clock[0], outcome='error')
+    assert trace.failed and trace.events[-1]['outcome'] == 'error'
+
+
 @pytest.mark.asyncio
 async def test_parent_span_links_and_closed_inherited_context_is_not_reused():
     @timing.traced('nested.child')

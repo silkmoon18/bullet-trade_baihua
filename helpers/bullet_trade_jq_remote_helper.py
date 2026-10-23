@@ -69,6 +69,7 @@ class _ExecutionTrace:
         self.remote = []
         self.events = []
         self.events_dropped = 0
+        self.events_aggregated = 0
         self.callback = dict(getattr(_execution_timing, 'callback_entry', None) or {})
         if self.callback:
             self.started = self.callback.pop('_entry_mono', self.started)
@@ -84,7 +85,13 @@ class _ExecutionTrace:
         row["errors"] += outcome != "ok"
         row.setdefault('first_finished_at', _wall_timestamp(time.time()*1000))
         row['last_finished_at'] = _wall_timestamp(time.time()*1000)
-        if len(self.events) < 128:
+        # Tiny name/transport calls remain in totals, not a 425-row event stream.
+        # Keep slow/error samples and every actual RPC/order milestone.
+        aggregate = (name == 'jq.api.get_security_info' or (
+            name.startswith('rpc.') and not name.startswith('rpc.strategy.')))
+        if aggregate and elapsed < 200 and outcome == 'ok':
+            self.events_aggregated += 1
+        elif len(self.events) < 128:
             self.events.append({'stage': name, 'ms': round(elapsed, 3),
                                 'start_offset_ms': round((started-self.started)*1000, 3),
                                 'finish_offset_ms': round((time.perf_counter()-self.started)*1000, 3),
@@ -93,14 +100,30 @@ class _ExecutionTrace:
             self.events_dropped += 1
 
     def message(self) -> str:
+        elapsed = (time.perf_counter()-self.started)*1000
+        detailed = elapsed >= 5000 or any(
+            row['errors'] or row['max_ms'] >= 2000 for row in self.stages.values())
+        stages = {}
+        for name, row in self.stages.items():
+            if not detailed and name.startswith('rpc.') and not name.startswith((
+                    'rpc.strategy.', 'rpc.dns_tcp_connect', 'rpc.connection_tls_auth_or_reuse')):
+                continue  # Nested socket/JSON spans duplicate the enclosing RPC.
+            keys = ('calls', 'ms', 'max_ms', 'errors')
+            if detailed or name.startswith(('rpc.strategy.', 'jq.api.order_', 'jq.api.cancel_order')):
+                keys += ('first_finished_at', 'last_finished_at')
+            stages[name] = {k: round(row[k], 3) if isinstance(row[k], float) else row[k]
+                            for k in keys if k in row}
+        remote = self.remote if detailed else [
+            {k: item[k] for k in ('action', 'trace_id', 'phase', 'span_id',
+                                  'started_at', 'finished_at', 'elapsed_ms') if k in item}
+            for item in self.remote]
         return "执行链路耗时 | " + json.dumps({
             "trace_id": self.trace_id, "phase": self.phase, "started_at": self.started_at,
             "finished_at": _wall_timestamp(time.time() * 1000),
-            "elapsed_ms": round((time.perf_counter()-self.started)*1000, 3),
-            "stages": {name: {k: round(v, 3) if isinstance(v, float) else v
-                              for k, v in row.items()} for name, row in self.stages.items()},
-            "remote": self.remote,
-            "events": self.events, "events_dropped": self.events_dropped, "callback": self.callback,
+            "elapsed_ms": round(elapsed, 3), "detail": "diagnostic" if detailed else "compact",
+            "stages": stages, "remote": remote,
+            "events": self.events, "events_dropped": self.events_dropped,
+            "events_aggregated": self.events_aggregated, "callback": self.callback,
             "process_instance": _timing_process_instance, "helper_loaded_at": _helper_loaded_at,
             "previous_timing_output_ms": getattr(_execution_timing, 'previous_output_ms', None),
             "rpc_connections": _rpc_stats['connections']-self.rpc_before['connections'],
@@ -200,6 +223,7 @@ __all__ = [
     "JOINQUANT_RUNTIME_FEATURES",
     "STRATEGY_RUNTIME_API_VERSION",
     "STRATEGY_RUNTIME_HELPER_MARKER",
+    "STRATEGY_RUNTIME_BUILD_ID",
     "PROFILE_SCHEMA_VERSION",
     "HONG_KONG_ETF_KEYWORDS",
     "HONG_KONG_ETF_CODE_DENYLIST",
@@ -247,6 +271,7 @@ __all__ = [
 
 STRATEGY_RUNTIME_API_VERSION = 26
 STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v26"
+STRATEGY_RUNTIME_BUILD_ID = "20261023-diagnostics-v2"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 _JQ_FIXED_SLIPPAGE = 0.002  # Native total spread; each side bears half.
@@ -648,9 +673,9 @@ class ExecutionRequest(_ExecutionRequestTuple):
 
 
 def default_etf_preopen_execution() -> ExecutionRequest:
-    """Preorder both sides independently; buys use the opening reference +1%."""
+    """Preorder both sides independently; buys use the opening reference +0.5%."""
     return ExecutionRequest(
-        style=LimitExecution(10_000, preopen=True),
+        style=LimitExecution(5_000, preopen=True),
         sell_style=LimitExecution(0, preopen=True),
         order_sequence=OrderSequence.INDEPENDENT,
     )
@@ -1009,6 +1034,8 @@ def _strategy_request_locked(action: str, payload: Dict[str, Any]) -> Dict[str, 
             request_id = uuid.uuid4().hex
             request_payload = dict(payload)
             request_payload["strategy_id"] = _active_state["strategy_id"]
+            if action in ("strategy.prepare_session", "strategy.submit_targets"):
+                request_payload["runtime_build_id"] = STRATEGY_RUNTIME_BUILD_ID
             trace = getattr(_execution_timing, "current", None)
             if trace is not None:
                 request_payload["trace_id"] = trace.trace_id
@@ -2075,10 +2102,8 @@ class JoinQuantRuntime:
         ):
             return
         try:
-            candidates = self._prepared_candidates(context)
+            self._prepared_candidates(context)  # Restore names, not an execution subscription pool.
             payload = {"initial_capital": self._qmt_initial_capital}
-            if candidates:
-                payload["candidate_securities"] = list(candidates)
             ensured = _strategy_request(
                 "strategy.prepare_session",
                 payload,
@@ -2097,9 +2122,15 @@ class JoinQuantRuntime:
             self._set_qmt_ready(True)
             self._log(
                 "info",
-                "QMT盘前准备完成 | 对账=READY 行情链路={} 定时目标={}；执行时以新快照提交目标".format(
+                "QMT盘前准备完成 | 对账=READY 行情链路={} 定时目标={}；执行时以新快照提交目标"
+                " | 预订阅范围={} 持仓订阅={} 候选订阅={} helper_build={} server_build={}".format(
                     "就绪" if ensured.get("quote_ready") else "未验证",
                     '支持' if self.state['server_features'].get('scheduled_targets_v1') is True else '未确认',
+                    ensured.get('quote_subscription_scope', '未确认'),
+                    ensured.get('subscribed_holdings', '未确认'),
+                    ensured.get('subscribed_candidates', '未确认'),
+                    STRATEGY_RUNTIME_BUILD_ID,
+                    ensured.get('server_runtime_build_id', 'unknown'),
                 ),
             )
         except Exception as exc:
@@ -2317,9 +2348,7 @@ class JoinQuantRuntime:
             _slot='snapshot',
             reference_security=reference_security,
         )
-        self._log(
-            "info",
-            "任务调度完成 | {}09:20 盘前预处理 | {}{} 下单 | ".format(
+        summary = ("任务调度完成 | {}09:20 盘前预处理 | {}{} 下单 | ".format(
                 "09:20 QMT盘前准备 | {} RPC连接预热 | ".format("/".join(sorted(warmup_times)))
                 if self.qmt_account_enabled else "",
                 "{} 锁定选股 | ".format(opening_decision_time)
@@ -2330,11 +2359,14 @@ class JoinQuantRuntime:
             + " | 选股={} 下单={}".format(
                 opening_decision_time if opening_decision is not None else open_decision_time,
                 open_order_time or open_decision_time
-            ),
-        )
-        if replace_existing:
-            self._log("info", "调度已恢复 | 入口数={} | 日程见任务调度摘要".format(len(registered)))
+            ))
         global_state = (self._namespace or {}).get('g')
+        if replace_existing and getattr(global_state, 'bt_schedule_log_summary', None) == summary:
+            self._log('info', '调度已恢复 | 入口数={} | 日程未变'.format(len(registered)))
+        else:
+            self._log('info', summary)
+        if global_state is not None:
+            setattr(global_state, 'bt_schedule_log_summary', summary)
         if global_state is not None and self.mode != RuntimeMode.BACKTEST:
             setattr(global_state, 'bt_scheduled_entries', {
                 slot: {'callback_name': getattr(row['callback'], '__name__', ''),
@@ -2567,14 +2599,14 @@ class JoinQuantRuntime:
 
     def log_process_initialize(self) -> None:
         name = (self._namespace or {}).get('STRATEGY_NAME')
-        if name:
-            self._log('info', '策略名称={} | strategy_id={}'.format(name, self.state.get('strategy_id')))
         self._log(
             "info",
-            "process_initialize 重建配置 {} | helper API={} marker={}".format(
+            "process_initialize 重建配置 {} | helper API={} marker={} build={} | 策略名称={} strategy_id={}".format(
                 time.strftime("%Y-%m-%d %H:%M:%S"),
                 STRATEGY_RUNTIME_API_VERSION,
                 STRATEGY_RUNTIME_HELPER_MARKER,
+                STRATEGY_RUNTIME_BUILD_ID,
+                name or self.state.get('strategy_id'), self.state.get('strategy_id'),
             ),
         )
 
@@ -2804,7 +2836,7 @@ class JoinQuantRuntime:
         security_names: Optional[Dict[str, str]] = None,
         *, execute_at: Any = None,
     ) -> Dict[str, Any]:
-        return submit_runtime_targets(
+        result = submit_runtime_targets(
             context,
             weights,
             marks,
@@ -2813,6 +2845,31 @@ class JoinQuantRuntime:
             security_names,
             **({"execute_at": execute_at} if execute_at is not None else {}),
         )
+        try:
+            self._log_effective_execution(result, execution)
+        except Exception:
+            pass  # Optional diagnostics must not turn an accepted target into a retry.
+        return result
+
+    def _log_effective_execution(self, result: Dict[str, Any], requested: ExecutionRequest) -> None:
+        raw = result.get("effective_execution")
+        if not isinstance(raw, dict):
+            self._log("warn", "QMT执行参数未核验 | 服务器未返回effective_execution；目标结果不变，不自动重发")
+            return
+        try:
+            effective = _execution_from_wire(raw)
+        except RuntimeError:
+            self._log("warn", "QMT执行参数未核验 | 服务器返回内容无效；目标结果不变，不自动重发")
+            return
+        buy = effective.style
+        band = getattr(buy, "price_band_ppm", None)
+        protection = getattr(buy, "protect_price_band_ppm", None)
+        self._log("info", "QMT实际执行参数 | helper_build={} server_build={} 买入类型={} 买入偏移ppm={} 买入保护ppm={} 顺序={} 买入预委托={}".format(
+            STRATEGY_RUNTIME_BUILD_ID, result.get("server_runtime_build_id", "unknown"),
+            buy.execution_type.value, band, protection, effective.order_sequence.value,
+            isinstance(buy, LimitExecution) and buy.preopen))
+        if _execution_to_wire(effective) != _execution_to_wire(requested):
+            self._log("warn", "QMT实际执行参数与本次请求不同 | 可能沿用已保存目标；以服务器返回为准，不修改旧委托或自动重发")
 
     @staticmethod
     def security_name(security: str, known_name: Any = "") -> str:
@@ -3339,7 +3396,7 @@ class JoinQuantRuntime:
         plan["qmt"] = "BUY_SENT"  # Accepted intent, not a claim of completed buys.
         self._log_qmt_planned_orders(result)
         self._log("info", "QMT轮换目标已提交 | 保留计划内持仓，跌停价卖出计划外/超额部分；"
-                  "{} | intent_id={}".format(
+                  "请求规则={}；实际规则见QMT实际执行参数 | intent_id={}".format(
                       ("买卖独立预委托，买入只用已有现金，固定参考价上浮{:g}%".format(
                           custom.style.price_band_ppm / 10_000)
                        if isinstance(custom.style, LimitExecution) else

@@ -84,11 +84,14 @@ async def test_future_target_still_refreshes_genuine_broker_events(api, timed_cl
     monkeypatch.setattr(service, '_schedule_open_resume', lambda _: None)
     accepted = await service.submit_targets(account, 'default', request(timed_clock))
     await drain_execution(service)
-    refreshes, refresh = [], service._refresh
+    refreshes, refresh = [], service._synchronize
     async def tracked_refresh(*args, **kwargs):
         refreshes.append(True)
         return await refresh(*args, **kwargs)
-    monkeypatch.setattr(service, '_refresh', tracked_refresh)
+    monkeypatch.setattr(service, '_synchronize', tracked_refresh)
+    async def no_valuation(*args, **kwargs):
+        pytest.fail('future-target broker facts must not depend on valuation quotes')
+    monkeypatch.setattr(service, '_marks', no_valuation)
     await service._handle_broker_event('default', 'trade')
     assert refreshes == [True] and broker.order_calls == 0
     assert service.get_intent({'strategy_id': 'good_etf'})['intent_id'] == accepted['intent']['intent_id']

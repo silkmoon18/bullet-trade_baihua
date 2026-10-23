@@ -194,7 +194,7 @@ def test_candidate_codes_and_names_are_same_day_plain_data_and_never_prices(help
     assert runtime._prepared_candidates(context) == ()
 
 
-def test_prewarm_sends_only_same_day_candidates_and_retains_no_target(helper, monkeypatch):
+def test_prewarm_keeps_candidate_pool_local_and_retains_no_target(helper, monkeypatch):
     namespace = {"g": NS()}
     runtime = helper.JoinQuantRuntime(_state("QMT_REMOTE", "sim_trade"), namespace)
     context = NS(current_dt=datetime(2026, 9, 8, 9, 20))
@@ -207,7 +207,7 @@ def test_prewarm_sends_only_same_day_candidates_and_retains_no_target(helper, mo
     monkeypatch.setattr(helper, "_restore_runtime_targets", lambda: None)
     runtime.prewarm_qmt(context)
     assert requests == [("strategy.prepare_session", {
-        "initial_capital": None, "candidate_securities": ["510050.XSHG"]
+        "initial_capital": None
     })]
     assert not hasattr(namespace["g"], "bt_open_decision")
     context.current_dt += timedelta(days=1)

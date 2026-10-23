@@ -460,7 +460,7 @@ async def test_prepare_session_checks_account_and_warms_owned_quotes(api, monkey
 
 
 @pytest.mark.asyncio
-async def test_prepare_session_subscribes_union_of_holdings_and_candidates_without_orders(api, monkeypatch):
+async def test_prepare_session_does_not_subscribe_candidate_pool(api, monkeypatch):
     service, broker, account, _ = api
     subscribed = []
 
@@ -478,9 +478,12 @@ async def test_prepare_session_subscribes_union_of_holdings_and_candidates_witho
             "510300.XSHG", SECURITY, "510300.XSHG", "159915.XSHE"
         ],
     })
-    assert subscribed == [("preopen:good_etf", ("159915.XSHE", SECURITY, "510300.XSHG"))]
+    assert subscribed == [("preopen:good_etf", (SECURITY,))]
     assert result["subscribed_holdings"] == 1
-    assert result["subscribed_candidates"] == 3
+    assert result["subscribed_candidates"] == 0
+    assert result["candidate_count"] == 3
+    assert result["quote_subscription_scope"] == "holdings_only"
+    assert result["server_runtime_build_id"] == strategy_api_module.STRATEGY_RUNTIME_BUILD_ID
     assert result["quote_ready"] is True
     assert broker.order_calls == 0
     assert service.planner.active_intents() == ()
@@ -503,7 +506,7 @@ async def test_invalid_candidate_payload_is_rejected_before_account_mutation(api
 
 
 @pytest.mark.asyncio
-async def test_failed_candidate_subscription_is_not_reported_as_prepared(api, monkeypatch):
+async def test_failed_holdings_subscription_is_not_reported_as_prepared(api, monkeypatch):
     service, broker, account, _ = api
 
     class FailedData:
@@ -514,6 +517,7 @@ async def test_failed_candidate_subscription_is_not_reported_as_prepared(api, mo
             pytest.fail("subscription failed")
 
     service.data_provider = FailedData()
+    monkeypatch.setattr(service, "_held_securities", lambda strategy_id: (SECURITY,))
     result = await service.prepare_session(account, "default", {
         "strategy_id": "good_etf", "candidate_securities": [SECURITY],
     })
@@ -527,7 +531,7 @@ async def test_failed_candidate_subscription_is_not_reported_as_prepared(api, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("holdings", [(SECURITY,), ()])
-async def test_candidate_subscription_quota_restores_safe_owner_set(api, monkeypatch, holdings):
+async def test_candidate_subscription_never_consumes_execution_quota(api, monkeypatch, holdings):
     service, broker, account, _ = api
 
     class LimitedData:
@@ -547,7 +551,7 @@ async def test_candidate_subscription_quota_restores_safe_owner_set(api, monkeyp
             self.applied = desired
 
         async def get_current_tick(self, security):
-            assert security in self.applied
+            assert security in self.applied or not holdings and security == "000300.XSHG"
             return {"lastPrice": 10, "timetag": datetime.now(SHANGHAI_TZ).isoformat()}
 
     data = LimitedData()
@@ -559,8 +563,8 @@ async def test_candidate_subscription_quota_restores_safe_owner_set(api, monkeyp
     assert data.applied == {"159915.XSHE", *holdings}
     assert data.owners.get("preopen:good_etf", set()) == set(holdings)
     assert result["subscribed_holdings"] == len(holdings)
-    assert result["subscribed_candidates"] == len(holdings)
-    assert result["quote_ready"] is bool(holdings)
+    assert result["subscribed_candidates"] == 0
+    assert result["quote_ready"] is True
     assert ("good_etf" in service._preopen_quote_owners) is bool(holdings)
     assert broker.order_calls == 0
     assert service.planner.active_intents() == ()

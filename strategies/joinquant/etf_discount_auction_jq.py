@@ -12,7 +12,7 @@
 # ETF竞价折价轮动_jq：半仓；09:26锁定选股，QMT买卖独立预委托。
 # 原文件good_etf_v2.py；仅改文件/展示名称，内部good_etf_v2身份和现有账本不变。
 # JQ由helper逐笔确认必要卖单，买单仅提交一次；QMT由服务器推进组合目标。
-# 新账本good_etf_v2，QMT初始资金5000；不继承、卖出或改写旧策略的归属持仓。
+# good_etf_v2累计投入10000；原5000账本需显式追加5000，不重置或认领其他策略持仓。
 
 # 导入必要的库
 import math
@@ -47,7 +47,7 @@ STOP_LOSS_RATIO = 0.95     # 止损线：现价跌破成本价 95%
 TAKE_PROFIT_RATIO = 1.10   # 止盈线：现价涨超成本价 110%
 DEPLOY_RATIO = 0.50        # 调仓目标半仓；整手取整、费用和限价预算可能使实际比例更低
 BUY_PRICE_INCREASE = 0.002 # 仅回测：原模型买入成交价额外上涨比例，0.001=0.1%；0保持原行为
-QMT_INITIAL_CAPITAL = 5000 # 新QMT策略虚拟账户初始资金，不修改聚宽账户资金
+QMT_INITIAL_CAPITAL = 10000 # 仅新建QMT账本的初始资金；已有账本须显式增资，不修改JQ资金
 SKIP_SUSPENDED_LIMITUP = True  # 选股时剔除停牌/涨停标的（False 恢复原行为）
 OPEN_DECISION_TIME = '09:26'  # QMT立即预挂买卖限价单；使用已有现金，不等待卖出回款
 OPEN_ORDER_TIME = '09:30'     # JQ原生先卖后买时间；不控制QMT执行

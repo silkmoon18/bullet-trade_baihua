@@ -26,7 +26,7 @@ def test_independent_preopen_request_is_durable_and_feature_gated(monkeypatch, s
     if supported:
         execution = submitted[0][3]
         assert execution.order_sequence is helper.OrderSequence.INDEPENDENT
-        assert execution.style == helper.LimitExecution(10000, preopen=True)
+        assert execution.style == helper.LimitExecution(5000, preopen=True)
         assert execution.sell_style.limit_prices == {'QMT_OLD': 7200000, 'QMT_TRIM': 9000000}
         assert execution.sell_style.preopen and seen == [{}]
         from bullet_trade.server.strategy.execution import execution_request_from_wire
